@@ -33,18 +33,46 @@ For explicit disable:
 -DBASICRHI_ENABLE_STREAMLINE=OFF -DBASICRHI_ENABLE_PIX=OFF
 ```
 
-## Build and install
+## Standalone build and install
+
+`BasicRHI` now uses CMake presets for standalone builds.
+
+Prerequisites:
+
+- CMake 3.23+
+- Ninja
+- `VCPKG_ROOT` set to your vcpkg checkout path
+
+Configure once:
 
 ```powershell
-cmake -S BasicRHI -B out/build/rhi -G Ninja -DCMAKE_BUILD_TYPE=Debug
-cmake --build out/build/rhi
-cmake --install out/build/rhi --prefix out/install/rhi
+cmake --preset ninja-x64-vcpkg
 ```
 
-Example with manual header paths:
+Build:
 
 ```powershell
-cmake -S BasicRHI -B out/build/rhi -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBASICRHI_STREAMLINE_HEADERS_DIR="C:/path/to/Streamline" -DBASICRHI_PIX_HEADERS_DIR="C:/path/to/pix"
+cmake --build --preset debug
+cmake --build --preset release
+```
+
+Install (example prefix):
+
+```powershell
+cmake --install out/build/ninja-x64-vcpkg --prefix out/install/rhi
+```
+
+If `VCPKG_ROOT` is not set in your shell:
+
+```powershell
+$env:VCPKG_ROOT = "C:/src/vcpkg"
+cmake --preset ninja-x64-vcpkg
+```
+
+Example with manual Streamline/PIX header paths:
+
+```powershell
+cmake --preset ninja-x64-vcpkg -DBASICRHI_STREAMLINE_HEADERS_DIR="C:/path/to/Streamline" -DBASICRHI_PIX_HEADERS_DIR="C:/path/to/pix"
 ```
 
 ## Consume from another CMake project
