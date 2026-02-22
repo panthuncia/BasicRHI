@@ -1,0 +1,10 @@
+{
+  "name": "basicrhi",
+  "version": "0.1.0",
+  "dependencies": [
+    "directx-headers",
+    "directx12-agility",
+    "spdlog"
+  ],
+  "builtin-baseline": "edffab1bcd2cb5b8c17d6ba34d5651ea0bf82979"
+}
