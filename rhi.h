@@ -843,24 +843,36 @@ namespace rhi {
 		uint64_t recordByteStride{};
 	};
 
-	struct WorkGraphNodeGpuInput {
-		uint32_t entryPointIndex{};
-		ResourceHandle inputBuffer{};
-		uint64_t bufferOffset{};
-		uint32_t numRecords{};
-		uint64_t recordByteStride{};
-	};
-
 	struct WorkGraphMultiNodeCpuInput {
 		uint32_t numNodeInputs{};
 		const WorkGraphNodeCpuInput* nodeInputs{};
 		uint64_t nodeInputByteStride{};
 	};
 
-	struct WorkGraphMultiNodeGpuInput {
-		uint32_t numNodeInputs{};
+	// These are the GPU-side structs for GPU input: TODO: When VK introduces shader_enqueue, we'll need to take another look at this
+	/*
+	typedef struct D3D12_NODE_GPU_INPUT
+	{
+		UINT EntrypointIndex;
+		UINT NumRecords;
+		D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE Records;
+	} D3D12_NODE_GPU_INPUT;
+
+	typedef struct D3D12_MULTI_NODE_GPU_INPUT
+	{
+		UINT NumNodeInputs;
+		D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE NodeInputs; // D3D12_GPU_NODE_INPUT array
+	} D3D12_MULTI_NODE_GPU_INPUT;
+	*/
+
+	struct WorkGraphNodeGpuInput {
 		ResourceHandle inputBuffer{};
-		uint64_t recordByteStride{};
+		uint64_t inputAddressOffset{};
+	};
+
+	struct WorkGraphMultiNodeGpuInput {
+		ResourceHandle inputBuffer{};
+		uint64_t inputAddressOffset{};
 	};
 
 	enum class WorkGraphDispatchMode : uint32_t {

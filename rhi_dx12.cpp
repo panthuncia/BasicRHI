@@ -3371,8 +3371,8 @@ namespace rhi {
 				l->cl->DispatchGraph(&d);
 				return;
 			} break;
-			case WorkGraphDispatchMode::NodeGpuInput: { // TODO: Validate
-				d.NodeGPUInput = l->dev->resources.get(desc.nodeGpuInput.inputBuffer)->res->GetGPUVirtualAddress();
+			case WorkGraphDispatchMode::NodeGpuInput: {
+				d.NodeGPUInput = l->dev->resources.get(desc.nodeGpuInput.inputBuffer)->res->GetGPUVirtualAddress() + desc.nodeGpuInput.inputAddressOffset;
 				l->cl->DispatchGraph(&d);
 				return;
 			} break;
@@ -3385,7 +3385,7 @@ namespace rhi {
 				return;
 			} break;
 			case WorkGraphDispatchMode::MultiNodeGpuInput: {
-				d.MultiNodeGPUInput = l->dev->resources.get(desc.multiNodeGpuInput.inputBuffer)->res->GetGPUVirtualAddress();
+				d.MultiNodeGPUInput = l->dev->resources.get(desc.multiNodeGpuInput.inputBuffer)->res->GetGPUVirtualAddress() + desc.multiNodeGpuInput.inputAddressOffset;
 				l->cl->DispatchGraph(&d);
 			} break;
 			default:
