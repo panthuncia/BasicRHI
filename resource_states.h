@@ -295,6 +295,7 @@ namespace rhi {
 		case ResourceSyncState::None:
 		case ResourceSyncState::All:
 		case ResourceSyncState::ComputeShading:
+		case ResourceSyncState::ExecuteIndirect:
 			return false;
 		}
 		return true;
