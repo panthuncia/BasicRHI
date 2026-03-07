@@ -16,8 +16,13 @@
 
 namespace rhi {
 
+	// Optional callback invoked by BreakIfDebugging (set by DX12 backend to log DRED data)
+	using BreakCallbackFn = void(*)();
+	inline BreakCallbackFn g_breakCallback = nullptr;
+
 	inline void BreakIfDebugging() {
 #if BUILD_TYPE == BUILD_DEBUG
+		if (g_breakCallback) g_breakCallback();
 		if (IsDebuggerPresent()) {
 			__debugbreak();
 		}

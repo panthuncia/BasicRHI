@@ -21,6 +21,158 @@
 
 namespace rhi {
 
+	// ---- DRED (Device Removed Extended Data) support ----
+
+	static ID3D12Device* g_dredDevice = nullptr;
+
+	static const char* BreadcrumbOpToString(D3D12_AUTO_BREADCRUMB_OP op) noexcept {
+		switch (op) {
+		case D3D12_AUTO_BREADCRUMB_OP_SETMARKER:                                      return "SetMarker";
+		case D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT:                                     return "BeginEvent";
+		case D3D12_AUTO_BREADCRUMB_OP_ENDEVENT:                                       return "EndEvent";
+		case D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED:                                  return "DrawInstanced";
+		case D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED:                           return "DrawIndexedInstanced";
+		case D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT:                                return "ExecuteIndirect";
+		case D3D12_AUTO_BREADCRUMB_OP_DISPATCH:                                       return "Dispatch";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION:                               return "CopyBufferRegion";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION:                              return "CopyTextureRegion";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE:                                   return "CopyResource";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYTILES:                                      return "CopyTiles";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCE:                             return "ResolveSubresource";
+		case D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW:                          return "ClearRenderTargetView";
+		case D3D12_AUTO_BREADCRUMB_OP_CLEARUNORDEREDACCESSVIEW:                       return "ClearUnorderedAccessView";
+		case D3D12_AUTO_BREADCRUMB_OP_CLEARDEPTHSTENCILVIEW:                          return "ClearDepthStencilView";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER:                                return "ResourceBarrier";
+		case D3D12_AUTO_BREADCRUMB_OP_EXECUTEBUNDLE:                                  return "ExecuteBundle";
+		case D3D12_AUTO_BREADCRUMB_OP_PRESENT:                                        return "Present";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOLVEQUERYDATA:                               return "ResolveQueryData";
+		case D3D12_AUTO_BREADCRUMB_OP_BEGINSUBMISSION:                                return "BeginSubmission";
+		case D3D12_AUTO_BREADCRUMB_OP_ENDSUBMISSION:                                  return "EndSubmission";
+		case D3D12_AUTO_BREADCRUMB_OP_DECODEFRAME:                                    return "DecodeFrame";
+		case D3D12_AUTO_BREADCRUMB_OP_PROCESSFRAMES:                                  return "ProcessFrames";
+		case D3D12_AUTO_BREADCRUMB_OP_ATOMICCOPYBUFFERUINT:                           return "AtomicCopyBufferUINT";
+		case D3D12_AUTO_BREADCRUMB_OP_ATOMICCOPYBUFFERUINT64:                         return "AtomicCopyBufferUINT64";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCEREGION:                       return "ResolveSubresourceRegion";
+		case D3D12_AUTO_BREADCRUMB_OP_WRITEBUFFERIMMEDIATE:                           return "WriteBufferImmediate";
+		case D3D12_AUTO_BREADCRUMB_OP_DECODEFRAME1:                                   return "DecodeFrame1";
+		case D3D12_AUTO_BREADCRUMB_OP_SETPROTECTEDRESOURCESESSION:                    return "SetProtectedResourceSession";
+		case D3D12_AUTO_BREADCRUMB_OP_DECODEFRAME2:                                   return "DecodeFrame2";
+		case D3D12_AUTO_BREADCRUMB_OP_PROCESSFRAMES1:                                 return "ProcessFrames1";
+		case D3D12_AUTO_BREADCRUMB_OP_BUILDRAYTRACINGACCELERATIONSTRUCTURE:            return "BuildRaytracingAccelerationStructure";
+		case D3D12_AUTO_BREADCRUMB_OP_EMITRAYTRACINGACCELERATIONSTRUCTUREPOSTBUILDINFO:return "EmitRaytracingAccelerationStructurePostbuildInfo";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYRAYTRACINGACCELERATIONSTRUCTURE:             return "CopyRaytracingAccelerationStructure";
+		case D3D12_AUTO_BREADCRUMB_OP_DISPATCHRAYS:                                   return "DispatchRays";
+		case D3D12_AUTO_BREADCRUMB_OP_INITIALIZEMETACOMMAND:                          return "InitializeMetaCommand";
+		case D3D12_AUTO_BREADCRUMB_OP_EXECUTEMETACOMMAND:                             return "ExecuteMetaCommand";
+		case D3D12_AUTO_BREADCRUMB_OP_ESTIMATEMOTION:                                 return "EstimateMotion";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOLVEMOTIONVECTORHEAP:                        return "ResolveMotionVectorHeap";
+		case D3D12_AUTO_BREADCRUMB_OP_SETPIPELINESTATE1:                              return "SetPipelineState1";
+		default:                                                                      return "Unknown";
+		}
+	}
+
+	static const char* DredAllocationTypeToString(D3D12_DRED_ALLOCATION_TYPE type) noexcept {
+		switch (type) {
+		case D3D12_DRED_ALLOCATION_TYPE_COMMAND_QUEUE:       return "CommandQueue";
+		case D3D12_DRED_ALLOCATION_TYPE_COMMAND_ALLOCATOR:   return "CommandAllocator";
+		case D3D12_DRED_ALLOCATION_TYPE_PIPELINE_STATE:      return "PipelineState";
+		case D3D12_DRED_ALLOCATION_TYPE_COMMAND_LIST:        return "CommandList";
+		case D3D12_DRED_ALLOCATION_TYPE_FENCE:               return "Fence";
+		case D3D12_DRED_ALLOCATION_TYPE_DESCRIPTOR_HEAP:     return "DescriptorHeap";
+		case D3D12_DRED_ALLOCATION_TYPE_HEAP:                return "Heap";
+		case D3D12_DRED_ALLOCATION_TYPE_QUERY_HEAP:          return "QueryHeap";
+		case D3D12_DRED_ALLOCATION_TYPE_COMMAND_SIGNATURE:   return "CommandSignature";
+		case D3D12_DRED_ALLOCATION_TYPE_PIPELINE_LIBRARY:    return "PipelineLibrary";
+		case D3D12_DRED_ALLOCATION_TYPE_VIDEO_DECODER:       return "VideoDecoder";
+		case D3D12_DRED_ALLOCATION_TYPE_VIDEO_PROCESSOR:     return "VideoProcessor";
+		case D3D12_DRED_ALLOCATION_TYPE_RESOURCE:            return "Resource";
+		case D3D12_DRED_ALLOCATION_TYPE_PASS:                return "Pass";
+		case D3D12_DRED_ALLOCATION_TYPE_CRYPTOSESSION:       return "CryptoSession";
+		case D3D12_DRED_ALLOCATION_TYPE_CRYPTOSESSIONPOLICY: return "CryptoSessionPolicy";
+		case D3D12_DRED_ALLOCATION_TYPE_PROTECTEDRESOURCESESSION: return "ProtectedResourceSession";
+		case D3D12_DRED_ALLOCATION_TYPE_VIDEO_DECODER_HEAP:  return "VideoDecoderHeap";
+		case D3D12_DRED_ALLOCATION_TYPE_COMMAND_POOL:        return "CommandPool";
+		case D3D12_DRED_ALLOCATION_TYPE_COMMAND_RECORDER:    return "CommandRecorder";
+		case D3D12_DRED_ALLOCATION_TYPE_STATE_OBJECT:        return "StateObject";
+		case D3D12_DRED_ALLOCATION_TYPE_METACOMMAND:         return "MetaCommand";
+		default:                                             return "Unknown";
+		}
+	}
+
+	static void LogDredData() noexcept {
+		if (!g_dredDevice) return;
+
+		HRESULT reason = g_dredDevice->GetDeviceRemovedReason();
+		if (reason == S_OK) return; // device is fine
+
+		spdlog::error("======== DEVICE REMOVED (reason 0x{:08X}) – DRED Report ========", static_cast<unsigned>(reason));
+
+		ComPtr<ID3D12DeviceRemovedExtendedData1> pDred;
+		if (FAILED(g_dredDevice->QueryInterface(IID_PPV_ARGS(&pDred)))) {
+			spdlog::error("  Could not query ID3D12DeviceRemovedExtendedData1.");
+			return;
+		}
+
+		// ---- Auto Breadcrumbs ----
+		D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 breadcrumbsOutput{};
+		if (SUCCEEDED(pDred->GetAutoBreadcrumbsOutput1(&breadcrumbsOutput))) {
+			const D3D12_AUTO_BREADCRUMB_NODE1* node = breadcrumbsOutput.pHeadAutoBreadcrumbNode;
+			int nodeIdx = 0;
+			while (node) {
+				const char*    clName = node->pCommandListDebugNameA  ? node->pCommandListDebugNameA  : "<unnamed>";
+				const char*    cqName = node->pCommandQueueDebugNameA ? node->pCommandQueueDebugNameA : "<unnamed>";
+				const UINT32   count  = node->BreadcrumbCount;
+				const UINT32   last   = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+
+				spdlog::error("  [Breadcrumb Node {}] CmdList='{}' Queue='{}' Ops={} LastCompleted={}",
+					nodeIdx, clName, cqName, count, last);
+
+				// Show the ops around the last completed breadcrumb
+				if (node->pCommandHistory && count > 0) {
+					UINT32 start = (last >= 3) ? last - 3 : 0;
+					UINT32 end   = (last + 4 < count) ? last + 4 : count;
+					for (UINT32 i = start; i < end; ++i) {
+						const char* marker = (i == last) ? " <<< LAST COMPLETED" :
+						                     (i == last + 1) ? " <<< LIKELY FAULTING OP" : "";
+						spdlog::error("    [{:5}] {}{}", i, BreadcrumbOpToString(node->pCommandHistory[i]), marker);
+					}
+				}
+				node = node->pNext;
+				nodeIdx++;
+			}
+			if (nodeIdx == 0) spdlog::error("  No auto-breadcrumb nodes.");
+		} else {
+			spdlog::error("  GetAutoBreadcrumbsOutput1 failed.");
+		}
+
+		// ---- Page Fault ----
+		D3D12_DRED_PAGE_FAULT_OUTPUT1 pageFaultOutput{};
+		if (SUCCEEDED(pDred->GetPageFaultAllocationOutput1(&pageFaultOutput))) {
+			if (pageFaultOutput.PageFaultVA != 0) {
+				spdlog::error("  GPU Page Fault VA: 0x{:016X}", pageFaultOutput.PageFaultVA);
+
+				auto logAllocList = [](const char* label, const D3D12_DRED_ALLOCATION_NODE1* node) {
+					if (!node) { spdlog::error("    {}: (none)", label); return; }
+					spdlog::error("    {}:", label);
+					while (node) {
+						const char* name = node->ObjectNameA ? node->ObjectNameA : "<unnamed>";
+						spdlog::error("      - '{}' ({})", name, DredAllocationTypeToString(node->AllocationType));
+						node = node->pNext;
+					}
+				};
+
+				logAllocList("Existing allocations matching fault VA", pageFaultOutput.pHeadExistingAllocationNode);
+				logAllocList("Recently freed allocations matching fault VA", pageFaultOutput.pHeadRecentFreedAllocationNode);
+			} else {
+				spdlog::error("  No GPU page fault reported.");
+			}
+		} else {
+			spdlog::error("  GetPageFaultAllocationOutput1 failed.");
+		}
+
+		spdlog::error("======== END DRED Report ========");
+	}
+
 	namespace {
 		static void Dx12WaitQueueIdle(Dx12QueueState& q) noexcept
 		{
@@ -1750,7 +1902,7 @@ namespace rhi {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 			Microsoft::WRL::ComPtr<ID3D12CommandAllocator> a;
 			if (const auto hr = impl->pNativeDevice->CreateCommandAllocator(ToDX(q), IID_PPV_ARGS(&a)); FAILED(hr)) {
-				__debugbreak();
+				BreakIfDebugging();
 				return ToRHI(hr);
 			}
 
@@ -3965,6 +4117,10 @@ namespace rhi {
 
 	void Dx12Device::Shutdown() noexcept {
 
+		// Clear DRED globals before tearing down the device
+		g_dredDevice = nullptr;
+		g_breakCallback = nullptr;
+
 		Dx12WaitQueueIdle(gfx);
 		Dx12WaitQueueIdle(comp);
 		Dx12WaitQueueIdle(copy);
@@ -4207,6 +4363,16 @@ namespace rhi {
 			if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
 				dbg->EnableDebugLayer(), flags |= DXGI_CREATE_FACTORY_DEBUG;
 			}
+
+			// Enable DRED auto-breadcrumbs and page fault reporting
+			// Must be configured *before* D3D12 device creation.
+			ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> dredSettings;
+			if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings)))) {
+				dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+				dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+				dredSettings->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+				spdlog::info("DRED auto-breadcrumbs and page fault reporting enabled.");
+			}
 		}
 
 		auto impl = std::make_shared<Dx12Device>();
@@ -4282,7 +4448,14 @@ namespace rhi {
 			impl->pSLProxyDevice = impl->pNativeDevice;
 		}
 
-		if (ci.enableDebug) EnableDebug(impl->pNativeDevice.Get());
+		if (ci.enableDebug) {
+			EnableDebug(impl->pNativeDevice.Get());
+
+			// Register the DRED device and break callback so BreakIfDebugging
+			// automatically checks for device removal and dumps DRED data.
+			g_dredDevice = impl->pNativeDevice.Get();
+			g_breakCallback = &LogDredData;
+		}
 
 		// Queue creation: MUST go through proxy device, store both proxy+native
 		auto makeQ = [&](D3D12_COMMAND_LIST_TYPE t, Dx12QueueState& out)
