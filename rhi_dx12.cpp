@@ -2758,6 +2758,12 @@ namespace rhi {
 					if (p.colors.data[i].loadOp == LoadOp::Clear) {
 						l->cl->ClearRenderTargetView(cpu, p.colors.data[i].clear.rgba, 0, nullptr);
 					}
+					else if (p.colors.data[i].loadOp == LoadOp::DontCare) {
+						auto* R = l->dev->resources.get(p.colors.data[i].resource);
+						if (R && R->res) {
+							l->cl->DiscardResource(R->res.Get(), nullptr);
+						}
+					}
 				}
 			}
 
@@ -2773,6 +2779,12 @@ namespace rhi {
 							(p.depth->depthLoad == LoadOp::Clear ? D3D12_CLEAR_FLAG_DEPTH : (D3D12_CLEAR_FLAGS)0) |
 							(p.depth->stencilLoad == LoadOp::Clear ? D3D12_CLEAR_FLAG_STENCIL : (D3D12_CLEAR_FLAGS)0),
 							c.depthStencil.depth, c.depthStencil.stencil, 0, nullptr);
+					}
+					else if (p.depth->depthLoad == LoadOp::DontCare || p.depth->stencilLoad == LoadOp::DontCare) {
+						auto* R = l->dev->resources.get(p.depth->resource);
+						if (R && R->res) {
+							l->cl->DiscardResource(R->res.Get(), nullptr);
+						}
 					}
 				}
 			}

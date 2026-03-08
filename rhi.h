@@ -1088,6 +1088,7 @@ namespace rhi {
 		LoadOp loadOp = LoadOp::Load;
 		StoreOp storeOp = StoreOp::Store;
 		ClearValue clear{};
+		ResourceHandle resource{};  // Required for LoadOp::DontCare (DiscardResource)
 	};
 
 	struct DepthAttachment {
@@ -1098,6 +1099,7 @@ namespace rhi {
 		StoreOp stencilStore = StoreOp::DontCare;
 		ClearValue clear{};
 		bool readOnly = false;
+		ResourceHandle resource{};  // Required for LoadOp::DontCare (DiscardResource)
 	};
 
 	struct PassBeginInfo {
