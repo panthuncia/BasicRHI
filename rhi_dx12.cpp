@@ -2761,7 +2761,15 @@ namespace rhi {
 					else if (p.colors.data[i].loadOp == LoadOp::DontCare) {
 						auto* R = l->dev->resources.get(p.colors.data[i].resource);
 						if (R && R->res) {
-							l->cl->DiscardResource(R->res.Get(), nullptr);
+							D3D12_DISCARD_REGION discardRegion{};
+							discardRegion.NumRects = 1;
+							discardRegion.pRects = nullptr;
+							if (p.colors.data[i].mipSlice == -1) {
+								BreakIfDebugging();
+							}
+							discardRegion.FirstSubresource = p.colors.data[i].mipSlice;
+							discardRegion.NumSubresources = 1;
+							l->cl->DiscardResource(R->res.Get(), &discardRegion);
 						}
 					}
 				}

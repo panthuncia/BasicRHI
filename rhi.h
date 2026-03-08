@@ -1089,6 +1089,7 @@ namespace rhi {
 		StoreOp storeOp = StoreOp::Store;
 		ClearValue clear{};
 		ResourceHandle resource{};  // Required for LoadOp::DontCare (DiscardResource)
+		int8_t mipSlice = -1; // Required for LoadOp::DontCare when discarding a specific mip level of a texture
 	};
 
 	struct DepthAttachment {
