@@ -4002,7 +4002,7 @@ namespace rhi {
 			return impl->fence ? impl->fence->GetCompletedValue() : 0;
 		}
 
-		static Result tl_timelineHostWait(Timeline* tl, const uint64_t p) noexcept {
+		static Result tl_timelineHostWait(Timeline* tl, const uint64_t p, uint32_t timeout_ms) noexcept {
 			auto* TL = dx12_detail::TL(tl);
 			HANDLE e = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 			if (!e) {
@@ -4015,8 +4015,12 @@ namespace rhi {
 				BreakIfDebugging();
 				return Result::Failed;
 			}
-			WaitForSingleObject(e, INFINITE);
+			const DWORD waitMs = (timeout_ms == UINT32_MAX) ? INFINITE : static_cast<DWORD>(timeout_ms);
+			DWORD waitResult = WaitForSingleObject(e, waitMs);
 			CloseHandle(e);
+			if (waitResult == WAIT_TIMEOUT) {
+				return Result::WaitTimeout;
+			}
 			return Result::Ok;
 		}
 		static void tl_setName(Timeline* tl, const char* n) noexcept {

@@ -1638,7 +1638,7 @@ namespace rhi {
 
 	struct TimelineVTable {
 		uint64_t(*getCompletedValue)(Timeline*) noexcept;
-		Result(*hostWait)(Timeline*, const uint64_t) noexcept; // blocks until reached
+		Result(*hostWait)(Timeline*, const uint64_t, uint32_t timeout_ms) noexcept; // blocks until reached or timeout
 		void (*setName)(Timeline*, const char*) noexcept;
 		uint32_t abi_version = 1;
 	};
@@ -1655,7 +1655,7 @@ namespace rhi {
 		constexpr void Reset() noexcept { impl = nullptr; vt = nullptr; }
 		const TimelineHandle& GetHandle() const noexcept { return handle; }
 		uint64_t GetCompletedValue() noexcept { return vt->getCompletedValue(this); }
-		Result HostWait(const uint64_t p) noexcept { return vt->hostWait(this, p); }
+		Result HostWait(const uint64_t p, uint32_t timeout_ms = UINT32_MAX) noexcept { return vt->hostWait(this, p, timeout_ms); }
 		void SetName(const char* n) noexcept { vt->setName(this, n); }
 	private:
 		TimelineHandle handle;
