@@ -43,7 +43,7 @@ namespace rhi {
 		// Texture constructor
 		Dx12Resource() {}
 		explicit Dx12Resource(ComPtr<ID3D12Resource> r, DXGI_FORMAT f, uint32_t width, uint32_t height, uint16_t mips, uint16_t arraySize, D3D12_RESOURCE_DIMENSION dim, uint16_t depth, Dx12Device* d)
-			: res(r), fmt(f), tex({ width, height, mips, arraySize, depth }), dev(d), kind(Dx12ResourceKind::Texture) {
+			: res(r), kind(Dx12ResourceKind::Texture), fmt(f), tex({ width, height, mips, arraySize, depth }), dev(d) {
 		}
 		// Buffer constructor
 		explicit Dx12Resource(ComPtr<ID3D12Resource> r, uint64_t size, Dx12Device* d)
@@ -209,6 +209,8 @@ namespace rhi {
 			d.Height = 1;
 			d.DepthOrArraySize = td.texture.depthOrLayers;
 			d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+			break;
+		default:
 			break;
 		}
 		return d;

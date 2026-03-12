@@ -12,7 +12,7 @@
 #include <string>
 
 #include "resource_states.h"
-#include "rhi_feature_Info.h"
+#include "rhi_feature_info.h"
 
 namespace rhi {
 
@@ -1939,89 +1939,7 @@ namespace rhi {
 
 
 	template<class TObject>
-	class ObjectPtr {
-	public:
-		using DestroyFn = void(*)(Device&, TObject&) noexcept;
-
-		ObjectPtr() = default;
-
-		ObjectPtr(Device dev, TObject obj, DestroyFn dfn, std::shared_ptr<void> keepAlive = {}) noexcept
-			: dev_(dev)
-			, obj_(obj)
-			, destroy_(dfn)
-			, keepAlive_(std::move(keepAlive))
-		{
-		}
-
-		~ObjectPtr() noexcept { Reset(); }
-
-		ObjectPtr(const ObjectPtr&) = delete;
-		ObjectPtr& operator=(const ObjectPtr&) = delete;
-
-		ObjectPtr(ObjectPtr&& o) noexcept { *this = std::move(o); }
-		ObjectPtr& operator=(ObjectPtr&& o) noexcept {
-			if (this == &o) return *this;
-			Reset();
-			dev_ = o.dev_;
-			obj_ = o.obj_;
-			destroy_ = o.destroy_;
-			keepAlive_ = std::move(o.keepAlive_);
-			o.destroy_ = nullptr;
-			o.obj_ = {};
-			o.dev_ = {};
-			return *this;
-		}
-
-		TObject* operator->() noexcept { return &obj_; }
-		const TObject* operator->() const noexcept { return &obj_; }
-		explicit operator bool() const noexcept { return static_cast<bool>(obj_); }
-		TObject& Get() noexcept { return obj_; }
-		const TObject& Get() const noexcept { return obj_; }
-
-		void Reset() noexcept {
-			if (!destroy_) {
-				obj_ = {};
-				dev_ = {};
-				keepAlive_.reset();
-				return;
-			}
-
-			// Keep backend alive while running the destroy callback.
-			auto keepAlive = std::move(keepAlive_);
-			auto dfn = destroy_;
-
-			// Copy out raw handles in case dfn() indirectly touches *this*.
-			Device dev = dev_;
-			TObject obj = obj_;
-
-			// Poison first so double-Reset is safe.
-			destroy_ = nullptr;
-			obj_ = {};
-			dev_ = {};
-			keepAlive_.reset();
-
-			if (dfn && static_cast<bool>(obj)) {
-				dfn(dev, obj);
-			}
-			// keepAlive drops here
-		}
-
-		TObject Release() noexcept {
-			destroy_ = nullptr;
-			keepAlive_.reset();
-			dev_ = {};
-			return std::exchange(obj_, {});
-		}
-
-		const std::shared_ptr<void>& KeepAliveRef() const noexcept { return keepAlive_; }
-		std::shared_ptr<void> KeepAlive() const noexcept { return keepAlive_; }
-
-	private:
-		Device    dev_{};
-		TObject   obj_{};
-		DestroyFn destroy_{};
-		std::shared_ptr<void> keepAlive_{};
-	};
+	class ObjectPtr;
 
 
 	using CommandAllocatorPtr = ObjectPtr<CommandAllocator>;
@@ -2155,7 +2073,7 @@ namespace rhi {
 		void* impl{};
 		const DeviceVTable* vt{};
 		Device() = default;
-		Device(void* i, const DeviceVTable* v) : impl(i), vt(v), deletionContext(i, v) {}
+		Device(void* i, const DeviceVTable* v) : deletionContext(i, v), impl(i), vt(v) {}
 		explicit constexpr operator bool() const noexcept {
 			return impl != nullptr && vt != nullptr && vt->abi_version >= RHI_DEVICE_ABI_MIN;
 		}
@@ -2216,8 +2134,95 @@ namespace rhi {
 		void Destroy() noexcept { vt->destroyDevice(this); impl = nullptr; vt = nullptr; }
 	};
 
+	// ObjectPtr defined here so Device is a complete type.
+	template<class TObject>
+	class ObjectPtr {
+	public:
+		using DestroyFn = void(*)(Device&, TObject&) noexcept;
+
+		ObjectPtr() = default;
+
+		ObjectPtr(Device dev, TObject obj, DestroyFn dfn, std::shared_ptr<void> keepAlive = {}) noexcept
+			: dev_(dev)
+			, obj_(obj)
+			, destroy_(dfn)
+			, keepAlive_(std::move(keepAlive))
+		{
+		}
+
+		~ObjectPtr() noexcept { Reset(); }
+
+		ObjectPtr(const ObjectPtr&) = delete;
+		ObjectPtr& operator=(const ObjectPtr&) = delete;
+
+		ObjectPtr(ObjectPtr&& o) noexcept { *this = std::move(o); }
+		ObjectPtr& operator=(ObjectPtr&& o) noexcept {
+			if (this == &o) return *this;
+			Reset();
+			dev_ = o.dev_;
+			obj_ = o.obj_;
+			destroy_ = o.destroy_;
+			keepAlive_ = std::move(o.keepAlive_);
+			o.destroy_ = nullptr;
+			o.obj_ = {};
+			o.dev_ = {};
+			return *this;
+		}
+
+		TObject* operator->() noexcept { return &obj_; }
+		const TObject* operator->() const noexcept { return &obj_; }
+		explicit operator bool() const noexcept { return static_cast<bool>(obj_); }
+		TObject& Get() noexcept { return obj_; }
+		const TObject& Get() const noexcept { return obj_; }
+
+		void Reset() noexcept {
+			if (!destroy_) {
+				obj_ = {};
+				dev_ = {};
+				keepAlive_.reset();
+				return;
+			}
+
+			// Keep backend alive while running the destroy callback.
+			auto keepAlive = std::move(keepAlive_);
+			auto dfn = destroy_;
+
+			// Copy out raw handles in case dfn() indirectly touches *this*.
+			Device dev = dev_;
+			TObject obj = obj_;
+
+			// Poison first so double-Reset is safe.
+			destroy_ = nullptr;
+			obj_ = {};
+			dev_ = {};
+			keepAlive_.reset();
+
+			if (dfn && static_cast<bool>(obj)) {
+				dfn(dev, obj);
+			}
+			// keepAlive drops here
+		}
+
+		TObject Release() noexcept {
+			destroy_ = nullptr;
+			keepAlive_.reset();
+			dev_ = {};
+			return std::exchange(obj_, {});
+		}
+
+		const std::shared_ptr<void>& KeepAliveRef() const noexcept { return keepAlive_; }
+		std::shared_ptr<void> KeepAlive() const noexcept { return keepAlive_; }
+
+	private:
+		Device    dev_{};
+		TObject   obj_{};
+		DestroyFn destroy_{};
+		std::shared_ptr<void> keepAlive_{};
+	};
+
 	class DevicePtr : public ObjectPtr<Device> {
 	public:
+		using DestroyFn = ObjectPtr<Device>::DestroyFn;
 		DevicePtr() = default;
 
 		explicit DevicePtr(Device d, DestroyFn fn, std::shared_ptr<void> keepAlive) noexcept

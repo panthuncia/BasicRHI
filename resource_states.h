@@ -285,6 +285,8 @@ namespace rhi {
 			if ((access & ~(ResourceAccessType::CopyDest)) != 0)
 				return false;
 			break;
+		default:
+			break;
 		}
 		//TODO: other types
 		return true;
@@ -297,6 +299,8 @@ namespace rhi {
 		case ResourceSyncState::ComputeShading:
 		case ResourceSyncState::ExecuteIndirect:
 			return false;
+		default:
+			break;
 		}
 		return true;
 	}

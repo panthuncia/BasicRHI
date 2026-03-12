@@ -22,8 +22,6 @@
 // THE SOFTWARE.
 //
 
-#pragma once
-
 #include "rhi.h"
 #include "rhi_allocator.h"
 #include "rhi_allocator_config.h"
