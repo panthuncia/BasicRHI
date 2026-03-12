@@ -1686,8 +1686,9 @@ namespace rhi {
 		Result(*submit)(Queue*, Span<CommandList>, const SubmitDesc&) noexcept;
 		Result(*signal)(Queue*, const TimelinePoint&) noexcept;
 		Result(*wait)(Queue*, const TimelinePoint&) noexcept;
+		void (*checkDebugMessages)(Queue*) noexcept;
 		void (*setName)(Queue*, const char*) noexcept;
-		uint32_t abi_version = 1;
+		uint32_t abi_version = 2;
 	};
 
 	class Queue {
@@ -1704,6 +1705,7 @@ namespace rhi {
 		Result Submit(Span<CommandList> lists, const SubmitDesc& s = {}) noexcept;
 		Result Signal(const TimelinePoint& p) noexcept;
 		Result Wait(const TimelinePoint& p) noexcept;
+		void CheckDebugMessages() noexcept;
 		QueueKind GetKind() const noexcept { return kind; }
 	private:
 		QueueKind kind;
@@ -2096,9 +2098,10 @@ namespace rhi {
 		void (*setNameDescriptorHeap)(Device*, DescriptorHeapHandle, const char*) noexcept;
 		void (*setNameTimeline)(Device*, TimelineHandle, const char*) noexcept;
 		void (*setNameHeap)(Device*, HeapHandle, const char*) noexcept;
+		void (*checkDebugMessages)(Device*) noexcept;
 
 		void (*destroyDevice)(Device*) noexcept;
-		uint32_t abi_version = 1;
+		uint32_t abi_version = 3;
 	};
 
 
@@ -2209,6 +2212,7 @@ namespace rhi {
 		Result QueryVideoMemoryInfo(uint32_t nodeIndex, MemorySegmentGroup segmentGroup, VideoMemoryInfo& out) const noexcept {
 			return vt->queryVideoMemoryInfo(this, nodeIndex, segmentGroup, out);
 		}
+		void CheckDebugMessages() noexcept { if (vt->checkDebugMessages) vt->checkDebugMessages(this); }
 		void Destroy() noexcept { vt->destroyDevice(this); impl = nullptr; vt = nullptr; }
 	};
 
@@ -2227,6 +2231,7 @@ namespace rhi {
 	inline Result Queue::Submit(Span<CommandList> lists, const SubmitDesc& s) noexcept { return vt->submit(this, lists, s); }
 	inline Result Queue::Signal(const TimelinePoint& p) noexcept { return vt->signal(this, p); }
 	inline Result Queue::Wait(const TimelinePoint& p) noexcept { return vt->wait(this, p); }
+	inline void Queue::CheckDebugMessages() noexcept { if (vt->checkDebugMessages) vt->checkDebugMessages(this); }
 
 	inline uint32_t Swapchain::ImageCount() noexcept { return vt->imageCount(this); }
 	inline uint32_t Swapchain::CurrentImageIndex() noexcept { return vt->currentImageIndex(this); }

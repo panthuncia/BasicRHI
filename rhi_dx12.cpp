@@ -2658,11 +2658,53 @@ namespace rhi {
 				auto* TL = dev->timelines.get(sgn.t); if (!TL) {
 					RHI_FAIL(Result::InvalidArgument);
 				}
+				if (sgn.value == 0) {
+					spdlog::error(
+						"q_submit post-signal: attempted to signal timeline(index={}, gen={}) "
+						"with value 0 via SubmitDesc. Break to inspect callstack.",
+						sgn.t.index, sgn.t.generation);
+					BreakIfDebugging();
+					continue;
+				}
+#if BUILD_TYPE == BUILD_DEBUG
+				{
+					auto last = qs->lastSignaledValue.find(sgn.t);
+					if (last != qs->lastSignaledValue.end() && sgn.value <= last->second) {
+						spdlog::error(
+							"q_submit post-signal monotonicity violation: timeline(index={}, gen={}) "
+							"attempted value={} but lastSignaled={}",
+							sgn.t.index, sgn.t.generation,
+							sgn.value, last->second);
+						BreakIfDebugging();
+						continue;
+					}
+					qs->lastSignaledValue[sgn.t] = sgn.value;
+				}
+#endif
 				if (const auto hr = qs->pNativeQueue->Signal(TL->fence.Get(), sgn.value); FAILED(hr)) {
 					RHI_FAIL(ToRHI(hr));
 				}
 			}
 			return Result::Ok;
+		}
+
+		static void q_checkDebugMessages(Queue* q) noexcept {
+			auto* qs = dx12_detail::QState(q);
+			if (!qs || !qs->dev) {
+				return;
+			}
+			LogDredData();
+		}
+
+		static void d_checkDebugMessages(Device* d) noexcept {
+			if (!d) {
+				return;
+			}
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl || !impl->pNativeDevice) {
+				return;
+			}
+			LogDredData();
 		}
 
 		static Result q_signal(Queue* q, const TimelinePoint& p) noexcept {
@@ -2675,9 +2717,25 @@ namespace rhi {
 				BreakIfDebugging();
 				return Result::InvalidArgument;
 			}
+			// Catch zero-value signals early - these are almost always bugs.
+			// Break here to get a callstack showing who triggered this.
+			if (p.value == 0) {
+				spdlog::error(
+					"q_signal: attempted to signal timeline(index={}, gen={}) with "
+					"value 0. This will violate monotonic ordering if the timeline "
+					"has ever been signaled before. Break here to inspect callstack.",
+					p.t.index, p.t.generation);
+				BreakIfDebugging();
+				return Result::InvalidArgument;
+			}
 #if BUILD_TYPE == BUILD_DEBUG
 			auto last = qs->lastSignaledValue.find(p.t);
 			if (last != qs->lastSignaledValue.end() && p.value <= last->second) {
+				spdlog::error(
+					"q_signal monotonicity violation: timeline(index={}, gen={}) "
+					"attempted value={} but lastSignaled={}",
+					p.t.index, p.t.generation,
+					p.value, last->second);
 				BreakIfDebugging();
 				return Result::InvalidArgument; // must be strictly greater
 			}
@@ -4069,8 +4127,8 @@ namespace rhi {
 			ComPtr<ID3D12InfoQueue> iq; if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&iq)))) {
 				D3D12_MESSAGE_ID blocked[] = { (D3D12_MESSAGE_ID)1356, (D3D12_MESSAGE_ID)1328, (D3D12_MESSAGE_ID)1008 };
 				D3D12_INFO_QUEUE_FILTER f{}; f.DenyList.NumIDs = (UINT)_countof(blocked); f.DenyList.pIDList = blocked; iq->AddStorageFilterEntries(&f);
-				iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
-				iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, true);
+				//iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
+				//iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, true);
 			}
 		}
 
@@ -4250,16 +4308,18 @@ namespace rhi {
 		&d_setNameDescriptorHeap,
 		&d_setNameTimeline,
 		&d_setNameHeap,
+		&d_checkDebugMessages,
 		&d_destroyDevice,
-		2u
+		3u
 	};
 
 	const QueueVTable g_qvt = {
 		&q_submit,
 		&q_signal,
 		&q_wait,
+		&q_checkDebugMessages,
 		&q_setName,
-		1u };
+		2u };
 
 	const CommandAllocatorVTable g_calvt = {
 		&ca_reset,
@@ -4518,6 +4578,28 @@ namespace rhi {
 				out.dev = impl.get();
 				impl->pNativeDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&out.fence));
 				out.value = 0;
+
+				const wchar_t* queueName = L"DX12 Unknown Queue";
+				switch (t) {
+				case D3D12_COMMAND_LIST_TYPE_DIRECT:
+					queueName = L"DX12 Graphics Queue";
+					break;
+				case D3D12_COMMAND_LIST_TYPE_COMPUTE:
+					queueName = L"DX12 Compute Queue";
+					break;
+				case D3D12_COMMAND_LIST_TYPE_COPY:
+					queueName = L"DX12 Copy Queue";
+					break;
+				default:
+					break;
+				}
+
+				if (out.pNativeQueue) {
+					out.pNativeQueue->SetName(queueName);
+				}
+				if (out.pSLProxyQueue && out.pSLProxyQueue.Get() != out.pNativeQueue.Get()) {
+					out.pSLProxyQueue->SetName(queueName);
+				}
 			};
 
 		makeQ(D3D12_COMMAND_LIST_TYPE_DIRECT, impl->gfx);
