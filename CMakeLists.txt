@@ -94,9 +94,9 @@ endif()
 
 if(_basicrhi_pix_available)
     if(TARGET Pix::headers)
-        target_link_libraries(BasicRHI PRIVATE Pix::headers)
+        target_link_libraries(BasicRHI PUBLIC Pix::headers)
     else()
-        target_include_directories(BasicRHI PRIVATE "${_basicrhi_pix_manual_include}")
+        target_include_directories(BasicRHI PUBLIC "${_basicrhi_pix_manual_include}")
     endif()
 endif()
 

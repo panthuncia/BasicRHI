@@ -9,15 +9,20 @@
 // - RHI_ENABLE_PIX            -> enable PIX markers on D3D12 (requires <pix3.h>)
 // - RHI_ENABLE_VULKAN_MARKERS -> enable VK_EXT_debug_utils markers on Vulkan
 
-#if __has_include(<pix3.h>)
-#ifndef USE_PIX
-#define USE_PIX 1
+#if !defined(RHI_ENABLE_PIX)
+#  if defined(BASICRHI_ENABLE_PIX) && BASICRHI_ENABLE_PIX
+#    define RHI_ENABLE_PIX 1
+#  else
+#    define RHI_ENABLE_PIX 0
+#  endif
 #endif
-#define PIX_ENABLE_BLOCK_ARGUMENT_COPY 0
-#include <pix3.h>
-#ifndef RHI_ENABLE_PIX
-#define RHI_ENABLE_PIX 1
-#endif
+
+#if RHI_ENABLE_PIX
+#  ifndef USE_PIX
+#    define USE_PIX 1
+#  endif
+#  define PIX_ENABLE_BLOCK_ARGUMENT_COPY 0
+#  include <pix3.h>
 #endif
 
 #if defined(RHI_ENABLE_VULKAN_MARKERS)
@@ -29,7 +34,7 @@ namespace rhi::debug {
     // Colors are 0xAARRGGBB
     using Color = rhi::colors::RGBA8;
 
-#if RHI_HAS_PIX
+#if RHI_ENABLE_PIX
     inline std::uint64_t to_pix(Color c) noexcept {
         using namespace rhi::colors;
         return PIX_COLOR(r(c), g(c), b(c));
