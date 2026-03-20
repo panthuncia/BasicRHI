@@ -307,6 +307,7 @@ namespace rhi {
 	template<> struct HandleFor<Dx12Heap> { using type = HeapHandle; };
 	template<> struct HandleFor<Dx12QueryPool> { using type = QueryPoolHandle; };
 	template<> struct HandleFor<Dx12Swapchain> { using type = SwapChainHandle; };
+	template<> struct HandleFor<Dx12QueueState> { using type = QueueHandle; };
 
 	template<typename T>
 	struct Slot { T obj{}; uint32_t generation{ 1 }; bool alive{ false }; };
@@ -379,7 +380,8 @@ namespace rhi {
 		Registry<Dx12QueryPool> queryPools;
 		Registry<Dx12Swapchain> swapchains; // For uniformity, not really part of device
 
-		Dx12QueueState gfx{}, comp{}, copy{};
+		Registry<Dx12QueueState> queues;
+		QueueHandle gfxHandle, compHandle, copyHandle;
 
 		bool steamlineInitialized = false;
 

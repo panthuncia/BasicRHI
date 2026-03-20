@@ -641,18 +641,88 @@ namespace rhi {
 
 		static Queue d_getQueue(Device* d, QueueKind qk) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
-			Queue out{ qk }; out.vt = &g_qvt;
-			Dx12QueueState* s = (qk == QueueKind::Graphics ? &impl->gfx : qk == QueueKind::Compute ? &impl->comp : &impl->copy);
-			s->dev = impl;
+			QueueHandle h = (qk == QueueKind::Graphics ? impl->gfxHandle : qk == QueueKind::Compute ? impl->compHandle : impl->copyHandle);
+			Queue out{ qk, h }; out.vt = &g_qvt;
 			out.impl = impl;
 			return out;
 		}
 
+		static Result d_createQueue(Device* d, QueueKind qk, const char* name, Queue& out) noexcept {
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+
+			D3D12_COMMAND_LIST_TYPE type{};
+			switch (qk) {
+			case QueueKind::Graphics: type = D3D12_COMMAND_LIST_TYPE_DIRECT;  break;
+			case QueueKind::Compute:  type = D3D12_COMMAND_LIST_TYPE_COMPUTE; break;
+			case QueueKind::Copy:     type = D3D12_COMMAND_LIST_TYPE_COPY;    break;
+			default: RHI_FAIL(Result::InvalidArgument);
+			}
+
+			Dx12QueueState qs{};
+			D3D12_COMMAND_QUEUE_DESC qd{};
+			qd.Type = type;
+
+			ComPtr<ID3D12CommandQueue> qProxy;
+			HRESULT hr = impl->pSLProxyDevice->CreateCommandQueue(&qd, IID_PPV_ARGS(&qProxy));
+			if (FAILED(hr)) { RHI_FAIL(ToRHI(hr)); }
+			qs.pSLProxyQueue = qProxy;
+
+			// Streamline: extract native queue
+			if (impl->steamlineInitialized)
+			{
+			#if BASICRHI_ENABLE_STREAMLINE
+				ID3D12CommandQueue* qNative = nullptr;
+				if (SL_FAILED(res, slGetNativeInterface(qs.pSLProxyQueue.Get(), (void**)&qNative)))
+					qs.pNativeQueue = qs.pSLProxyQueue;
+				else
+					qs.pNativeQueue.Attach(qNative);
+			#else
+				qs.pNativeQueue = qs.pSLProxyQueue;
+			#endif
+			}
+			else
+			{
+				qs.pNativeQueue = qs.pSLProxyQueue;
+			}
+
+			qs.dev = impl;
+			hr = impl->pNativeDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&qs.fence));
+			if (FAILED(hr)) { RHI_FAIL(ToRHI(hr)); }
+			qs.value = 0;
+
+			if (name) {
+				const int wLen = MultiByteToWideChar(CP_UTF8, 0, name, -1, nullptr, 0);
+				if (wLen > 0) {
+					std::vector<wchar_t> wname(wLen);
+					MultiByteToWideChar(CP_UTF8, 0, name, -1, wname.data(), wLen);
+					if (qs.pNativeQueue)  qs.pNativeQueue->SetName(wname.data());
+					if (qs.pSLProxyQueue && qs.pSLProxyQueue.Get() != qs.pNativeQueue.Get())
+						qs.pSLProxyQueue->SetName(wname.data());
+				}
+			}
+
+			QueueHandle h = impl->queues.alloc(qs);
+			out = Queue{ qk, h };
+			out.vt = &g_qvt;
+			out.impl = impl;
+			return Result::Ok;
+		}
+
+		static void d_destroyQueue(DeviceDeletionContext* ctx, QueueHandle h) noexcept {
+			auto* impl = dx12_detail::Dev(ctx);
+			if (!impl) return;
+			auto* qs = impl->queues.get(h);
+			if (!qs) return;
+			// Drain the queue before destroying it
+			Dx12WaitQueueIdle(*qs);
+			impl->queues.free(h);
+		}
+
 		static Result d_waitIdle(Device* d) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
-			Dx12WaitQueueIdle(impl->gfx);
-			Dx12WaitQueueIdle(impl->comp);
-			Dx12WaitQueueIdle(impl->copy);
+			for (auto& slot : impl->queues.slots) {
+				if (slot.alive) Dx12WaitQueueIdle(slot.obj);
+			}
 			return Result::Ok;
 		}
 		static void   d_flushDeletionQueue(Device*) noexcept {}
@@ -675,7 +745,8 @@ namespace rhi {
 			desc.Flags = flags;
 
 			ComPtr<IDXGISwapChain1> sc1;
-			if (const auto hr = impl->pSLProxyFactory->CreateSwapChainForHwnd(impl->gfx.pSLProxyQueue.Get(), static_cast<HWND>(hwnd), &desc, nullptr, nullptr, &sc1); FAILED(hr)) {
+			auto* gfxState = impl->queues.get(impl->gfxHandle);
+			if (const auto hr = impl->pSLProxyFactory->CreateSwapChainForHwnd(gfxState->pSLProxyQueue.Get(), static_cast<HWND>(hwnd), &desc, nullptr, nullptr, &sc1); FAILED(hr)) {
 				RHI_FAIL(ToRHI(hr));
 			}
 			ComPtr<IDXGISwapChain3> proxySc3;
@@ -2413,9 +2484,10 @@ namespace rhi {
 
 		static TimestampCalibration d_getTimestampCalibration(Device* d, QueueKind q) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
-			auto* s = (q == QueueKind::Graphics) ? &impl->gfx : (q == QueueKind::Compute ? &impl->comp : &impl->copy);
+			QueueHandle h = (q == QueueKind::Graphics) ? impl->gfxHandle : (q == QueueKind::Compute ? impl->compHandle : impl->copyHandle);
+			auto* s = impl->queues.get(h);
 			UINT64 freq = 0;
-			if (s->pNativeQueue) s->pNativeQueue->GetTimestampFrequency(&freq);
+			if (s && s->pNativeQueue) s->pNativeQueue->GetTimestampFrequency(&freq);
 			return { freq };
 		}
 
@@ -4203,9 +4275,13 @@ namespace rhi {
 		g_dredDevice = nullptr;
 		g_breakCallback = nullptr;
 
-		Dx12WaitQueueIdle(gfx);
-		Dx12WaitQueueIdle(comp);
-		Dx12WaitQueueIdle(copy);
+		Dx12WaitQueueIdle(*queues.get(gfxHandle));
+		Dx12WaitQueueIdle(*queues.get(compHandle));
+		Dx12WaitQueueIdle(*queues.get(copyHandle));
+		// Also drain any dynamically-created queues
+		for (auto& slot : queues.slots) {
+			if (slot.alive) Dx12WaitQueueIdle(slot.obj);
+		}
 
 		swapchains.clear();
 		queryPools.clear();
@@ -4220,9 +4296,8 @@ namespace rhi {
 		samplers.clear();
 		resources.clear();
 
-		gfx = {};
-		comp = {};
-		copy = {};
+		queues.clear();
+		gfxHandle = {}; compHandle = {}; copyHandle = {};
 
 #if BUILD_TYPE == BUILD_DEBUG
 		// Hold a temporary ref so we can report AFTER we drop our member refs.
@@ -4289,6 +4364,8 @@ namespace rhi {
 		&d_destroyQueryPool,
 
 		&d_getQueue,
+		&d_createQueue,
+		&d_destroyQueue,
 		&d_waitIdle,
 		&d_flushDeletionQueue,
 		&d_getDescriptorHandleIncrementSize,
@@ -4542,15 +4619,16 @@ namespace rhi {
 		}
 
 		// Queue creation: MUST go through proxy device, store both proxy+native
-		auto makeQ = [&](D3D12_COMMAND_LIST_TYPE t, Dx12QueueState& out)
+		auto makeQ = [&](D3D12_COMMAND_LIST_TYPE t, const wchar_t* debugName) -> QueueHandle
 			{
+				Dx12QueueState out{};
 				D3D12_COMMAND_QUEUE_DESC qd{};
 				qd.Type = t;
 
 				// Hooked API: CreateCommandQueue must be invoked on proxy when SL enabled
 				ComPtr<ID3D12CommandQueue> qProxy;
 				HRESULT hr = impl->pSLProxyDevice->CreateCommandQueue(&qd, IID_PPV_ARGS(&qProxy));
-				if (FAILED(hr)) { /* handle */ }
+				if (FAILED(hr)) { return {}; }
 
 				out.pSLProxyQueue = qProxy;
 
@@ -4579,32 +4657,19 @@ namespace rhi {
 				impl->pNativeDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&out.fence));
 				out.value = 0;
 
-				const wchar_t* queueName = L"DX12 Unknown Queue";
-				switch (t) {
-				case D3D12_COMMAND_LIST_TYPE_DIRECT:
-					queueName = L"DX12 Graphics Queue";
-					break;
-				case D3D12_COMMAND_LIST_TYPE_COMPUTE:
-					queueName = L"DX12 Compute Queue";
-					break;
-				case D3D12_COMMAND_LIST_TYPE_COPY:
-					queueName = L"DX12 Copy Queue";
-					break;
-				default:
-					break;
-				}
-
 				if (out.pNativeQueue) {
-					out.pNativeQueue->SetName(queueName);
+					out.pNativeQueue->SetName(debugName);
 				}
 				if (out.pSLProxyQueue && out.pSLProxyQueue.Get() != out.pNativeQueue.Get()) {
-					out.pSLProxyQueue->SetName(queueName);
+					out.pSLProxyQueue->SetName(debugName);
 				}
+
+				return impl->queues.alloc(out);
 			};
 
-		makeQ(D3D12_COMMAND_LIST_TYPE_DIRECT, impl->gfx);
-		makeQ(D3D12_COMMAND_LIST_TYPE_COMPUTE, impl->comp);
-		makeQ(D3D12_COMMAND_LIST_TYPE_COPY, impl->copy);
+		impl->gfxHandle  = makeQ(D3D12_COMMAND_LIST_TYPE_DIRECT,  L"DX12 Graphics Queue");
+		impl->compHandle = makeQ(D3D12_COMMAND_LIST_TYPE_COMPUTE, L"DX12 Compute Queue");
+		impl->copyHandle = makeQ(D3D12_COMMAND_LIST_TYPE_COPY,    L"DX12 Copy Queue");
 
 		Device d{ pImpl, &g_devvt };
 		outPtr = MakeDevicePtr(&d, impl);

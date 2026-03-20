@@ -25,14 +25,7 @@ namespace rhi::dx12_detail
 	{
 		Dx12Device* dev = Dev(q);
 		if (!dev || !q) return nullptr;
-
-		switch (q->GetKind())
-		{
-		case QueueKind::Graphics: return &dev->gfx;
-		case QueueKind::Compute:  return &dev->comp;
-		case QueueKind::Copy:     return &dev->copy;
-		default:                  return nullptr;
-		}
+		return dev->queues.get(q->GetQueueHandle());
 	}
 
 	// Registry-resolved backend objects.

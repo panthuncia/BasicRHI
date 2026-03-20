@@ -65,6 +65,7 @@ namespace rhi {
 		struct HHeap {};
 		struct HQueryPool {};
 		struct HSwapChain {};
+		struct HQueue {};
 
 		// forward-declared trait; default is no-op (safe in release)
 		template<class Tag> struct NameOps {
@@ -114,6 +115,7 @@ namespace rhi {
 	using HeapHandle = Handle<detail::HHeap>;
 	using QueryPoolHandle = Handle<detail::HQueryPool>;
 	using SwapChainHandle = Handle<detail::HSwapChain>;
+	using QueueHandle = Handle<detail::HQueue>;
 
 	// ---------------- Enums & structs ----------------
 
@@ -1694,7 +1696,7 @@ namespace rhi {
 	class Queue {
 	public:
 		Queue() = default;
-		explicit Queue(QueueKind k) : kind(k) {}
+		explicit Queue(QueueKind k, QueueHandle h = {}) : kind(k), queueHandle(h) {}
 		void* impl{};
 		const QueueVTable* vt{};
 		explicit constexpr operator bool() const noexcept {
@@ -1707,8 +1709,10 @@ namespace rhi {
 		Result Wait(const TimelinePoint& p) noexcept;
 		void CheckDebugMessages() noexcept;
 		QueueKind GetKind() const noexcept { return kind; }
+		QueueHandle GetQueueHandle() const noexcept { return queueHandle; }
 	private:
-		QueueKind kind;
+		QueueKind kind{};
+		QueueHandle queueHandle;
 	};
 
 	struct ResourceVTable {
@@ -1996,6 +2000,8 @@ namespace rhi {
 		void (*destroyQueryPool)(DeviceDeletionContext*, QueryPoolHandle) noexcept;
 
 		Queue(*getQueue)(Device*, QueueKind) noexcept;
+		Result(*createQueue)(Device*, QueueKind, const char* name, Queue&) noexcept;
+		void(*destroyQueue)(DeviceDeletionContext*, QueueHandle) noexcept;
 		Result(*deviceWaitIdle)(Device*) noexcept;
 		void (*flushDeletionQueue)(Device*) noexcept;
 		uint32_t(*getDescriptorHandleIncrementSize)(Device*, DescriptorHeapType) noexcept;
@@ -2019,7 +2025,7 @@ namespace rhi {
 		void (*checkDebugMessages)(Device*) noexcept;
 
 		void (*destroyDevice)(Device*) noexcept;
-		uint32_t abi_version = 3;
+		uint32_t abi_version = 4;
 	};
 
 
@@ -2028,6 +2034,7 @@ namespace rhi {
 		const DeviceVTable* vt{};
 		DeviceDeletionContext() = default;
 		DeviceDeletionContext(void* i, const DeviceVTable* v) : impl(i), vt(v) {}
+		inline void DestroyQueue(QueueHandle h) noexcept { vt->destroyQueue(this, h); }
 		inline void DestroyCommandList(CommandList* cl) noexcept { vt->destroyCommandList(this, cl); }
 		inline void DestroySwapchain(Swapchain* sc) noexcept { vt->destroySwapchain(this, sc); }
 		inline void DestroyPipelineLayout(PipelineLayoutHandle h) noexcept { vt->destroyPipelineLayout(this, h); }
@@ -2086,6 +2093,8 @@ namespace rhi {
 		Result CreateCommandList(QueueKind q, CommandAllocator alloc, CommandListPtr& out) noexcept { return vt->createCommandList(this, q, alloc, out); }
 		void DestroyCommandList(CommandList* cl) noexcept { deletionContext.DestroyCommandList(cl); }
 		Queue GetQueue(QueueKind q) noexcept { return vt->getQueue(this, q); }
+		Result CreateQueue(QueueKind k, const char* name, Queue& out) noexcept { return vt->createQueue(this, k, name, out); }
+		void DestroyQueue(QueueHandle h) noexcept { deletionContext.DestroyQueue(h); }
 		Result WaitIdle() noexcept { return vt->deviceWaitIdle(this); }
 		void FlushDeletionQueue() noexcept { vt->flushDeletionQueue(this); }
 		Result CreateSwapchain(void* hwnd, const uint32_t w, const uint32_t h, const Format fmt, const uint32_t buffers, const bool allowTearing, SwapchainPtr& out) noexcept { return vt->createSwapchain(this, hwnd, w, h, fmt, buffers, allowTearing, out); }
