@@ -409,7 +409,11 @@ namespace rhi {
 	struct ViewDesc { ViewKind kind = ViewKind::SRV; ResourceHandle texture{}; TextureSubresourceRange range{}; Format formatOverride = Format::Unknown; };
 
 	enum class Filter : uint8_t { Nearest, Linear };
-	enum class MipFilter : uint8_t { Nearest, Linear };
+	enum class MipFilter : uint8_t {
+		None,
+		Nearest,
+		Linear
+	};
 	enum class AddressMode : uint8_t { Wrap, Mirror, Clamp, Border, MirrorOnce };
 	enum class CompareOp : uint8_t {
 		Never, Less, Equal, LessEqual, Greater, NotEqual, GreaterEqual, Always

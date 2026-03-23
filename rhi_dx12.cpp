@@ -853,21 +853,20 @@ namespace rhi {
 			for (uint32_t i = 0; i < ld.staticSamplers.size; ++i) {
 				const auto& ss = ld.staticSamplers.data[i];
 				D3D12_STATIC_SAMPLER_DESC s{};
-				// Map SamplerDesc -> D3D12 fields TODO: complete
-				s.Filter = (ss.sampler.maxAnisotropy > 1) ? D3D12_FILTER_ANISOTROPIC
-					: D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-				s.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-				s.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-				s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-				s.MipLODBias = 0.0f;
+				s.Filter = BuildDxFilter(ss.sampler);
+				s.AddressU = ToDX(ss.sampler.addressU);
+				s.AddressV = ToDX(ss.sampler.addressV);
+				s.AddressW = ToDX(ss.sampler.addressW);
+				s.MipLODBias = ss.sampler.mipLodBias;
 				s.MaxAnisotropy = ss.sampler.maxAnisotropy;
-				s.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-				s.MinLOD = 0.0f;
-				s.MaxLOD = D3D12_FLOAT32_MAX;
+				s.ComparisonFunc = ss.sampler.compareEnable ? ToDX(ss.sampler.compareOp) : D3D12_COMPARISON_FUNC_NEVER;
+				s.MinLOD = EffectiveDxMinLod(ss.sampler);
+				s.MaxLOD = EffectiveDxMaxLod(ss.sampler);
 				s.ShaderRegister = ss.binding; // binding -> ShaderRegister
 				s.RegisterSpace = ss.set;     // set -> RegisterSpace
 				s.ShaderVisibility = ToDx12Vis(ss.visibility);
-				s.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+				s.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+				s.MaxAnisotropy = (ss.sampler.maxAnisotropy > 1) ? (std::min<uint32_t>(ss.sampler.maxAnisotropy, 16u)) : 1u;
 				ssmps.push_back(s);
 				// (arrayCount>1: add multiple entries or extend StaticSamplerDesc to carry per-binding arrays)
 			}
@@ -1774,8 +1773,8 @@ namespace rhi {
 			desc.MaxAnisotropy = (sd.maxAnisotropy > 1) ? (std::min<uint32_t>(sd.maxAnisotropy, 16u)) : 1u;
 
 			desc.MipLODBias = sd.mipLodBias;
-			desc.MinLOD = sd.minLod;
-			desc.MaxLOD = sd.maxLod;
+			desc.MinLOD = EffectiveDxMinLod(sd);
+			desc.MaxLOD = EffectiveDxMaxLod(sd);
 
 			desc.ComparisonFunc = sd.compareEnable ? ToDX(sd.compareOp) : D3D12_COMPARISON_FUNC_NEVER;
 

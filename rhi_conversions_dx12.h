@@ -392,6 +392,29 @@ namespace rhi {
 			out[2] = sd.borderColor[2]; out[3] = sd.borderColor[3]; break;
 		}
 	}
+	inline static float EffectiveDxFixedLod(const SamplerDesc& sd) noexcept {
+		const float clampedMin = (std::max)(sd.minLod, 0.0f);
+		if (sd.maxLod < clampedMin) {
+			return sd.maxLod;
+		}
+		return clampedMin;
+	}
+	inline static float EffectiveDxMinLod(const SamplerDesc& sd) noexcept {
+		if (sd.mipFilter != MipFilter::None) {
+			return sd.minLod;
+		}
+
+		// DX12 has no native "disable mipmaps" filter mode. The closest match is
+		// point mip selection plus clamping LOD to a single level.
+		return EffectiveDxFixedLod(sd);
+	}
+	inline static float EffectiveDxMaxLod(const SamplerDesc& sd) noexcept {
+		if (sd.mipFilter != MipFilter::None) {
+			return sd.maxLod;
+		}
+
+		return EffectiveDxFixedLod(sd);
+	}
 	inline static D3D12_FILTER BuildDxFilter(const SamplerDesc& sd) noexcept {
 		const auto red = ToDX(sd.reduction, sd.compareEnable);
 
