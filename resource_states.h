@@ -101,6 +101,7 @@ namespace rhi {
 		if (access & ResourceAccessType::IndexBuffer) num++;
 		if (access & ResourceAccessType::VertexBuffer) num++;
 		if (access & ResourceAccessType::ConstantBuffer) num++;
+		if (access & ResourceAccessType::IndirectArgument) num++;
 
 		return num;
 	}
@@ -143,6 +144,9 @@ namespace rhi {
 				return ResourceLayout::GenericRead;
 			}
 			if (access & ResourceAccessType::ConstantBuffer) {
+				return ResourceLayout::GenericRead;
+			}
+			if (access & ResourceAccessType::IndirectArgument) {
 				return ResourceLayout::GenericRead;
 			}
 		}
@@ -228,27 +232,27 @@ namespace rhi {
 		}
 		switch (layout) {
 		case ResourceLayout::Common:
-			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::CopyDest | ResourceAccessType::CopySource)) != 0)
+			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument | ResourceAccessType::CopyDest | ResourceAccessType::CopySource)) != 0)
 				return false;
 			break;
 		case ResourceLayout::DirectCommon:
-			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::CopyDest | ResourceAccessType::CopySource | ResourceAccessType::UnorderedAccess)) != 0)
+			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument | ResourceAccessType::CopyDest | ResourceAccessType::CopySource | ResourceAccessType::UnorderedAccess)) != 0)
 				return false;
 			break;
 		case ResourceLayout::ComputeCommon:
-			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::CopyDest | ResourceAccessType::CopySource | ResourceAccessType::UnorderedAccess)) != 0)
+			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument | ResourceAccessType::CopyDest | ResourceAccessType::CopySource | ResourceAccessType::UnorderedAccess)) != 0)
 				return false;
 			break;
 		case ResourceLayout::GenericRead:
-			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::CopySource)) != 0)
+			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument | ResourceAccessType::CopySource)) != 0)
 				return false;
 			break;
 		case ResourceLayout::DirectGenericRead:
-			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::CopySource | ResourceAccessType::DepthRead /*| ResourceAccessType::SHADING_RATE_SOURCE | ResourceAccessType::RESOLVE_SOURCE*/)) != 0)
+			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument | ResourceAccessType::CopySource | ResourceAccessType::DepthRead /*| ResourceAccessType::SHADING_RATE_SOURCE | ResourceAccessType::RESOLVE_SOURCE*/)) != 0)
 				return false;
 			break;
 		case ResourceLayout::ComputeGenericRead:
-			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::CopySource)) != 0)
+			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument | ResourceAccessType::CopySource)) != 0)
 				return false;
 			break;
 		case ResourceLayout::RenderTarget:
