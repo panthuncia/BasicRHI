@@ -264,6 +264,78 @@ namespace rhi {
 		}
 	}
 
+	constexpr const char* ResultName(Result r) noexcept
+	{
+		switch (r)
+		{
+		case Result::Ok: return "Ok";
+		case Result::False: return "False";
+		case Result::Unknown: return "Unknown";
+		case Result::PresentOccluded: return "PresentOccluded";
+		case Result::PresentClipped: return "PresentClipped";
+		case Result::PresentUnoccluded: return "PresentUnoccluded";
+		case Result::PresentRequired: return "PresentRequired";
+		case Result::NoRedirection: return "NoRedirection";
+		case Result::NoDesktopAccess: return "NoDesktopAccess";
+		case Result::VidPnSourceInUse: return "VidPnSourceInUse";
+		case Result::ModeChanged: return "ModeChanged";
+		case Result::ModeChangeInProgress: return "ModeChangeInProgress";
+		case Result::DdaWasStillDrawing: return "DdaWasStillDrawing";
+		case Result::Failed: return "Failed";
+		case Result::Unexpected: return "Unexpected";
+		case Result::Aborted: return "Aborted";
+		case Result::AccessDenied: return "AccessDenied";
+		case Result::InvalidArgument: return "InvalidArgument";
+		case Result::InvalidNativeHandle: return "InvalidNativeHandle";
+		case Result::InvalidNativePointer: return "InvalidNativePointer";
+		case Result::NoInterface: return "NoInterface";
+		case Result::NotImplemented: return "NotImplemented";
+		case Result::OutOfMemory: return "OutOfMemory";
+		case Result::InvalidCall: return "InvalidCall";
+		case Result::Unsupported: return "Unsupported";
+		case Result::SdkComponentMissing: return "SdkComponentMissing";
+		case Result::DynamicCodePolicyViolation: return "DynamicCodePolicyViolation";
+		case Result::NotFound: return "NotFound";
+		case Result::MoreData: return "MoreData";
+		case Result::AlreadyExists: return "AlreadyExists";
+		case Result::NameAlreadyExists: return "NameAlreadyExists";
+		case Result::DeviceLost: return "DeviceLost";
+		case Result::DeviceRemoved: return "DeviceRemoved";
+		case Result::DeviceHung: return "DeviceHung";
+		case Result::DeviceReset: return "DeviceReset";
+		case Result::DriverInternalError: return "DriverInternalError";
+		case Result::StillDrawing: return "StillDrawing";
+		case Result::WaitTimeout: return "WaitTimeout";
+		case Result::NotCurrent: return "NotCurrent";
+		case Result::ModeChangeBlocked: return "ModeChangeBlocked";
+		case Result::SessionDisconnected: return "SessionDisconnected";
+		case Result::RemoteClientDisconnected: return "RemoteClientDisconnected";
+		case Result::RestrictToOutputStale: return "RestrictToOutputStale";
+		case Result::NonCompositedUi: return "NonCompositedUi";
+		case Result::PresentationLost: return "PresentationLost";
+		case Result::SetDisplayModeRequired: return "SetDisplayModeRequired";
+		case Result::FrameStatisticsDisjoint: return "FrameStatisticsDisjoint";
+		case Result::AccessLost: return "AccessLost";
+		case Result::NonExclusive: return "NonExclusive";
+		case Result::CannotProtectContent: return "CannotProtectContent";
+		case Result::HwProtectionOutOfMemory: return "HwProtectionOutOfMemory";
+		case Result::CacheCorrupt: return "CacheCorrupt";
+		case Result::CacheFull: return "CacheFull";
+		case Result::CacheHashCollision: return "CacheHashCollision";
+		case Result::AdapterNotFound: return "AdapterNotFound";
+		case Result::DriverVersionMismatch: return "DriverVersionMismatch";
+		case Result::InvalidRedistributable: return "InvalidRedistributable";
+		case Result::MpoUnpinned: return "MpoUnpinned";
+		case Result::RemoteOutOfMemory: return "RemoteOutOfMemory";
+		case Result::FileNotFound: return "FileNotFound";
+		case Result::PathNotFound: return "PathNotFound";
+		case Result::InvalidData: return "InvalidData";
+		case Result::DiskFull: return "DiskFull";
+		case Result::SharingViolation: return "SharingViolation";
+		default: return "<unknown>";
+		}
+	}
+
 	constexpr bool Failed(Result r) noexcept { return !IsOk(r); }
 
 
@@ -495,11 +567,17 @@ namespace rhi {
 
 	struct LayoutBindingRange { uint32_t set = 0, binding = 0, count = 1; bool readOnly = true; ShaderStage visibility = ShaderStage::All; };
 
+	enum class PushConstantRangeType : uint32_t {
+		RootConstants32,
+		EmulatedRootConstants,
+	};
+
 	struct PushConstantRangeDesc {
 		ShaderStage visibility = ShaderStage::All;
 		uint32_t num32BitValues = 0;
 		uint32_t set = 0;            // maps to RegisterSpace on DX12 (ignored on Vulkan)
 		uint32_t binding = 0;        // maps to ShaderRegister on DX12 (ignored on Vulkan)
+		PushConstantRangeType type = PushConstantRangeType::RootConstants32;
 	};
 
 	struct StaticSamplerDesc {

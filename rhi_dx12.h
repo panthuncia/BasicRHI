@@ -118,16 +118,6 @@ namespace rhi {
 		Dx12PipelineLayout() {}
 		explicit Dx12PipelineLayout(const PipelineLayoutDesc& d, Dx12Device* device)
 			: desc(d), dev(device) {
-			// build root constant param lookup
-			for (uint32_t i = 0; i < pcs.size(); ++i) {
-				const auto& p = pcs[i];
-				RootConstParam rcp;
-				rcp.set = p.set;
-				rcp.binding = p.binding;
-				rcp.num32 = p.num32BitValues;
-				rcp.rootIndex = i; // assume order is preserved
-				rcParams.push_back(rcp);
-			}
 		}
 		PipelineLayoutDesc desc;
 		std::vector<PushConstantRangeDesc> pcs;
@@ -138,6 +128,7 @@ namespace rhi {
 			uint32_t binding;
 			uint32_t num32;      // max 32-bit values in this range
 			uint32_t rootIndex;  // root parameter index in this RS
+			PushConstantRangeType type = PushConstantRangeType::RootConstants32;
 		};
 		std::vector<RootConstParam> rcParams;
 		Dx12Device* dev = nullptr;
@@ -159,6 +150,21 @@ namespace rhi {
 		Dx12Device* dev = nullptr;
 	};
 	struct Dx12CommandList {
+		struct RootCbvScratchPage {
+			Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+			uint8_t* mapped = nullptr;
+			D3D12_GPU_VIRTUAL_ADDRESS gpuBase = 0;
+			size_t capacity = 0;
+			size_t cursor = 0;
+		};
+
+		struct RootCbvShadowState {
+			uint32_t set = 0;
+			uint32_t binding = 0;
+			uint32_t rootIndex = 0;
+			std::vector<uint32_t> values;
+		};
+
 		Dx12CommandList() {}
 		explicit Dx12CommandList(Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList10> c, Microsoft::WRL::ComPtr<ID3D12CommandAllocator> a, D3D12_COMMAND_LIST_TYPE t, Dx12Device* d)
 			: cl(c), alloc(a), type(t), dev(d) {
@@ -170,6 +176,8 @@ namespace rhi {
 		Dx12PipelineLayout* boundLayoutPtr = nullptr;
 		Dx12Device* dev = nullptr;
 		Dx12Pipeline* boundPipeline = nullptr; // For debug validation
+		std::vector<RootCbvScratchPage> rootCbvScratchPages;
+		std::vector<RootCbvShadowState> rootCbvShadowStates;
 	};
 
 	// Build D3D12_RESOURCE_DESC1 for buffers

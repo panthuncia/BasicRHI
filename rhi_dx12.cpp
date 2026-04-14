@@ -225,6 +225,47 @@ namespace rhi {
 			}
 		}
 
+		static void Dx12LogInfoQueueMessagesSince(ID3D12Device* device, UINT64 startIndex, UINT64 maxMessages = 16) noexcept
+		{
+			if (!device) return;
+
+			ComPtr<ID3D12InfoQueue> iq;
+			if (FAILED(device->QueryInterface(IID_PPV_ARGS(&iq))) || !iq) {
+				return;
+			}
+
+			const UINT64 endIndex = iq->GetNumStoredMessagesAllowedByRetrievalFilter();
+			if (endIndex <= startIndex) {
+				return;
+			}
+
+			UINT64 firstIndex = startIndex;
+			if (endIndex - firstIndex > maxMessages) {
+				firstIndex = endIndex - maxMessages;
+			}
+
+			for (UINT64 index = firstIndex; index < endIndex; ++index) {
+				SIZE_T messageBytes = 0;
+				if (FAILED(iq->GetMessage(index, nullptr, &messageBytes)) || messageBytes == 0) {
+					continue;
+				}
+
+				std::vector<char> storage(messageBytes);
+				auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+				if (FAILED(iq->GetMessage(index, message, &messageBytes))) {
+					continue;
+				}
+
+				spdlog::error(
+					"D3D12 InfoQueue[{}]: severity={} category={} id={} {}",
+					index,
+					static_cast<uint32_t>(message->Severity),
+					static_cast<uint32_t>(message->Category),
+					static_cast<uint32_t>(message->ID),
+					message->pDescription ? message->pDescription : "<no description>");
+			}
+		}
+
 		static void DxgiReportLiveObjects(const char* phase) noexcept
 		{
 			Microsoft::WRL::ComPtr<IDXGIDebug1> dxgiDebug;
@@ -259,10 +300,11 @@ namespace rhi {
 			rtv.NumRenderTargets = 0;
 			DXGI_FORMAT dsv = DXGI_FORMAT_UNKNOWN;
 			DXGI_SAMPLE_DESC sample{ 1,0 };
+			D3D12_PRIMITIVE_TOPOLOGY_TYPE primitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
 			std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
 			D3D12_INPUT_LAYOUT_DESC inputLayoutDesc{ nullptr, 0 };
 
-			bool hasRast = false, hasBlend = false, hasDepth = false, hasRTV = false, hasDSV = false, hasSample = false, hasInputLayout = false;
+			bool hasRast = false, hasBlend = false, hasDepth = false, hasRTV = false, hasDSV = false, hasSample = false, hasInputLayout = false, hasPrimitiveTopology = false;
 
 			for (uint32_t i = 0; i < count; i++) {
 				switch (items[i].type) {
@@ -270,6 +312,7 @@ namespace rhi {
 					auto& L = *static_cast<const SubobjLayout*>(items[i].data);
 					auto* pl = dimpl->pipelineLayouts.get(L.layout);
 					if (!pl || !pl->root) {
+						spdlog::error("DX12 pipeline creation: invalid pipeline layout or missing native root signature");
 						RHI_FAIL(Result::InvalidArgument);
 					}
 					root = pl->root.Get();
@@ -351,6 +394,11 @@ namespace rhi {
 					ToDx12InputLayout(static_cast<const SubobjInputLayout*>(items[i].data)->il, inputLayout);
 					inputLayoutDesc = { inputLayout.data(), static_cast<uint32_t>(inputLayout.size()) };
 				} break;
+				case PsoSubobj::PrimitiveTopology: {
+					hasPrimitiveTopology = true;
+					auto& T = *static_cast<const SubobjPrimitiveTopology*>(items[i].data);
+					primitiveTopologyType = ToDXTopologyType(T.pt);
+				} break;
 				case PsoSubobj::Flags: {
 					break;
 				}
@@ -373,6 +421,11 @@ namespace rhi {
 
 			if (hasCS)    sb.push(SO_CS{ .Value = cs });
 			if (hasGfx) {
+				if (!hasPrimitiveTopology) {
+					primitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+					spdlog::warn("DX12 graphics PSO created without explicit primitive topology; defaulting to TRIANGLE topology type");
+				}
+				sb.push(SO_PrimTopology{ .Value = primitiveTopologyType });
 				if (as.pShaderBytecode) sb.push(SO_AS{ .Value = as });
 				if (ms.pShaderBytecode) sb.push(SO_MS{ .Value = ms });
 				if (vs.pShaderBytecode) sb.push(SO_VS{ .Value = vs });
@@ -385,12 +438,39 @@ namespace rhi {
 				if (hasDSV)    sb.push(SO_DsvFormat{ .Value = dsv });
 				if (hasSample) sb.push(SO_SampleDesc{ .Value = sample });
 				if (hasInputLayout) sb.push(SO_InputLayout{ .Value = inputLayoutDesc });
-				// sb.push(SO_PrimTopology{ .Value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE });
 			}
 			auto sd = sb.desc();
 
+			UINT64 infoQueueStart = 0;
+			ComPtr<ID3D12InfoQueue> infoQueue;
+			if (SUCCEEDED(dimpl->pNativeDevice->QueryInterface(IID_PPV_ARGS(&infoQueue))) && infoQueue) {
+				infoQueueStart = infoQueue->GetNumStoredMessagesAllowedByRetrievalFilter();
+			}
+
 			ComPtr<ID3D12PipelineState> pso;
 			if (const auto hr = dimpl->pNativeDevice->CreatePipelineState(&sd, IID_PPV_ARGS(&pso)); FAILED(hr)) {
+				spdlog::error(
+					"DX12 CreatePipelineState failed: hr=0x{:08X}, isCompute={}, hasCS={}, hasGfx={}, hasVS={}, hasPS={}, hasAS={}, hasMS={}, rootSet={}, topologyType={}, rtvCount={}, rtv0=0x{:X}, dsv=0x{:X}, sampleCount={}, sampleQuality={}, hasDepth={}, depthEnable={}, depthWrite={}, streamSize={}",
+					static_cast<uint32_t>(hr),
+					isCompute,
+					hasCS,
+					hasGfx,
+					vs.pShaderBytecode != nullptr,
+					ps.pShaderBytecode != nullptr,
+					as.pShaderBytecode != nullptr,
+					ms.pShaderBytecode != nullptr,
+					root != nullptr,
+					static_cast<uint32_t>(primitiveTopologyType),
+					rtv.NumRenderTargets,
+					static_cast<uint32_t>(rtv.RTFormats[0]),
+					static_cast<uint32_t>(dsv),
+					sample.Count,
+					sample.Quality,
+					hasDepth,
+					depth.DepthEnable,
+					depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL,
+					sd.SizeInBytes);
+				Dx12LogInfoQueueMessagesSince(dimpl->pNativeDevice.Get(), infoQueueStart);
 				RHI_FAIL(ToRHI(hr));
 			}
 
@@ -836,21 +916,148 @@ namespace rhi {
 			}
 		}
 
+		static bool Dx12UsesEmulatedRootConstants(const PushConstantRangeDesc& pc) noexcept {
+			return pc.type == PushConstantRangeType::EmulatedRootConstants;
+		}
+
+		static size_t Dx12AlignUpSize(size_t value, size_t alignment) noexcept {
+			return (value + (alignment - 1)) & ~(alignment - 1);
+		}
+
+		static bool Dx12EnsureRootCbvScratchPage(Dx12Device* impl, Dx12CommandList& list, size_t minSize) noexcept {
+			constexpr size_t kDefaultPageSize = 64 * 1024;
+			const size_t capacity = (std::max)(Dx12AlignUpSize(minSize, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT), kDefaultPageSize);
+
+			D3D12_HEAP_PROPERTIES hp{};
+			hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+			hp.CreationNodeMask = 1;
+			hp.VisibleNodeMask = 1;
+
+			const D3D12_RESOURCE_DESC1 desc = MakeBufferDesc1(capacity, D3D12_RESOURCE_FLAG_NONE);
+
+			Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+			const HRESULT hr = impl->pNativeDevice->CreateCommittedResource3(
+				&hp,
+				D3D12_HEAP_FLAG_NONE,
+				&desc,
+				D3D12_BARRIER_LAYOUT_UNDEFINED,
+				nullptr,
+				nullptr,
+				0,
+				nullptr,
+				IID_PPV_ARGS(&resource));
+			if (FAILED(hr) || !resource) {
+				spdlog::error(
+					"DX12 root CBV scratch allocation failed: hr=0x{:08X}, capacity={}",
+					static_cast<uint32_t>(hr),
+					capacity);
+				return false;
+			}
+
+			void* mapped = nullptr;
+			if (FAILED(resource->Map(0, nullptr, &mapped)) || !mapped) {
+				spdlog::error("DX12 root CBV scratch map failed for capacity={}", capacity);
+				return false;
+			}
+
+			Dx12CommandList::RootCbvScratchPage page{};
+			page.gpuBase = resource->GetGPUVirtualAddress();
+			page.capacity = capacity;
+			page.cursor = 0;
+			page.mapped = static_cast<uint8_t*>(mapped);
+			page.resource = std::move(resource);
+			list.rootCbvScratchPages.push_back(std::move(page));
+			return true;
+		}
+
+		static bool Dx12AllocateRootCbvScratch(Dx12CommandList* list, size_t size, D3D12_GPU_VIRTUAL_ADDRESS& gpuAddress, void*& cpuAddress) noexcept {
+			if (!list || !list->dev || size == 0) {
+				return false;
+			}
+
+			for (auto& page : list->rootCbvScratchPages) {
+				const size_t alignedCursor = Dx12AlignUpSize(page.cursor, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+				if (alignedCursor + size > page.capacity) {
+					continue;
+				}
+
+				gpuAddress = page.gpuBase + alignedCursor;
+				cpuAddress = page.mapped + alignedCursor;
+				page.cursor = alignedCursor + size;
+				return true;
+			}
+
+			if (!Dx12EnsureRootCbvScratchPage(list->dev, *list, size)) {
+				return false;
+			}
+
+			auto& page = list->rootCbvScratchPages.back();
+			gpuAddress = page.gpuBase;
+			cpuAddress = page.mapped;
+			page.cursor = size;
+			return true;
+		}
+
+		static Dx12CommandList::RootCbvShadowState* Dx12GetRootCbvShadowState(
+			Dx12CommandList* list,
+			const Dx12PipelineLayout::RootConstParam& rc) noexcept {
+			for (auto& state : list->rootCbvShadowStates) {
+				if (state.set == rc.set && state.binding == rc.binding && state.rootIndex == rc.rootIndex) {
+					if (state.values.size() != rc.num32) {
+						state.values.assign(rc.num32, 0u);
+					}
+					return &state;
+				}
+			}
+
+			Dx12CommandList::RootCbvShadowState state{};
+			state.set = rc.set;
+			state.binding = rc.binding;
+			state.rootIndex = rc.rootIndex;
+			state.values.assign(rc.num32, 0u);
+			list->rootCbvShadowStates.push_back(std::move(state));
+			return &list->rootCbvShadowStates.back();
+		}
+
 		static Result d_createPipelineLayout(Device* d, const PipelineLayoutDesc& ld, PipelineLayoutPtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 
 			// Root parameters: push constants only (bindless tables omitted for brevity)
 			std::vector<D3D12_ROOT_PARAMETER1> params;
 			params.reserve(ld.pushConstants.size);
+			std::vector<D3D12_ROOT_PARAMETER> paramsV10;
+			paramsV10.reserve(ld.pushConstants.size);
 			for (uint32_t i = 0; i < ld.pushConstants.size; ++i) {
 				const auto& pc = ld.pushConstants.data[i];
+				const bool useRootCbv = Dx12UsesEmulatedRootConstants(pc);
 				D3D12_ROOT_PARAMETER1 p{};
-				p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-				p.Constants.Num32BitValues = pc.num32BitValues;
-				p.Constants.ShaderRegister = pc.binding;   // binding -> ShaderRegister
-				p.Constants.RegisterSpace = pc.set;       // set     -> RegisterSpace
+				p.ParameterType = useRootCbv ? D3D12_ROOT_PARAMETER_TYPE_CBV : D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+				if (useRootCbv) {
+					p.Descriptor.ShaderRegister = pc.binding;
+					p.Descriptor.RegisterSpace = pc.set;
+					p.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+				}
+				else {
+					p.Constants.Num32BitValues = pc.num32BitValues;
+					p.Constants.ShaderRegister = pc.binding;   // binding -> ShaderRegister
+					p.Constants.RegisterSpace = pc.set;       // set     -> RegisterSpace
+				}
 				p.ShaderVisibility = ToDx12Vis(pc.visibility);
 				params.push_back(p);
+
+				D3D12_ROOT_PARAMETER pV10{};
+				pV10.ParameterType = useRootCbv ? D3D12_ROOT_PARAMETER_TYPE_CBV : D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+				if (useRootCbv) {
+					pV10.Descriptor.ShaderRegister = pc.binding;
+					pV10.Descriptor.RegisterSpace = pc.set;
+				}
+				else {
+					pV10.Constants.Num32BitValues = pc.num32BitValues;
+					pV10.Constants.ShaderRegister = pc.binding;
+					pV10.Constants.RegisterSpace = pc.set;
+				}
+				pV10.ShaderVisibility = ToDx12Vis(pc.visibility);
+				paramsV10.push_back(pV10);
 			}
 
 			// Static samplers
@@ -896,13 +1103,191 @@ namespace rhi {
 			Microsoft::WRL::ComPtr<ID3DBlob> blob, err;
 			HRESULT hr = D3DX12SerializeVersionedRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1_1, &blob, &err);
 			if (FAILED(hr)) {
+				const char* errorText = (err && err->GetBufferPointer())
+					? static_cast<const char*>(err->GetBufferPointer())
+					: "<no serializer error>";
+				spdlog::error(
+					"DX12 CreatePipelineLayout serialize failed: hr=0x{:08X}, flags=0x{:X}, pushConstantCount={}, staticSamplerCount={}, error={} ",
+					static_cast<uint32_t>(hr),
+					static_cast<uint32_t>(rs.Desc_1_1.Flags),
+					static_cast<uint32_t>(ld.pushConstants.size),
+					static_cast<uint32_t>(ld.staticSamplers.size),
+					errorText);
 				RHI_FAIL(ToRHI(hr));
+			}
+
+			UINT64 infoQueueStart = 0;
+			Microsoft::WRL::ComPtr<ID3D12InfoQueue> infoQueue;
+			if (SUCCEEDED(impl->pNativeDevice->QueryInterface(IID_PPV_ARGS(&infoQueue))) && infoQueue) {
+				infoQueueStart = infoQueue->GetNumStoredMessagesAllowedByRetrievalFilter();
 			}
 			Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
 			hr = impl->pNativeDevice->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
 				IID_PPV_ARGS(&root));
 			if (FAILED(hr)) {
+				auto probeRootSignature = [&](const char* label,
+					const D3D12_ROOT_PARAMETER* probeParams,
+					UINT probeParamCount,
+					const D3D12_STATIC_SAMPLER_DESC* probeSamplers,
+					UINT probeSamplerCount,
+					D3D12_ROOT_SIGNATURE_FLAGS probeFlags) {
+					D3D12_ROOT_SIGNATURE_DESC probeDesc{};
+					probeDesc.NumParameters = probeParamCount;
+					probeDesc.pParameters = probeParams;
+					probeDesc.NumStaticSamplers = probeSamplerCount;
+					probeDesc.pStaticSamplers = probeSamplers;
+					probeDesc.Flags = probeFlags;
+
+					Microsoft::WRL::ComPtr<ID3DBlob> probeBlob, probeErr;
+					const HRESULT serializeHr = D3D12SerializeRootSignature(
+						&probeDesc,
+						D3D_ROOT_SIGNATURE_VERSION_1,
+						&probeBlob,
+						&probeErr);
+					HRESULT createHr = E_FAIL;
+					if (SUCCEEDED(serializeHr) && probeBlob) {
+						Microsoft::WRL::ComPtr<ID3D12RootSignature> probeRoot;
+						createHr = impl->pNativeDevice->CreateRootSignature(
+							0,
+							probeBlob->GetBufferPointer(),
+							probeBlob->GetBufferSize(),
+							IID_PPV_ARGS(&probeRoot));
+					}
+
+					const char* probeErrorText = (probeErr && probeErr->GetBufferPointer())
+						? static_cast<const char*>(probeErr->GetBufferPointer())
+						: "<no probe serializer error>";
+					spdlog::error(
+						"DX12 CreatePipelineLayout probe [{}]: serializeHr=0x{:08X}, createHr=0x{:08X}, paramCount={}, samplerCount={}, flags=0x{:X}, serializerError={}",
+						label,
+						static_cast<uint32_t>(serializeHr),
+						static_cast<uint32_t>(createHr),
+						probeParamCount,
+						probeSamplerCount,
+						static_cast<uint32_t>(probeFlags),
+						probeErrorText);
+				};
+
+				probeRootSignature("empty", nullptr, 0, nullptr, 0, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+				probeRootSignature("samplers-only", nullptr, 0, ssmps.data(), static_cast<UINT>(ssmps.size()), D3D12_ROOT_SIGNATURE_FLAG_NONE);
+				probeRootSignature("full-params-no-samplers", paramsV10.data(), static_cast<UINT>(paramsV10.size()), nullptr, 0, rs.Desc_1_1.Flags);
+				probeRootSignature("reduced-params-with-samplers", paramsV10.data(), static_cast<UINT>((std::min<size_t>)(5, paramsV10.size())), ssmps.data(), static_cast<UINT>(ssmps.size()), D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+				probeRootSignature("descriptor-params-only", paramsV10.size() >= 7 ? &paramsV10[5] : nullptr, paramsV10.size() >= 7 ? 2u : 0u, ssmps.data(), static_cast<UINT>(ssmps.size()), D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+				D3D12_FEATURE_DATA_ROOT_SIGNATURE rootSigFeature{};
+				rootSigFeature.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+				HRESULT rootSigFeatureHr = impl->pNativeDevice->CheckFeatureSupport(
+					D3D12_FEATURE_ROOT_SIGNATURE,
+					&rootSigFeature,
+					sizeof(rootSigFeature));
+
+				D3D12_FEATURE_DATA_D3D12_OPTIONS options0{};
+				HRESULT optionsHr = impl->pNativeDevice->CheckFeatureSupport(
+					D3D12_FEATURE_D3D12_OPTIONS,
+					&options0,
+					sizeof(options0));
+
+				D3D12_FEATURE_DATA_SHADER_MODEL shaderModelFeature{};
+				shaderModelFeature.HighestShaderModel = D3D_SHADER_MODEL_6_8;
+				(void)impl->pNativeDevice->CheckFeatureSupport(
+					D3D12_FEATURE_SHADER_MODEL,
+					&shaderModelFeature,
+					sizeof(shaderModelFeature));
+				spdlog::error(
+					"DX12 CreatePipelineLayout capabilities: highestShaderModel=0x{:X}, rootSignatureFeatureHr=0x{:08X}, highestRootSignatureVersion=0x{:X}, optionsHr=0x{:08X}, resourceBindingTier={}, resourceHeapTier={}",
+					static_cast<uint32_t>(shaderModelFeature.HighestShaderModel),
+					static_cast<uint32_t>(rootSigFeatureHr),
+					static_cast<uint32_t>(rootSigFeature.HighestVersion),
+					static_cast<uint32_t>(optionsHr),
+					static_cast<uint32_t>(options0.ResourceBindingTier),
+					static_cast<uint32_t>(options0.ResourceHeapTier));
+
+				constexpr D3D12_ROOT_SIGNATURE_FLAGS kDirectIndexingFlags =
+					D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+					D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+				D3D12_VERSIONED_ROOT_SIGNATURE_DESC fallbackRs = rs;
+				fallbackRs.Desc_1_1.Flags &= ~kDirectIndexingFlags;
+
+				Microsoft::WRL::ComPtr<ID3DBlob> fallbackBlob, fallbackErr;
+				const HRESULT fallbackSerializeHr = D3DX12SerializeVersionedRootSignature(
+					&fallbackRs,
+					D3D_ROOT_SIGNATURE_VERSION_1_1,
+					&fallbackBlob,
+					&fallbackErr);
+				HRESULT fallbackCreateHr = E_FAIL;
+				if (SUCCEEDED(fallbackSerializeHr) && fallbackBlob) {
+					Microsoft::WRL::ComPtr<ID3D12RootSignature> fallbackRoot;
+					fallbackCreateHr = impl->pNativeDevice->CreateRootSignature(
+						0,
+						fallbackBlob->GetBufferPointer(),
+						fallbackBlob->GetBufferSize(),
+						IID_PPV_ARGS(&fallbackRoot));
+				}
+
+				const char* fallbackErrorText = (fallbackErr && fallbackErr->GetBufferPointer())
+					? static_cast<const char*>(fallbackErr->GetBufferPointer())
+					: "<no fallback serializer error>";
+				spdlog::error(
+					"DX12 CreatePipelineLayout fallback without direct heap indexing: serializeHr=0x{:08X}, createHr=0x{:08X}, fallbackFlags=0x{:X}, serializerError={}",
+					static_cast<uint32_t>(fallbackSerializeHr),
+					static_cast<uint32_t>(fallbackCreateHr),
+					static_cast<uint32_t>(fallbackRs.Desc_1_1.Flags),
+					fallbackErrorText);
+				if (SUCCEEDED(fallbackCreateHr)) {
+					spdlog::error(
+						"DX12 CreatePipelineLayout probe: root signature succeeds only after removing direct heap indexing flags. This renderer requires ResourceDescriptorHeap[] and SamplerDescriptorHeap[] bindless access, so the current device/proxy is not compatible with the existing root signature model.");
+				}
+
+				D3D12_ROOT_SIGNATURE_DESC rsV10{};
+				rsV10.NumParameters = static_cast<UINT>(paramsV10.size());
+				rsV10.pParameters = paramsV10.data();
+				rsV10.NumStaticSamplers = static_cast<UINT>(ssmps.size());
+				rsV10.pStaticSamplers = ssmps.data();
+				rsV10.Flags = rs.Desc_1_1.Flags;
+
+				Microsoft::WRL::ComPtr<ID3DBlob> legacyBlob, legacyErr;
+				const HRESULT legacySerializeHr = D3D12SerializeRootSignature(
+					&rsV10,
+					D3D_ROOT_SIGNATURE_VERSION_1,
+					&legacyBlob,
+					&legacyErr);
+				HRESULT legacyCreateHr = E_FAIL;
+				Microsoft::WRL::ComPtr<ID3D12RootSignature> legacyRoot;
+				if (SUCCEEDED(legacySerializeHr) && legacyBlob) {
+					legacyCreateHr = impl->pNativeDevice->CreateRootSignature(
+						0,
+						legacyBlob->GetBufferPointer(),
+						legacyBlob->GetBufferSize(),
+						IID_PPV_ARGS(&legacyRoot));
+				}
+
+				const char* legacyErrorText = (legacyErr && legacyErr->GetBufferPointer())
+					? static_cast<const char*>(legacyErr->GetBufferPointer())
+					: "<no legacy serializer error>";
+				spdlog::error(
+					"DX12 CreatePipelineLayout legacy v1.0 fallback: serializeHr=0x{:08X}, createHr=0x{:08X}, flags=0x{:X}, serializerError={}",
+					static_cast<uint32_t>(legacySerializeHr),
+					static_cast<uint32_t>(legacyCreateHr),
+					static_cast<uint32_t>(rsV10.Flags),
+					legacyErrorText);
+				if (SUCCEEDED(legacyCreateHr) && legacyRoot) {
+					spdlog::warn("DX12 CreatePipelineLayout: using legacy root signature v1.0 fallback after v1.1 CreateRootSignature failed");
+					root = legacyRoot;
+					hr = S_OK;
+				}
+
+				if (FAILED(hr)) {
+
+				spdlog::error(
+					"DX12 CreatePipelineLayout CreateRootSignature failed: hr=0x{:08X}, flags=0x{:X}, pushConstantCount={}, staticSamplerCount={}, blobSize={}",
+					static_cast<uint32_t>(hr),
+					static_cast<uint32_t>(rs.Desc_1_1.Flags),
+					static_cast<uint32_t>(ld.pushConstants.size),
+					static_cast<uint32_t>(ld.staticSamplers.size),
+					blob ? blob->GetBufferSize() : 0);
+				Dx12LogInfoQueueMessagesSince(impl->pNativeDevice.Get(), infoQueueStart);
 				RHI_FAIL(ToRHI(hr));
+				}
 			}
 
 			Dx12PipelineLayout L(ld, impl);
@@ -913,7 +1298,11 @@ namespace rhi {
 				for (uint32_t i = 0; i < ld.pushConstants.size; ++i) {
 					const auto& pc = ld.pushConstants.data[i];
 					L.rcParams.push_back(Dx12PipelineLayout::RootConstParam{
-						pc.set, pc.binding, pc.num32BitValues, /*rootIndex=*/i
+						pc.set,
+						pc.binding,
+						pc.num32BitValues,
+						/*rootIndex=*/i,
+						pc.type
 						});
 				}
 			}
@@ -1314,6 +1703,30 @@ namespace rhi {
 				auto* L = impl->pipelineLayouts.get(layout);
 				if (!L || !L->root) {
 					RHI_FAIL(Result::InvalidArgument);
+				}
+				for (uint32_t i = 0; i < cd.args.size; ++i) {
+					if (cd.args.data[i].kind != IndirectArgKind::Constant) {
+						continue;
+					}
+
+					const uint32_t rootIndex = cd.args.data[i].u.rootConstants.rootIndex;
+					if (rootIndex >= L->rcParams.size()) {
+						spdlog::error(
+							"DX12 CreateCommandSignature: root constant arg {} targets invalid root parameter slot {}",
+							i,
+							rootIndex);
+						RHI_FAIL(Result::InvalidArgument);
+					}
+
+					if (L->rcParams[rootIndex].type != PushConstantRangeType::RootConstants32) {
+						spdlog::error(
+							"DX12 CreateCommandSignature: root constant arg {} targets emulated root-constant slot {} (set={}, binding={})",
+							i,
+							rootIndex,
+							L->rcParams[rootIndex].set,
+							L->rcParams[rootIndex].binding);
+						RHI_FAIL(Result::InvalidArgument);
+					}
 				}
 				rs = L->root.Get();
 			}
@@ -2028,7 +2441,11 @@ namespace rhi {
 			}
 			
 			const Dx12CommandList rec(cl, A->alloc, A->type, impl);
-			const auto h = impl->commandLists.alloc(rec);
+			Dx12CommandList recWithScratch = rec;
+			if (!Dx12EnsureRootCbvScratchPage(impl, recWithScratch, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT)) {
+				RHI_FAIL(Result::Failed);
+			}
+			const auto h = impl->commandLists.alloc(recWithScratch);
 
 			CommandList ret{ h };
 			ret.impl = impl;
@@ -2888,6 +3305,12 @@ namespace rhi {
 			}
 			l->boundPipeline = nullptr;
 #endif
+			l->boundLayout = {};
+			l->boundLayoutPtr = nullptr;
+			l->rootCbvShadowStates.clear();
+			for (auto& page : l->rootCbvScratchPages) {
+				page.cursor = 0;
+			}
 			l->cl->Reset(a->alloc.Get(), nullptr);
 		}
 
@@ -3025,6 +3448,9 @@ namespace rhi {
 				break;
 			}
 
+			if (impl->boundLayout.index != layoutH.index || impl->boundLayout.generation != layoutH.generation) {
+				impl->rootCbvShadowStates.clear();
+			}
 			impl->boundLayout = layoutH;
 			impl->boundLayoutPtr = L;
 		}
@@ -3678,12 +4104,42 @@ namespace rhi {
 
 			// Write to requested stages. On DX12, graphics/compute have distinct root constant slots.
 			const auto* p32 = static_cast<const uint32_t*>(data);
-			if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::Compute)) {
-				impl->cl->SetComputeRoot32BitConstants(rc->rootIndex, num32, p32, dstOffset32);
+			if (rc->type == PushConstantRangeType::RootConstants32) {
+				if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::Compute)) {
+					impl->cl->SetComputeRoot32BitConstants(rc->rootIndex, num32, p32, dstOffset32);
+				}
+				if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::AllGraphics)) {
+					impl->cl->SetGraphicsRoot32BitConstants(rc->rootIndex, num32, p32, dstOffset32);
+				}
+				return;
 			}
-			// If any graphics states are set, write there too
+
+			auto* shadowState = Dx12GetRootCbvShadowState(impl, *rc);
+			if (!shadowState || shadowState->values.size() != maxAvail) {
+				BreakIfDebugging();
+				return;
+			}
+			std::memcpy(shadowState->values.data() + dstOffset32, p32, static_cast<size_t>(num32) * sizeof(uint32_t));
+
+			D3D12_GPU_VIRTUAL_ADDRESS gpuAddress = 0;
+			void* cpuAddress = nullptr;
+			const size_t uploadBytes = static_cast<size_t>(maxAvail) * sizeof(uint32_t);
+			if (!Dx12AllocateRootCbvScratch(impl, uploadBytes, gpuAddress, cpuAddress) || !cpuAddress) {
+				BreakIfDebugging();
+				spdlog::error(
+					"DX12 root CBV scratch allocation failed for set={}, binding={}, bytes={}",
+					rc->set,
+					rc->binding,
+					uploadBytes);
+				return;
+			}
+			std::memcpy(cpuAddress, shadowState->values.data(), uploadBytes);
+
+			if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::Compute)) {
+				impl->cl->SetComputeRootConstantBufferView(rc->rootIndex, gpuAddress);
+			}
 			if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::AllGraphics)) {
-				impl->cl->SetGraphicsRoot32BitConstants(rc->rootIndex, num32, p32, dstOffset32);
+				impl->cl->SetGraphicsRootConstantBufferView(rc->rootIndex, gpuAddress);
 			}
 		}
 
