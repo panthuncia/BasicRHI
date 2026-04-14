@@ -43,11 +43,11 @@ namespace rhi {
 		// Texture constructor
 		Dx12Resource() {}
 		explicit Dx12Resource(ComPtr<ID3D12Resource> r, DXGI_FORMAT f, uint32_t width, uint32_t height, uint16_t mips, uint16_t arraySize, D3D12_RESOURCE_DIMENSION dim, uint16_t depth, Dx12Device* d)
-			: res(r), kind(Dx12ResourceKind::Texture), fmt(f), tex({ width, height, mips, arraySize, depth }), dev(d) {
+			: res(r), kind(Dx12ResourceKind::Texture), fmt(f), tex({ width, height, mips, arraySize, depth }), dim(dim), dev(d) {
 		}
 		// Buffer constructor
 		explicit Dx12Resource(ComPtr<ID3D12Resource> r, uint64_t size, Dx12Device* d)
-			: res(r), kind(Dx12ResourceKind::Buffer), buf({ size }), dev(d) {
+			: res(r), kind(Dx12ResourceKind::Buffer), buf({ size }), dim(D3D12_RESOURCE_DIMENSION_BUFFER), dev(d) {
 		}
 		Microsoft::WRL::ComPtr<ID3D12Resource> res;
 		Dx12ResourceKind kind;
@@ -256,15 +256,17 @@ namespace rhi {
 	struct Dx12Swapchain {
 		Dx12Swapchain() {}
 		explicit Dx12Swapchain(ComPtr<IDXGISwapChain3> pNativeSC, ComPtr<IDXGISwapChain3> pSlProxySC, DXGI_FORMAT f, UINT width, UINT height, UINT c,
+			UINT swapchainFlags,
 			std::vector<ComPtr<ID3D12Resource>> images,
 			std::vector<ResourceHandle> imageHandles,
 			Dx12Device* d)
-			: pNativeSC(pNativeSC), pSlProxySC(pSlProxySC), fmt(f), w(width), h(height), count(c), images(images), imageHandles(imageHandles), dev(d) {
+			: pNativeSC(pNativeSC), pSlProxySC(pSlProxySC), fmt(f), w(width), h(height), count(c), flags(swapchainFlags), images(images), imageHandles(imageHandles), dev(d) {
 		}
 		ComPtr<IDXGISwapChain3> pNativeSC;
 		ComPtr<IDXGISwapChain3> pSlProxySC;
 		DXGI_FORMAT fmt{};
 		UINT w{}, h{}, count{};
+		UINT flags{};
 		UINT current{};
 		std::vector<ComPtr<ID3D12Resource>> images;
 		std::vector<ResourceHandle> imageHandles;

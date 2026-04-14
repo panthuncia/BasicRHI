@@ -98,7 +98,6 @@ namespace rhi {
 		default:                                             return "Unknown";
 		}
 	}
-
 	static void LogDredData() noexcept {
 		if (!g_dredDevice) return;
 
@@ -758,12 +757,18 @@ namespace rhi {
 			slGetNativeInterface(proxySc3.Get(), reinterpret_cast<void**>(&nativeSc3Raw));
 			ComPtr<IDXGISwapChain3> nativeSc3;
 			nativeSc3.Attach(nativeSc3Raw);
+			if (!nativeSc3) {
+				RHI_FAIL(Result::InvalidNativePointer);
+			}
 
 			std::vector<ComPtr<ID3D12Resource>> imgs(bufferCount);
 			std::vector<ResourceHandle> imgHandles(bufferCount);
 
 			for (UINT i = 0; i < bufferCount; i++) {
-				proxySc3->GetBuffer(i, IID_PPV_ARGS(&imgs[i]));
+				auto hr = nativeSc3->GetBuffer(i, IID_PPV_ARGS(&imgs[i]));
+				if (FAILED(hr)) {
+					RHI_FAIL(ToRHI(hr));
+				}
 				// Register as a TextureHandle
 				Dx12Resource t(imgs[i], desc.Format, w, h, 1, 1, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1, impl);
 				imgHandles[i] = impl->resources.alloc(t);
@@ -772,6 +777,7 @@ namespace rhi {
 
 			auto scWrap = Dx12Swapchain(
 				nativeSc3, proxySc3, desc.Format, w, h, bufferCount,
+				desc.Flags,
 				imgs, imgHandles,
 				impl
 			);
@@ -1804,6 +1810,20 @@ namespace rhi {
 				BreakIfDebugging();
 				return Result::InvalidArgument;
 			}
+			if (rd.dimension != RtvDim::Buffer && (!T || !T->res)) {
+				spdlog::critical(
+					"DX12 createRTV: null resource for handle=({}, {}) heap=({}, {}) fmt={} dim={} tex={}x{}",
+					texture.index,
+					texture.generation,
+					s.heap.index,
+					s.index,
+					T ? static_cast<unsigned>(T->fmt) : 0u,
+					T ? static_cast<unsigned>(T->dim) : 0u,
+					T ? T->tex.w : 0u,
+					T ? T->tex.h : 0u);
+				BreakIfDebugging();
+				return Result::InvalidArgument;
+			}
 
 			D3D12_RENDER_TARGET_VIEW_DESC r{};
 			ID3D12Resource* pRes = nullptr;
@@ -1893,7 +1913,6 @@ namespace rhi {
 				BreakIfDebugging();
 				return Result::Unsupported;
 			}
-
 			impl->pNativeDevice->CreateRenderTargetView(pRes, &r, dst);
 			return Result::Ok;
 		}
@@ -2871,6 +2890,34 @@ namespace rhi {
 #endif
 			l->cl->Reset(a->alloc.Get(), nullptr);
 		}
+
+		static bool DxSafeClearRenderTargetView(
+			ID3D12GraphicsCommandList* commandList,
+			D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+			const float* rgba) noexcept {
+			__try {
+				commandList->ClearRenderTargetView(cpu, rgba, 0, nullptr);
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		static bool DxSafeOMSetRenderTargets(
+			ID3D12GraphicsCommandList* commandList,
+			UINT numRtvs,
+			const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs,
+			const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) noexcept {
+			__try {
+				commandList->OMSetRenderTargets(numRtvs, rtvs, FALSE, dsv);
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
 		static void cl_beginPass(CommandList* cl, const PassBeginInfo& p) noexcept {
 			auto* l = dx12_detail::CL(cl);
 			if (!l) {
@@ -2885,7 +2932,15 @@ namespace rhi {
 				if (DxGetDstCpu(l->dev, p.colors.data[i].rtv, cpu, D3D12_DESCRIPTOR_HEAP_TYPE_RTV)) {
 					rtvs.push_back(cpu);
 					if (p.colors.data[i].loadOp == LoadOp::Clear) {
-						l->cl->ClearRenderTargetView(cpu, p.colors.data[i].clear.rgba, 0, nullptr);
+						if (!DxSafeClearRenderTargetView(l->cl.Get(), cpu, p.colors.data[i].clear.rgba)) {
+							spdlog::critical(
+								"DX12 BeginPass: ClearRenderTargetView crashed for color[{}] cpu=0x{:X}",
+								i,
+								static_cast<unsigned long long>(cpu.ptr));
+							LogDredData();
+							BreakIfDebugging();
+							std::abort();
+						}
 					}
 					else if (p.colors.data[i].loadOp == LoadOp::DontCare) {
 						auto* R = l->dev->resources.get(p.colors.data[i].resource);
@@ -2901,6 +2956,14 @@ namespace rhi {
 							l->cl->DiscardResource(R->res.Get(), &discardRegion);
 						}
 					}
+				}
+				else {
+					spdlog::error(
+						"DX12 BeginPass: failed to resolve RTV descriptor for color[{}] heap=({}, {}) index={}",
+						i,
+						p.colors.data[i].rtv.heap.index,
+						p.colors.data[i].rtv.heap.generation,
+						p.colors.data[i].rtv.index);
 				}
 			}
 
@@ -2926,7 +2989,12 @@ namespace rhi {
 				}
 			}
 
-			l->cl->OMSetRenderTargets((UINT)rtvs.size(), rtvs.data(), FALSE, pDsv);
+			if (!DxSafeOMSetRenderTargets(l->cl.Get(), (UINT)rtvs.size(), rtvs.data(), pDsv)) {
+				spdlog::critical("DX12 BeginPass: OMSetRenderTargets crashed");
+				LogDredData();
+				BreakIfDebugging();
+				std::abort();
+			}
 			D3D12_VIEWPORT vp{ 0,0,(float)p.width,(float)p.height,0.0f,1.0f };
 			D3D12_RECT sc{ 0,0,(LONG)p.width,(LONG)p.height };
 			l->cl->RSSetViewports(1, &vp);
@@ -3714,13 +3782,21 @@ namespace rhi {
 			uint32_t flags) noexcept
 		{
 			auto* s = dx12_detail::SC(sc);
-			if (!s || !s->pSlProxySC || !s->dev) return Result::InvalidNativePointer;
+			if (!s || !s->pSlProxySC || !s->dev) {
+				spdlog::critical(
+					"DX12 resizeBuffers: invalid state sc={} proxySc={} dev={}",
+					static_cast<void*>(s),
+					s ? static_cast<void*>(s->pSlProxySC.Get()) : nullptr,
+					s ? static_cast<void*>(s->dev) : nullptr);
+				return Result::InvalidNativePointer;
+			}
 
 			auto* dev = s->dev;
 
 			const uint32_t oldCount = s->count;
 			const uint32_t newCount = (numBuffers != 0) ? numBuffers : oldCount;
 			const DXGI_FORMAT newFmt = (newFormat != Format::Unknown) ? ToDxgi(newFormat) : s->fmt;
+			const UINT resizeFlags = s->flags | static_cast<UINT>(flags);
 
 			// Ensure nothing is using the old backbuffers.
 			if (dev->self.vt && dev->self.vt->deviceWaitIdle)
@@ -3742,8 +3818,34 @@ namespace rhi {
 			}
 
 			// Resize swapchain buffers.
-			HRESULT hr = s->pSlProxySC->ResizeBuffers((UINT)newCount, (UINT)w, (UINT)h, newFmt, (UINT)flags);
-			if (FAILED(hr)) return ToRHI(hr);
+			HRESULT hr = s->pSlProxySC->ResizeBuffers((UINT)newCount, (UINT)w, (UINT)h, newFmt, resizeFlags);
+			if (FAILED(hr)) {
+				spdlog::critical(
+					"DX12 resizeBuffers: proxy ResizeBuffers failed hr=0x{:08X} proxySc={} nativeSc={} oldCount={} newCount={} size={}x{} fmt={} flags=0x{:08X} storedFlags=0x{:08X}",
+					static_cast<unsigned>(hr),
+					static_cast<void*>(s->pSlProxySC.Get()),
+					static_cast<void*>(s->pNativeSC.Get()),
+					oldCount,
+					newCount,
+					w,
+					h,
+					static_cast<unsigned>(newFmt),
+					resizeFlags,
+					s->flags);
+				return ToRHI(hr);
+			}
+
+			IDXGISwapChain3* nativeSc3Raw = nullptr;
+			slGetNativeInterface(s->pSlProxySC.Get(), reinterpret_cast<void**>(&nativeSc3Raw));
+			ComPtr<IDXGISwapChain3> nativeSc3;
+			nativeSc3.Attach(nativeSc3Raw);
+			if (!nativeSc3) {
+				spdlog::critical(
+					"DX12 resizeBuffers: slGetNativeInterface returned null native swapchain proxySc={}",
+					static_cast<void*>(s->pSlProxySC.Get()));
+				return Result::InvalidNativePointer;
+			}
+			s->pNativeSC = nativeSc3;
 
 			// If w/h were 0, query actual post-resize dims.
 			if (w == 0 || h == 0)
@@ -3755,6 +3857,7 @@ namespace rhi {
 
 			s->fmt = newFmt;
 			s->count = (UINT)newCount;
+			s->flags = resizeFlags;
 
 			// Adjust handle arrays (free excess if shrinking, alloc new if growing).
 			if (newCount < s->imageHandles.size())
@@ -3782,8 +3885,15 @@ namespace rhi {
 			for (uint32_t i = 0; i < newCount; ++i)
 			{
 				ComPtr<ID3D12Resource> img;
-				hr = s->pSlProxySC->GetBuffer((UINT)i, IID_PPV_ARGS(&img));
-				if (FAILED(hr)) return ToRHI(hr);
+				hr = s->pNativeSC->GetBuffer((UINT)i, IID_PPV_ARGS(&img));
+				if (FAILED(hr)) {
+					spdlog::critical(
+						"DX12 resizeBuffers: GetBuffer failed index={} hr=0x{:08X} nativeSc={}",
+						i,
+						static_cast<unsigned>(hr),
+						static_cast<void*>(s->pNativeSC.Get()));
+					return ToRHI(hr);
+				}
 
 				s->images[i] = img;
 
@@ -3794,7 +3904,18 @@ namespace rhi {
 				if (s->imageHandles[i].generation != 0)
 				{
 					if (auto* r = dev->resources.get(s->imageHandles[i]))
-						*r = t;
+					{
+						r->res = img;
+						r->kind = Dx12ResourceKind::Texture;
+						r->fmt = newFmt;
+						r->tex.w = s->w;
+						r->tex.h = s->h;
+						r->tex.mips = 1;
+						r->tex.arraySize = 1;
+						r->tex.depth = 1;
+						r->dim = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+						r->dev = s->dev;
+					}
 					else
 						s->imageHandles[i] = dev->resources.alloc(t);
 				}
