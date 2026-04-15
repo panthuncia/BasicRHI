@@ -266,6 +266,33 @@ namespace rhi {
 			}
 		}
 
+		static void Dx12LogDeviceState(ID3D12Device* device, const char* phase) noexcept
+		{
+			if (!device) {
+				spdlog::info("DX12 device state {} device=null", phase ? phase : "<unknown>");
+				return;
+			}
+
+			const HRESULT reason = device->GetDeviceRemovedReason();
+			UINT64 infoQueueCount = 0;
+			ComPtr<ID3D12InfoQueue> iq;
+			if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&iq))) && iq) {
+				infoQueueCount = iq->GetNumStoredMessagesAllowedByRetrievalFilter();
+			}
+
+			spdlog::info(
+				"DX12 device state {} device={} removedReason=0x{:08X} infoQueueCount={}",
+				phase ? phase : "<unknown>",
+				static_cast<const void*>(device),
+				static_cast<unsigned>(reason),
+				infoQueueCount);
+
+			if (reason != S_OK) {
+				Dx12LogInfoQueueMessagesSince(device, infoQueueCount > 16 ? infoQueueCount - 16 : 0);
+				LogDredData();
+			}
+		}
+
 		static void DxgiReportLiveObjects(const char* phase) noexcept
 		{
 			Microsoft::WRL::ComPtr<IDXGIDebug1> dxgiDebug;
@@ -509,6 +536,16 @@ namespace rhi {
 			if (!desc.programName || desc.programName[0] == '\0') return Result::InvalidArgument;
 			if (desc.libraries.size == 0) return Result::InvalidArgument;
 
+			spdlog::info(
+				"DX12 work graph creation begin: program='{}' libraries={} localRootAssociations={} explicitNodes={} entrypoints={} flags=0x{:X} allowAdditions={}",
+				desc.programName,
+				desc.libraries.size,
+				desc.localRootAssociations.size,
+				desc.explicitNodes.size,
+				desc.entrypoints.size,
+				static_cast<unsigned>(desc.flags),
+				desc.allowStateObjectAdditions);
+
 			if (desc.flags & WorkGraphFlags::WorkGraphFlagsEntrypointGraphicsNodesRasterizeInOrder) {
 				// Not yet supported in d3d12.h
 				spdlog::error("DX12 work graph creation: EntrypointGraphicsNodesRasterizeInOrder flag is not supported yet");
@@ -518,10 +555,19 @@ namespace rhi {
 			// Feature gate, should have already checked through RHI, but just in case
 			{
 				D3D12_FEATURE_DATA_D3D12_OPTIONS21 opt{};
-				if (FAILED(dimpl->pNativeDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS21, &opt, sizeof(opt)))) {
+				const HRESULT featureHr = dimpl->pNativeDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS21, &opt, sizeof(opt));
+				spdlog::info(
+					"DX12 work graph creation: CheckFeatureSupport(OPTIONS21) hr=0x{:08X} tier={}",
+					static_cast<unsigned>(featureHr),
+					static_cast<unsigned>(opt.WorkGraphsTier));
+				if (FAILED(featureHr)) {
+					spdlog::error(
+						"DX12 work graph creation: CheckFeatureSupport(OPTIONS21) failed hr=0x{:08X}",
+						static_cast<unsigned>(featureHr));
 					return Result::Unsupported;
 				}
 				if (opt.WorkGraphsTier == D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED) {
+					spdlog::error("DX12 work graph creation: WorkGraphsTier reports NOT_SUPPORTED for program '{}'", desc.programName);
 					return Result::Unsupported;
 				}
 			}
@@ -558,7 +604,10 @@ namespace rhi {
 			// Global root signature
 			if (desc.globalRootSignature.valid()) {
 				const auto* pl = dimpl->pipelineLayouts.get(desc.globalRootSignature);
-				if (!pl || !pl->root) return Result::InvalidArgument;
+				if (!pl || !pl->root) {
+					spdlog::error("DX12 work graph creation: invalid global root signature handle for program '{}'", desc.programName);
+					return Result::InvalidArgument;
+				}
 				auto* grs = soDesc.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
 				grs->SetRootSignature(pl->root.Get());
 			}
@@ -566,7 +615,10 @@ namespace rhi {
 			// Local root signature associations
 			for (const LocalRootAssociation& assoc : desc.localRootAssociations) {
 				const auto* pl = dimpl->pipelineLayouts.get(assoc.localRootSignature);
-				if (!pl || !pl->root) return Result::InvalidArgument;
+				if (!pl || !pl->root) {
+					spdlog::error("DX12 work graph creation: invalid local root signature handle for program '{}'", desc.programName);
+					return Result::InvalidArgument;
+				}
 
 				auto* lrs = soDesc.CreateSubobject<CD3DX12_LOCAL_ROOT_SIGNATURE_SUBOBJECT>();
 				lrs->SetRootSignature(pl->root.Get());
@@ -671,35 +723,72 @@ namespace rhi {
 				wg->AddEntrypoint(toNodeId(e));
 			}
 
+			spdlog::info("DX12 work graph creation: calling CreateStateObject for program '{}'", desc.programName);
+
 			ComPtr<ID3D12StateObject> stateObject;
 			if (const auto hr = dimpl->pNativeDevice->CreateStateObject(soDesc, IID_PPV_ARGS(&stateObject)); FAILED(hr)) {
+				spdlog::error(
+					"DX12 work graph creation: CreateStateObject failed for program '{}' hr=0x{:08X}",
+					desc.programName,
+					static_cast<unsigned>(hr));
 				RHI_FAIL(ToRHI(hr));
 			}
+			spdlog::info("DX12 work graph creation: CreateStateObject succeeded for program '{}'", desc.programName);
 
 			ComPtr<ID3D12StateObjectProperties1> props1;
 			if (const auto hr = stateObject.As(&props1); FAILED(hr) || !props1) {
+				spdlog::error(
+					"DX12 work graph creation: QueryInterface(ID3D12StateObjectProperties1) failed for program '{}' hr=0x{:08X} props1={}",
+					desc.programName,
+					static_cast<unsigned>(hr),
+					static_cast<bool>(props1));
 				RHI_FAIL(Result::Failed);
 			}
+			spdlog::info("DX12 work graph creation: QueryInterface(ID3D12StateObjectProperties1) succeeded for program '{}'", desc.programName);
 			ComPtr<ID3D12WorkGraphProperties> wgProps;
 			if (const auto hr = stateObject.As(&wgProps); FAILED(hr) || !wgProps) {
+				spdlog::error(
+					"DX12 work graph creation: QueryInterface(ID3D12WorkGraphProperties) failed for program '{}' hr=0x{:08X} wgProps={}",
+					desc.programName,
+					static_cast<unsigned>(hr),
+					static_cast<bool>(wgProps));
 				RHI_FAIL(Result::Failed);
 			}
+			spdlog::info("DX12 work graph creation: QueryInterface(ID3D12WorkGraphProperties) succeeded for program '{}'", desc.programName);
 
 			const D3D12_PROGRAM_IDENTIFIER programId = props1->GetProgramIdentifier(programNameW);
 			const UINT wgIndex = wgProps->GetWorkGraphIndex(programNameW);
+			spdlog::info(
+				"DX12 work graph creation: GetProgramIdentifier/GetWorkGraphIndex program='{}' wgIndex={}",
+				desc.programName,
+				wgIndex);
 			const UINT numEntries = wgProps->GetNumEntrypoints(wgIndex);
+			spdlog::info(
+				"DX12 work graph creation: GetNumEntrypoints program='{}' wgIndex={} numEntries={}",
+				desc.programName,
+				wgIndex,
+				numEntries);
 			if (numEntries == 0) {
 				spdlog::error("DX12 work graph creation: no entrypoints found for program '{}'", desc.programName);
 				RHI_FAIL(Result::InvalidArgument);
 			}
 			D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS mem{};
 			wgProps->GetWorkGraphMemoryRequirements(wgIndex, &mem);
+			spdlog::info(
+				"DX12 work graph creation: GetWorkGraphMemoryRequirements program='{}'",
+				desc.programName);
+			spdlog::info(
+				"DX12 work graph memory requirements: min={} max={} granularity={}",
+				static_cast<unsigned long long>(mem.MinSizeInBytes),
+				static_cast<unsigned long long>(mem.MaxSizeInBytes),
+				static_cast<unsigned>(mem.SizeGranularityInBytes));
 
 			auto handle = dimpl->workGraphs.alloc(Dx12WorkGraph(stateObject, props1, wgProps, programId, wgIndex, mem, dimpl));
 			WorkGraph ret(handle);
 			ret.vt = &g_wgvt;
 			ret.impl = dimpl;
 			out = MakeWorkGraphPtr(d, ret, dimpl->selfWeak.lock());
+			spdlog::info("DX12 work graph creation complete: program='{}' handleValid={} outValid={}", desc.programName, handle.valid(), static_cast<bool>(out));
 			return Result::Ok;
 		}
 
@@ -833,10 +922,15 @@ namespace rhi {
 				RHI_FAIL(ToRHI(hr));
 			}
 
-			IDXGISwapChain3* nativeSc3Raw = nullptr;
-			slGetNativeInterface(proxySc3.Get(), reinterpret_cast<void**>(&nativeSc3Raw));
 			ComPtr<IDXGISwapChain3> nativeSc3;
-			nativeSc3.Attach(nativeSc3Raw);
+			if (impl->steamlineInitialized) {
+				IDXGISwapChain3* nativeSc3Raw = nullptr;
+				slGetNativeInterface(proxySc3.Get(), reinterpret_cast<void**>(&nativeSc3Raw));
+				nativeSc3.Attach(nativeSc3Raw);
+			}
+			else {
+				nativeSc3 = proxySc3;
+			}
 			if (!nativeSc3) {
 				RHI_FAIL(Result::InvalidNativePointer);
 			}
@@ -2402,11 +2496,20 @@ namespace rhi {
 
 		static Result d_createCommandAllocator(Device* d, QueueKind q, CommandAllocatorPtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
+			ID3D12Device* createDevice = impl->steamlineInitialized ? impl->pSLProxyDevice.Get() : impl->pNativeDevice.Get();
+			spdlog::info(
+				"DX12 create command allocator begin queue={} deviceImpl={} createDevice={} usingProxyDevice={}",
+				static_cast<int>(q),
+				static_cast<const void*>(impl),
+				static_cast<const void*>(createDevice),
+				impl->steamlineInitialized);
 			Microsoft::WRL::ComPtr<ID3D12CommandAllocator> a;
-			if (const auto hr = impl->pNativeDevice->CreateCommandAllocator(ToDX(q), IID_PPV_ARGS(&a)); FAILED(hr)) {
+			if (const auto hr = createDevice->CreateCommandAllocator(ToDX(q), IID_PPV_ARGS(&a)); FAILED(hr)) {
+				spdlog::error("DX12 create command allocator failed queue={} hr=0x{:08X}", static_cast<int>(q), static_cast<unsigned>(hr));
 				BreakIfDebugging();
 				return ToRHI(hr);
 			}
+			spdlog::info("DX12 create command allocator native create complete queue={} allocator={}", static_cast<int>(q), static_cast<const void*>(a.Get()));
 
 			Dx12Allocator A(a, ToDX(q), impl);
 			const auto h = impl->allocators.alloc(A);
@@ -2415,6 +2518,7 @@ namespace rhi {
 			ret.impl = impl;
 			ret.vt = &g_calvt;
 			out = MakeCommandAllocatorPtr(d, ret, static_cast<Dx12Device*>(d->impl)->selfWeak.lock());
+			spdlog::info("DX12 create command allocator complete queue={} handleValid={} outValid={}", static_cast<int>(q), h.valid(), static_cast<bool>(out));
 			return Result::Ok;
 		}
 
@@ -2424,33 +2528,57 @@ namespace rhi {
 
 		static Result d_createCommandList(Device* d, QueueKind q, CommandAllocator ca, CommandListPtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
+			ID3D12Device* createDevice = impl->steamlineInitialized ? impl->pSLProxyDevice.Get() : impl->pNativeDevice.Get();
 			const auto* A = dx12_detail::Alloc(&ca);
+			spdlog::info(
+				"DX12 create command list begin queue={} deviceImpl={} nativeDevice10={} proxyDevice={} createDevice={} sameDevicePointer={} allocatorValid={} allocatorImpl={} allocatorType={} usingProxyDevice={}",
+				static_cast<int>(q),
+				static_cast<const void*>(impl),
+				static_cast<const void*>(impl ? impl->pNativeDevice.Get() : nullptr),
+				static_cast<const void*>(impl ? impl->pSLProxyDevice.Get() : nullptr),
+				static_cast<const void*>(createDevice),
+				impl ? (impl->pNativeDevice.Get() == impl->pSLProxyDevice.Get()) : false,
+				A != nullptr,
+				A ? static_cast<const void*>(A->alloc.Get()) : nullptr,
+				A ? static_cast<int>(A->type) : -1,
+				impl ? impl->steamlineInitialized : false);
 			if (!A) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			ComPtr<ID3D12GraphicsCommandList> cl0; // Needs at least version 10 for work graphs
-			if (const auto hr = impl->pNativeDevice->CreateCommandList(0, A->type, A->alloc.Get(), nullptr, IID_PPV_ARGS(&cl0)); FAILED(hr)) {
+			spdlog::info("DX12 create command list before CreateCommandList queue={}", static_cast<int>(q));
+			Dx12LogDeviceState(impl ? impl->pNativeDevice.Get() : nullptr, "before CreateCommandList");
+			if (const auto hr = createDevice->CreateCommandList(0, A->type, A->alloc.Get(), nullptr, IID_PPV_ARGS(&cl0)); FAILED(hr)) {
+				spdlog::error("DX12 create command list CreateCommandList failed queue={} hr=0x{:08X}", static_cast<int>(q), static_cast<unsigned>(hr));
 				RHI_FAIL(ToRHI(hr));
 			}
+			spdlog::info("DX12 create command list CreateCommandList complete queue={} cl0={}", static_cast<int>(q), static_cast<const void*>(cl0.Get()));
 
 			// Attempt upcast to ID3D12GraphicsCommandList10
 			Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList10> cl;
+			spdlog::info("DX12 create command list before As(ID3D12GraphicsCommandList10) queue={}", static_cast<int>(q));
 			if (const auto hr = cl0.As(&cl); FAILED(hr)) {
+				spdlog::error("DX12 create command list As(ID3D12GraphicsCommandList10) failed queue={} hr=0x{:08X}", static_cast<int>(q), static_cast<unsigned>(hr));
 				RHI_FAIL(ToRHI(hr));
 			}
+			spdlog::info("DX12 create command list As(ID3D12GraphicsCommandList10) complete queue={} cl10={}", static_cast<int>(q), static_cast<const void*>(cl.Get()));
 			
 			const Dx12CommandList rec(cl, A->alloc, A->type, impl);
 			Dx12CommandList recWithScratch = rec;
+			spdlog::info("DX12 create command list before EnsureRootCbvScratchPage queue={}", static_cast<int>(q));
 			if (!Dx12EnsureRootCbvScratchPage(impl, recWithScratch, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT)) {
+				spdlog::error("DX12 create command list EnsureRootCbvScratchPage failed queue={}", static_cast<int>(q));
 				RHI_FAIL(Result::Failed);
 			}
+			spdlog::info("DX12 create command list EnsureRootCbvScratchPage complete queue={}", static_cast<int>(q));
 			const auto h = impl->commandLists.alloc(recWithScratch);
 
 			CommandList ret{ h };
 			ret.impl = impl;
 			ret.vt = &g_clvt;
 			out = MakeCommandListPtr(d, ret, static_cast<Dx12Device*>(d->impl)->selfWeak.lock());
+			spdlog::info("DX12 create command list complete queue={} handleValid={} outValid={}", static_cast<int>(q), h.valid(), static_cast<bool>(out));
 			return Result::Ok;
 		}
 
@@ -3289,7 +3417,9 @@ namespace rhi {
 
 		static void cl_end(CommandList* cl) noexcept {
 			auto* w = dx12_detail::CL(cl);
+			spdlog::info("DX12 command list end begin cl={} native={}", static_cast<const void*>(w), w ? static_cast<const void*>(w->cl.Get()) : nullptr);
 			w->cl->Close();
+			spdlog::info("DX12 command list end complete cl={}", static_cast<const void*>(w));
 		}
 		static void cl_reset(CommandList* cl, const CommandAllocator& ca) noexcept {
 			auto* l = dx12_detail::CL(cl);
@@ -3311,7 +3441,14 @@ namespace rhi {
 			for (auto& page : l->rootCbvScratchPages) {
 				page.cursor = 0;
 			}
+			spdlog::info(
+				"DX12 command list reset begin cl={} native={} allocator={} nativeAllocator={}",
+				static_cast<const void*>(l),
+				l ? static_cast<const void*>(l->cl.Get()) : nullptr,
+				static_cast<const void*>(a),
+				a ? static_cast<const void*>(a->alloc.Get()) : nullptr);
 			l->cl->Reset(a->alloc.Get(), nullptr);
+			spdlog::info("DX12 command list reset complete cl={}", static_cast<const void*>(l));
 		}
 
 		static bool DxSafeClearRenderTargetView(
@@ -4291,10 +4428,15 @@ namespace rhi {
 				return ToRHI(hr);
 			}
 
-			IDXGISwapChain3* nativeSc3Raw = nullptr;
-			slGetNativeInterface(s->pSlProxySC.Get(), reinterpret_cast<void**>(&nativeSc3Raw));
 			ComPtr<IDXGISwapChain3> nativeSc3;
-			nativeSc3.Attach(nativeSc3Raw);
+			if (s->dev->steamlineInitialized) {
+				IDXGISwapChain3* nativeSc3Raw = nullptr;
+				slGetNativeInterface(s->pSlProxySC.Get(), reinterpret_cast<void**>(&nativeSc3Raw));
+				nativeSc3.Attach(nativeSc3Raw);
+			}
+			else {
+				nativeSc3 = s->pSlProxySC;
+			}
 			if (!nativeSc3) {
 				spdlog::critical(
 					"DX12 resizeBuffers: slGetNativeInterface returned null native swapchain proxySc={}",
@@ -4488,7 +4630,13 @@ namespace rhi {
 				return;
 			}
 			auto* A = dx12_detail::Alloc(ca);
+			spdlog::info(
+				"DX12 command allocator reset begin allocator={} native={} queueType={}",
+				static_cast<const void*>(A),
+				A ? static_cast<const void*>(A->alloc.Get()) : nullptr,
+				A ? static_cast<int>(A->type) : -1);
 			A->alloc->Reset(); // ID3D12CommandAllocator::Reset()
+			spdlog::info("DX12 command allocator reset complete allocator={}", static_cast<const void*>(A));
 		}
 
 		// ------------------ QueryPool vtable funcs ----------------
@@ -5183,6 +5331,31 @@ namespace rhi {
 		else
 		{
 			impl->pSLProxyDevice = impl->pNativeDevice;
+		}
+
+		spdlog::info(
+			"DX12 device setup: streamlineEnabled={} nativeDevice10={} proxyDevice={} samePointer={}",
+			l_enableStreamline,
+			static_cast<const void*>(impl->pNativeDevice.Get()),
+			static_cast<const void*>(impl->pSLProxyDevice.Get()),
+			impl->pNativeDevice.Get() == impl->pSLProxyDevice.Get());
+		if (l_enableStreamline)
+		{
+	#if BASICRHI_ENABLE_STREAMLINE
+			ID3D12Device* extractedNativeDevice = nullptr;
+			if (SL_FAILED(res, slGetNativeInterface(impl->pSLProxyDevice.Get(), reinterpret_cast<void**>(&extractedNativeDevice))) || !extractedNativeDevice) {
+				spdlog::warn(
+					"DX12 device setup: slGetNativeInterface(proxyDevice) failed proxyDevice={}",
+					static_cast<const void*>(impl->pSLProxyDevice.Get()));
+			}
+			else {
+				spdlog::info(
+					"DX12 device setup: proxy->native extractedDevice={} matchesStoredNative={}",
+					static_cast<const void*>(extractedNativeDevice),
+					extractedNativeDevice == impl->pNativeDevice.Get());
+				extractedNativeDevice->Release();
+			}
+	#endif
 		}
 
 		if (ci.enableDebug) {
