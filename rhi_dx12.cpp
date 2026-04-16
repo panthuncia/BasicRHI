@@ -4856,6 +4856,11 @@ namespace rhi {
 			}
 			auto wg = l->dev->workGraphs.get(h);
 			auto backingMem = l->dev->resources.get(backingMemory);
+			if (!wg || !wg->stateObject || !backingMem || !backingMem->res) {
+				BreakIfDebugging();
+				return;
+			}
+
 			D3D12_SET_PROGRAM_DESC desc{};
 			desc.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
 			desc.WorkGraph.Flags = resetBackingMemory ? static_cast<D3D12_SET_WORK_GRAPH_FLAGS>(D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE) : static_cast<D3D12_SET_WORK_GRAPH_FLAGS>(D3D12_WORK_GRAPH_FLAG_NONE);
