@@ -9,17 +9,29 @@ include(GNUInstallDirs)
 
 option(BASICRHI_ENABLE_STREAMLINE "Enable Streamline integration in BasicRHI" ON)
 option(BASICRHI_ENABLE_PIX "Enable PIX integration in BasicRHI" ON)
+option(BASICRHI_ENABLE_RESHAPE "Enable GPU-Reshape debug instrumentation scaffolding in BasicRHI" OFF)
 set(BASICRHI_STREAMLINE_HEADERS_DIR "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/Streamline" CACHE PATH "Directory containing Streamline headers (e.g. sl.h)")
 set(BASICRHI_PIX_HEADERS_DIR "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/pix" CACHE PATH "Directory containing PIX headers (e.g. pix3.h)")
 
 find_package(DirectX-Headers CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
+find_package(fmt CONFIG REQUIRED)
 find_package(DirectX12-Agility CONFIG REQUIRED)
 
 set(_basicrhi_streamline_available OFF)
 set(_basicrhi_pix_available OFF)
+set(_basicrhi_reshape_available OFF)
 set(_basicrhi_streamline_manual_include "")
 set(_basicrhi_pix_manual_include "")
+
+if(BASICRHI_ENABLE_RESHAPE)
+    if(TARGET GRS.Backends.DX12.Layer)
+        set(_basicrhi_reshape_available ON)
+        message(STATUS "BasicRHI: GPU-Reshape runtime resolved from in-tree GPU-Reshape targets")
+    else()
+        message(WARNING "BasicRHI: BASICRHI_ENABLE_RESHAPE was requested, but GPU-Reshape targets are unavailable. ReShape support will be disabled.")
+    endif()
+endif()
 
 if(BASICRHI_ENABLE_STREAMLINE)
     if(NOT TARGET Streamline::headers)
@@ -100,6 +112,35 @@ if(_basicrhi_pix_available)
     endif()
 endif()
 
+if(_basicrhi_reshape_available)
+    set(_basicrhi_reshape_source_root "${CMAKE_CURRENT_LIST_DIR}/../GPU-Reshape/Source")
+    set(_basicrhi_reshape_binary_root "${CMAKE_BINARY_DIR}/GPU-Reshape/Source")
+    get_target_property(_basicrhi_fmt_include_dirs fmt::fmt INTERFACE_INCLUDE_DIRECTORIES)
+
+    if(_basicrhi_fmt_include_dirs)
+        target_include_directories(BasicRHI BEFORE PRIVATE ${_basicrhi_fmt_include_dirs})
+    endif()
+
+    target_include_directories(BasicRHI PRIVATE
+        "${_basicrhi_reshape_source_root}/Backends/DX12/Layer/Include"
+        "${_basicrhi_reshape_binary_root}/Backends/DX12/Layer/Include"
+        "${_basicrhi_reshape_source_root}/Libraries/Backend/Include"
+        "${_basicrhi_reshape_binary_root}/Libraries/Backend/Include"
+        "${_basicrhi_reshape_source_root}/Libraries/Message/Include"
+        "${_basicrhi_reshape_binary_root}/Libraries/Message/Include"
+        "${_basicrhi_reshape_source_root}/Libraries/Common/Include"
+        "${_basicrhi_reshape_source_root}/Libraries/Bridge/Include"
+        "${_basicrhi_reshape_binary_root}/Libraries/Bridge/Include"
+        "${_basicrhi_reshape_source_root}/Services/HostResolver/Include"
+        "${CMAKE_BINARY_DIR}/External/include"
+        "${CMAKE_CURRENT_LIST_DIR}/../GPU-Reshape/ThirdParty/MD5/Include"
+    )
+
+    target_link_libraries(BasicRHI PUBLIC
+        $<BUILD_INTERFACE:GRS.Libraries.Backend>
+    )
+endif()
+
 # Public header(s)
 set_target_properties(BasicRHI PROPERTIES
     PUBLIC_HEADER "rhi.h"
@@ -164,10 +205,12 @@ PUBLIC
     Microsoft::DirectX-Headers
 PRIVATE 
     Microsoft::DirectX12-Agility 
+    fmt::fmt
     spdlog::spdlog_header_only
 )
 
 target_compile_definitions(BasicRHI PUBLIC
     BASICRHI_ENABLE_STREAMLINE=$<IF:$<BOOL:${_basicrhi_streamline_available}>,1,0>
     BASICRHI_ENABLE_PIX=$<IF:$<BOOL:${_basicrhi_pix_available}>,1,0>
+    BASICRHI_ENABLE_RESHAPE=$<IF:$<BOOL:${_basicrhi_reshape_available}>,1,0>
 )

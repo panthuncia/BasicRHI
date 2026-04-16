@@ -121,6 +121,7 @@ namespace rhi {
 
 	enum class Backend : uint32_t { Null, D3D12, Vulkan };
 	enum class QueueKind : uint32_t { Graphics, Compute, Copy };
+	enum class DebugInstrumentationDiagnosticSeverity : uint32_t { Info, Warning, Error };
 
 	enum class Result : uint32_t
 	{
@@ -263,6 +264,39 @@ namespace rhi {
 			return false;
 		}
 	}
+
+	struct DebugInstrumentationCreateInfo {
+		bool enableRuntimeInstrumentation = false;
+		bool enableSynchronousRecording = false;
+	};
+
+	struct DebugInstrumentationCapabilities {
+		bool backendBuildEnabled = false;
+		bool installSupported = false;
+		bool globalInstrumentationSupported = false;
+		bool shaderInstrumentationSupported = false;
+		bool pipelineInstrumentationSupported = false;
+		bool synchronousRecordingSupported = false;
+		uint32_t featureCount = 0;
+	};
+
+	struct DebugInstrumentationState {
+		bool requested = false;
+		bool active = false;
+		bool synchronousRecording = false;
+		uint64_t globalFeatureMask = 0;
+	};
+
+	struct DebugInstrumentationFeature {
+		uint64_t featureBit = 0;
+		char name[64]{};
+		char description[192]{};
+	};
+
+	struct DebugInstrumentationDiagnostic {
+		DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
+		char message[256]{};
+	};
 
 	constexpr const char* ResultName(Result r) noexcept
 	{
@@ -2105,9 +2139,17 @@ namespace rhi {
 		void (*setNameTimeline)(Device*, TimelineHandle, const char*) noexcept;
 		void (*setNameHeap)(Device*, HeapHandle, const char*) noexcept;
 		void (*checkDebugMessages)(Device*) noexcept;
+		Result(*getDebugInstrumentationCapabilities)(const Device*, DebugInstrumentationCapabilities&) noexcept;
+		Result(*getDebugInstrumentationState)(const Device*, DebugInstrumentationState&) noexcept;
+		uint32_t(*getDebugInstrumentationFeatureCount)(const Device*) noexcept;
+		Result(*copyDebugInstrumentationFeatures)(const Device*, uint32_t first, DebugInstrumentationFeature*, uint32_t capacity, uint32_t* copied) noexcept;
+		uint32_t(*getDebugInstrumentationDiagnosticCount)(const Device*) noexcept;
+		Result(*copyDebugInstrumentationDiagnostics)(const Device*, uint32_t first, DebugInstrumentationDiagnostic*, uint32_t capacity, uint32_t* copied) noexcept;
+		Result(*setDebugGlobalInstrumentationMask)(Device*, uint64_t) noexcept;
+		Result(*setDebugSynchronousRecording)(Device*, bool) noexcept;
 
 		void (*destroyDevice)(Device*) noexcept;
-		uint32_t abi_version = 4;
+		uint32_t abi_version = 5;
 	};
 
 
@@ -2395,7 +2437,12 @@ namespace rhi {
 		vt->dispatchWorkGraph(this, desc);
 	}
 
-	struct DeviceCreateInfo { Backend backend = Backend::D3D12; uint32_t framesInFlight = 3; bool enableDebug = true; };
+	struct DeviceCreateInfo {
+		Backend backend = Backend::D3D12;
+		uint32_t framesInFlight = 3;
+		bool enableDebug = true;
+		DebugInstrumentationCreateInfo instrumentation{};
+	};
 
 	static inline ShaderBinary DXIL(ID3DBlob* blob) {
 		return { blob ? blob->GetBufferPointer() : nullptr,

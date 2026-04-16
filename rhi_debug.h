@@ -58,6 +58,108 @@ namespace rhi::debug {
     bool Init(Device d) noexcept;
     void Shutdown(Device /*d*/) noexcept; // currently a no-op
 
+    inline Result GetInstrumentationCapabilities(Device d, DebugInstrumentationCapabilities& out) noexcept {
+        if (!d || !d.vt || !d.vt->getDebugInstrumentationCapabilities) {
+            return Result::Unsupported;
+        }
+        return d.vt->getDebugInstrumentationCapabilities(&d, out);
+    }
+
+    inline Result GetInstrumentationState(Device d, DebugInstrumentationState& out) noexcept {
+        if (!d || !d.vt || !d.vt->getDebugInstrumentationState) {
+            return Result::Unsupported;
+        }
+        return d.vt->getDebugInstrumentationState(&d, out);
+    }
+
+    inline uint32_t GetInstrumentationFeatureCount(Device d) noexcept {
+        if (!d || !d.vt || !d.vt->getDebugInstrumentationFeatureCount) {
+            return 0;
+        }
+        return d.vt->getDebugInstrumentationFeatureCount(&d);
+    }
+
+    inline Result CopyInstrumentationFeatures(Device d,
+        uint32_t first,
+        DebugInstrumentationFeature* outFeatures,
+        uint32_t capacity,
+        uint32_t* copied = nullptr) noexcept {
+        if (!d || !d.vt || !d.vt->copyDebugInstrumentationFeatures) {
+            if (copied) {
+                *copied = 0;
+            }
+            return Result::Unsupported;
+        }
+        return d.vt->copyDebugInstrumentationFeatures(&d, first, outFeatures, capacity, copied);
+    }
+
+    inline std::vector<DebugInstrumentationFeature> GetInstrumentationFeatures(Device d) {
+        std::vector<DebugInstrumentationFeature> features(GetInstrumentationFeatureCount(d));
+        if (features.empty()) {
+            return features;
+        }
+
+        uint32_t copied = 0;
+        if (!IsOk(CopyInstrumentationFeatures(d, 0, features.data(), static_cast<uint32_t>(features.size()), &copied))) {
+            features.clear();
+            return features;
+        }
+
+        features.resize(copied);
+        return features;
+    }
+
+    inline uint32_t GetInstrumentationDiagnosticCount(Device d) noexcept {
+        if (!d || !d.vt || !d.vt->getDebugInstrumentationDiagnosticCount) {
+            return 0;
+        }
+        return d.vt->getDebugInstrumentationDiagnosticCount(&d);
+    }
+
+    inline Result CopyInstrumentationDiagnostics(Device d,
+        uint32_t first,
+        DebugInstrumentationDiagnostic* outDiagnostics,
+        uint32_t capacity,
+        uint32_t* copied = nullptr) noexcept {
+        if (!d || !d.vt || !d.vt->copyDebugInstrumentationDiagnostics) {
+            if (copied) {
+                *copied = 0;
+            }
+            return Result::Unsupported;
+        }
+        return d.vt->copyDebugInstrumentationDiagnostics(&d, first, outDiagnostics, capacity, copied);
+    }
+
+    inline std::vector<DebugInstrumentationDiagnostic> GetInstrumentationDiagnostics(Device d) {
+        std::vector<DebugInstrumentationDiagnostic> diagnostics(GetInstrumentationDiagnosticCount(d));
+        if (diagnostics.empty()) {
+            return diagnostics;
+        }
+
+        uint32_t copied = 0;
+        if (!IsOk(CopyInstrumentationDiagnostics(d, 0, diagnostics.data(), static_cast<uint32_t>(diagnostics.size()), &copied))) {
+            diagnostics.clear();
+            return diagnostics;
+        }
+
+        diagnostics.resize(copied);
+        return diagnostics;
+    }
+
+    inline Result SetGlobalInstrumentationMask(Device d, uint64_t featureMask) noexcept {
+        if (!d || !d.vt || !d.vt->setDebugGlobalInstrumentationMask) {
+            return Result::Unsupported;
+        }
+        return d.vt->setDebugGlobalInstrumentationMask(&d, featureMask);
+    }
+
+    inline Result SetSynchronousRecording(Device d, bool enabled) noexcept {
+        if (!d || !d.vt || !d.vt->setDebugSynchronousRecording) {
+            return Result::Unsupported;
+        }
+        return d.vt->setDebugSynchronousRecording(&d, enabled);
+    }
+
     // Command list markers
     void Begin(CommandList cmd, Color color, const char* name) noexcept;
     void End(CommandList cmd) noexcept;

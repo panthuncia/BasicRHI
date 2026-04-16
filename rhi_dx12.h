@@ -8,6 +8,7 @@
 #include <dxgi1_6.h>
 #include <wrl.h>
 #include <vector>
+#include <mutex>
 #include <cassert>
 #include <spdlog/spdlog.h>
 #include <optional>
@@ -301,6 +302,15 @@ namespace rhi {
 		Dx12Device* dev = nullptr;
 	};
 
+	struct Dx12DebugInstrumentationSession {
+		DebugInstrumentationCapabilities capabilities{};
+		DebugInstrumentationState state{};
+		std::vector<DebugInstrumentationFeature> features;
+		std::deque<DebugInstrumentationDiagnostic> diagnostics;
+		void* runtime = nullptr;
+		std::mutex mutex;
+	};
+
 	// tiny handle registry
 	template<class Obj> struct HandleFor;  // no default
 
@@ -394,6 +404,7 @@ namespace rhi {
 		QueueHandle gfxHandle, compHandle, copyHandle;
 
 		bool steamlineInitialized = false;
+		Dx12DebugInstrumentationSession debugInstrumentation;
 
 		// lifetime anchor
 		std::weak_ptr<Dx12Device> selfWeak;

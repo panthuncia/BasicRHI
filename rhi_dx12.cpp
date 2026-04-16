@@ -11,8 +11,23 @@
 #include <sl_core_api.h>
 #include <sl_security.h>
 #endif
+#if BASICRHI_ENABLE_RESHAPE
+#include <Backends/DX12/Layer.h>
+#include <Backend/Environment.h>
+#include <Backend/EnvironmentInfo.h>
+#include <Bridge/IBridge.h>
+#include <Bridge/Log/LogSeverity.h>
+#include <Common/ComRef.h>
+#include <Message/IMessageStorage.h>
+#include <Message/MessageStream.h>
+#include <Schemas/Config.h>
+#include <Schemas/Feature.h>
+#include <Schemas/Instrumentation.h>
+#include <Schemas/Log.h>
+#endif
 #include <string>
 #include <deque>
+#include <cstring>
 
 #include "rhi_dx12_casting.h"
 
@@ -20,6 +35,45 @@
 #define VERIFY(expr) if (FAILED(expr)) { spdlog::error("Validation error!"); }
 
 namespace rhi {
+	#if BASICRHI_ENABLE_RESHAPE
+	namespace {
+		struct Dx12ReShapeRuntime {
+			HMODULE module{ nullptr };
+			PFN_D3D12_CREATE_DEVICE_GPUOPEN createDeviceGPUOpen{ nullptr };
+			::Backend::Environment environment;
+			ComRef<IBridge> bridge{ nullptr };
+		};
+
+		static void Dx12PollReShapeMessages(Dx12Device* impl) noexcept;
+
+		static std::wstring Dx12GetExecutableDirectory() noexcept {
+			wchar_t buffer[MAX_PATH] = {};
+			const DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+			if (!length || length >= MAX_PATH) {
+				return {};
+			}
+
+			std::wstring path(buffer, length);
+			const size_t separator = path.find_last_of(L"\\/");
+			if (separator == std::wstring::npos) {
+				return {};
+			}
+
+			path.resize(separator);
+			return path;
+		}
+
+		static HMODULE Dx12LoadReShapeLayerModule() noexcept {
+			const std::wstring executableDirectory = Dx12GetExecutableDirectory();
+			if (executableDirectory.empty()) {
+				return nullptr;
+			}
+
+			const std::wstring modulePath = executableDirectory + L"\\GRS.Backends.DX12.Layer.dll";
+			return LoadLibraryW(modulePath.c_str());
+		}
+	}
+	#endif
 
 	// ---- DRED (Device Removed Extended Data) support ----
 
@@ -3328,7 +3382,309 @@ namespace rhi {
 			if (!qs || !qs->dev) {
 				return;
 			}
+			Dx12PollReShapeMessages(qs->dev);
 			LogDredData();
+		}
+
+		static void Dx12CopyDebugString(char* dst, size_t dstSize, const char* src) noexcept {
+			if (!dst || dstSize == 0) {
+				return;
+			}
+
+			dst[0] = '\0';
+			if (!src) {
+				return;
+			}
+
+			const size_t srcLen = std::strlen(src);
+			const size_t copyLen = (std::min)(srcLen, dstSize - 1);
+			std::memcpy(dst, src, copyLen);
+			dst[copyLen] = '\0';
+		}
+
+		static void Dx12AppendInstrumentationDiagnostic(Dx12Device* impl, DebugInstrumentationDiagnosticSeverity severity, const char* message) noexcept {
+			if (!impl) {
+				return;
+			}
+
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			auto& diagnostics = impl->debugInstrumentation.diagnostics;
+			if (diagnostics.size() >= 32) {
+				diagnostics.pop_front();
+			}
+
+			DebugInstrumentationDiagnostic diagnostic{};
+			diagnostic.severity = severity;
+			Dx12CopyDebugString(diagnostic.message, sizeof(diagnostic.message), message);
+			diagnostics.push_back(diagnostic);
+		}
+
+		#if BASICRHI_ENABLE_RESHAPE
+		static Dx12ReShapeRuntime* Dx12GetReShapeRuntime(Dx12Device* impl) noexcept {
+			return impl ? static_cast<Dx12ReShapeRuntime*>(impl->debugInstrumentation.runtime) : nullptr;
+		}
+
+		static DebugInstrumentationDiagnosticSeverity Dx12MapReShapeSeverity(uint32_t severity) noexcept {
+			switch (static_cast<LogSeverity>(severity)) {
+			case LogSeverity::Info:
+				return DebugInstrumentationDiagnosticSeverity::Info;
+			case LogSeverity::Warning:
+				return DebugInstrumentationDiagnosticSeverity::Warning;
+			case LogSeverity::Error:
+			default:
+				return DebugInstrumentationDiagnosticSeverity::Error;
+			}
+		}
+
+		static void Dx12SetReShapeFeatureList(Dx12Device* impl, const FeatureListMessage& message) noexcept {
+			MessageStream descriptorStream;
+			message.descriptors.Transfer(descriptorStream);
+
+			std::vector<DebugInstrumentationFeature> features;
+			for (auto it = MessageStreamView(descriptorStream).GetIterator(); it; ++it) {
+				if (!it.Is(FeatureDescriptorMessage::kID)) {
+					continue;
+				}
+
+				auto* descriptor = it.Get<FeatureDescriptorMessage>();
+				const std::string featureName{ descriptor->name.View() };
+				const std::string featureDescription{ descriptor->description.View() };
+				DebugInstrumentationFeature feature{};
+				feature.featureBit = descriptor->featureBit;
+				Dx12CopyDebugString(feature.name, sizeof(feature.name), featureName.c_str());
+				Dx12CopyDebugString(feature.description, sizeof(feature.description), featureDescription.c_str());
+				features.push_back(feature);
+			}
+
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			impl->debugInstrumentation.features = std::move(features);
+			impl->debugInstrumentation.capabilities.featureCount = static_cast<uint32_t>(impl->debugInstrumentation.features.size());
+		}
+
+		static void Dx12PollReShapeMessages(Dx12Device* impl) noexcept {
+			auto* runtime = Dx12GetReShapeRuntime(impl);
+			if (!runtime || !runtime->bridge) {
+				return;
+			}
+
+			IMessageStorage* storage = runtime->bridge->GetOutput();
+			if (!storage) {
+				return;
+			}
+
+			uint32_t streamCount = 0;
+			storage->ConsumeStreams(&streamCount, nullptr);
+			if (streamCount == 0) {
+				return;
+			}
+
+			std::vector<MessageStream> streams(streamCount);
+			storage->ConsumeStreams(&streamCount, streams.data());
+
+			for (uint32_t streamIndex = 0; streamIndex < streamCount; ++streamIndex) {
+				MessageStream& stream = streams[streamIndex];
+				const MessageSchema schema = stream.GetSchema();
+
+				if (stream.Is<LogMessage>()) {
+					ConstMessageStreamView<LogMessage> view(stream);
+					for (auto it = view.GetIterator(); it; ++it) {
+						Dx12AppendInstrumentationDiagnostic(impl, Dx12MapReShapeSeverity(it->severity), it->message.View().data());
+					}
+					storage->Free(stream);
+					continue;
+				}
+
+				if (schema == OrderedMessageSchema::GetSchema()) {
+					ConstMessageStreamView<> view(stream);
+					for (auto it = view.GetIterator(); it; ++it) {
+						switch (it.GetID()) {
+						case FeatureListMessage::kID:
+							Dx12SetReShapeFeatureList(impl, *it.Get<FeatureListMessage>());
+							break;
+						case SetGlobalInstrumentationMessage::kID: {
+							std::lock_guard guard(impl->debugInstrumentation.mutex);
+							impl->debugInstrumentation.state.globalFeatureMask = it.Get<SetGlobalInstrumentationMessage>()->featureBitSet;
+							break;
+						}
+						default:
+							break;
+						}
+					}
+				}
+
+				storage->Free(stream);
+			}
+		}
+
+		static Result Dx12CommitReShapeMessages(Dx12Device* impl, MessageStream& stream) noexcept {
+			auto* runtime = Dx12GetReShapeRuntime(impl);
+			if (!runtime || !runtime->bridge) {
+				RHI_FAIL(Result::Unsupported);
+			}
+
+			runtime->bridge->GetOutput()->AddStreamAndSwap(stream);
+			runtime->bridge->Commit();
+			Dx12PollReShapeMessages(impl);
+			return Result::Ok;
+		}
+
+		static Result Dx12RefreshReShapeFeatures(Dx12Device* impl) noexcept {
+			MessageStream stream;
+			auto* message = MessageStreamView<>(stream).Add<GetFeaturesMessage>();
+			message->featureBitSet = ~0ull;
+			return Dx12CommitReShapeMessages(impl, stream);
+		}
+
+		static bool Dx12InitializeReShapeRuntime(Dx12Device* impl, const DeviceCreateInfo& ci) noexcept {
+			auto* runtime = new (std::nothrow) Dx12ReShapeRuntime();
+			if (!runtime) {
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, "Failed to allocate GPU-Reshape runtime state.");
+				return false;
+			}
+
+			runtime->module = Dx12LoadReShapeLayerModule();
+			if (!runtime->module) {
+				delete runtime;
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, "Failed to load GRS.Backends.DX12.Layer.dll. Ensure the ReShape layer is staged beside the executable.");
+				return false;
+			}
+
+			runtime->createDeviceGPUOpen = reinterpret_cast<PFN_D3D12_CREATE_DEVICE_GPUOPEN>(GetProcAddress(runtime->module, "D3D12CreateDeviceGPUOpen"));
+			if (!runtime->createDeviceGPUOpen) {
+				FreeLibrary(runtime->module);
+				delete runtime;
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, "Failed to resolve D3D12CreateDeviceGPUOpen from GRS.Backends.DX12.Layer.dll.");
+				return false;
+			}
+
+			::Backend::EnvironmentInfo environmentInfo{};
+			environmentInfo.device.applicationName = "BasicRenderer";
+			environmentInfo.device.apiName = "D3D12";
+			environmentInfo.memoryBridge = true;
+			environmentInfo.loadPlugins = true;
+
+			if (!runtime->environment.Install(environmentInfo)) {
+				FreeLibrary(runtime->module);
+				delete runtime;
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, "GPU-Reshape environment initialization failed. Check that the runtime layer and backend plugins are staged beside the executable.");
+				return false;
+			}
+
+			runtime->bridge = runtime->environment.GetRegistry()->Get<IBridge>();
+			if (!runtime->bridge) {
+				FreeLibrary(runtime->module);
+				delete runtime;
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, "GPU-Reshape bridge initialization failed.");
+				return false;
+			}
+
+			D3D12_DEVICE_GPUOPEN_GPU_RESHAPE_INFO gpuOpenInfo{};
+			gpuOpenInfo.registry = runtime->environment.GetRegistry();
+
+			Microsoft::WRL::ComPtr<ID3D12Device10> reshapeDevice;
+			const HRESULT hr = runtime->createDeviceGPUOpen(
+				impl->adapter.Get(),
+				D3D_FEATURE_LEVEL_12_0,
+				IID_PPV_ARGS(&reshapeDevice),
+				&gpuOpenInfo);
+			if (FAILED(hr)) {
+				FreeLibrary(runtime->module);
+				delete runtime;
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, "GPU-Reshape failed to wrap the D3D12 device. Falling back to an uninstrumented device.");
+				return false;
+			}
+
+			{
+				std::lock_guard guard(impl->debugInstrumentation.mutex);
+				impl->debugInstrumentation.runtime = runtime;
+				impl->debugInstrumentation.state.active = true;
+				impl->debugInstrumentation.capabilities.installSupported = false;
+				impl->debugInstrumentation.capabilities.globalInstrumentationSupported = true;
+				impl->debugInstrumentation.capabilities.shaderInstrumentationSupported = false;
+				impl->debugInstrumentation.capabilities.pipelineInstrumentationSupported = false;
+				impl->debugInstrumentation.capabilities.synchronousRecordingSupported = true;
+			}
+
+			impl->pNativeDevice = reshapeDevice;
+
+			MessageStream configStream;
+			auto* configMessage = MessageStreamView<>(configStream).Add<SetApplicationInstrumentationConfigMessage>();
+			configMessage->synchronousRecording = ci.instrumentation.enableSynchronousRecording;
+			if (Dx12CommitReShapeMessages(impl, configStream) != Result::Ok) {
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Warning, "GPU-Reshape synchronous recording setup did not complete cleanly.");
+			}
+
+			if (Dx12RefreshReShapeFeatures(impl) != Result::Ok) {
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Warning, "GPU-Reshape feature discovery failed.");
+			}
+
+			if (impl->debugInstrumentation.features.empty()) {
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Warning, "GPU-Reshape initialized, but no backend instrumentation features were discovered.");
+			}
+
+			return true;
+		}
+
+		static void Dx12ShutdownReShapeRuntime(Dx12Device* impl) noexcept {
+			if (!impl) {
+				return;
+			}
+
+			auto* runtime = Dx12GetReShapeRuntime(impl);
+			if (!runtime) {
+				return;
+			}
+
+			Dx12PollReShapeMessages(impl);
+			if (runtime->module) {
+				FreeLibrary(runtime->module);
+				runtime->module = nullptr;
+			}
+			delete runtime;
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			impl->debugInstrumentation.runtime = nullptr;
+			impl->debugInstrumentation.state.active = false;
+		}
+		#else
+		static void Dx12PollReShapeMessages(Dx12Device*) noexcept {
+		}
+
+		static bool Dx12InitializeReShapeRuntime(Dx12Device*, const DeviceCreateInfo&) noexcept {
+			return false;
+		}
+
+		static void Dx12ShutdownReShapeRuntime(Dx12Device*) noexcept {
+		}
+		#endif
+
+		static void Dx12InitializeDebugInstrumentation(Dx12Device* impl, const DeviceCreateInfo& ci) noexcept {
+			if (!impl) {
+				return;
+			}
+
+			auto& instrumentation = impl->debugInstrumentation;
+			instrumentation.state.requested = ci.instrumentation.enableRuntimeInstrumentation;
+			instrumentation.state.active = false;
+			instrumentation.state.synchronousRecording = ci.instrumentation.enableSynchronousRecording;
+			instrumentation.state.globalFeatureMask = 0;
+			instrumentation.capabilities.backendBuildEnabled = BASICRHI_ENABLE_RESHAPE != 0;
+			instrumentation.capabilities.installSupported = false;
+			instrumentation.capabilities.globalInstrumentationSupported = ci.instrumentation.enableRuntimeInstrumentation && (BASICRHI_ENABLE_RESHAPE != 0);
+			instrumentation.capabilities.shaderInstrumentationSupported = false;
+			instrumentation.capabilities.pipelineInstrumentationSupported = false;
+			instrumentation.capabilities.synchronousRecordingSupported = ci.instrumentation.enableRuntimeInstrumentation && (BASICRHI_ENABLE_RESHAPE != 0);
+			instrumentation.capabilities.featureCount = 0;
+
+			if (!instrumentation.state.requested) {
+				return;
+			}
+
+		#if !BASICRHI_ENABLE_RESHAPE
+			Dx12AppendInstrumentationDiagnostic(
+				impl,
+				DebugInstrumentationDiagnosticSeverity::Warning,
+				"Runtime instrumentation was requested, but BasicRHI was built without BASICRHI_ENABLE_RESHAPE. Instrumentation remains inactive.");
+		#endif
 		}
 
 		static void d_checkDebugMessages(Device* d) noexcept {
@@ -3339,7 +3695,201 @@ namespace rhi {
 			if (!impl || !impl->pNativeDevice) {
 				return;
 			}
+			Dx12PollReShapeMessages(impl);
 			LogDredData();
+		}
+
+		static Result d_getDebugInstrumentationCapabilities(const Device* d, DebugInstrumentationCapabilities& out) noexcept {
+			if (!d) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			Dx12PollReShapeMessages(impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			out = impl->debugInstrumentation.capabilities;
+			out.featureCount = static_cast<uint32_t>(impl->debugInstrumentation.features.size());
+			return Result::Ok;
+		}
+
+		static Result d_getDebugInstrumentationState(const Device* d, DebugInstrumentationState& out) noexcept {
+			if (!d) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			Dx12PollReShapeMessages(impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			out = impl->debugInstrumentation.state;
+			return Result::Ok;
+		}
+
+		static uint32_t d_getDebugInstrumentationFeatureCount(const Device* d) noexcept {
+			if (!d) {
+				return 0;
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				return 0;
+			}
+
+			Dx12PollReShapeMessages(impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			return static_cast<uint32_t>(impl->debugInstrumentation.features.size());
+		}
+
+		static Result d_copyDebugInstrumentationFeatures(const Device* d,
+			uint32_t first,
+			DebugInstrumentationFeature* outFeatures,
+			uint32_t capacity,
+			uint32_t* copied) noexcept {
+			if (copied) {
+				*copied = 0;
+			}
+
+			if (!d) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			Dx12PollReShapeMessages(impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			const auto& features = impl->debugInstrumentation.features;
+			if (first >= features.size() || capacity == 0 || !outFeatures) {
+				return Result::Ok;
+			}
+
+			const uint32_t available = static_cast<uint32_t>(features.size() - first);
+			const uint32_t toCopy = (std::min)(capacity, available);
+			for (uint32_t index = 0; index < toCopy; ++index) {
+				outFeatures[index] = features[first + index];
+			}
+
+			if (copied) {
+				*copied = toCopy;
+			}
+			return Result::Ok;
+		}
+
+		static uint32_t d_getDebugInstrumentationDiagnosticCount(const Device* d) noexcept {
+			if (!d) {
+				return 0;
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				return 0;
+			}
+
+			Dx12PollReShapeMessages(impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			return static_cast<uint32_t>(impl->debugInstrumentation.diagnostics.size());
+		}
+
+		static Result d_copyDebugInstrumentationDiagnostics(const Device* d,
+			uint32_t first,
+			DebugInstrumentationDiagnostic* outDiagnostics,
+			uint32_t capacity,
+			uint32_t* copied) noexcept {
+			if (copied) {
+				*copied = 0;
+			}
+
+			if (!d) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			Dx12PollReShapeMessages(impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			const auto& diagnostics = impl->debugInstrumentation.diagnostics;
+			if (first >= diagnostics.size() || capacity == 0 || !outDiagnostics) {
+				return Result::Ok;
+			}
+
+			const uint32_t available = static_cast<uint32_t>(diagnostics.size() - first);
+			const uint32_t toCopy = (std::min)(capacity, available);
+			for (uint32_t index = 0; index < toCopy; ++index) {
+				outDiagnostics[index] = diagnostics[first + index];
+			}
+
+			if (copied) {
+				*copied = toCopy;
+			}
+			return Result::Ok;
+		}
+
+		static Result d_setDebugGlobalInstrumentationMask(Device* d, uint64_t featureMask) noexcept {
+			if (!d) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			if (!impl->debugInstrumentation.state.active) {
+				RHI_FAIL(Result::Unsupported);
+			}
+
+			MessageStream stream;
+			auto* message = MessageStreamView<>(stream).Add<SetGlobalInstrumentationMessage>(SetGlobalInstrumentationMessage::AllocationInfo{
+				.specializationByteSize = 0
+			});
+			message->featureBitSet = featureMask;
+
+			if (Dx12CommitReShapeMessages(impl, stream) != Result::Ok) {
+				RHI_FAIL(Result::Failed);
+			}
+
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			impl->debugInstrumentation.state.globalFeatureMask = featureMask;
+			return Result::Ok;
+		}
+
+		static Result d_setDebugSynchronousRecording(Device* d, bool enabled) noexcept {
+			if (!d) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			if (!impl->debugInstrumentation.state.active) {
+				RHI_FAIL(Result::Unsupported);
+			}
+
+			MessageStream stream;
+			auto* message = MessageStreamView<>(stream).Add<SetApplicationInstrumentationConfigMessage>();
+			message->synchronousRecording = enabled;
+
+			if (Dx12CommitReShapeMessages(impl, stream) != Result::Ok) {
+				RHI_FAIL(Result::Failed);
+			}
+
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			impl->debugInstrumentation.state.synchronousRecording = enabled;
+			return Result::Ok;
 		}
 
 		static Result q_signal(Queue* q, const TimelinePoint& p) noexcept {
@@ -5025,7 +5575,7 @@ namespace rhi {
 
 #if BUILD_TYPE == BUILD_DEBUG
 		// Hold a temporary ref so we can report AFTER we drop our member refs.
-		const Microsoft::WRL::ComPtr<ID3D12Device> devForReport = pNativeDevice;
+		Microsoft::WRL::ComPtr<ID3D12Device> devForReport = pNativeDevice;
 #endif
 
 		// Drop SL Proxy objects
@@ -5047,7 +5597,10 @@ namespace rhi {
 #if BUILD_TYPE == BUILD_DEBUG
 		Dx12ReportLiveObjects(devForReport.Get(), "Dx12Device::Shutdown - D3D12 live objects (post-release)");
 		DxgiReportLiveObjects("Dx12Device::Shutdown - DXGI live objects (post-release)");
+		devForReport.Reset();
 #endif
+
+		Dx12ShutdownReShapeRuntime(this);
 	}
 
 
@@ -5110,8 +5663,16 @@ namespace rhi {
 		&d_setNameTimeline,
 		&d_setNameHeap,
 		&d_checkDebugMessages,
+		&d_getDebugInstrumentationCapabilities,
+		&d_getDebugInstrumentationState,
+		&d_getDebugInstrumentationFeatureCount,
+		&d_copyDebugInstrumentationFeatures,
+		&d_getDebugInstrumentationDiagnosticCount,
+		&d_copyDebugInstrumentationDiagnostics,
+		&d_setDebugGlobalInstrumentationMask,
+		&d_setDebugSynchronousRecording,
 		&d_destroyDevice,
-		3u
+		5u
 	};
 
 	const QueueVTable g_qvt = {
@@ -5263,6 +5824,7 @@ namespace rhi {
 		auto impl = std::make_shared<Dx12Device>();
 		impl->selfWeak = impl;
 		Dx12Device* pImpl = impl.get();
+		Dx12InitializeDebugInstrumentation(pImpl, ci);
 
 		// Native factory/device
 		CreateDXGIFactory2(flags, IID_PPV_ARGS(&impl->pNativeFactory));
@@ -5297,12 +5859,31 @@ namespace rhi {
 		impl->pNativeFactory->EnumAdapters1(0, &adapter);
 		adapter.As(&impl->adapter);
 
-		ComPtr<ID3D12Device> base;
-		D3D12CreateDevice(impl->adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&base));
+		if (ci.instrumentation.enableRuntimeInstrumentation && l_enableStreamline)
+		{
+			spdlog::warn("Disabling Streamline because GPU-Reshape instrumentation is enabled for this device.");
+			Dx12AppendInstrumentationDiagnostic(
+				pImpl,
+				DebugInstrumentationDiagnosticSeverity::Warning,
+				"Streamline is disabled while GPU-Reshape instrumentation is active on the same device.");
+			l_enableStreamline = false;
+		}
 
-		auto hasDevice10 = base.As(&impl->pNativeDevice);
-		if (FAILED(hasDevice10)) {
-			RHI_FAIL(ToRHI(hasDevice10));
+		bool reshapeWrappedDevice = false;
+	#if BASICRHI_ENABLE_RESHAPE
+		if (ci.instrumentation.enableRuntimeInstrumentation) {
+			reshapeWrappedDevice = Dx12InitializeReShapeRuntime(pImpl, ci);
+		}
+	#endif
+
+		if (!reshapeWrappedDevice) {
+			ComPtr<ID3D12Device> base;
+			D3D12CreateDevice(impl->adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&base));
+
+			auto hasDevice10 = base.As(&impl->pNativeDevice);
+			if (FAILED(hasDevice10)) {
+				RHI_FAIL(ToRHI(hasDevice10));
+			}
 		}
 
 		// Streamline manual hooking setup
