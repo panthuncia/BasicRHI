@@ -5876,6 +5876,20 @@ namespace rhi {
 		}
 	#endif
 
+		if (reshapeWrappedDevice) {
+			ComPtr<IDXGIFactory7> reshapeFactory;
+			const HRESULT reshapeFactoryHr = CreateDXGIFactory2(flags, IID_PPV_ARGS(&reshapeFactory));
+			if (FAILED(reshapeFactoryHr)) {
+				RHI_FAIL(ToRHI(reshapeFactoryHr));
+			}
+
+			// The initial factory was created before the ReShape layer DLL was loaded, so
+			// swapchains from that factory return native backbuffers. Refresh the factory now
+			// that the layer is active so GetBuffer returns wrapped resources that match the
+			// wrapped device stored in pNativeDevice.
+			impl->pSLProxyFactory = reshapeFactory;
+		}
+
 		if (!reshapeWrappedDevice) {
 			ComPtr<ID3D12Device> base;
 			D3D12CreateDevice(impl->adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&base));
