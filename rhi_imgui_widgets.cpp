@@ -49,6 +49,41 @@ namespace rhi::debug {
             return message;
         }
 
+        const char* IssueSectionLabel(DebugInstrumentationIssueType type) noexcept {
+            switch (type) {
+            case DebugInstrumentationIssueType::Pipeline:
+                return "Pipelines With Warnings/Errors";
+            case DebugInstrumentationIssueType::ShaderFile:
+                return "Faulty Shader Files";
+            default:
+                return "Issues";
+            }
+        }
+
+        void DrawInstrumentationIssue(const DebugInstrumentationIssue& issue) {
+            ImGui::TextColored(SeverityColor(issue.severity), "[%s]", SeverityLabel(issue.severity));
+            ImGui::SameLine();
+
+            if (issue.type == DebugInstrumentationIssueType::ShaderFile && issue.path[0] != '\0') {
+                ImGui::TextWrapped("%s", issue.path);
+                if (issue.label[0] != '\0') {
+                    ImGui::Indent();
+                    ImGui::TextDisabled("%s", issue.label);
+                    ImGui::Unindent();
+                }
+            } else if (issue.label[0] != '\0') {
+                ImGui::TextWrapped("%s", issue.label);
+            } else {
+                ImGui::TextWrapped("Object %llu", static_cast<unsigned long long>(issue.objectUid));
+            }
+
+            if (issue.message[0] != '\0') {
+                ImGui::Indent();
+                ImGui::TextWrapped("%s", issue.message);
+                ImGui::Unindent();
+            }
+        }
+
     }
 
     void InstrumentationWidget::Draw(Device device, bool* pOpen, const char* title) {
@@ -80,6 +115,7 @@ namespace rhi::debug {
         }
 
         const std::vector<DebugInstrumentationFeature> features = GetInstrumentationFeatures(device);
+        const std::vector<DebugInstrumentationIssue> issues = GetInstrumentationIssues(device);
         const std::vector<DebugInstrumentationDiagnostic> diagnostics = GetInstrumentationDiagnostics(device);
 
         if (!lastStatus_.empty()) {
@@ -215,6 +251,51 @@ namespace rhi::debug {
             if (!haveEnabledFeature) {
                 ImGui::TextDisabled("No instrumentation features are currently enabled.");
             }
+        }
+
+        ImGui::Separator();
+        ImGui::Checkbox("Show Issues", &showIssues_);
+        if (showIssues_) {
+            const auto pipelineIssueCount = static_cast<int>(std::count_if(
+                issues.begin(),
+                issues.end(),
+                [](const DebugInstrumentationIssue& issue) {
+                    return issue.type == DebugInstrumentationIssueType::Pipeline;
+                }));
+            const auto shaderIssueCount = static_cast<int>(std::count_if(
+                issues.begin(),
+                issues.end(),
+                [](const DebugInstrumentationIssue& issue) {
+                    return issue.type == DebugInstrumentationIssueType::ShaderFile;
+                }));
+
+            if (ImGui::BeginChild("InstrumentationIssues", ImVec2(0.0f, 220.0f), true)) {
+                ImGui::Text("%s", IssueSectionLabel(DebugInstrumentationIssueType::Pipeline));
+                if (pipelineIssueCount == 0) {
+                    ImGui::TextDisabled("No pipeline warnings or errors were reported.");
+                } else {
+                    for (const DebugInstrumentationIssue& issue : issues) {
+                        if (issue.type != DebugInstrumentationIssueType::Pipeline) {
+                            continue;
+                        }
+                        DrawInstrumentationIssue(issue);
+                    }
+                }
+
+                ImGui::Separator();
+                ImGui::Text("%s", IssueSectionLabel(DebugInstrumentationIssueType::ShaderFile));
+                if (shaderIssueCount == 0) {
+                    ImGui::TextDisabled("No faulty shader files were resolved from the reported issues.");
+                } else {
+                    for (const DebugInstrumentationIssue& issue : issues) {
+                        if (issue.type != DebugInstrumentationIssueType::ShaderFile) {
+                            continue;
+                        }
+                        DrawInstrumentationIssue(issue);
+                    }
+                }
+            }
+            ImGui::EndChild();
         }
 
         ImGui::Separator();

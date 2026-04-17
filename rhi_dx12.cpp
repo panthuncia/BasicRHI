@@ -22,13 +22,20 @@
 #include <Message/IMessageStorage.h>
 #include <Message/MessageStream.h>
 #include <Schemas/Config.h>
+#include <Schemas/Diagnostic.h>
 #include <Schemas/Feature.h>
 #include <Schemas/Instrumentation.h>
 #include <Schemas/Log.h>
+#include <Schemas/PipelineMetadata.h>
+#include <Schemas/SGUID.h>
+#include <Schemas/ShaderMetadata.h>
+#include <Schemas/Features/Descriptor.h>
+#include <Schemas/Features/ResourceBounds.h>
 #endif
 #include <string>
 #include <deque>
 #include <cstring>
+#include <charconv>
 
 #include "rhi_dx12_casting.h"
 
@@ -46,6 +53,7 @@ namespace rhi {
 		};
 
 		static void Dx12PollReShapeMessages(Dx12Device* impl) noexcept;
+			static void Dx12BuildDefaultInstrumentationSpecialization(MessageStream& out) noexcept;
 
 		static std::wstring Dx12GetExecutableDirectory() noexcept {
 			wchar_t buffer[MAX_PATH] = {};
@@ -3313,6 +3321,179 @@ namespace rhi {
 			dst[copyLen] = '\0';
 		}
 
+		static bool Dx12TryParseIssueUid(const char* message, const char* prefix, uint64_t& uid) noexcept {
+			if (!message || !prefix) {
+				return false;
+			}
+
+			const size_t prefixLength = std::strlen(prefix);
+			if (std::strncmp(message, prefix, prefixLength) != 0) {
+				return false;
+			}
+
+			const char* first = message + prefixLength;
+			const char* last = first;
+			while (*last >= '0' && *last <= '9') {
+				++last;
+			}
+
+			if (first == last) {
+				return false;
+			}
+
+			uid = 0;
+			const auto result = std::from_chars(first, last, uid);
+			return result.ec == std::errc{};
+		}
+
+		static bool Dx12HasPendingPipelineIssueUnlocked(const Dx12DebugInstrumentationSession& session,
+			DebugInstrumentationDiagnosticSeverity severity,
+			uint64_t pipelineUid,
+			const char* message) {
+			for (const Dx12PendingInstrumentationPipelineIssue& issue : session.pendingPipelineIssues) {
+				if (issue.severity == severity && issue.pipelineUid == pipelineUid && issue.message == (message ? message : "")) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		static bool Dx12HasPendingShaderIssueUnlocked(const Dx12DebugInstrumentationSession& session,
+			DebugInstrumentationDiagnosticSeverity severity,
+			uint64_t shaderUid,
+			const char* message) {
+			for (const Dx12PendingInstrumentationShaderIssue& issue : session.pendingShaderIssues) {
+				if (issue.severity == severity && issue.shaderUid == shaderUid && issue.message == (message ? message : "")) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		static void Dx12MarkIssueFromMessageUnlocked(Dx12DebugInstrumentationSession& session,
+			DebugInstrumentationDiagnosticSeverity severity,
+			const char* message) {
+			if (severity == DebugInstrumentationDiagnosticSeverity::Info || !message || !message[0]) {
+				return;
+			}
+
+			uint64_t uid = 0;
+			if (Dx12TryParseIssueUid(message, "Pipeline ", uid)) {
+				if (!Dx12HasPendingPipelineIssueUnlocked(session, severity, uid, message)) {
+					session.pendingPipelineIssues.push_back(Dx12PendingInstrumentationPipelineIssue{
+						.severity = severity,
+						.pipelineUid = uid,
+						.message = message
+					});
+					session.issuesDirty = true;
+				}
+				if (!session.pipelineNames.contains(uid) && !session.requestedPipelineNames.contains(uid)) {
+					session.pendingPipelineNameRequests.insert(uid);
+				}
+				return;
+			}
+
+			if (Dx12TryParseIssueUid(message, "Shader ", uid)) {
+				if (!Dx12HasPendingShaderIssueUnlocked(session, severity, uid, message)) {
+					session.pendingShaderIssues.push_back(Dx12PendingInstrumentationShaderIssue{
+						.severity = severity,
+						.shaderUid = uid,
+						.message = message
+					});
+					session.issuesDirty = true;
+				}
+				Dx12ShaderIssueMetadata& metadata = session.shaderMetadata[uid];
+				if (!metadata.requested) {
+					session.pendingShaderCodeRequests.insert(uid);
+				}
+			}
+		}
+
+		static void Dx12RebuildInstrumentationIssuesUnlocked(Dx12DebugInstrumentationSession& session) {
+			if (!session.issuesDirty) {
+				return;
+			}
+
+			session.issues.clear();
+			std::unordered_set<std::string> keys;
+
+			auto tryAppendIssue = [&](const DebugInstrumentationIssue& issue) {
+				std::string key;
+				key.reserve(512);
+				key += std::to_string(static_cast<uint32_t>(issue.severity));
+				key += '|';
+				key += std::to_string(static_cast<uint32_t>(issue.type));
+				key += '|';
+				key += std::to_string(issue.objectUid);
+				key += '|';
+				key += issue.label;
+				key += '|';
+				key += issue.path;
+				key += '|';
+				key += issue.message;
+				if (keys.insert(key).second) {
+					session.issues.push_back(issue);
+				}
+			};
+
+			for (const Dx12PendingInstrumentationPipelineIssue& pendingIssue : session.pendingPipelineIssues) {
+				DebugInstrumentationIssue issue{};
+				issue.severity = pendingIssue.severity;
+				issue.type = DebugInstrumentationIssueType::Pipeline;
+				issue.objectUid = pendingIssue.pipelineUid;
+				const auto pipelineNameIt = session.pipelineNames.find(pendingIssue.pipelineUid);
+				if (pipelineNameIt != session.pipelineNames.end() && !pipelineNameIt->second.empty()) {
+					char label[128] = {};
+					std::snprintf(
+						label,
+						sizeof(label),
+						"%s (UID %llu)",
+						pipelineNameIt->second.c_str(),
+						static_cast<unsigned long long>(pendingIssue.pipelineUid));
+					Dx12CopyDebugString(issue.label, sizeof(issue.label), label);
+				} else {
+					char label[64] = {};
+					std::snprintf(label, sizeof(label), "Pipeline %llu", static_cast<unsigned long long>(pendingIssue.pipelineUid));
+					Dx12CopyDebugString(issue.label, sizeof(issue.label), label);
+				}
+				Dx12CopyDebugString(issue.message, sizeof(issue.message), pendingIssue.message.c_str());
+				tryAppendIssue(issue);
+			}
+
+			for (const Dx12PendingInstrumentationShaderIssue& pendingIssue : session.pendingShaderIssues) {
+				const auto metadataIt = session.shaderMetadata.find(pendingIssue.shaderUid);
+				const bool hasFilePaths = metadataIt != session.shaderMetadata.end() && !metadataIt->second.filePaths.empty();
+
+				if (!hasFilePaths) {
+					DebugInstrumentationIssue issue{};
+					issue.severity = pendingIssue.severity;
+					issue.type = DebugInstrumentationIssueType::ShaderFile;
+					issue.objectUid = pendingIssue.shaderUid;
+					char label[64] = {};
+					std::snprintf(label, sizeof(label), "Shader %llu", static_cast<unsigned long long>(pendingIssue.shaderUid));
+					Dx12CopyDebugString(issue.label, sizeof(issue.label), label);
+					Dx12CopyDebugString(issue.message, sizeof(issue.message), pendingIssue.message.c_str());
+					tryAppendIssue(issue);
+					continue;
+				}
+
+				for (const std::string& filePath : metadataIt->second.filePaths) {
+					DebugInstrumentationIssue issue{};
+					issue.severity = pendingIssue.severity;
+					issue.type = DebugInstrumentationIssueType::ShaderFile;
+					issue.objectUid = pendingIssue.shaderUid;
+					char label[64] = {};
+					std::snprintf(label, sizeof(label), "Shader %llu", static_cast<unsigned long long>(pendingIssue.shaderUid));
+					Dx12CopyDebugString(issue.label, sizeof(issue.label), label);
+					Dx12CopyDebugString(issue.path, sizeof(issue.path), filePath.c_str());
+					Dx12CopyDebugString(issue.message, sizeof(issue.message), pendingIssue.message.c_str());
+					tryAppendIssue(issue);
+				}
+			}
+
+			session.issuesDirty = false;
+		}
+
 		static void Dx12AppendInstrumentationDiagnostic(Dx12Device* impl, DebugInstrumentationDiagnosticSeverity severity, const char* message) noexcept {
 			if (!impl) {
 				return;
@@ -3342,6 +3523,7 @@ namespace rhi {
 			diagnostic.severity = severity;
 			Dx12CopyDebugString(diagnostic.message, sizeof(diagnostic.message), message);
 			diagnostics.push_back(diagnostic);
+			Dx12MarkIssueFromMessageUnlocked(impl->debugInstrumentation, severity, safeMessage);
 		}
 
 		#if BASICRHI_ENABLE_RESHAPE
@@ -3349,6 +3531,7 @@ namespace rhi {
 			return impl ? static_cast<Dx12ReShapeRuntime*>(impl->debugInstrumentation.runtime) : nullptr;
 		}
 
+		static Result Dx12CommitReShapeMessages(Dx12Device* impl, MessageStream& stream) noexcept;
 		static Result Dx12RefreshReShapeFeatures(Dx12Device* impl) noexcept;
 
 		static DebugInstrumentationDiagnosticSeverity Dx12MapReShapeSeverity(uint32_t severity) noexcept {
@@ -3361,6 +3544,142 @@ namespace rhi {
 			default:
 				return DebugInstrumentationDiagnosticSeverity::Error;
 			}
+		}
+
+		static uint64_t Dx12FindFeatureBitByNameUnlocked(const Dx12DebugInstrumentationSession& session, const char* featureName) noexcept {
+			if (!featureName || !featureName[0]) {
+				return 0;
+			}
+
+			for (const DebugInstrumentationFeature& feature : session.features) {
+				if (std::strcmp(feature.name, featureName) == 0) {
+					return feature.featureBit;
+				}
+			}
+
+			return 0;
+		}
+
+		static void Dx12BuildDefaultInstrumentationSpecialization(MessageStream& out) noexcept {
+			auto* config = MessageStreamView<>(out).Add<SetInstrumentationConfigMessage>();
+			config->validationCoverage = 0;
+			config->safeGuard = 0;
+			config->detail = 1;
+			config->traceback = 1;
+		}
+
+		template <typename TMessage>
+		static uint32_t Dx12GetChunkMask(const TMessage& message) noexcept {
+			return *reinterpret_cast<const uint32_t*>(&message) >> (32u - static_cast<uint32_t>(TMessage::Chunk::Count));
+		}
+
+		static void Dx12QueueShaderSourceMappingRequestUnlocked(Dx12DebugInstrumentationSession& session, uint64_t sguid) noexcept {
+			if (!sguid) {
+				return;
+			}
+
+			auto& mapping = session.shaderSourceMappings[sguid];
+			if (mapping.requested || session.requestedShaderSourceMappings.count(sguid)) {
+				return;
+			}
+
+			session.pendingShaderSourceMappingRequests.insert(sguid);
+		}
+
+		static std::string Dx12FormatShaderSourceMappingSuffix(const Dx12DebugInstrumentationSession& session, uint64_t sguid) {
+			if (!sguid) {
+				return {};
+			}
+
+			auto it = session.shaderSourceMappings.find(sguid);
+			if (it == session.shaderSourceMappings.end() || !it->second.resolved) {
+				char buffer[64] = {};
+				std::snprintf(buffer, sizeof(buffer), " [SGUID %llu]", static_cast<unsigned long long>(sguid));
+				return std::string(buffer);
+			}
+
+			const Dx12ShaderSourceMappingMetadata& mapping = it->second;
+			char location[96] = {};
+			std::snprintf(
+				location,
+				sizeof(location),
+				" [line %u, col %u]",
+				mapping.line,
+				mapping.column);
+
+			std::string suffix(location);
+			if (!mapping.sourceLine.empty()) {
+				suffix += " ";
+				suffix += mapping.sourceLine;
+			}
+			return suffix;
+		}
+
+		static std::string Dx12FormatTracebackSuffix(const Dx12DebugInstrumentationSession& session, uint32_t rollingExecutionUid, uint32_t pipelineUid) {
+			if (!rollingExecutionUid && !pipelineUid) {
+				return {};
+			}
+
+			char header[96] = {};
+			std::snprintf(
+				header,
+				sizeof(header),
+				" [pipeline %u, execution %u]",
+				pipelineUid,
+				rollingExecutionUid);
+
+			std::string suffix(header);
+			auto stackIt = session.executionStacks.find(rollingExecutionUid);
+			if (stackIt != session.executionStacks.end() && !stackIt->second.empty()) {
+				suffix += "\nHost Stack Trace:\n";
+				suffix += stackIt->second;
+			}
+			return suffix;
+		}
+
+		static std::string Dx12FormatDescriptorMismatchMessage(
+			const Dx12DebugInstrumentationSession& session,
+			const DescriptorMismatchMessage& message,
+			const DescriptorMismatchMessage::TracebackChunk* traceback) {
+			static constexpr const char* kTypeNames[] = { "Texture", "Buffer", "CBuffer", "Sampler" };
+
+			std::string text;
+			if (message.isUndefined) {
+				text = "Descriptor is undefined";
+			} else if (message.isOutOfBounds) {
+				text = "Descriptor indexing out of bounds";
+			} else if (message.isTableNotBound) {
+				text = "Descriptor table not bound";
+			} else {
+				text = "Descriptor mismatch detected";
+			}
+
+			text += ", shader expected ";
+			text += kTypeNames[message.compileType & 0x3u];
+			if (!message.isUndefined && !message.isOutOfBounds && !message.isTableNotBound) {
+				text += " but received ";
+				text += kTypeNames[message.runtimeType & 0x3u];
+			}
+
+			text += Dx12FormatShaderSourceMappingSuffix(session, message.sguid);
+			if (traceback) {
+				text += Dx12FormatTracebackSuffix(session, traceback->rollingExecutionUID, traceback->pipelineUid);
+			}
+
+			return text;
+		}
+
+		static std::string Dx12FormatResourceBoundsMessage(
+			const Dx12DebugInstrumentationSession& session,
+			const ResourceIndexOutOfBoundsMessage& message,
+			const ResourceIndexOutOfBoundsMessage::TracebackChunk* traceback) {
+			std::string text = message.isTexture ? "Texture" : "Buffer";
+			text += message.isWrite ? " write out of bounds" : " read out of bounds";
+			text += Dx12FormatShaderSourceMappingSuffix(session, message.sguid);
+			if (traceback) {
+				text += Dx12FormatTracebackSuffix(session, traceback->rollingExecutionUID, traceback->pipelineUid);
+			}
+			return text;
 		}
 
 		static void Dx12SetReShapeFeatureList(Dx12Device* impl, const FeatureListMessage& message) noexcept {
@@ -3441,6 +3760,7 @@ namespace rhi {
 
 			std::vector<MessageStream> streams(streamCount);
 			storage->ConsumeStreams(&streamCount, streams.data());
+			MessageStream requestStream;
 
 			for (uint32_t streamIndex = 0; streamIndex < streamCount; ++streamIndex) {
 				MessageStream& stream = streams[streamIndex];
@@ -3462,6 +3782,91 @@ namespace rhi {
 						case FeatureListMessage::kID:
 							Dx12SetReShapeFeatureList(impl, *it.Get<FeatureListMessage>());
 							break;
+						case InstrumentationDiagnosticMessage::kID: {
+							auto* message = it.Get<InstrumentationDiagnosticMessage>();
+							if (!message) {
+								break;
+							}
+
+							char summary[160] = {};
+							if (message->failedShaders != 0 || message->failedPipelines != 0) {
+								std::snprintf(
+									summary,
+									sizeof(summary),
+									"Instrumentation failed for %u shader(s) and %u pipeline(s).",
+									message->failedShaders,
+									message->failedPipelines);
+								Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, summary);
+							}
+
+							std::snprintf(
+								summary,
+								sizeof(summary),
+								"Instrumented %u shader(s) (%u ms) and %u pipeline(s) (%u ms), total %u ms.",
+								message->passedShaders,
+								message->millisecondsShaders,
+								message->passedPipelines,
+								message->millisecondsPipelines,
+								message->millisecondsTotal);
+							Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Info, summary);
+
+							MessageStream diagnosticStream;
+							message->messages.Transfer(diagnosticStream);
+							ConstMessageStreamView<CompilationDiagnosticMessage> diagnosticsView(diagnosticStream);
+							for (auto diagIt = diagnosticsView.GetIterator(); diagIt; ++diagIt) {
+								Dx12AppendInstrumentationDiagnostic(
+									impl,
+									DebugInstrumentationDiagnosticSeverity::Error,
+									diagIt->content.View().data());
+							}
+							break;
+						}
+						case PipelineNameMessage::kID: {
+							auto* message = it.Get<PipelineNameMessage>();
+							if (!message) {
+								break;
+							}
+
+							std::lock_guard guard(impl->debugInstrumentation.mutex);
+							impl->debugInstrumentation.pipelineNames[message->pipelineUID] = std::string(message->name.View());
+							impl->debugInstrumentation.issuesDirty = true;
+							break;
+						}
+						case ShaderCodeMessage::kID: {
+							auto* message = it.Get<ShaderCodeMessage>();
+							if (!message) {
+								break;
+							}
+
+							std::lock_guard guard(impl->debugInstrumentation.mutex);
+							Dx12ShaderIssueMetadata& metadata = impl->debugInstrumentation.shaderMetadata[message->shaderUID];
+							metadata.requested = true;
+							metadata.resolved = message->found != 0;
+							impl->debugInstrumentation.issuesDirty = true;
+							break;
+						}
+						case ShaderCodeFileMessage::kID: {
+							auto* message = it.Get<ShaderCodeFileMessage>();
+							if (!message) {
+								break;
+							}
+
+							const std::string filename(message->filename.View());
+							if (filename.empty()) {
+								break;
+							}
+
+							std::lock_guard guard(impl->debugInstrumentation.mutex);
+							Dx12ShaderIssueMetadata& metadata = impl->debugInstrumentation.shaderMetadata[message->shaderUID];
+							metadata.requested = true;
+							metadata.resolved = true;
+							auto& filePaths = metadata.filePaths;
+							if (std::find(filePaths.begin(), filePaths.end(), filename) == filePaths.end()) {
+								filePaths.push_back(filename);
+								impl->debugInstrumentation.issuesDirty = true;
+							}
+							break;
+						}
 						case SetGlobalInstrumentationMessage::kID: {
 							std::lock_guard guard(impl->debugInstrumentation.mutex);
 							impl->debugInstrumentation.state.globalFeatureMask = it.Get<SetGlobalInstrumentationMessage>()->featureBitSet;
@@ -3471,9 +3876,149 @@ namespace rhi {
 							break;
 						}
 					}
+				} else if (stream.Is<ShaderSourceMappingMessage>()) {
+					ConstMessageStreamView<ShaderSourceMappingMessage> view(stream);
+					for (auto it = view.GetIterator(); it; ++it) {
+						std::lock_guard guard(impl->debugInstrumentation.mutex);
+						Dx12ShaderSourceMappingMetadata& mapping = impl->debugInstrumentation.shaderSourceMappings[it->sguid];
+						mapping.requested = true;
+						mapping.resolved = it->shaderGUID != 0 || !it->contents.Empty();
+						mapping.shaderGuid = it->shaderGUID;
+						mapping.line = it->line;
+						mapping.column = it->column;
+						mapping.sourceLine.assign(it->contents.View());
+					}
+				} else if (stream.Is<ExecutionStackTraceMessage>()) {
+					ConstMessageStreamView<ExecutionStackTraceMessage> view(stream);
+					for (auto it = view.GetIterator(); it; ++it) {
+						if (!it->rollingExecutionUID) {
+							continue;
+						}
+
+						std::lock_guard guard(impl->debugInstrumentation.mutex);
+						impl->debugInstrumentation.executionStacks[it->rollingExecutionUID] = std::string(it->stackTrace.View());
+					}
+				} else if (stream.Is<DescriptorMismatchMessage>()) {
+					ConstMessageStreamView<DescriptorMismatchMessage> view(stream);
+					for (auto it = view.GetIterator(); it; ++it) {
+						const DescriptorMismatchMessage* message = it.Get();
+						const uint32_t chunkMask = Dx12GetChunkMask(*message);
+						const uint8_t* chunkData = reinterpret_cast<const uint8_t*>(message) + sizeof(DescriptorMismatchMessage);
+						const DescriptorMismatchMessage::TracebackChunk* traceback = nullptr;
+
+						if (chunkMask & static_cast<uint32_t>(DescriptorMismatchMessage::Chunk::Detail)) {
+							chunkData += sizeof(DescriptorMismatchMessage::DetailChunk);
+						}
+						if (chunkMask & static_cast<uint32_t>(DescriptorMismatchMessage::Chunk::Traceback)) {
+							traceback = reinterpret_cast<const DescriptorMismatchMessage::TracebackChunk*>(chunkData);
+						}
+
+						std::string formatted;
+						{
+							std::lock_guard guard(impl->debugInstrumentation.mutex);
+							Dx12QueueShaderSourceMappingRequestUnlocked(impl->debugInstrumentation, message->sguid);
+							formatted = Dx12FormatDescriptorMismatchMessage(impl->debugInstrumentation, *message, traceback);
+						}
+
+						Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, formatted.c_str());
+					}
+				} else if (stream.Is<ResourceIndexOutOfBoundsMessage>()) {
+					ConstMessageStreamView<ResourceIndexOutOfBoundsMessage> view(stream);
+					for (auto it = view.GetIterator(); it; ++it) {
+						const ResourceIndexOutOfBoundsMessage* message = it.Get();
+						const uint32_t chunkMask = Dx12GetChunkMask(*message);
+						const uint8_t* chunkData = reinterpret_cast<const uint8_t*>(message) + sizeof(ResourceIndexOutOfBoundsMessage);
+						const ResourceIndexOutOfBoundsMessage::TracebackChunk* traceback = nullptr;
+
+						if (chunkMask & static_cast<uint32_t>(ResourceIndexOutOfBoundsMessage::Chunk::Detail)) {
+							chunkData += sizeof(ResourceIndexOutOfBoundsMessage::DetailChunk);
+						}
+						if (chunkMask & static_cast<uint32_t>(ResourceIndexOutOfBoundsMessage::Chunk::Traceback)) {
+							traceback = reinterpret_cast<const ResourceIndexOutOfBoundsMessage::TracebackChunk*>(chunkData);
+						}
+
+						std::string formatted;
+						{
+							std::lock_guard guard(impl->debugInstrumentation.mutex);
+							Dx12QueueShaderSourceMappingRequestUnlocked(impl->debugInstrumentation, message->sguid);
+							formatted = Dx12FormatResourceBoundsMessage(impl->debugInstrumentation, *message, traceback);
+						}
+
+						Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Warning, formatted.c_str());
+					}
 				}
 
 				storage->Free(stream);
+			}
+
+			bool queuedDefaultDescriptorMask = false;
+			{
+				std::lock_guard guard(impl->debugInstrumentation.mutex);
+				if (impl->debugInstrumentation.state.active
+					&& impl->debugInstrumentation.featureQueryCompleted
+					&& !impl->debugInstrumentation.defaultDescriptorMaskApplied
+					&& !impl->debugInstrumentation.explicitGlobalFeatureMaskConfigured
+					&& impl->debugInstrumentation.state.globalFeatureMask == 0) {
+					const uint64_t descriptorFeatureBit = Dx12FindFeatureBitByNameUnlocked(impl->debugInstrumentation, "Descriptor");
+					if (descriptorFeatureBit != 0) {
+						MessageStream specializationStream;
+						Dx12BuildDefaultInstrumentationSpecialization(specializationStream);
+						auto* message = MessageStreamView<>(requestStream).Add<SetGlobalInstrumentationMessage>(SetGlobalInstrumentationMessage::AllocationInfo{
+							.specializationByteSize = specializationStream.GetByteSize()
+						});
+						message->featureBitSet = descriptorFeatureBit;
+						message->specialization.Set(specializationStream);
+						impl->debugInstrumentation.state.globalFeatureMask = descriptorFeatureBit;
+						impl->debugInstrumentation.defaultDescriptorMaskApplied = true;
+						queuedDefaultDescriptorMask = true;
+					}
+				}
+
+				Dx12RebuildInstrumentationIssuesUnlocked(impl->debugInstrumentation);
+			}
+
+			{
+				std::lock_guard guard(impl->debugInstrumentation.mutex);
+				for (uint64_t pipelineUid : impl->debugInstrumentation.pendingPipelineNameRequests) {
+					auto* message = MessageStreamView<>(requestStream).Add<GetPipelineNameMessage>();
+					message->pipelineUID = pipelineUid;
+					impl->debugInstrumentation.requestedPipelineNames.insert(pipelineUid);
+				}
+				impl->debugInstrumentation.pendingPipelineNameRequests.clear();
+
+				for (uint64_t shaderUid : impl->debugInstrumentation.pendingShaderCodeRequests) {
+					auto* message = MessageStreamView<>(requestStream).Add<GetShaderCodeMessage>();
+					message->shaderUID = shaderUid;
+					message->poolCode = 0;
+					message->deferred = 0;
+					impl->debugInstrumentation.shaderMetadata[shaderUid].requested = true;
+				}
+				impl->debugInstrumentation.pendingShaderCodeRequests.clear();
+
+				for (uint64_t sguid : impl->debugInstrumentation.pendingShaderSourceMappingRequests) {
+					auto* message = MessageStreamView<>(requestStream).Add<GetShaderSourceMappingMessage>();
+					message->sguid = sguid;
+					impl->debugInstrumentation.requestedShaderSourceMappings.insert(sguid);
+					impl->debugInstrumentation.shaderSourceMappings[sguid].requested = true;
+				}
+				impl->debugInstrumentation.pendingShaderSourceMappingRequests.clear();
+			}
+
+			if (requestStream.GetByteSize() != 0) {
+				const Result result = Dx12CommitReShapeMessages(impl, requestStream);
+				if (queuedDefaultDescriptorMask) {
+					if (IsOk(result)) {
+						Dx12AppendInstrumentationDiagnostic(
+							impl,
+							DebugInstrumentationDiagnosticSeverity::Info,
+							"Descriptor instrumentation is now enabled by default; shaders and pipelines will instrument as they are discovered.");
+					} else {
+						Dx12AppendInstrumentationDiagnostic(
+							impl,
+							DebugInstrumentationDiagnosticSeverity::Warning,
+							"Descriptor instrumentation default enable failed; shader instrumentation may remain inactive until a feature mask is set.");
+					}
+				}
 			}
 		}
 
@@ -3838,6 +4383,60 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		static uint32_t d_getDebugInstrumentationIssueCount(const Device* d) noexcept {
+			if (!d) {
+				return 0;
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				return 0;
+			}
+
+			Dx12PollReShapeMessages(impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			Dx12RebuildInstrumentationIssuesUnlocked(impl->debugInstrumentation);
+			return static_cast<uint32_t>(impl->debugInstrumentation.issues.size());
+		}
+
+		static Result d_copyDebugInstrumentationIssues(const Device* d,
+			uint32_t first,
+			DebugInstrumentationIssue* outIssues,
+			uint32_t capacity,
+			uint32_t* copied) noexcept {
+			if (copied) {
+				*copied = 0;
+			}
+
+			if (!d) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			Dx12PollReShapeMessages(impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			Dx12RebuildInstrumentationIssuesUnlocked(impl->debugInstrumentation);
+			const auto& issues = impl->debugInstrumentation.issues;
+			if (first >= issues.size() || capacity == 0 || !outIssues) {
+				return Result::Ok;
+			}
+
+			const uint32_t available = static_cast<uint32_t>(issues.size() - first);
+			const uint32_t toCopy = (std::min)(capacity, available);
+			for (uint32_t index = 0; index < toCopy; ++index) {
+				outIssues[index] = issues[first + index];
+			}
+
+			if (copied) {
+				*copied = toCopy;
+			}
+			return Result::Ok;
+		}
+
 		static Result d_setDebugGlobalInstrumentationMask(Device* d, uint64_t featureMask) noexcept {
 			if (!d) {
 				RHI_FAIL(Result::InvalidArgument);
@@ -3852,11 +4451,20 @@ namespace rhi {
 				RHI_FAIL(Result::Unsupported);
 			}
 
+			{
+				std::lock_guard guard(impl->debugInstrumentation.mutex);
+				impl->debugInstrumentation.explicitGlobalFeatureMaskConfigured = true;
+				impl->debugInstrumentation.defaultDescriptorMaskApplied = true;
+			}
+
 			MessageStream stream;
+			MessageStream specializationStream;
+			Dx12BuildDefaultInstrumentationSpecialization(specializationStream);
 			auto* message = MessageStreamView<>(stream).Add<SetGlobalInstrumentationMessage>(SetGlobalInstrumentationMessage::AllocationInfo{
-				.specializationByteSize = 0
+				.specializationByteSize = specializationStream.GetByteSize()
 			});
 			message->featureBitSet = featureMask;
+			message->specialization.Set(specializationStream);
 
 			if (Dx12CommitReShapeMessages(impl, stream) != Result::Ok) {
 				RHI_FAIL(Result::Failed);
@@ -5661,10 +6269,12 @@ namespace rhi {
 		&d_copyDebugInstrumentationFeatures,
 		&d_getDebugInstrumentationDiagnosticCount,
 		&d_copyDebugInstrumentationDiagnostics,
+		&d_getDebugInstrumentationIssueCount,
+		&d_copyDebugInstrumentationIssues,
 		&d_setDebugGlobalInstrumentationMask,
 		&d_setDebugSynchronousRecording,
 		&d_destroyDevice,
-		5u
+		6u
 	};
 
 	const QueueVTable g_qvt = {

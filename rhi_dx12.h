@@ -13,6 +13,8 @@
 #include <spdlog/spdlog.h>
 #include <optional>
 #include <deque>
+#include <unordered_map>
+#include <unordered_set>
 #include <cstddef>  // offsetof
 #include <type_traits>
 #include <cstdint>
@@ -302,11 +304,53 @@ namespace rhi {
 		Dx12Device* dev = nullptr;
 	};
 
+	struct Dx12PendingInstrumentationPipelineIssue {
+		DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
+		uint64_t pipelineUid = 0;
+		std::string message;
+	};
+
+	struct Dx12PendingInstrumentationShaderIssue {
+		DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
+		uint64_t shaderUid = 0;
+		std::string message;
+	};
+
+	struct Dx12ShaderIssueMetadata {
+		bool requested = false;
+		bool resolved = false;
+		std::vector<std::string> filePaths;
+	};
+
+	struct Dx12ShaderSourceMappingMetadata {
+		bool requested = false;
+		bool resolved = false;
+		uint64_t shaderGuid = 0;
+		uint32_t line = 0;
+		uint32_t column = 0;
+		std::string sourceLine;
+	};
+
 	struct Dx12DebugInstrumentationSession {
 		DebugInstrumentationCapabilities capabilities{};
 		DebugInstrumentationState state{};
 		std::vector<DebugInstrumentationFeature> features;
 		std::deque<DebugInstrumentationDiagnostic> diagnostics;
+		std::vector<DebugInstrumentationIssue> issues;
+		std::vector<Dx12PendingInstrumentationPipelineIssue> pendingPipelineIssues;
+		std::vector<Dx12PendingInstrumentationShaderIssue> pendingShaderIssues;
+		std::unordered_map<uint64_t, std::string> pipelineNames;
+		std::unordered_map<uint64_t, Dx12ShaderIssueMetadata> shaderMetadata;
+		std::unordered_map<uint64_t, Dx12ShaderSourceMappingMetadata> shaderSourceMappings;
+		std::unordered_map<uint32_t, std::string> executionStacks;
+		std::unordered_set<uint64_t> requestedPipelineNames;
+		std::unordered_set<uint64_t> pendingPipelineNameRequests;
+		std::unordered_set<uint64_t> pendingShaderCodeRequests;
+		std::unordered_set<uint64_t> requestedShaderSourceMappings;
+		std::unordered_set<uint64_t> pendingShaderSourceMappingRequests;
+		bool issuesDirty = false;
+		bool defaultDescriptorMaskApplied = false;
+		bool explicitGlobalFeatureMaskConfigured = false;
 		uint32_t featureQueryAttempts = 0;
 		bool featureQueryCompleted = false;
 		void* runtime = nullptr;

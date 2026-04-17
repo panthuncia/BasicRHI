@@ -129,6 +129,10 @@ if(_basicrhi_reshape_available)
     target_include_directories(BasicRHI PRIVATE
         "${_basicrhi_reshape_source_root}/Backends/DX12/Layer/Include"
         "${_basicrhi_reshape_binary_root}/Backends/DX12/Layer/Include"
+        "${_basicrhi_reshape_source_root}/Features/Descriptor/Backend/Include"
+        "${_basicrhi_reshape_binary_root}/Features/Descriptor/Backend/Include"
+        "${_basicrhi_reshape_source_root}/Features/ResourceBounds/Backend/Include"
+        "${_basicrhi_reshape_binary_root}/Features/ResourceBounds/Backend/Include"
         "${_basicrhi_reshape_source_root}/Libraries/Backend/Include"
         "${_basicrhi_reshape_binary_root}/Libraries/Backend/Include"
         "${_basicrhi_reshape_source_root}/Libraries/Message/Include"

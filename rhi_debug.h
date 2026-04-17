@@ -146,6 +146,43 @@ namespace rhi::debug {
         return diagnostics;
     }
 
+    inline uint32_t GetInstrumentationIssueCount(Device d) noexcept {
+        if (!d || !d.vt || !d.vt->getDebugInstrumentationIssueCount) {
+            return 0;
+        }
+        return d.vt->getDebugInstrumentationIssueCount(&d);
+    }
+
+    inline Result CopyInstrumentationIssues(Device d,
+        uint32_t first,
+        DebugInstrumentationIssue* outIssues,
+        uint32_t capacity,
+        uint32_t* copied = nullptr) noexcept {
+        if (!d || !d.vt || !d.vt->copyDebugInstrumentationIssues) {
+            if (copied) {
+                *copied = 0;
+            }
+            return Result::Unsupported;
+        }
+        return d.vt->copyDebugInstrumentationIssues(&d, first, outIssues, capacity, copied);
+    }
+
+    inline std::vector<DebugInstrumentationIssue> GetInstrumentationIssues(Device d) {
+        std::vector<DebugInstrumentationIssue> issues(GetInstrumentationIssueCount(d));
+        if (issues.empty()) {
+            return issues;
+        }
+
+        uint32_t copied = 0;
+        if (!IsOk(CopyInstrumentationIssues(d, 0, issues.data(), static_cast<uint32_t>(issues.size()), &copied))) {
+            issues.clear();
+            return issues;
+        }
+
+        issues.resize(copied);
+        return issues;
+    }
+
     inline Result SetGlobalInstrumentationMask(Device d, uint64_t featureMask) noexcept {
         if (!d || !d.vt || !d.vt->setDebugGlobalInstrumentationMask) {
             return Result::Unsupported;

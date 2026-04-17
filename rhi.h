@@ -122,6 +122,7 @@ namespace rhi {
 	enum class Backend : uint32_t { Null, D3D12, Vulkan };
 	enum class QueueKind : uint32_t { Graphics, Compute, Copy };
 	enum class DebugInstrumentationDiagnosticSeverity : uint32_t { Info, Warning, Error };
+	enum class DebugInstrumentationIssueType : uint32_t { Pipeline, ShaderFile };
 
 	enum class Result : uint32_t
 	{
@@ -295,6 +296,15 @@ namespace rhi {
 
 	struct DebugInstrumentationDiagnostic {
 		DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
+		char message[256]{};
+	};
+
+	struct DebugInstrumentationIssue {
+		DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
+		DebugInstrumentationIssueType type = DebugInstrumentationIssueType::Pipeline;
+		uint64_t objectUid = 0;
+		char label[128]{};
+		char path[260]{};
 		char message[256]{};
 	};
 
@@ -2145,11 +2155,13 @@ namespace rhi {
 		Result(*copyDebugInstrumentationFeatures)(const Device*, uint32_t first, DebugInstrumentationFeature*, uint32_t capacity, uint32_t* copied) noexcept;
 		uint32_t(*getDebugInstrumentationDiagnosticCount)(const Device*) noexcept;
 		Result(*copyDebugInstrumentationDiagnostics)(const Device*, uint32_t first, DebugInstrumentationDiagnostic*, uint32_t capacity, uint32_t* copied) noexcept;
+		uint32_t(*getDebugInstrumentationIssueCount)(const Device*) noexcept;
+		Result(*copyDebugInstrumentationIssues)(const Device*, uint32_t first, DebugInstrumentationIssue*, uint32_t capacity, uint32_t* copied) noexcept;
 		Result(*setDebugGlobalInstrumentationMask)(Device*, uint64_t) noexcept;
 		Result(*setDebugSynchronousRecording)(Device*, bool) noexcept;
 
 		void (*destroyDevice)(Device*) noexcept;
-		uint32_t abi_version = 5;
+		uint32_t abi_version = 6;
 	};
 
 
