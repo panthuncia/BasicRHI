@@ -6881,7 +6881,7 @@ namespace rhi {
 			}
 
 			sl::Preferences pref{};
-			pref.showConsole = false; // for debugging, set to false in production
+			pref.showConsole = true; // for debugging, set to false in production
 			pref.logLevel = sl::LogLevel::eDefault;
 			auto path = GetExePath() + L"\\NVSL";
 			const wchar_t* path_wchar = path.c_str();
@@ -7167,14 +7167,6 @@ namespace rhi {
 	#if !BASICRHI_ENABLE_STREAMLINE
 		l_enableStreamline = false;
 	#endif
-		if (l_enableStreamline)
-		{
-			if (!InitSL())
-			{
-				spdlog::error("Failed to initialize NVIDIA Streamline. DLSS will not be available.");
-				l_enableStreamline = false;
-			}
-		}
 
 		UINT flags = 0;
 		if (ci.enableDebug)
@@ -7202,46 +7194,12 @@ namespace rhi {
 
 		// Native factory/device
 		CreateDXGIFactory2(flags, IID_PPV_ARGS(&impl->pNativeFactory));
-
-		// Streamline manual hooking setup
-		if (l_enableStreamline)
-		{
-	#if BASICRHI_ENABLE_STREAMLINE
-			impl->steamlineInitialized = true;
-			// IMPORTANT: slInit(pref.flags |= eUseManualHooking) must have been called
-			// before this.
-
-			impl->pSLProxyFactory = impl->pNativeFactory;
-			{
-				IDXGIFactory* fac = impl->pSLProxyFactory.Get();
-				if (SL_FAILED(res, slUpgradeInterface(reinterpret_cast<void**>(&fac)))) {
-					RHI_FAIL(Result::Failed);
-				}
-				impl->pSLProxyFactory.Attach(static_cast<IDXGIFactory7*>(fac));
-			}
-	#else
-			l_enableStreamline = false;
-			impl->pSLProxyFactory = impl->pNativeFactory;
-	#endif
-		}
-		else
-		{
-			impl->pSLProxyFactory = impl->pNativeFactory;
-		}
+		impl->steamlineInitialized = false;
+		impl->pSLProxyFactory = impl->pNativeFactory;
 
 		ComPtr<IDXGIAdapter1> adapter;
 		impl->pNativeFactory->EnumAdapters1(0, &adapter);
 		adapter.As(&impl->adapter);
-
-		if (ci.instrumentation.enableRuntimeInstrumentation && l_enableStreamline)
-		{
-			spdlog::warn("Disabling Streamline because GPU-Reshape instrumentation is enabled for this device.");
-			Dx12AppendInstrumentationDiagnostic(
-				pImpl,
-				DebugInstrumentationDiagnosticSeverity::Warning,
-				"Streamline is disabled while GPU-Reshape instrumentation is active on the same device.");
-			l_enableStreamline = false;
-		}
 
 		bool reshapeWrappedDevice = false;
 	#if BASICRHI_ENABLE_RESHAPE
@@ -7274,16 +7232,45 @@ namespace rhi {
 			}
 		}
 
+		if (reshapeWrappedDevice && l_enableStreamline)
+		{
+			spdlog::warn("Disabling Streamline because GPU-Reshape instrumentation is enabled for this device.");
+			Dx12AppendInstrumentationDiagnostic(
+				pImpl,
+				DebugInstrumentationDiagnosticSeverity::Warning,
+				"Streamline is disabled while GPU-Reshape instrumentation is active on the same device.");
+			l_enableStreamline = false;
+		}
+
 		// Streamline manual hooking setup
 		if (l_enableStreamline)
 		{
 	#if BASICRHI_ENABLE_STREAMLINE
+			if (!InitSL())
+			{
+				spdlog::error("Failed to initialize NVIDIA Streamline. DLSS will not be available.");
+				l_enableStreamline = false;
+			}
+		}
+		if (l_enableStreamline)
+		{
 			// Tell SL which native device to use
 			if (SL_FAILED(res, slSetD3DDevice(impl->pNativeDevice.Get()))) {
 				RHI_FAIL(Result::Failed);
 			}
 
-			// Make proxy device/factory via slUpgradeInterface
+			// Manual hooking must happen after the native device is registered with Streamline.
+			// Upgrading the factory first causes plugin initialization to observe an active API hook
+			// without any device having been provided via slSetD3DDevice.
+			{
+				IDXGIFactory* fac = impl->pSLProxyFactory.Get();
+				if (SL_FAILED(res, slUpgradeInterface(reinterpret_cast<void**>(&fac)))) {
+					RHI_FAIL(Result::Failed);
+				}
+				impl->pSLProxyFactory.Attach(static_cast<IDXGIFactory7*>(fac));
+			}
+
+			// Make proxy device via slUpgradeInterface
 			impl->pSLProxyDevice = impl->pNativeDevice;
 			{
 				ID3D12Device* dev = impl->pSLProxyDevice.Get();
@@ -7292,6 +7279,7 @@ namespace rhi {
 				}
 				impl->pSLProxyDevice.Attach(dev);
 			}
+			impl->steamlineInitialized = true;
 	#else
 			l_enableStreamline = false;
 			impl->pSLProxyDevice = impl->pNativeDevice;
