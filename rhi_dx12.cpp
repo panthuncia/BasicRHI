@@ -11,8 +11,8 @@
 #include <sl_core_api.h>
 #include <sl_security.h>
 #endif
-#include <Message/MessageStream.h>
 #if BASICRHI_ENABLE_RESHAPE
+#include <Message/MessageStream.h>
 #include <Backends/DX12/Layer.h>
 #include <Backend/Environment.h>
 #include <Backend/EnvironmentInfo.h>
@@ -48,6 +48,13 @@
 #define VERIFY(expr) if (FAILED(expr)) { spdlog::error("Validation error!"); }
 
 namespace rhi {
+	namespace {
+		static void Dx12PollReShapeMessages(Dx12Device* impl) noexcept;
+		static Result Dx12RefreshReShapeFeatures(Dx12Device* impl) noexcept;
+		static void Dx12EnsureReShapeFeatureList(Dx12Device* impl) noexcept;
+		static bool Dx12InitializeReShapeRuntime(Dx12Device* impl, const DeviceCreateInfo& ci) noexcept;
+		static void Dx12ShutdownReShapeRuntime(Dx12Device* impl) noexcept;
+	}
 	#if BASICRHI_ENABLE_RESHAPE
 	namespace {
 		struct Dx12ReShapeRuntime {
@@ -80,7 +87,6 @@ namespace rhi {
 			Dx12ReShapeRuntime* runtime = nullptr;
 		};
 
-		static void Dx12PollReShapeMessages(Dx12Device* impl) noexcept;
 		static void Dx12BuildDefaultInstrumentationSpecialization(MessageStream& out) noexcept;
 
 		static std::wstring Dx12GetExecutableDirectory() noexcept {
@@ -2867,7 +2873,8 @@ namespace rhi {
 			if (!impl) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
-			const auto* H = impl->heaps.get(hh); if (!H || !H->heap) {
+			const auto* H = impl->heaps.get(hh); 
+			if (!H || !H->heap) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 			if (td.texture.width == 0 || td.texture.height == 0 || td.texture.format == Format::Unknown) {
@@ -4040,23 +4047,29 @@ namespace rhi {
 			session.issuesDirty = false;
 		}
 
-		static void Dx12AppendInstrumentationDiagnostic(Dx12Device* impl, DebugInstrumentationDiagnosticSeverity severity, const char* message) noexcept {
+		static void Dx12AppendInstrumentationDiagnostic(
+			Dx12Device* impl,
+			DebugInstrumentationDiagnosticSeverity severity,
+			const char* message,
+			bool mirrorToSpdlog = true) noexcept {
 			if (!impl) {
 				return;
 			}
 
 			const char* safeMessage = message ? message : "";
-			switch (severity) {
-			case DebugInstrumentationDiagnosticSeverity::Info:
-				spdlog::info("GPU-Reshape: {}", safeMessage);
-				break;
-			case DebugInstrumentationDiagnosticSeverity::Warning:
-				spdlog::warn("GPU-Reshape: {}", safeMessage);
-				break;
-			case DebugInstrumentationDiagnosticSeverity::Error:
-			default:
-				spdlog::error("GPU-Reshape: {}", safeMessage);
-				break;
+			if (mirrorToSpdlog) {
+				switch (severity) {
+				case DebugInstrumentationDiagnosticSeverity::Info:
+					spdlog::info("GPU-Reshape: {}", safeMessage);
+					break;
+				case DebugInstrumentationDiagnosticSeverity::Warning:
+					spdlog::warn("GPU-Reshape: {}", safeMessage);
+					break;
+				case DebugInstrumentationDiagnosticSeverity::Error:
+				default:
+					spdlog::error("GPU-Reshape: {}", safeMessage);
+					break;
+			}
 			}
 
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
@@ -4545,7 +4558,7 @@ namespace rhi {
 						}
 					}
 
-					Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, formatted.c_str());
+					Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, formatted.c_str(), false);
 				}
 				return;
 			}
@@ -4602,7 +4615,7 @@ namespace rhi {
 						}
 					}
 
-					Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Warning, formatted.c_str());
+					Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Warning, formatted.c_str(), false);
 				}
 			}
 		}
@@ -4931,14 +4944,7 @@ namespace rhi {
 			impl->debugInstrumentation.featureQueryCompleted = false;
 		}
 		#else
-		static void Dx12BuildDefaultInstrumentationSpecialization(MessageStream&) noexcept {
-		}
-
 		static void Dx12PollReShapeMessages(Dx12Device*) noexcept {
-		}
-
-		static Result Dx12CommitReShapeMessages(Dx12Device*, MessageStream&) noexcept {
-			return Result::Unsupported;
 		}
 
 		static Result Dx12RefreshReShapeFeatures(Dx12Device*) noexcept {
@@ -7392,14 +7398,19 @@ namespace rhi {
 		std::vector<InstrumentationExecutionDetailSnapshot> GetInstrumentationExecutionDetails(
 			Device device,
 			const DebugInstrumentationIssue& issue) {
+			(void)issue;
 			std::vector<InstrumentationExecutionDetailSnapshot> details;
 			if (!device || device.vt != &g_devvt || !device.impl) {
 				return details;
 			}
 
+			#if BASICRHI_ENABLE_RESHAPE
 			auto* impl = static_cast<Dx12Device*>(device.impl);
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
 			return Dx12CollectExecutionDetailSnapshotsUnlocked(impl->debugInstrumentation, issue);
+			#else
+			return details;
+			#endif
 		}
 
 		bool RetainInstrumentationExecutionDetail(
@@ -7409,9 +7420,13 @@ namespace rhi {
 				return false;
 			}
 
+			#if BASICRHI_ENABLE_RESHAPE
 			auto* impl = static_cast<Dx12Device*>(device.impl);
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
 			return Dx12RetainExecutionDetailUnlocked(impl->debugInstrumentation, detailId);
+			#else
+			return false;
+			#endif
 		}
 	}
 

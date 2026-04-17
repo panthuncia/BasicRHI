@@ -2,7 +2,9 @@
 
 #include <imgui.h>
 
+#if BASICRHI_ENABLE_RESHAPE
 #include <Backend/Resource/ResourceToken.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -151,6 +153,7 @@ namespace rhi::debug {
             return type < std::size(kTypeNames) ? kTypeNames[type] : "Unknown";
         }
 
+        #if BASICRHI_ENABLE_RESHAPE
         const char* ResourceTokenTypeLabel(::Backend::IL::ResourceTokenType type) noexcept {
             switch (type) {
             case ::Backend::IL::ResourceTokenType::Texture:
@@ -165,8 +168,10 @@ namespace rhi::debug {
                 return "Unknown";
             }
         }
+        #endif
 
         std::string FormatPackedToken(uint32_t packedToken) {
+        #if BASICRHI_ENABLE_RESHAPE
             ResourceToken token{};
             token.packedToken = packedToken;
 
@@ -179,6 +184,11 @@ namespace rhi::debug {
                 ResourceTokenTypeLabel(token.GetType()),
                 token.puid);
             return buffer;
+        #else
+            char buffer[32] = {};
+            std::snprintf(buffer, sizeof(buffer), "0x%08X", packedToken);
+            return buffer;
+        #endif
         }
 
         struct ShaderIssueTreeNode {
