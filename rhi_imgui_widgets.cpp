@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
 
 #include "rhi_debug.h"
 
@@ -49,38 +53,212 @@ namespace rhi::debug {
             return message;
         }
 
-        const char* IssueSectionLabel(DebugInstrumentationIssueType type) noexcept {
-            switch (type) {
-            case DebugInstrumentationIssueType::Pipeline:
-                return "Pipelines With Warnings/Errors";
-            case DebugInstrumentationIssueType::ShaderFile:
-                return "Faulty Shader Files";
+        int SeverityRank(DebugInstrumentationDiagnosticSeverity severity) noexcept {
+            switch (severity) {
+            case DebugInstrumentationDiagnosticSeverity::Error:
+                return 2;
+            case DebugInstrumentationDiagnosticSeverity::Warning:
+                return 1;
+            case DebugInstrumentationDiagnosticSeverity::Info:
             default:
-                return "Issues";
+                return 0;
             }
         }
 
-        void DrawInstrumentationIssue(const DebugInstrumentationIssue& issue) {
-            ImGui::TextColored(SeverityColor(issue.severity), "[%s]", SeverityLabel(issue.severity));
-            ImGui::SameLine();
+        DebugInstrumentationDiagnosticSeverity MaxSeverity(
+            DebugInstrumentationDiagnosticSeverity lhs,
+            DebugInstrumentationDiagnosticSeverity rhs) noexcept {
+            return SeverityRank(lhs) >= SeverityRank(rhs) ? lhs : rhs;
+        }
 
-            if (issue.type == DebugInstrumentationIssueType::ShaderFile && issue.path[0] != '\0') {
-                ImGui::TextWrapped("%s", issue.path);
-                if (issue.label[0] != '\0') {
-                    ImGui::Indent();
-                    ImGui::TextDisabled("%s", issue.label);
-                    ImGui::Unindent();
+        std::string_view ShaderFilename(std::string_view path) noexcept {
+            const size_t split = path.find_last_of("\\/");
+            if (split == std::string_view::npos) {
+                return path;
+            }
+            return path.substr(split + 1);
+        }
+
+        std::string DefaultPipelineLabel(uint64_t pipelineUid) {
+            char label[64] = {};
+            std::snprintf(label, sizeof(label), "Pipeline %llu", static_cast<unsigned long long>(pipelineUid));
+            return label;
+        }
+
+        struct ShaderIssueTreeNode {
+            std::string key;
+            std::string displayName;
+            std::string fullPath;
+            DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
+            std::vector<const DebugInstrumentationIssue*> issues;
+        };
+
+        struct PipelineIssueTreeNode {
+            uint64_t pipelineUid = 0;
+            std::string label;
+            DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
+            std::vector<const DebugInstrumentationIssue*> pipelineIssues;
+            std::vector<ShaderIssueTreeNode> shaderIssues;
+        };
+
+        std::vector<PipelineIssueTreeNode> BuildIssueTree(const std::vector<DebugInstrumentationIssue>& issues) {
+            static constexpr uint64_t kUnattributedPipelineUid = (std::numeric_limits<uint64_t>::max)();
+
+            std::vector<PipelineIssueTreeNode> tree;
+            std::unordered_map<uint64_t, size_t> pipelineLookup;
+
+            auto ensurePipelineNode = [&](uint64_t pipelineUid, const char* label) -> PipelineIssueTreeNode& {
+                const auto [it, inserted] = pipelineLookup.emplace(pipelineUid, tree.size());
+                if (inserted) {
+                    PipelineIssueTreeNode node{};
+                    node.pipelineUid = pipelineUid;
+                    if (pipelineUid == kUnattributedPipelineUid) {
+                        node.label = "Unattributed Shader Issues";
+                    } else if (label && label[0] != '\0') {
+                        node.label = label;
+                    } else {
+                        node.label = DefaultPipelineLabel(pipelineUid);
+                    }
+                    tree.push_back(std::move(node));
+                } else if (label && label[0] != '\0') {
+                    PipelineIssueTreeNode& node = tree[it->second];
+                    if (node.label.empty() || node.label == DefaultPipelineLabel(pipelineUid)) {
+                        node.label = label;
+                    }
                 }
-            } else if (issue.label[0] != '\0') {
-                ImGui::TextWrapped("%s", issue.label);
-            } else {
-                ImGui::TextWrapped("Object %llu", static_cast<unsigned long long>(issue.objectUid));
+                return tree[it->second];
+            };
+
+            for (const DebugInstrumentationIssue& issue : issues) {
+                if (issue.type == DebugInstrumentationIssueType::Pipeline) {
+                    PipelineIssueTreeNode& node = ensurePipelineNode(issue.objectUid, issue.label);
+                    node.pipelineIssues.push_back(&issue);
+                    node.severity = MaxSeverity(node.severity, issue.severity);
+                    continue;
+                }
+
+                if (issue.type != DebugInstrumentationIssueType::ShaderFile) {
+                    continue;
+                }
+
+                const uint64_t pipelineUid = issue.parentPipelineUid != 0 ? issue.parentPipelineUid : kUnattributedPipelineUid;
+                PipelineIssueTreeNode& node = ensurePipelineNode(pipelineUid, nullptr);
+                node.severity = MaxSeverity(node.severity, issue.severity);
+
+                std::string shaderKey;
+                std::string shaderDisplayName;
+                std::string shaderFullPath;
+                if (issue.path[0] != '\0') {
+                    shaderFullPath = issue.path;
+                    shaderDisplayName = std::string(ShaderFilename(shaderFullPath));
+                    shaderKey = shaderFullPath;
+                } else if (issue.label[0] != '\0') {
+                    shaderDisplayName = issue.label;
+                    shaderKey = issue.label;
+                } else {
+                    char fallback[64] = {};
+                    std::snprintf(fallback, sizeof(fallback), "Shader %llu", static_cast<unsigned long long>(issue.objectUid));
+                    shaderDisplayName = fallback;
+                    shaderKey = fallback;
+                }
+
+                auto shaderIt = std::find_if(
+                    node.shaderIssues.begin(),
+                    node.shaderIssues.end(),
+                    [&](const ShaderIssueTreeNode& shaderNode) {
+                        return shaderNode.key == shaderKey;
+                    });
+                if (shaderIt == node.shaderIssues.end()) {
+                    ShaderIssueTreeNode shaderNode{};
+                    shaderNode.key = shaderKey;
+                    shaderNode.displayName = shaderDisplayName;
+                    shaderNode.fullPath = shaderFullPath;
+                    shaderNode.severity = issue.severity;
+                    shaderNode.issues.push_back(&issue);
+                    node.shaderIssues.push_back(std::move(shaderNode));
+                } else {
+                    shaderIt->severity = MaxSeverity(shaderIt->severity, issue.severity);
+                    shaderIt->issues.push_back(&issue);
+                }
             }
 
-            if (issue.message[0] != '\0') {
+            return tree;
+        }
+
+        void DrawIssueMessageLine(const DebugInstrumentationIssue& issue) {
+            ImGui::TextColored(SeverityColor(issue.severity), "[%s]", SeverityLabel(issue.severity));
+            ImGui::SameLine();
+            ImGui::TextWrapped("%s", issue.message[0] != '\0' ? issue.message : "Issue reported.");
+
+            if (issue.path[0] != '\0') {
                 ImGui::Indent();
-                ImGui::TextWrapped("%s", issue.message);
+                ImGui::TextDisabled("%s", issue.path);
                 ImGui::Unindent();
+            }
+        }
+
+        void DrawIssueTree(const std::vector<DebugInstrumentationIssue>& issues) {
+            const std::vector<PipelineIssueTreeNode> tree = BuildIssueTree(issues);
+            if (tree.empty()) {
+                ImGui::TextDisabled("No pipeline warnings or shader issues were reported.");
+                return;
+            }
+
+            for (const PipelineIssueTreeNode& pipelineNode : tree) {
+                const std::string pipelineId = std::string("##pipeline_") + std::to_string(pipelineNode.pipelineUid);
+                const ImGuiTreeNodeFlags pipelineFlags = ImGuiTreeNodeFlags_SpanAvailWidth;
+                ImGui::PushStyleColor(ImGuiCol_Text, SeverityColor(pipelineNode.severity));
+                const bool open = ImGui::TreeNodeEx(
+                    pipelineId.c_str(),
+                    pipelineFlags,
+                    "%s",
+                    pipelineNode.label.c_str());
+                ImGui::PopStyleColor();
+                if (!open) {
+                    continue;
+                }
+
+                for (const DebugInstrumentationIssue* pipelineIssue : pipelineNode.pipelineIssues) {
+                    if (!pipelineIssue) {
+                        continue;
+                    }
+                    DrawIssueMessageLine(*pipelineIssue);
+                }
+
+                for (size_t shaderIndex = 0; shaderIndex < pipelineNode.shaderIssues.size(); ++shaderIndex) {
+                    const ShaderIssueTreeNode& shaderNode = pipelineNode.shaderIssues[shaderIndex];
+                    const std::string shaderId = std::string("##shader_")
+                        + std::to_string(pipelineNode.pipelineUid)
+                        + "_"
+                        + std::to_string(shaderIndex);
+                    ImGui::PushStyleColor(ImGuiCol_Text, SeverityColor(shaderNode.severity));
+                    const bool shaderOpen = ImGui::TreeNodeEx(
+                        shaderId.c_str(),
+                        ImGuiTreeNodeFlags_SpanAvailWidth,
+                        "%s",
+                        shaderNode.displayName.c_str());
+                    ImGui::PopStyleColor();
+                    if (!shaderOpen) {
+                        continue;
+                    }
+
+                    if (!shaderNode.fullPath.empty()) {
+                        ImGui::TextDisabled("%s", shaderNode.fullPath.c_str());
+                    }
+                    for (const DebugInstrumentationIssue* shaderIssue : shaderNode.issues) {
+                        if (!shaderIssue) {
+                            continue;
+                        }
+                        DrawIssueMessageLine(*shaderIssue);
+                    }
+                    ImGui::TreePop();
+                }
+
+                if (pipelineNode.pipelineIssues.empty() && pipelineNode.shaderIssues.empty()) {
+                    ImGui::TextDisabled("No detailed issues available.");
+                }
+
+                ImGui::TreePop();
             }
         }
 
@@ -158,161 +336,131 @@ namespace rhi::debug {
         uint64_t workingMask = state.globalFeatureMask;
         const bool allowFeatureEditing = state.active && capabilities.globalInstrumentationSupported && !features.empty();
 
-        if (!allowFeatureEditing) {
-            ImGui::BeginDisabled();
-        }
-        if (ImGui::Button("Enable All Features")) {
-            uint64_t fullMask = 0;
+        if (ImGui::BeginTable("InstrumentationLayout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
+            ImGui::TableNextColumn();
+
+            if (!allowFeatureEditing) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Button("Enable All Features")) {
+                uint64_t fullMask = 0;
+                for (const DebugInstrumentationFeature& feature : features) {
+                    fullMask |= feature.featureBit;
+                }
+
+                const Result result = SetGlobalInstrumentationMask(device, fullMask);
+                lastStatus_ = FormatActionResult("Enable all features", result);
+                lastStatusWasError_ = !IsOk(result);
+                if (IsOk(result)) {
+                    workingMask = fullMask;
+                    state.globalFeatureMask = fullMask;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Disable All Features")) {
+                const Result result = SetGlobalInstrumentationMask(device, 0);
+                lastStatus_ = FormatActionResult("Disable all features", result);
+                lastStatusWasError_ = !IsOk(result);
+                if (IsOk(result)) {
+                    workingMask = 0;
+                    state.globalFeatureMask = 0;
+                }
+            }
+            if (!allowFeatureEditing) {
+                ImGui::EndDisabled();
+            }
+
+            int enabledFeatureCount = 0;
             for (const DebugInstrumentationFeature& feature : features) {
-                fullMask |= feature.featureBit;
+                if (IsInstrumentationFeatureEnabled(workingMask, feature)) {
+                    ++enabledFeatureCount;
+                }
             }
 
-            const Result result = SetGlobalInstrumentationMask(device, fullMask);
-            lastStatus_ = FormatActionResult("Enable all features", result);
-            lastStatusWasError_ = !IsOk(result);
-            if (IsOk(result)) {
-                workingMask = fullMask;
-                state.globalFeatureMask = fullMask;
-            }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Disable All Features")) {
-            const Result result = SetGlobalInstrumentationMask(device, 0);
-            lastStatus_ = FormatActionResult("Disable all features", result);
-            lastStatusWasError_ = !IsOk(result);
-            if (IsOk(result)) {
-                workingMask = 0;
-                state.globalFeatureMask = 0;
-            }
-        }
-        if (!allowFeatureEditing) {
-            ImGui::EndDisabled();
-        }
+            ImGui::Text("Enabled Features: %d / %u", enabledFeatureCount, static_cast<unsigned>(features.size()));
 
-        int enabledFeatureCount = 0;
-        for (const DebugInstrumentationFeature& feature : features) {
-            if (IsInstrumentationFeatureEnabled(workingMask, feature)) {
-                ++enabledFeatureCount;
-            }
-        }
-
-        ImGui::Text("Enabled Features: %d / %u", enabledFeatureCount, static_cast<unsigned>(features.size()));
-
-        if (ImGui::BeginChild("InstrumentationFeatures", ImVec2(0.0f, 220.0f), true)) {
-            if (features.empty()) {
-                ImGui::TextDisabled("No backend features were discovered.");
-            }
-
-            for (size_t index = 0; index < features.size(); ++index) {
-                const DebugInstrumentationFeature& feature = features[index];
-                bool enabled = IsInstrumentationFeatureEnabled(workingMask, feature);
-
-                if (!allowFeatureEditing) {
-                    ImGui::BeginDisabled();
+            if (ImGui::BeginChild("InstrumentationFeatures", ImVec2(0.0f, 220.0f), true)) {
+                if (features.empty()) {
+                    ImGui::TextDisabled("No backend features were discovered.");
                 }
 
-                std::array<char, 96> checkboxLabel{};
-                std::snprintf(checkboxLabel.data(), checkboxLabel.size(), "%s##feature_%zu", feature.name, index);
-                if (ImGui::Checkbox(checkboxLabel.data(), &enabled)) {
-                    const uint64_t updatedMask = UpdateInstrumentationFeatureMask(workingMask, feature, enabled);
-                    const Result result = SetGlobalInstrumentationMask(device, updatedMask);
-                    lastStatus_ = FormatActionResult(feature.name, result);
-                    lastStatusWasError_ = !IsOk(result);
-                    if (IsOk(result)) {
-                        workingMask = updatedMask;
-                        state.globalFeatureMask = updatedMask;
+                for (size_t index = 0; index < features.size(); ++index) {
+                    const DebugInstrumentationFeature& feature = features[index];
+                    bool enabled = IsInstrumentationFeatureEnabled(workingMask, feature);
+
+                    if (!allowFeatureEditing) {
+                        ImGui::BeginDisabled();
                     }
-                }
 
-                if (!allowFeatureEditing) {
-                    ImGui::EndDisabled();
-                }
-
-                if (feature.description[0] != '\0') {
-                    ImGui::Indent();
-                    ImGui::TextWrapped("%s", feature.description);
-                    ImGui::Unindent();
-                }
-            }
-        }
-        ImGui::EndChild();
-
-        if (ImGui::CollapsingHeader("Currently Enabled", ImGuiTreeNodeFlags_DefaultOpen)) {
-            bool haveEnabledFeature = false;
-            for (const DebugInstrumentationFeature& feature : features) {
-                if (!IsInstrumentationFeatureEnabled(workingMask, feature)) {
-                    continue;
-                }
-
-                haveEnabledFeature = true;
-                ImGui::BulletText("%s", feature.name);
-            }
-
-            if (!haveEnabledFeature) {
-                ImGui::TextDisabled("No instrumentation features are currently enabled.");
-            }
-        }
-
-        ImGui::Separator();
-        ImGui::Checkbox("Show Issues", &showIssues_);
-        if (showIssues_) {
-            const auto pipelineIssueCount = static_cast<int>(std::count_if(
-                issues.begin(),
-                issues.end(),
-                [](const DebugInstrumentationIssue& issue) {
-                    return issue.type == DebugInstrumentationIssueType::Pipeline;
-                }));
-            const auto shaderIssueCount = static_cast<int>(std::count_if(
-                issues.begin(),
-                issues.end(),
-                [](const DebugInstrumentationIssue& issue) {
-                    return issue.type == DebugInstrumentationIssueType::ShaderFile;
-                }));
-
-            if (ImGui::BeginChild("InstrumentationIssues", ImVec2(0.0f, 220.0f), true)) {
-                ImGui::Text("%s", IssueSectionLabel(DebugInstrumentationIssueType::Pipeline));
-                if (pipelineIssueCount == 0) {
-                    ImGui::TextDisabled("No pipeline warnings or errors were reported.");
-                } else {
-                    for (const DebugInstrumentationIssue& issue : issues) {
-                        if (issue.type != DebugInstrumentationIssueType::Pipeline) {
-                            continue;
+                    std::array<char, 96> checkboxLabel{};
+                    std::snprintf(checkboxLabel.data(), checkboxLabel.size(), "%s##feature_%zu", feature.name, index);
+                    if (ImGui::Checkbox(checkboxLabel.data(), &enabled)) {
+                        const uint64_t updatedMask = UpdateInstrumentationFeatureMask(workingMask, feature, enabled);
+                        const Result result = SetGlobalInstrumentationMask(device, updatedMask);
+                        lastStatus_ = FormatActionResult(feature.name, result);
+                        lastStatusWasError_ = !IsOk(result);
+                        if (IsOk(result)) {
+                            workingMask = updatedMask;
+                            state.globalFeatureMask = updatedMask;
                         }
-                        DrawInstrumentationIssue(issue);
                     }
-                }
 
-                ImGui::Separator();
-                ImGui::Text("%s", IssueSectionLabel(DebugInstrumentationIssueType::ShaderFile));
-                if (shaderIssueCount == 0) {
-                    ImGui::TextDisabled("No faulty shader files were resolved from the reported issues.");
-                } else {
-                    for (const DebugInstrumentationIssue& issue : issues) {
-                        if (issue.type != DebugInstrumentationIssueType::ShaderFile) {
-                            continue;
-                        }
-                        DrawInstrumentationIssue(issue);
+                    if (!allowFeatureEditing) {
+                        ImGui::EndDisabled();
+                    }
+
+                    if (feature.description[0] != '\0') {
+                        ImGui::Indent();
+                        ImGui::TextWrapped("%s", feature.description);
+                        ImGui::Unindent();
                     }
                 }
             }
             ImGui::EndChild();
-        }
 
-        ImGui::Separator();
-        ImGui::Checkbox("Show Diagnostics", &showDiagnostics_);
-        if (showDiagnostics_) {
-            if (ImGui::BeginChild("InstrumentationDiagnostics", ImVec2(0.0f, 180.0f), true)) {
-                if (diagnostics.empty()) {
-                    ImGui::TextDisabled("No diagnostics available.");
+            if (ImGui::CollapsingHeader("Currently Enabled", ImGuiTreeNodeFlags_DefaultOpen)) {
+                bool haveEnabledFeature = false;
+                for (const DebugInstrumentationFeature& feature : features) {
+                    if (!IsInstrumentationFeatureEnabled(workingMask, feature)) {
+                        continue;
+                    }
+
+                    haveEnabledFeature = true;
+                    ImGui::BulletText("%s", feature.name);
                 }
 
-                for (const DebugInstrumentationDiagnostic& diagnostic : diagnostics) {
-                    ImGui::TextColored(SeverityColor(diagnostic.severity), "[%s]", SeverityLabel(diagnostic.severity));
-                    ImGui::SameLine();
-                    ImGui::TextWrapped("%s", diagnostic.message);
+                if (!haveEnabledFeature) {
+                    ImGui::TextDisabled("No instrumentation features are currently enabled.");
                 }
             }
-            ImGui::EndChild();
+
+            ImGui::Separator();
+            ImGui::Checkbox("Show Diagnostics", &showDiagnostics_);
+            if (showDiagnostics_) {
+                if (ImGui::BeginChild("InstrumentationDiagnostics", ImVec2(0.0f, 200.0f), true)) {
+                    if (diagnostics.empty()) {
+                        ImGui::TextDisabled("No diagnostics available.");
+                    }
+
+                    for (const DebugInstrumentationDiagnostic& diagnostic : diagnostics) {
+                        ImGui::TextColored(SeverityColor(diagnostic.severity), "[%s]", SeverityLabel(diagnostic.severity));
+                        ImGui::SameLine();
+                        ImGui::TextWrapped("%s", diagnostic.message);
+                    }
+                }
+                ImGui::EndChild();
+            }
+
+            ImGui::TableNextColumn();
+            ImGui::Checkbox("Show Issues", &showIssues_);
+            if (showIssues_) {
+                if (ImGui::BeginChild("InstrumentationIssues", ImVec2(0.0f, 0.0f), true)) {
+                    DrawIssueTree(issues);
+                }
+                ImGui::EndChild();
+            }
+
+            ImGui::EndTable();
         }
 
         ImGui::End();

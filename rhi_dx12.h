@@ -313,6 +313,7 @@ namespace rhi {
 	struct Dx12PendingInstrumentationShaderIssue {
 		DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
 		uint64_t shaderUid = 0;
+		uint64_t pipelineUid = 0;
 		uint64_t sguid = 0;
 		std::string message;
 	};
@@ -323,12 +324,14 @@ namespace rhi {
 		bool nativeBinary = false;
 		bool hasDebugFiles = false;
 		std::vector<std::string> filePaths;
+		std::unordered_map<uint32_t, std::string> filePathsByUid;
 	};
 
 	struct Dx12ShaderSourceMappingMetadata {
 		bool requested = false;
 		bool resolved = false;
 		uint64_t shaderGuid = 0;
+		uint32_t fileUid = UINT32_MAX;
 		uint32_t line = 0;
 		uint32_t column = 0;
 		std::string sourceLine;

@@ -3427,11 +3427,13 @@ namespace rhi {
 		static bool Dx12HasPendingShaderIssueUnlocked(const Dx12DebugInstrumentationSession& session,
 			DebugInstrumentationDiagnosticSeverity severity,
 			uint64_t shaderUid,
+			uint64_t pipelineUid,
 			uint64_t sguid,
 			const char* message) {
 			for (const Dx12PendingInstrumentationShaderIssue& issue : session.pendingShaderIssues) {
 				if (issue.severity == severity
 					&& issue.shaderUid == shaderUid
+					&& issue.pipelineUid == pipelineUid
 					&& issue.sguid == sguid
 					&& issue.message == (message ? message : "")) {
 					return true;
@@ -3465,16 +3467,18 @@ namespace rhi {
 		static void Dx12QueuePendingShaderIssueUnlocked(Dx12DebugInstrumentationSession& session,
 			DebugInstrumentationDiagnosticSeverity severity,
 			uint64_t shaderUid,
+			uint64_t pipelineUid,
 			uint64_t sguid,
 			const char* message) {
 			if (!shaderUid && !sguid) {
 				return;
 			}
 
-			if (!Dx12HasPendingShaderIssueUnlocked(session, severity, shaderUid, sguid, message)) {
+			if (!Dx12HasPendingShaderIssueUnlocked(session, severity, shaderUid, pipelineUid, sguid, message)) {
 				session.pendingShaderIssues.push_back(Dx12PendingInstrumentationShaderIssue{
 					.severity = severity,
 					.shaderUid = shaderUid,
+					.pipelineUid = pipelineUid,
 					.sguid = sguid,
 					.message = message ? message : ""
 				});
@@ -3503,7 +3507,7 @@ namespace rhi {
 			}
 
 			if (Dx12TryParseIssueUid(message, "Shader ", uid)) {
-				Dx12QueuePendingShaderIssueUnlocked(session, severity, uid, 0, message);
+				Dx12QueuePendingShaderIssueUnlocked(session, severity, uid, 0, 0, message);
 			}
 		}
 
@@ -3577,9 +3581,25 @@ namespace rhi {
 				std::vector<std::string> primaryFilePaths;
 				bool hasInternalFilePaths = false;
 				bool nativeNoSourceShader = false;
+				const Dx12ShaderSourceMappingMetadata* resolvedMapping = nullptr;
+				if (pendingIssue.sguid != 0) {
+					const auto mappingIt = session.shaderSourceMappings.find(pendingIssue.sguid);
+					if (mappingIt != session.shaderSourceMappings.end() && mappingIt->second.resolved) {
+						resolvedMapping = &mappingIt->second;
+					}
+				}
 				if (metadataIt != session.shaderMetadata.end()) {
 					nativeNoSourceShader = metadataIt->second.nativeBinary && !metadataIt->second.hasDebugFiles;
+					if (resolvedMapping && resolvedMapping->fileUid != UINT32_MAX) {
+						auto exactPathIt = metadataIt->second.filePathsByUid.find(resolvedMapping->fileUid);
+						if (exactPathIt != metadataIt->second.filePathsByUid.end() && Dx12IsPrimaryShaderSourcePath(exactPathIt->second)) {
+							primaryFilePaths.push_back(exactPathIt->second);
+						}
+					}
 					for (const std::string& filePath : metadataIt->second.filePaths) {
+						if (std::find(primaryFilePaths.begin(), primaryFilePaths.end(), filePath) != primaryFilePaths.end()) {
+							continue;
+						}
 						if (Dx12IsPrimaryShaderSourcePath(filePath)) {
 							primaryFilePaths.push_back(filePath);
 						} else {
@@ -3604,6 +3624,7 @@ namespace rhi {
 					issue.severity = pendingIssue.severity;
 					issue.type = DebugInstrumentationIssueType::ShaderFile;
 					issue.objectUid = resolvedShaderUid != 0 ? resolvedShaderUid : pendingIssue.sguid;
+					issue.parentPipelineUid = pendingIssue.pipelineUid;
 					char label[64] = {};
 					if (resolvedShaderUid != 0) {
 						std::snprintf(label, sizeof(label), "Shader %llu", static_cast<unsigned long long>(resolvedShaderUid));
@@ -3621,6 +3642,7 @@ namespace rhi {
 					issue.severity = pendingIssue.severity;
 					issue.type = DebugInstrumentationIssueType::ShaderFile;
 					issue.objectUid = resolvedShaderUid;
+					issue.parentPipelineUid = pendingIssue.pipelineUid;
 					char label[64] = {};
 					std::snprintf(label, sizeof(label), "Shader %llu", static_cast<unsigned long long>(resolvedShaderUid));
 					Dx12CopyDebugString(issue.label, sizeof(issue.label), label);
@@ -3699,6 +3721,22 @@ namespace rhi {
 			return 0;
 		}
 
+		static uint64_t Dx12BuildDefaultInstrumentationFeatureMaskUnlocked(const Dx12DebugInstrumentationSession& session) noexcept {
+			static constexpr const char* kDefaultFeatureNames[] = {
+				"Descriptor",
+				"Resource Bounds",
+				"Initialization",
+				"Concurrency",
+			};
+
+			uint64_t featureMask = 0;
+			for (const char* featureName : kDefaultFeatureNames) {
+				featureMask |= Dx12FindFeatureBitByNameUnlocked(session, featureName);
+			}
+
+			return featureMask;
+		}
+
 		static void Dx12BuildDefaultInstrumentationSpecialization(MessageStream& out) noexcept {
 			auto* config = MessageStreamView<>(out).Add<SetInstrumentationConfigMessage>();
 			config->validationCoverage = 0;
@@ -3738,17 +3776,21 @@ namespace rhi {
 			}
 
 			const Dx12ShaderSourceMappingMetadata& mapping = it->second;
-			char location[96] = {};
-			std::snprintf(
-				location,
-				sizeof(location),
-				" [line %u, col %u]",
-				mapping.line,
-				mapping.column);
-
-			std::string suffix(location);
+			std::string suffix;
+			if (mapping.fileUid != UINT32_MAX) {
+				char location[96] = {};
+				std::snprintf(
+					location,
+					sizeof(location),
+					" [line %u, col %u]",
+					mapping.line + 1,
+					mapping.column + 1);
+				suffix = location;
+			}
 			if (!mapping.sourceLine.empty()) {
-				suffix += " ";
+				if (!suffix.empty()) {
+					suffix += " ";
+				}
 				suffix += mapping.sourceLine;
 			}
 			return suffix;
@@ -3957,6 +3999,7 @@ namespace rhi {
 						metadata.requested = true;
 						metadata.resolved = true;
 						metadata.hasDebugFiles = true;
+						metadata.filePathsByUid[message->fileUID] = filename;
 						auto& filePaths = metadata.filePaths;
 						if (std::find(filePaths.begin(), filePaths.end(), filename) == filePaths.end()) {
 							filePaths.push_back(filename);
@@ -3984,6 +4027,7 @@ namespace rhi {
 					mapping.requested = true;
 					mapping.resolved = it->shaderGUID != 0 || !it->contents.Empty();
 					mapping.shaderGuid = it->shaderGUID;
+					mapping.fileUid = it->fileUID;
 					mapping.line = it->line;
 					mapping.column = it->column;
 					mapping.sourceLine.assign(it->contents.View());
@@ -4034,6 +4078,7 @@ namespace rhi {
 							impl->debugInstrumentation,
 							DebugInstrumentationDiagnosticSeverity::Error,
 							shaderUid,
+							traceback ? traceback->pipelineUid : 0,
 							message->sguid,
 							formatted.c_str());
 						if (traceback && traceback->pipelineUid != 0) {
@@ -4079,6 +4124,7 @@ namespace rhi {
 							impl->debugInstrumentation,
 							DebugInstrumentationDiagnosticSeverity::Warning,
 							shaderUid,
+							traceback ? traceback->pipelineUid : 0,
 							message->sguid,
 							formatted.c_str());
 						if (traceback && traceback->pipelineUid != 0) {
@@ -4150,7 +4196,7 @@ namespace rhi {
 				}
 			}
 
-			bool queuedDefaultDescriptorMask = false;
+			bool queuedDefaultFeatureMask = false;
 			{
 				std::lock_guard guard(impl->debugInstrumentation.mutex);
 				if (impl->debugInstrumentation.state.active
@@ -4158,18 +4204,18 @@ namespace rhi {
 					&& !impl->debugInstrumentation.defaultDescriptorMaskApplied
 					&& !impl->debugInstrumentation.explicitGlobalFeatureMaskConfigured
 					&& impl->debugInstrumentation.state.globalFeatureMask == 0) {
-					const uint64_t descriptorFeatureBit = Dx12FindFeatureBitByNameUnlocked(impl->debugInstrumentation, "Descriptor");
-					if (descriptorFeatureBit != 0) {
+					const uint64_t defaultFeatureMask = Dx12BuildDefaultInstrumentationFeatureMaskUnlocked(impl->debugInstrumentation);
+					if (defaultFeatureMask != 0) {
 						MessageStream specializationStream;
 						Dx12BuildDefaultInstrumentationSpecialization(specializationStream);
 						auto* message = MessageStreamView<>(requestStream).Add<SetGlobalInstrumentationMessage>(SetGlobalInstrumentationMessage::AllocationInfo{
 							.specializationByteSize = specializationStream.GetByteSize()
 						});
-						message->featureBitSet = descriptorFeatureBit;
+						message->featureBitSet = defaultFeatureMask;
 						message->specialization.Set(specializationStream);
-						impl->debugInstrumentation.state.globalFeatureMask = descriptorFeatureBit;
+						impl->debugInstrumentation.state.globalFeatureMask = defaultFeatureMask;
 						impl->debugInstrumentation.defaultDescriptorMaskApplied = true;
-						queuedDefaultDescriptorMask = true;
+						queuedDefaultFeatureMask = true;
 					}
 				}
 
@@ -4205,17 +4251,17 @@ namespace rhi {
 
 			if (requestStream.GetByteSize() != 0) {
 				const Result result = Dx12CommitReShapeMessages(impl, requestStream);
-				if (queuedDefaultDescriptorMask) {
+				if (queuedDefaultFeatureMask) {
 					if (IsOk(result)) {
 						Dx12AppendInstrumentationDiagnostic(
 							impl,
 							DebugInstrumentationDiagnosticSeverity::Info,
-							"Descriptor instrumentation is now enabled by default; shaders and pipelines will instrument as they are discovered.");
+							"Default GPU-Reshape instrumentation features are now enabled by default (Descriptor, Resource Bounds, Initialization, Concurrency) as shaders and pipelines are discovered.");
 					} else {
 						Dx12AppendInstrumentationDiagnostic(
 							impl,
 							DebugInstrumentationDiagnosticSeverity::Warning,
-							"Descriptor instrumentation default enable failed; shader instrumentation may remain inactive until a feature mask is set.");
+							"Default GPU-Reshape instrumentation feature enable failed; shader instrumentation may remain inactive until a feature mask is set.");
 					}
 				}
 			}

@@ -303,6 +303,7 @@ namespace rhi {
 		DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
 		DebugInstrumentationIssueType type = DebugInstrumentationIssueType::Pipeline;
 		uint64_t objectUid = 0;
+		uint64_t parentPipelineUid = 0;
 		char label[128]{};
 		char path[260]{};
 		char message[256]{};
@@ -2161,7 +2162,7 @@ namespace rhi {
 		Result(*setDebugSynchronousRecording)(Device*, bool) noexcept;
 
 		void (*destroyDevice)(Device*) noexcept;
-		uint32_t abi_version = 6;
+		uint32_t abi_version = 7;
 	};
 
 
