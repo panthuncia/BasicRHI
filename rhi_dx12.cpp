@@ -15,6 +15,7 @@
 #include <Backends/DX12/Layer.h>
 #include <Backend/Environment.h>
 #include <Backend/EnvironmentInfo.h>
+#include <Backend/StartupContainer.h>
 #include <Bridge/IBridge.h>
 #include <Bridge/Log/LogSeverity.h>
 #include <Common/ComRef.h>
@@ -3552,6 +3553,15 @@ namespace rhi {
 				delete runtime;
 				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, "GPU-Reshape environment initialization failed. Check that the runtime layer and backend plugins are staged beside the executable.");
 				return false;
+			}
+
+			if (auto startupContainer = runtime->environment.GetRegistry()->Get<::Backend::StartupContainer>()) {
+				auto* texelAddressingMessage = MessageStreamView<>(startupContainer->stream).Add<SetTexelAddressingMessage>();
+				texelAddressingMessage->enabled = true;
+				Dx12AppendInstrumentationDiagnostic(
+					impl,
+					DebugInstrumentationDiagnosticSeverity::Info,
+					"GPU-Reshape startup config enabled texel addressing for the in-process BasicRHI runtime.");
 			}
 
 			runtime->bridge = runtime->environment.GetRegistry()->Get<IBridge>();
