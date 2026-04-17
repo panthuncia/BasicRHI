@@ -15,6 +15,8 @@ namespace rhi::debug {
         bool lastStatusWasError_ = false;
         bool showIssues_ = true;
         bool showDiagnostics_ = true;
+        std::string selectedIssueKey_;
+        uint64_t selectedExecutionDetailId_ = 0;
     };
 
 }

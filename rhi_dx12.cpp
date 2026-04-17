@@ -34,12 +34,15 @@
 #include <Schemas/Features/ResourceBounds.h>
 #endif
 #include <string>
+#include <algorithm>
+#include <cctype>
 #include <deque>
 #include <cstring>
 #include <charconv>
 #include <new>
 
 #include "rhi_dx12_casting.h"
+#include "rhi_debug_internal.h"
 
 
 #define VERIFY(expr) if (FAILED(expr)) { spdlog::error("Validation error!"); }
@@ -3412,12 +3415,367 @@ namespace rhi {
 				|| extension == ".frag";
 		}
 
+		static std::string Dx12NormalizeIssueMessageForDeduplication(std::string_view input) {
+			std::string normalized(input);
+			constexpr std::string_view kExecutionToken = "execution ";
+			size_t searchOffset = 0;
+			while ((searchOffset = normalized.find(kExecutionToken, searchOffset)) != std::string::npos) {
+				size_t digitOffset = searchOffset + kExecutionToken.size();
+				size_t digitEnd = digitOffset;
+				while (digitEnd < normalized.size() && std::isdigit(static_cast<unsigned char>(normalized[digitEnd])) != 0) {
+					++digitEnd;
+				}
+				if (digitEnd > digitOffset) {
+					normalized.replace(digitOffset, digitEnd - digitOffset, "#");
+					searchOffset = digitOffset + 1;
+				} else {
+					searchOffset = digitOffset;
+				}
+			}
+			return normalized;
+		}
+
+		static void Dx12AppendRollingExecutionUid(std::vector<uint32_t>& rollingExecutionUids, uint32_t rollingExecutionUid) {
+			if (!rollingExecutionUid) {
+				return;
+			}
+
+			if (std::find(rollingExecutionUids.begin(), rollingExecutionUids.end(), rollingExecutionUid) == rollingExecutionUids.end()) {
+				rollingExecutionUids.push_back(rollingExecutionUid);
+			}
+		}
+
+		static std::string Dx12BuildExecutionDetailRetentionKey(const Dx12InstrumentationExecutionDetail& detail) {
+			std::string key;
+			key.reserve(256);
+			key += std::to_string(static_cast<uint32_t>(detail.severity));
+			key += '|';
+			key += std::to_string(static_cast<uint32_t>(detail.kind));
+			key += '|';
+			key += std::to_string(detail.shaderUid);
+			key += '|';
+			key += std::to_string(detail.pipelineUid);
+			key += '|';
+			key += std::to_string(detail.sguid);
+			key += '|';
+			key += Dx12NormalizeIssueMessageForDeduplication(detail.message);
+			return key;
+		}
+
+		template <typename TTraceback>
+		static Dx12InstrumentationTracebackDetail Dx12BuildTracebackDetail(const TTraceback* traceback) {
+			Dx12InstrumentationTracebackDetail detail{};
+			if (!traceback) {
+				return detail;
+			}
+
+			detail.valid = true;
+			detail.executionFlag = traceback->executionFlag;
+			detail.rollingExecutionUid = traceback->rollingExecutionUID;
+			detail.pipelineUid = traceback->pipelineUid;
+			std::copy(std::begin(traceback->markerHashes32), std::end(traceback->markerHashes32), detail.markerHashes32.begin());
+			detail.queueUid = traceback->queueUid;
+			detail.kernelLaunch = { traceback->kernelLaunchX, traceback->kernelLaunchY, traceback->kernelLaunchZ };
+			detail.thread = { traceback->threadX, traceback->threadY, traceback->threadZ };
+			return detail;
+		}
+
+		static void Dx12AppendExecutionDetailUnlocked(Dx12DebugInstrumentationSession& session, Dx12InstrumentationExecutionDetail detail) {
+			constexpr size_t kMaxExecutionDetails = 2048;
+			constexpr size_t kMaxArchivedExecutionDetailsPerIssue = 16;
+			if (!detail.detailId) {
+				detail.detailId = session.nextExecutionDetailId++;
+			}
+
+			const std::string retentionKey = Dx12BuildExecutionDetailRetentionKey(detail);
+			auto& archivedDetails = session.archivedExecutionDetailsByKey[retentionKey];
+			if (archivedDetails.size() >= kMaxArchivedExecutionDetailsPerIssue) {
+				archivedDetails.pop_front();
+			}
+			archivedDetails.push_back(detail);
+
+			if (session.executionDetails.size() >= kMaxExecutionDetails) {
+				session.executionDetails.pop_front();
+			}
+			session.executionDetails.push_back(std::move(detail));
+		}
+
+		static bool Dx12RetainExecutionDetailUnlocked(Dx12DebugInstrumentationSession& session, uint64_t detailId) {
+			if (!detailId) {
+				return false;
+			}
+
+			if (session.retainedExecutionDetails.contains(detailId)) {
+				return true;
+			}
+
+			auto retainIfMatch = [&](const Dx12InstrumentationExecutionDetail& detail) {
+				if (detail.detailId != detailId) {
+					return false;
+				}
+				session.retainedExecutionDetails.emplace(detailId, detail);
+				return true;
+			};
+
+			for (auto it = session.executionDetails.rbegin(); it != session.executionDetails.rend(); ++it) {
+				if (retainIfMatch(*it)) {
+					return true;
+				}
+			}
+
+			for (const auto& [key, details] : session.archivedExecutionDetailsByKey) {
+				(void)key;
+				for (auto it = details.rbegin(); it != details.rend(); ++it) {
+					if (retainIfMatch(*it)) {
+						return true;
+					}
+				}
+			}
+
+			return false;
+		}
+
+		static uint64_t Dx12ResolveExecutionDetailShaderUidUnlocked(
+			const Dx12DebugInstrumentationSession& session,
+			const Dx12InstrumentationExecutionDetail& detail) noexcept {
+			if (detail.shaderUid != 0) {
+				return detail.shaderUid;
+			}
+
+			if (detail.sguid == 0) {
+				return 0;
+			}
+
+			const auto mappingIt = session.shaderSourceMappings.find(detail.sguid);
+			if (mappingIt != session.shaderSourceMappings.end() && mappingIt->second.resolved) {
+				return mappingIt->second.shaderGuid;
+			}
+
+			return 0;
+		}
+
+		static std::string Dx12ResolveExecutionDetailPipelineLabelUnlocked(
+			const Dx12DebugInstrumentationSession& session,
+			uint64_t pipelineUid) {
+			if (pipelineUid == 0) {
+				return "Unknown pipeline";
+			}
+
+			const auto pipelineNameIt = session.pipelineNames.find(pipelineUid);
+			if (pipelineNameIt != session.pipelineNames.end() && !pipelineNameIt->second.empty()) {
+				return pipelineNameIt->second;
+			}
+
+			char label[64] = {};
+			std::snprintf(label, sizeof(label), "Pipeline %llu", static_cast<unsigned long long>(pipelineUid));
+			return label;
+		}
+
+		static bool Dx12ExecutionDetailHasPathUnlocked(
+			const Dx12DebugInstrumentationSession& session,
+			const Dx12InstrumentationExecutionDetail& detail,
+			std::string_view expectedPath) {
+			if (expectedPath.empty()) {
+				return true;
+			}
+
+			const std::string expected(expectedPath);
+			const uint64_t resolvedShaderUid = Dx12ResolveExecutionDetailShaderUidUnlocked(session, detail);
+			const auto metadataIt = resolvedShaderUid != 0
+				? session.shaderMetadata.find(resolvedShaderUid)
+				: session.shaderMetadata.end();
+
+			if (detail.sguid != 0) {
+				const auto mappingIt = session.shaderSourceMappings.find(detail.sguid);
+				if (mappingIt != session.shaderSourceMappings.end() && mappingIt->second.resolved && metadataIt != session.shaderMetadata.end()) {
+					const auto exactPathIt = metadataIt->second.filePathsByUid.find(mappingIt->second.fileUid);
+					if (exactPathIt != metadataIt->second.filePathsByUid.end() && exactPathIt->second == expected) {
+						return true;
+					}
+				}
+			}
+
+			if (metadataIt == session.shaderMetadata.end()) {
+				return false;
+			}
+
+			return std::find(
+				metadataIt->second.filePaths.begin(),
+				metadataIt->second.filePaths.end(),
+				expected) != metadataIt->second.filePaths.end();
+		}
+
+		static bool Dx12IssueMatchesExecutionDetailUnlocked(
+			const Dx12DebugInstrumentationSession& session,
+			const DebugInstrumentationIssue& issue,
+			const Dx12InstrumentationExecutionDetail& detail) {
+			if (issue.severity != detail.severity) {
+				return false;
+			}
+
+			if (Dx12NormalizeIssueMessageForDeduplication(issue.message) != Dx12NormalizeIssueMessageForDeduplication(detail.message)) {
+				return false;
+			}
+
+			if (issue.type == DebugInstrumentationIssueType::Pipeline) {
+				return detail.pipelineUid != 0 && issue.objectUid == detail.pipelineUid;
+			}
+
+			if (issue.type != DebugInstrumentationIssueType::ShaderFile) {
+				return false;
+			}
+
+			const uint64_t resolvedShaderUid = Dx12ResolveExecutionDetailShaderUidUnlocked(session, detail);
+			const uint64_t expectedObjectUid = resolvedShaderUid != 0 ? resolvedShaderUid : detail.sguid;
+			if (expectedObjectUid == 0 || issue.objectUid != expectedObjectUid) {
+				return false;
+			}
+
+			if (issue.parentPipelineUid != 0 && detail.pipelineUid != 0 && issue.parentPipelineUid != detail.pipelineUid) {
+				return false;
+			}
+
+			if (issue.path[0] != '\0' && !Dx12ExecutionDetailHasPathUnlocked(session, detail, issue.path)) {
+				return false;
+			}
+
+			return true;
+		}
+
+		static debug::InstrumentationExecutionDetailKind Dx12MapExecutionDetailKind(Dx12InstrumentationExecutionKind kind) noexcept {
+			switch (kind) {
+			case Dx12InstrumentationExecutionKind::DescriptorMismatch:
+				return debug::InstrumentationExecutionDetailKind::DescriptorMismatch;
+			case Dx12InstrumentationExecutionKind::ResourceIndexOutOfBounds:
+				return debug::InstrumentationExecutionDetailKind::ResourceIndexOutOfBounds;
+			default:
+				return debug::InstrumentationExecutionDetailKind::Unknown;
+			}
+		}
+
+		static debug::InstrumentationExecutionDetailSnapshot Dx12BuildExecutionDetailSnapshotUnlocked(
+			const Dx12DebugInstrumentationSession& session,
+			const Dx12InstrumentationExecutionDetail& detail) {
+			debug::InstrumentationExecutionDetailSnapshot snapshot{};
+			snapshot.detailId = detail.detailId;
+			snapshot.pipelineUid = detail.pipelineUid;
+			snapshot.shaderUid = Dx12ResolveExecutionDetailShaderUidUnlocked(session, detail);
+			snapshot.sguid = detail.sguid;
+			snapshot.severity = detail.severity;
+			snapshot.kind = Dx12MapExecutionDetailKind(detail.kind);
+			snapshot.pipelineLabel = Dx12ResolveExecutionDetailPipelineLabelUnlocked(session, detail.pipelineUid);
+			snapshot.message = detail.message;
+
+			snapshot.traceback.valid = detail.traceback.valid;
+			snapshot.traceback.executionFlag = detail.traceback.executionFlag;
+			snapshot.traceback.rollingExecutionUid = detail.traceback.rollingExecutionUid;
+			snapshot.traceback.queueUid = detail.traceback.queueUid;
+			snapshot.traceback.markerHashes32 = detail.traceback.markerHashes32;
+			snapshot.traceback.kernelLaunch = detail.traceback.kernelLaunch;
+			snapshot.traceback.thread = detail.traceback.thread;
+			if (detail.traceback.valid) {
+				const auto stackIt = session.executionStacks.find(detail.traceback.rollingExecutionUid);
+				if (stackIt != session.executionStacks.end()) {
+					snapshot.traceback.hostStackTrace = stackIt->second;
+				}
+			}
+
+			snapshot.descriptorMismatch.hasDetail = detail.descriptorMismatch.hasDetail;
+			snapshot.descriptorMismatch.token = detail.descriptorMismatch.token;
+			snapshot.descriptorMismatch.compileType = detail.descriptorMismatch.compileType;
+			snapshot.descriptorMismatch.runtimeType = detail.descriptorMismatch.runtimeType;
+			snapshot.descriptorMismatch.isUndefined = detail.descriptorMismatch.isUndefined;
+			snapshot.descriptorMismatch.isOutOfBounds = detail.descriptorMismatch.isOutOfBounds;
+			snapshot.descriptorMismatch.isTableNotBound = detail.descriptorMismatch.isTableNotBound;
+
+			snapshot.resourceBounds.hasDetail = detail.resourceBounds.hasDetail;
+			snapshot.resourceBounds.token = detail.resourceBounds.token;
+			snapshot.resourceBounds.coordinate = detail.resourceBounds.coordinate;
+			snapshot.resourceBounds.isTexture = detail.resourceBounds.isTexture;
+			snapshot.resourceBounds.isWrite = detail.resourceBounds.isWrite;
+
+			if (detail.sguid != 0) {
+				const auto mappingIt = session.shaderSourceMappings.find(detail.sguid);
+				if (mappingIt != session.shaderSourceMappings.end() && mappingIt->second.resolved) {
+					snapshot.sourceLine = mappingIt->second.line;
+					snapshot.sourceColumn = mappingIt->second.column;
+					snapshot.sourceText = mappingIt->second.sourceLine;
+
+					const uint64_t shaderUid = snapshot.shaderUid;
+					const auto metadataIt = shaderUid != 0
+						? session.shaderMetadata.find(shaderUid)
+						: session.shaderMetadata.end();
+					if (metadataIt != session.shaderMetadata.end()) {
+						const auto exactPathIt = metadataIt->second.filePathsByUid.find(mappingIt->second.fileUid);
+						if (exactPathIt != metadataIt->second.filePathsByUid.end()) {
+							snapshot.sourcePath = exactPathIt->second;
+						}
+					}
+				}
+			}
+
+			if (snapshot.sourcePath.empty() && detail.sguid != 0) {
+				char buffer[64] = {};
+				std::snprintf(buffer, sizeof(buffer), "SGUID %llu", static_cast<unsigned long long>(detail.sguid));
+				snapshot.sourcePath = buffer;
+			}
+
+			return snapshot;
+		}
+
+		static std::vector<debug::InstrumentationExecutionDetailSnapshot> Dx12CollectExecutionDetailSnapshotsUnlocked(
+			const Dx12DebugInstrumentationSession& session,
+			const DebugInstrumentationIssue& issue) {
+			std::vector<debug::InstrumentationExecutionDetailSnapshot> snapshots;
+			std::unordered_set<uint64_t> seenDetailIds;
+
+			auto tryAppend = [&](const Dx12InstrumentationExecutionDetail& detail) {
+				if (!Dx12IssueMatchesExecutionDetailUnlocked(session, issue, detail)) {
+					return;
+				}
+
+				if (!seenDetailIds.insert(detail.detailId).second) {
+					return;
+				}
+
+				snapshots.push_back(Dx12BuildExecutionDetailSnapshotUnlocked(session, detail));
+			};
+
+			for (const auto& [detailId, detail] : session.retainedExecutionDetails) {
+				(void)detailId;
+				tryAppend(detail);
+			}
+
+			for (const auto& [key, details] : session.archivedExecutionDetailsByKey) {
+				(void)key;
+				for (const Dx12InstrumentationExecutionDetail& detail : details) {
+					tryAppend(detail);
+				}
+			}
+
+			for (const Dx12InstrumentationExecutionDetail& detail : session.executionDetails) {
+				tryAppend(detail);
+			}
+
+			std::sort(
+				snapshots.begin(),
+				snapshots.end(),
+				[](const debug::InstrumentationExecutionDetailSnapshot& lhs, const debug::InstrumentationExecutionDetailSnapshot& rhs) {
+					return lhs.detailId > rhs.detailId;
+				});
+
+			return snapshots;
+		}
+
 		static bool Dx12HasPendingPipelineIssueUnlocked(const Dx12DebugInstrumentationSession& session,
 			DebugInstrumentationDiagnosticSeverity severity,
 			uint64_t pipelineUid,
 			const char* message) {
+			const std::string normalizedMessage = Dx12NormalizeIssueMessageForDeduplication(message ? message : "");
 			for (const Dx12PendingInstrumentationPipelineIssue& issue : session.pendingPipelineIssues) {
-				if (issue.severity == severity && issue.pipelineUid == pipelineUid && issue.message == (message ? message : "")) {
+				if (issue.severity == severity
+					&& issue.pipelineUid == pipelineUid
+					&& Dx12NormalizeIssueMessageForDeduplication(issue.message) == normalizedMessage) {
 					return true;
 				}
 			}
@@ -3430,12 +3788,13 @@ namespace rhi {
 			uint64_t pipelineUid,
 			uint64_t sguid,
 			const char* message) {
+			const std::string normalizedMessage = Dx12NormalizeIssueMessageForDeduplication(message ? message : "");
 			for (const Dx12PendingInstrumentationShaderIssue& issue : session.pendingShaderIssues) {
 				if (issue.severity == severity
 					&& issue.shaderUid == shaderUid
 					&& issue.pipelineUid == pipelineUid
 					&& issue.sguid == sguid
-					&& issue.message == (message ? message : "")) {
+					&& Dx12NormalizeIssueMessageForDeduplication(issue.message) == normalizedMessage) {
 					return true;
 				}
 			}
@@ -3445,7 +3804,8 @@ namespace rhi {
 		static void Dx12QueuePendingPipelineIssueUnlocked(Dx12DebugInstrumentationSession& session,
 			DebugInstrumentationDiagnosticSeverity severity,
 			uint64_t pipelineUid,
-			const char* message) {
+			const char* message,
+			uint32_t rollingExecutionUid = 0) {
 			if (!pipelineUid) {
 				return;
 			}
@@ -3456,7 +3816,18 @@ namespace rhi {
 					.pipelineUid = pipelineUid,
 					.message = message ? message : ""
 				});
+				Dx12AppendRollingExecutionUid(session.pendingPipelineIssues.back().rollingExecutionUids, rollingExecutionUid);
 				session.issuesDirty = true;
+			} else {
+				const std::string normalizedMessage = Dx12NormalizeIssueMessageForDeduplication(message ? message : "");
+				for (Dx12PendingInstrumentationPipelineIssue& issue : session.pendingPipelineIssues) {
+					if (issue.severity == severity
+						&& issue.pipelineUid == pipelineUid
+						&& Dx12NormalizeIssueMessageForDeduplication(issue.message) == normalizedMessage) {
+						Dx12AppendRollingExecutionUid(issue.rollingExecutionUids, rollingExecutionUid);
+						break;
+					}
+				}
 			}
 
 			if (!session.pipelineNames.contains(pipelineUid) && !session.requestedPipelineNames.contains(pipelineUid)) {
@@ -3469,7 +3840,8 @@ namespace rhi {
 			uint64_t shaderUid,
 			uint64_t pipelineUid,
 			uint64_t sguid,
-			const char* message) {
+			const char* message,
+			uint32_t rollingExecutionUid = 0) {
 			if (!shaderUid && !sguid) {
 				return;
 			}
@@ -3482,7 +3854,20 @@ namespace rhi {
 					.sguid = sguid,
 					.message = message ? message : ""
 				});
+				Dx12AppendRollingExecutionUid(session.pendingShaderIssues.back().rollingExecutionUids, rollingExecutionUid);
 				session.issuesDirty = true;
+			} else {
+				const std::string normalizedMessage = Dx12NormalizeIssueMessageForDeduplication(message ? message : "");
+				for (Dx12PendingInstrumentationShaderIssue& issue : session.pendingShaderIssues) {
+					if (issue.severity == severity
+						&& issue.shaderUid == shaderUid
+						&& issue.pipelineUid == pipelineUid
+						&& issue.sguid == sguid
+						&& Dx12NormalizeIssueMessageForDeduplication(issue.message) == normalizedMessage) {
+						Dx12AppendRollingExecutionUid(issue.rollingExecutionUids, rollingExecutionUid);
+						break;
+					}
+				}
 			}
 
 			if (shaderUid) {
@@ -3532,7 +3917,7 @@ namespace rhi {
 				key += '|';
 				key += issue.path;
 				key += '|';
-				key += issue.message;
+				key += Dx12NormalizeIssueMessageForDeduplication(issue.message);
 				if (keys.insert(key).second) {
 					session.issues.push_back(issue);
 				}
@@ -3676,6 +4061,15 @@ namespace rhi {
 
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
 			auto& diagnostics = impl->debugInstrumentation.diagnostics;
+
+			const std::string normalizedMessage = Dx12NormalizeIssueMessageForDeduplication(safeMessage);
+			for (const DebugInstrumentationDiagnostic& existing : diagnostics) {
+				if (existing.severity == severity && Dx12NormalizeIssueMessageForDeduplication(existing.message) == normalizedMessage) {
+					Dx12MarkIssueFromMessageUnlocked(impl->debugInstrumentation, severity, safeMessage);
+					return;
+				}
+			}
+
 			if (diagnostics.size() >= 32) {
 				diagnostics.pop_front();
 			}
@@ -3861,6 +4255,56 @@ namespace rhi {
 				text += Dx12FormatTracebackSuffix(session, traceback->rollingExecutionUID, traceback->pipelineUid);
 			}
 			return text;
+		}
+
+		static void Dx12AppendDescriptorMismatchExecutionDetailUnlocked(
+			Dx12DebugInstrumentationSession& session,
+			uint64_t shaderUid,
+			const DescriptorMismatchMessage& message,
+			const DescriptorMismatchMessage::DetailChunk* detailChunk,
+			const DescriptorMismatchMessage::TracebackChunk* traceback,
+			const char* formattedMessage) {
+			Dx12InstrumentationExecutionDetail detail{};
+			detail.severity = DebugInstrumentationDiagnosticSeverity::Error;
+			detail.kind = Dx12InstrumentationExecutionKind::DescriptorMismatch;
+			detail.shaderUid = shaderUid;
+			detail.pipelineUid = traceback ? traceback->pipelineUid : 0;
+			detail.sguid = message.sguid;
+			detail.message = formattedMessage ? formattedMessage : "";
+			detail.traceback = Dx12BuildTracebackDetail(traceback);
+			detail.descriptorMismatch.hasDetail = detailChunk != nullptr;
+			detail.descriptorMismatch.token = detailChunk ? detailChunk->token : 0;
+			detail.descriptorMismatch.compileType = message.compileType;
+			detail.descriptorMismatch.runtimeType = message.runtimeType;
+			detail.descriptorMismatch.isUndefined = message.isUndefined != 0;
+			detail.descriptorMismatch.isOutOfBounds = message.isOutOfBounds != 0;
+			detail.descriptorMismatch.isTableNotBound = message.isTableNotBound != 0;
+			Dx12AppendExecutionDetailUnlocked(session, std::move(detail));
+		}
+
+		static void Dx12AppendResourceBoundsExecutionDetailUnlocked(
+			Dx12DebugInstrumentationSession& session,
+			uint64_t shaderUid,
+			const ResourceIndexOutOfBoundsMessage& message,
+			const ResourceIndexOutOfBoundsMessage::DetailChunk* detailChunk,
+			const ResourceIndexOutOfBoundsMessage::TracebackChunk* traceback,
+			const char* formattedMessage) {
+			Dx12InstrumentationExecutionDetail detail{};
+			detail.severity = DebugInstrumentationDiagnosticSeverity::Warning;
+			detail.kind = Dx12InstrumentationExecutionKind::ResourceIndexOutOfBounds;
+			detail.shaderUid = shaderUid;
+			detail.pipelineUid = traceback ? traceback->pipelineUid : 0;
+			detail.sguid = message.sguid;
+			detail.message = formattedMessage ? formattedMessage : "";
+			detail.traceback = Dx12BuildTracebackDetail(traceback);
+			detail.resourceBounds.hasDetail = detailChunk != nullptr;
+			detail.resourceBounds.token = detailChunk ? detailChunk->token : 0;
+			detail.resourceBounds.coordinate = detailChunk
+				? std::array<uint32_t, 3>{ detailChunk->coordinate[0], detailChunk->coordinate[1], detailChunk->coordinate[2] }
+				: std::array<uint32_t, 3>{ 0, 0, 0 };
+			detail.resourceBounds.isTexture = message.isTexture != 0;
+			detail.resourceBounds.isWrite = message.isWrite != 0;
+			Dx12AppendExecutionDetailUnlocked(session, std::move(detail));
 		}
 
 		static void Dx12SetReShapeFeatureList(Dx12Device* impl, const FeatureListMessage& message) noexcept {
@@ -4055,9 +4499,11 @@ namespace rhi {
 					const DescriptorMismatchMessage* message = it.Get();
 					const uint32_t chunkMask = Dx12GetChunkMask(*message);
 					const uint8_t* chunkData = reinterpret_cast<const uint8_t*>(message) + sizeof(DescriptorMismatchMessage);
+					const DescriptorMismatchMessage::DetailChunk* detailChunk = nullptr;
 					const DescriptorMismatchMessage::TracebackChunk* traceback = nullptr;
 
 					if (chunkMask & static_cast<uint32_t>(DescriptorMismatchMessage::Chunk::Detail)) {
+						detailChunk = reinterpret_cast<const DescriptorMismatchMessage::DetailChunk*>(chunkData);
 						chunkData += sizeof(DescriptorMismatchMessage::DetailChunk);
 					}
 					if (chunkMask & static_cast<uint32_t>(DescriptorMismatchMessage::Chunk::Traceback)) {
@@ -4074,19 +4520,28 @@ namespace rhi {
 							shaderUid = mappingIt->second.shaderGuid;
 						}
 						formatted = Dx12FormatDescriptorMismatchMessage(impl->debugInstrumentation, *message, traceback);
+						Dx12AppendDescriptorMismatchExecutionDetailUnlocked(
+							impl->debugInstrumentation,
+							shaderUid,
+							*message,
+							detailChunk,
+							traceback,
+							formatted.c_str());
 						Dx12QueuePendingShaderIssueUnlocked(
 							impl->debugInstrumentation,
 							DebugInstrumentationDiagnosticSeverity::Error,
 							shaderUid,
 							traceback ? traceback->pipelineUid : 0,
 							message->sguid,
-							formatted.c_str());
+							formatted.c_str(),
+							traceback ? traceback->rollingExecutionUID : 0);
 						if (traceback && traceback->pipelineUid != 0) {
 							Dx12QueuePendingPipelineIssueUnlocked(
 								impl->debugInstrumentation,
 								DebugInstrumentationDiagnosticSeverity::Error,
 								traceback->pipelineUid,
-								formatted.c_str());
+								formatted.c_str(),
+								traceback->rollingExecutionUID);
 						}
 					}
 
@@ -4101,9 +4556,11 @@ namespace rhi {
 					const ResourceIndexOutOfBoundsMessage* message = it.Get();
 					const uint32_t chunkMask = Dx12GetChunkMask(*message);
 					const uint8_t* chunkData = reinterpret_cast<const uint8_t*>(message) + sizeof(ResourceIndexOutOfBoundsMessage);
+					const ResourceIndexOutOfBoundsMessage::DetailChunk* detailChunk = nullptr;
 					const ResourceIndexOutOfBoundsMessage::TracebackChunk* traceback = nullptr;
 
 					if (chunkMask & static_cast<uint32_t>(ResourceIndexOutOfBoundsMessage::Chunk::Detail)) {
+						detailChunk = reinterpret_cast<const ResourceIndexOutOfBoundsMessage::DetailChunk*>(chunkData);
 						chunkData += sizeof(ResourceIndexOutOfBoundsMessage::DetailChunk);
 					}
 					if (chunkMask & static_cast<uint32_t>(ResourceIndexOutOfBoundsMessage::Chunk::Traceback)) {
@@ -4120,19 +4577,28 @@ namespace rhi {
 							shaderUid = mappingIt->second.shaderGuid;
 						}
 						formatted = Dx12FormatResourceBoundsMessage(impl->debugInstrumentation, *message, traceback);
+						Dx12AppendResourceBoundsExecutionDetailUnlocked(
+							impl->debugInstrumentation,
+							shaderUid,
+							*message,
+							detailChunk,
+							traceback,
+							formatted.c_str());
 						Dx12QueuePendingShaderIssueUnlocked(
 							impl->debugInstrumentation,
 							DebugInstrumentationDiagnosticSeverity::Warning,
 							shaderUid,
 							traceback ? traceback->pipelineUid : 0,
 							message->sguid,
-							formatted.c_str());
+							formatted.c_str(),
+							traceback ? traceback->rollingExecutionUID : 0);
 						if (traceback && traceback->pipelineUid != 0) {
 							Dx12QueuePendingPipelineIssueUnlocked(
 								impl->debugInstrumentation,
 								DebugInstrumentationDiagnosticSeverity::Warning,
 								traceback->pipelineUid,
-								formatted.c_str());
+								formatted.c_str(),
+								traceback->rollingExecutionUID);
 						}
 					}
 
@@ -6920,6 +7386,33 @@ namespace rhi {
 		Device d{ pImpl, &g_devvt };
 		outPtr = MakeDevicePtr(&d, impl);
 		return Result::Ok;
+	}
+
+	namespace debug {
+		std::vector<InstrumentationExecutionDetailSnapshot> GetInstrumentationExecutionDetails(
+			Device device,
+			const DebugInstrumentationIssue& issue) {
+			std::vector<InstrumentationExecutionDetailSnapshot> details;
+			if (!device || device.vt != &g_devvt || !device.impl) {
+				return details;
+			}
+
+			auto* impl = static_cast<Dx12Device*>(device.impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			return Dx12CollectExecutionDetailSnapshotsUnlocked(impl->debugInstrumentation, issue);
+		}
+
+		bool RetainInstrumentationExecutionDetail(
+			Device device,
+			uint64_t detailId) {
+			if (!device || device.vt != &g_devvt || !device.impl || !detailId) {
+				return false;
+			}
+
+			auto* impl = static_cast<Dx12Device*>(device.impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			return Dx12RetainExecutionDetailUnlocked(impl->debugInstrumentation, detailId);
+		}
 	}
 
 

@@ -2,8 +2,11 @@
 
 #include <imgui.h>
 
+#include <Backend/Resource/ResourceToken.h>
+
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstring>
 #include <limits>
 #include <string_view>
@@ -11,6 +14,7 @@
 #include <vector>
 
 #include "rhi_debug.h"
+#include "rhi_debug_internal.h"
 
 namespace rhi::debug {
 
@@ -83,6 +87,98 @@ namespace rhi::debug {
             char label[64] = {};
             std::snprintf(label, sizeof(label), "Pipeline %llu", static_cast<unsigned long long>(pipelineUid));
             return label;
+        }
+
+        std::string NormalizeIssueMessageForDeduplication(std::string_view input) {
+            std::string normalized(input);
+            constexpr std::string_view kExecutionToken = "execution ";
+            size_t searchOffset = 0;
+            while ((searchOffset = normalized.find(kExecutionToken, searchOffset)) != std::string::npos) {
+                size_t digitOffset = searchOffset + kExecutionToken.size();
+                size_t digitEnd = digitOffset;
+                while (digitEnd < normalized.size() && std::isdigit(static_cast<unsigned char>(normalized[digitEnd])) != 0) {
+                    ++digitEnd;
+                }
+                if (digitEnd > digitOffset) {
+                    normalized.replace(digitOffset, digitEnd - digitOffset, "#");
+                    searchOffset = digitOffset + 1;
+                } else {
+                    searchOffset = digitOffset;
+                }
+            }
+            return normalized;
+        }
+
+        std::string BuildIssueIdentityKey(const DebugInstrumentationIssue& issue) {
+            std::string key;
+            key.reserve(512);
+            key += std::to_string(static_cast<uint32_t>(issue.severity));
+            key += '|';
+            key += std::to_string(static_cast<uint32_t>(issue.type));
+            key += '|';
+            key += std::to_string(issue.objectUid);
+            key += '|';
+            key += issue.label;
+            key += '|';
+            key += issue.path;
+            key += '|';
+            key += NormalizeIssueMessageForDeduplication(issue.message);
+            return key;
+        }
+
+        const DebugInstrumentationIssue* FindIssueByIdentityKey(const std::vector<DebugInstrumentationIssue>& issues, const std::string& selectedIssueKey) {
+            auto it = std::find_if(
+                issues.begin(),
+                issues.end(),
+                [&](const DebugInstrumentationIssue& issue) {
+                    return BuildIssueIdentityKey(issue) == selectedIssueKey;
+                });
+            return it != issues.end() ? &(*it) : nullptr;
+        }
+        const char* ExecutionKindLabel(InstrumentationExecutionDetailKind kind) noexcept {
+            switch (kind) {
+            case InstrumentationExecutionDetailKind::DescriptorMismatch:
+                return "Descriptor mismatch";
+            case InstrumentationExecutionDetailKind::ResourceIndexOutOfBounds:
+                return "Resource bounds";
+            default:
+                return "Unknown";
+            }
+        }
+
+        const char* DescriptorTypeLabel(uint32_t type) noexcept {
+            static constexpr const char* kTypeNames[] = { "Texture", "Buffer", "CBuffer", "Sampler" };
+            return type < std::size(kTypeNames) ? kTypeNames[type] : "Unknown";
+        }
+
+        const char* ResourceTokenTypeLabel(::Backend::IL::ResourceTokenType type) noexcept {
+            switch (type) {
+            case ::Backend::IL::ResourceTokenType::Texture:
+                return "Texture";
+            case ::Backend::IL::ResourceTokenType::Buffer:
+                return "Buffer";
+            case ::Backend::IL::ResourceTokenType::CBuffer:
+                return "CBuffer";
+            case ::Backend::IL::ResourceTokenType::Sampler:
+                return "Sampler";
+            default:
+                return "Unknown";
+            }
+        }
+
+        std::string FormatPackedToken(uint32_t packedToken) {
+            ResourceToken token{};
+            token.packedToken = packedToken;
+
+            char buffer[128] = {};
+            std::snprintf(
+                buffer,
+                sizeof(buffer),
+                "0x%08X (%s, PUID %u)",
+                packedToken,
+                ResourceTokenTypeLabel(token.GetType()),
+                token.puid);
+            return buffer;
         }
 
         struct ShaderIssueTreeNode {
@@ -185,24 +281,39 @@ namespace rhi::debug {
             return tree;
         }
 
-        void DrawIssueMessageLine(const DebugInstrumentationIssue& issue) {
-            ImGui::TextColored(SeverityColor(issue.severity), "[%s]", SeverityLabel(issue.severity));
-            ImGui::SameLine();
-            ImGui::TextWrapped("%s", issue.message[0] != '\0' ? issue.message : "Issue reported.");
+        bool DrawIssueMessageLine(const DebugInstrumentationIssue& issue, std::string& selectedIssueKey) {
+            const std::string issueKey = BuildIssueIdentityKey(issue);
+            const bool selected = selectedIssueKey == issueKey;
+            std::string label = "[";
+            label += SeverityLabel(issue.severity);
+            label += "] ";
+            label += issue.message[0] != '\0' ? issue.message : "Issue reported.";
+
+            ImGui::PushID(issueKey.c_str());
+            ImGui::PushStyleColor(ImGuiCol_Text, SeverityColor(issue.severity));
+            const bool changed = ImGui::Selectable(label.c_str(), selected);
+            ImGui::PopStyleColor();
+            if (changed) {
+                selectedIssueKey = issueKey;
+            }
 
             if (issue.path[0] != '\0') {
                 ImGui::Indent();
                 ImGui::TextDisabled("%s", issue.path);
                 ImGui::Unindent();
             }
+            ImGui::PopID();
+            return changed;
         }
 
-        void DrawIssueTree(const std::vector<DebugInstrumentationIssue>& issues) {
+        bool DrawIssueTree(const std::vector<DebugInstrumentationIssue>& issues, std::string& selectedIssueKey) {
             const std::vector<PipelineIssueTreeNode> tree = BuildIssueTree(issues);
             if (tree.empty()) {
                 ImGui::TextDisabled("No pipeline warnings or shader issues were reported.");
-                return;
+                return false;
             }
+
+            bool selectionChanged = false;
 
             for (const PipelineIssueTreeNode& pipelineNode : tree) {
                 const std::string pipelineId = std::string("##pipeline_") + std::to_string(pipelineNode.pipelineUid);
@@ -222,7 +333,7 @@ namespace rhi::debug {
                     if (!pipelineIssue) {
                         continue;
                     }
-                    DrawIssueMessageLine(*pipelineIssue);
+                    selectionChanged = DrawIssueMessageLine(*pipelineIssue, selectedIssueKey) || selectionChanged;
                 }
 
                 for (size_t shaderIndex = 0; shaderIndex < pipelineNode.shaderIssues.size(); ++shaderIndex) {
@@ -249,7 +360,7 @@ namespace rhi::debug {
                         if (!shaderIssue) {
                             continue;
                         }
-                        DrawIssueMessageLine(*shaderIssue);
+                        selectionChanged = DrawIssueMessageLine(*shaderIssue, selectedIssueKey) || selectionChanged;
                     }
                     ImGui::TreePop();
                 }
@@ -259,6 +370,190 @@ namespace rhi::debug {
                 }
 
                 ImGui::TreePop();
+            }
+
+            return selectionChanged;
+        }
+
+        void DrawExecutionDetailPane(
+            Device device,
+            const std::vector<DebugInstrumentationIssue>& issues,
+            const std::string& selectedIssueKey,
+            uint64_t& selectedExecutionDetailId) {
+            const DebugInstrumentationIssue* selectedIssue = FindIssueByIdentityKey(issues, selectedIssueKey);
+            if (!selectedIssue) {
+                ImGui::TextDisabled("Select an issue to inspect captured executions.");
+                return;
+            }
+
+            std::vector<InstrumentationExecutionDetailSnapshot> matchingDetails = GetInstrumentationExecutionDetails(device, *selectedIssue);
+
+            ImGui::TextColored(SeverityColor(selectedIssue->severity), "[%s] %s", SeverityLabel(selectedIssue->severity), selectedIssue->message);
+            if (selectedIssue->path[0] != '\0') {
+                ImGui::TextDisabled("%s", selectedIssue->path);
+            }
+            ImGui::Separator();
+
+            if (matchingDetails.empty()) {
+                selectedExecutionDetailId = 0;
+                ImGui::TextDisabled("No per-execution values were captured for this issue.");
+                return;
+            }
+
+            auto selectedIt = std::find_if(
+                matchingDetails.begin(),
+                matchingDetails.end(),
+                [&](const InstrumentationExecutionDetailSnapshot& detail) {
+                    return detail.detailId == selectedExecutionDetailId;
+                });
+            if (selectedIt == matchingDetails.end()) {
+                selectedExecutionDetailId = matchingDetails.front().detailId;
+                selectedIt = matchingDetails.begin();
+            }
+
+            ImGui::Text("Executions: %u", static_cast<unsigned>(matchingDetails.size()));
+            if (ImGui::BeginChild("InstrumentationExecutionList", ImVec2(0.0f, 140.0f), true)) {
+                for (const InstrumentationExecutionDetailSnapshot& detail : matchingDetails) {
+                    char label[256] = {};
+                    if (detail.traceback.valid && detail.traceback.rollingExecutionUid != 0) {
+                        std::snprintf(
+                            label,
+                            sizeof(label),
+                            "Execution %u | Event %llu | T(%u,%u,%u) | %s | %s",
+                            detail.traceback.rollingExecutionUid,
+                            static_cast<unsigned long long>(detail.detailId),
+                            detail.traceback.thread[0],
+                            detail.traceback.thread[1],
+                            detail.traceback.thread[2],
+                            ExecutionKindLabel(detail.kind),
+                            detail.pipelineLabel.c_str());
+                    } else {
+                        std::snprintf(
+                            label,
+                            sizeof(label),
+                            "Event %llu | %s | %s",
+                            static_cast<unsigned long long>(detail.detailId),
+                            ExecutionKindLabel(detail.kind),
+                            detail.pipelineLabel.c_str());
+                    }
+
+                    ImGui::PushID(static_cast<int>(detail.detailId));
+                    if (ImGui::Selectable(label, selectedExecutionDetailId == detail.detailId)) {
+                        selectedExecutionDetailId = detail.detailId;
+                        (void)RetainInstrumentationExecutionDetail(device, detail.detailId);
+                        selectedIt = std::find_if(
+                            matchingDetails.begin(),
+                            matchingDetails.end(),
+                            [&](const InstrumentationExecutionDetailSnapshot& candidate) {
+                                return candidate.detailId == detail.detailId;
+                            });
+                    }
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndChild();
+
+            if (selectedIt == matchingDetails.end()) {
+                return;
+            }
+
+            const InstrumentationExecutionDetailSnapshot& detail = *selectedIt;
+
+            ImGui::Separator();
+            if (ImGui::BeginTable("InstrumentationExecutionDetails", 2, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp)) {
+                auto row = [](const char* key, const std::string& value) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(key);
+                    ImGui::TableNextColumn();
+                    ImGui::TextWrapped("%s", value.c_str());
+                };
+
+                row("Severity", SeverityLabel(detail.severity));
+                row("Operation", ExecutionKindLabel(detail.kind));
+                row("Pipeline", detail.pipelineLabel.empty() ? DefaultPipelineLabel(detail.pipelineUid) : detail.pipelineLabel);
+                if (!detail.sourcePath.empty()) {
+                    std::string sourceLocation = detail.sourcePath;
+                    char lineColumn[48] = {};
+                    std::snprintf(lineColumn, sizeof(lineColumn), " (%u:%u)", detail.sourceLine + 1, detail.sourceColumn + 1);
+                    sourceLocation += lineColumn;
+                    row("Source", sourceLocation);
+                }
+                if (detail.traceback.valid) {
+                    row("Execution UID", std::to_string(detail.traceback.rollingExecutionUid));
+                    row("Execution Flag", std::to_string(detail.traceback.executionFlag));
+                    row(
+                        "Kernel Launch",
+                        std::to_string(detail.traceback.kernelLaunch[0]) + ", "
+                        + std::to_string(detail.traceback.kernelLaunch[1]) + ", "
+                        + std::to_string(detail.traceback.kernelLaunch[2]));
+                    row(
+                        "Thread",
+                        std::to_string(detail.traceback.thread[0]) + ", "
+                        + std::to_string(detail.traceback.thread[1]) + ", "
+                        + std::to_string(detail.traceback.thread[2]));
+                    row("Queue UID", std::to_string(detail.traceback.queueUid));
+
+                    char markerBuffer[128] = {};
+                    std::snprintf(
+                        markerBuffer,
+                        sizeof(markerBuffer),
+                        "%08X %08X %08X %08X %08X",
+                        detail.traceback.markerHashes32[0],
+                        detail.traceback.markerHashes32[1],
+                        detail.traceback.markerHashes32[2],
+                        detail.traceback.markerHashes32[3],
+                        detail.traceback.markerHashes32[4]);
+                    row("Marker Hashes", markerBuffer);
+                }
+
+                switch (detail.kind) {
+                case InstrumentationExecutionDetailKind::DescriptorMismatch:
+                    row("Expected Descriptor", DescriptorTypeLabel(detail.descriptorMismatch.compileType & 0x3u));
+                    if (!detail.descriptorMismatch.isUndefined
+                        && !detail.descriptorMismatch.isOutOfBounds
+                        && !detail.descriptorMismatch.isTableNotBound) {
+                        row("Runtime Descriptor", DescriptorTypeLabel(detail.descriptorMismatch.runtimeType & 0x3u));
+                    }
+                    row("Undefined", detail.descriptorMismatch.isUndefined ? "Yes" : "No");
+                    row("Index Out Of Bounds", detail.descriptorMismatch.isOutOfBounds ? "Yes" : "No");
+                    row("Table Not Bound", detail.descriptorMismatch.isTableNotBound ? "Yes" : "No");
+                    if (detail.descriptorMismatch.hasDetail) {
+                        row("Resource Token", FormatPackedToken(detail.descriptorMismatch.token));
+                    }
+                    break;
+                case InstrumentationExecutionDetailKind::ResourceIndexOutOfBounds:
+                    row("Resource Kind", detail.resourceBounds.isTexture ? "Texture" : "Buffer");
+                    row("Access", detail.resourceBounds.isWrite ? "Write" : "Read");
+                    if (detail.resourceBounds.hasDetail) {
+                        row("Resource Token", FormatPackedToken(detail.resourceBounds.token));
+                        row(
+                            "Coordinates",
+                            std::to_string(detail.resourceBounds.coordinate[0]) + ", "
+                            + std::to_string(detail.resourceBounds.coordinate[1]) + ", "
+                            + std::to_string(detail.resourceBounds.coordinate[2]));
+                    }
+                    break;
+                default:
+                    break;
+                }
+
+                ImGui::EndTable();
+            }
+
+            if (!detail.sourceText.empty()) {
+                ImGui::Separator();
+                ImGui::TextDisabled("Source Line");
+                ImGui::TextWrapped("%s", detail.sourceText.c_str());
+            }
+
+            if (!detail.traceback.hostStackTrace.empty()) {
+                ImGui::Separator();
+                ImGui::TextDisabled("Host Stack Trace");
+                if (ImGui::BeginChild("InstrumentationExecutionStack", ImVec2(0.0f, 120.0f), true)) {
+                    ImGui::TextWrapped("%s", detail.traceback.hostStackTrace.c_str());
+                }
+                ImGui::EndChild();
             }
         }
 
@@ -295,6 +590,11 @@ namespace rhi::debug {
         const std::vector<DebugInstrumentationFeature> features = GetInstrumentationFeatures(device);
         const std::vector<DebugInstrumentationIssue> issues = GetInstrumentationIssues(device);
         const std::vector<DebugInstrumentationDiagnostic> diagnostics = GetInstrumentationDiagnostics(device);
+
+        if (!selectedIssueKey_.empty() && !FindIssueByIdentityKey(issues, selectedIssueKey_)) {
+            selectedIssueKey_.clear();
+            selectedExecutionDetailId_ = 0;
+        }
 
         if (!lastStatus_.empty()) {
             const ImVec4 statusColor = lastStatusWasError_
@@ -455,7 +755,23 @@ namespace rhi::debug {
             ImGui::Checkbox("Show Issues", &showIssues_);
             if (showIssues_) {
                 if (ImGui::BeginChild("InstrumentationIssues", ImVec2(0.0f, 0.0f), true)) {
-                    DrawIssueTree(issues);
+                    if (ImGui::BeginTable("InstrumentationIssueLayout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
+                        ImGui::TableNextColumn();
+                        if (ImGui::BeginChild("InstrumentationIssueTree", ImVec2(0.0f, 0.0f), false)) {
+                            if (DrawIssueTree(issues, selectedIssueKey_)) {
+                                selectedExecutionDetailId_ = 0;
+                            }
+                        }
+                        ImGui::EndChild();
+
+                        ImGui::TableNextColumn();
+                        if (ImGui::BeginChild("InstrumentationIssueDetails", ImVec2(0.0f, 0.0f), false)) {
+                            DrawExecutionDetailPane(device, issues, selectedIssueKey_, selectedExecutionDetailId_);
+                        }
+                        ImGui::EndChild();
+
+                        ImGui::EndTable();
+                    }
                 }
                 ImGui::EndChild();
             }

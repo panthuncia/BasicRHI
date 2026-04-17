@@ -13,6 +13,7 @@
 #include <spdlog/spdlog.h>
 #include <optional>
 #include <deque>
+#include <array>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstddef>  // offsetof
@@ -308,6 +309,7 @@ namespace rhi {
 		DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
 		uint64_t pipelineUid = 0;
 		std::string message;
+		std::vector<uint32_t> rollingExecutionUids;
 	};
 
 	struct Dx12PendingInstrumentationShaderIssue {
@@ -316,6 +318,55 @@ namespace rhi {
 		uint64_t pipelineUid = 0;
 		uint64_t sguid = 0;
 		std::string message;
+		std::vector<uint32_t> rollingExecutionUids;
+	};
+
+	enum class Dx12InstrumentationExecutionKind : uint8_t {
+		Unknown,
+		DescriptorMismatch,
+		ResourceIndexOutOfBounds,
+	};
+
+	struct Dx12InstrumentationTracebackDetail {
+		bool valid = false;
+		uint32_t executionFlag = 0;
+		uint32_t rollingExecutionUid = 0;
+		uint32_t pipelineUid = 0;
+		std::array<uint32_t, 5> markerHashes32{};
+		uint32_t queueUid = 0;
+		std::array<uint32_t, 3> kernelLaunch{};
+		std::array<uint32_t, 3> thread{};
+	};
+
+	struct Dx12InstrumentationDescriptorMismatchDetail {
+		bool hasDetail = false;
+		uint32_t token = 0;
+		uint32_t compileType = 0;
+		uint32_t runtimeType = 0;
+		bool isUndefined = false;
+		bool isOutOfBounds = false;
+		bool isTableNotBound = false;
+	};
+
+	struct Dx12InstrumentationResourceBoundsDetail {
+		bool hasDetail = false;
+		uint32_t token = 0;
+		std::array<uint32_t, 3> coordinate{};
+		bool isTexture = false;
+		bool isWrite = false;
+	};
+
+	struct Dx12InstrumentationExecutionDetail {
+		uint64_t detailId = 0;
+		DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
+		Dx12InstrumentationExecutionKind kind = Dx12InstrumentationExecutionKind::Unknown;
+		uint64_t shaderUid = 0;
+		uint64_t pipelineUid = 0;
+		uint64_t sguid = 0;
+		std::string message;
+		Dx12InstrumentationTracebackDetail traceback;
+		Dx12InstrumentationDescriptorMismatchDetail descriptorMismatch;
+		Dx12InstrumentationResourceBoundsDetail resourceBounds;
 	};
 
 	struct Dx12ShaderIssueMetadata {
@@ -349,11 +400,15 @@ namespace rhi {
 		std::unordered_map<uint64_t, Dx12ShaderIssueMetadata> shaderMetadata;
 		std::unordered_map<uint64_t, Dx12ShaderSourceMappingMetadata> shaderSourceMappings;
 		std::unordered_map<uint32_t, std::string> executionStacks;
+		std::deque<Dx12InstrumentationExecutionDetail> executionDetails;
+		std::unordered_map<std::string, std::deque<Dx12InstrumentationExecutionDetail>> archivedExecutionDetailsByKey;
+		std::unordered_map<uint64_t, Dx12InstrumentationExecutionDetail> retainedExecutionDetails;
 		std::unordered_set<uint64_t> requestedPipelineNames;
 		std::unordered_set<uint64_t> pendingPipelineNameRequests;
 		std::unordered_set<uint64_t> pendingShaderCodeRequests;
 		std::unordered_set<uint64_t> requestedShaderSourceMappings;
 		std::unordered_set<uint64_t> pendingShaderSourceMappingRequests;
+		uint64_t nextExecutionDetailId = 1;
 		bool issuesDirty = false;
 		bool defaultDescriptorMaskApplied = false;
 		bool explicitGlobalFeatureMaskConfigured = false;
