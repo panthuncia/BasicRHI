@@ -17,6 +17,7 @@ find_package(DirectX-Headers CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(DirectX12-Agility CONFIG REQUIRED)
+find_package(imgui CONFIG REQUIRED)
 
 set(_basicrhi_streamline_available OFF)
 set(_basicrhi_pix_available OFF)
@@ -70,6 +71,7 @@ endif()
 # Build a static library for now.
 add_library(BasicRHI STATIC 
     rhi_dx12.cpp
+    rhi_imgui_widgets.cpp
     "rhi_interop.h" 
     "rhi_dx12.h"  
     "rhi_interop_dx12.h" 
@@ -78,6 +80,7 @@ add_library(BasicRHI STATIC
     "rhi_interop_dx12.cpp" 
     "rhi_conversions_dx12.h" 
     "rhi_debug.h"
+    "rhi_imgui_widgets.h"
     "rhi_colors.h"
     "rhi_allocator.h" 
     "rhi_allocator.cpp" "rhi_feature_info.h" "rhi_dx12_casting.h")
@@ -95,6 +98,8 @@ target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:Clang>:
     -Wno-error=nonportable-include-path
 >)
 add_library(BasicRHI::BasicRHI ALIAS BasicRHI)
+
+target_link_libraries(BasicRHI PRIVATE imgui::imgui)
 
 if(_basicrhi_streamline_available)
     if(TARGET Streamline::headers)
@@ -143,7 +148,7 @@ endif()
 
 # Public header(s)
 set_target_properties(BasicRHI PROPERTIES
-    PUBLIC_HEADER "rhi.h"
+    PUBLIC_HEADER "rhi.h;rhi_debug.h;rhi_imgui_widgets.h"
 )
 
 # Set sources

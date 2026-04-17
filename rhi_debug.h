@@ -153,6 +153,30 @@ namespace rhi::debug {
         return d.vt->setDebugGlobalInstrumentationMask(&d, featureMask);
     }
 
+    inline bool IsInstrumentationFeatureEnabled(uint64_t featureMask, const DebugInstrumentationFeature& feature) noexcept {
+        return feature.featureBit != 0 && (featureMask & feature.featureBit) == feature.featureBit;
+    }
+
+    inline bool IsInstrumentationFeatureEnabled(const DebugInstrumentationState& state, const DebugInstrumentationFeature& feature) noexcept {
+        return IsInstrumentationFeatureEnabled(state.globalFeatureMask, feature);
+    }
+
+    inline uint64_t UpdateInstrumentationFeatureMask(uint64_t featureMask, const DebugInstrumentationFeature& feature, bool enabled) noexcept {
+        if (feature.featureBit == 0) {
+            return featureMask;
+        }
+
+        return enabled ? (featureMask | feature.featureBit) : (featureMask & ~feature.featureBit);
+    }
+
+    inline Result SetInstrumentationFeatureEnabled(Device d, uint64_t featureMask, const DebugInstrumentationFeature& feature, bool enabled) noexcept {
+        return SetGlobalInstrumentationMask(d, UpdateInstrumentationFeatureMask(featureMask, feature, enabled));
+    }
+
+    inline Result SetInstrumentationFeatureEnabled(Device d, const DebugInstrumentationState& state, const DebugInstrumentationFeature& feature, bool enabled) noexcept {
+        return SetInstrumentationFeatureEnabled(d, state.globalFeatureMask, feature, enabled);
+    }
+
     inline Result SetSynchronousRecording(Device d, bool enabled) noexcept {
         if (!d || !d.vt || !d.vt->setDebugSynchronousRecording) {
             return Result::Unsupported;

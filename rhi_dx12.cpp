@@ -320,33 +320,6 @@ namespace rhi {
 			}
 		}
 
-		static void Dx12LogDeviceState(ID3D12Device* device, const char* phase) noexcept
-		{
-			if (!device) {
-				spdlog::info("DX12 device state {} device=null", phase ? phase : "<unknown>");
-				return;
-			}
-
-			const HRESULT reason = device->GetDeviceRemovedReason();
-			UINT64 infoQueueCount = 0;
-			ComPtr<ID3D12InfoQueue> iq;
-			if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&iq))) && iq) {
-				infoQueueCount = iq->GetNumStoredMessagesAllowedByRetrievalFilter();
-			}
-
-			spdlog::info(
-				"DX12 device state {} device={} removedReason=0x{:08X} infoQueueCount={}",
-				phase ? phase : "<unknown>",
-				static_cast<const void*>(device),
-				static_cast<unsigned>(reason),
-				infoQueueCount);
-
-			if (reason != S_OK) {
-				Dx12LogInfoQueueMessagesSince(device, infoQueueCount > 16 ? infoQueueCount - 16 : 0);
-				LogDredData();
-			}
-		}
-
 		static void DxgiReportLiveObjects(const char* phase) noexcept
 		{
 			Microsoft::WRL::ComPtr<IDXGIDebug1> dxgiDebug;
@@ -500,8 +473,10 @@ namespace rhi {
 			PsoStreamBuilder sb;
 			sb.push(SO_RootSignature{ .Value = root });
 
-			if (hasCS)    sb.push(SO_CS{ .Value = cs });
-			if (hasGfx) {
+			if (hasCS) {
+				sb.push(SO_CS{ .Value = cs });
+			}
+			else {
 				if (!hasPrimitiveTopology) {
 					primitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 					spdlog::warn("DX12 graphics PSO created without explicit primitive topology; defaulting to TRIANGLE topology type");
@@ -512,11 +487,11 @@ namespace rhi {
 				if (vs.pShaderBytecode) sb.push(SO_VS{ .Value = vs });
 				if (ps.pShaderBytecode) sb.push(SO_PS{ .Value = ps });
 
-				if (hasRast)   sb.push(SO_Rasterizer{ .Value = rast });
-				if (hasBlend)  sb.push(SO_Blend{ .Value = blend });
-				if (hasDepth)  sb.push(SO_DepthStencil{ .Value = depth });
-				if (hasRTV)    sb.push(SO_RtvFormats{ .Value = rtv });
-				if (hasDSV)    sb.push(SO_DsvFormat{ .Value = dsv });
+				if (hasRast) sb.push(SO_Rasterizer{ .Value = rast });
+				if (hasBlend) sb.push(SO_Blend{ .Value = blend });
+				if (hasDepth) sb.push(SO_DepthStencil{ .Value = depth });
+				if (hasRTV) sb.push(SO_RtvFormats{ .Value = rtv });
+				if (hasDSV) sb.push(SO_DsvFormat{ .Value = dsv });
 				if (hasSample) sb.push(SO_SampleDesc{ .Value = sample });
 				if (hasInputLayout) sb.push(SO_InputLayout{ .Value = inputLayoutDesc });
 			}
@@ -590,16 +565,6 @@ namespace rhi {
 			if (!desc.programName || desc.programName[0] == '\0') return Result::InvalidArgument;
 			if (desc.libraries.size == 0) return Result::InvalidArgument;
 
-			spdlog::info(
-				"DX12 work graph creation begin: program='{}' libraries={} localRootAssociations={} explicitNodes={} entrypoints={} flags=0x{:X} allowAdditions={}",
-				desc.programName,
-				desc.libraries.size,
-				desc.localRootAssociations.size,
-				desc.explicitNodes.size,
-				desc.entrypoints.size,
-				static_cast<unsigned>(desc.flags),
-				desc.allowStateObjectAdditions);
-
 			if (desc.flags & WorkGraphFlags::WorkGraphFlagsEntrypointGraphicsNodesRasterizeInOrder) {
 				// Not yet supported in d3d12.h
 				spdlog::error("DX12 work graph creation: EntrypointGraphicsNodesRasterizeInOrder flag is not supported yet");
@@ -610,10 +575,6 @@ namespace rhi {
 			{
 				D3D12_FEATURE_DATA_D3D12_OPTIONS21 opt{};
 				const HRESULT featureHr = dimpl->pNativeDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS21, &opt, sizeof(opt));
-				spdlog::info(
-					"DX12 work graph creation: CheckFeatureSupport(OPTIONS21) hr=0x{:08X} tier={}",
-					static_cast<unsigned>(featureHr),
-					static_cast<unsigned>(opt.WorkGraphsTier));
 				if (FAILED(featureHr)) {
 					spdlog::error(
 						"DX12 work graph creation: CheckFeatureSupport(OPTIONS21) failed hr=0x{:08X}",
@@ -777,8 +738,6 @@ namespace rhi {
 				wg->AddEntrypoint(toNodeId(e));
 			}
 
-			spdlog::info("DX12 work graph creation: calling CreateStateObject for program '{}'", desc.programName);
-
 			ComPtr<ID3D12StateObject> stateObject;
 			if (const auto hr = dimpl->pNativeDevice->CreateStateObject(soDesc, IID_PPV_ARGS(&stateObject)); FAILED(hr)) {
 				spdlog::error(
@@ -787,7 +746,6 @@ namespace rhi {
 					static_cast<unsigned>(hr));
 				RHI_FAIL(ToRHI(hr));
 			}
-			spdlog::info("DX12 work graph creation: CreateStateObject succeeded for program '{}'", desc.programName);
 
 			ComPtr<ID3D12StateObjectProperties1> props1;
 			if (const auto hr = stateObject.As(&props1); FAILED(hr) || !props1) {
@@ -798,7 +756,6 @@ namespace rhi {
 					static_cast<bool>(props1));
 				RHI_FAIL(Result::Failed);
 			}
-			spdlog::info("DX12 work graph creation: QueryInterface(ID3D12StateObjectProperties1) succeeded for program '{}'", desc.programName);
 			ComPtr<ID3D12WorkGraphProperties> wgProps;
 			if (const auto hr = stateObject.As(&wgProps); FAILED(hr) || !wgProps) {
 				spdlog::error(
@@ -808,41 +765,22 @@ namespace rhi {
 					static_cast<bool>(wgProps));
 				RHI_FAIL(Result::Failed);
 			}
-			spdlog::info("DX12 work graph creation: QueryInterface(ID3D12WorkGraphProperties) succeeded for program '{}'", desc.programName);
 
 			const D3D12_PROGRAM_IDENTIFIER programId = props1->GetProgramIdentifier(programNameW);
 			const UINT wgIndex = wgProps->GetWorkGraphIndex(programNameW);
-			spdlog::info(
-				"DX12 work graph creation: GetProgramIdentifier/GetWorkGraphIndex program='{}' wgIndex={}",
-				desc.programName,
-				wgIndex);
 			const UINT numEntries = wgProps->GetNumEntrypoints(wgIndex);
-			spdlog::info(
-				"DX12 work graph creation: GetNumEntrypoints program='{}' wgIndex={} numEntries={}",
-				desc.programName,
-				wgIndex,
-				numEntries);
 			if (numEntries == 0) {
 				spdlog::error("DX12 work graph creation: no entrypoints found for program '{}'", desc.programName);
 				RHI_FAIL(Result::InvalidArgument);
 			}
 			D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS mem{};
 			wgProps->GetWorkGraphMemoryRequirements(wgIndex, &mem);
-			spdlog::info(
-				"DX12 work graph creation: GetWorkGraphMemoryRequirements program='{}'",
-				desc.programName);
-			spdlog::info(
-				"DX12 work graph memory requirements: min={} max={} granularity={}",
-				static_cast<unsigned long long>(mem.MinSizeInBytes),
-				static_cast<unsigned long long>(mem.MaxSizeInBytes),
-				static_cast<unsigned>(mem.SizeGranularityInBytes));
 
 			auto handle = dimpl->workGraphs.alloc(Dx12WorkGraph(stateObject, props1, wgProps, programId, wgIndex, mem, dimpl));
 			WorkGraph ret(handle);
 			ret.vt = &g_wgvt;
 			ret.impl = dimpl;
 			out = MakeWorkGraphPtr(d, ret, dimpl->selfWeak.lock());
-			spdlog::info("DX12 work graph creation complete: program='{}' handleValid={} outValid={}", desc.programName, handle.valid(), static_cast<bool>(out));
 			return Result::Ok;
 		}
 
@@ -2551,19 +2489,12 @@ namespace rhi {
 		static Result d_createCommandAllocator(Device* d, QueueKind q, CommandAllocatorPtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 			ID3D12Device* createDevice = impl->steamlineInitialized ? impl->pSLProxyDevice.Get() : impl->pNativeDevice.Get();
-			spdlog::info(
-				"DX12 create command allocator begin queue={} deviceImpl={} createDevice={} usingProxyDevice={}",
-				static_cast<int>(q),
-				static_cast<const void*>(impl),
-				static_cast<const void*>(createDevice),
-				impl->steamlineInitialized);
 			Microsoft::WRL::ComPtr<ID3D12CommandAllocator> a;
 			if (const auto hr = createDevice->CreateCommandAllocator(ToDX(q), IID_PPV_ARGS(&a)); FAILED(hr)) {
 				spdlog::error("DX12 create command allocator failed queue={} hr=0x{:08X}", static_cast<int>(q), static_cast<unsigned>(hr));
 				BreakIfDebugging();
 				return ToRHI(hr);
 			}
-			spdlog::info("DX12 create command allocator native create complete queue={} allocator={}", static_cast<int>(q), static_cast<const void*>(a.Get()));
 
 			Dx12Allocator A(a, ToDX(q), impl);
 			const auto h = impl->allocators.alloc(A);
@@ -2572,7 +2503,6 @@ namespace rhi {
 			ret.impl = impl;
 			ret.vt = &g_calvt;
 			out = MakeCommandAllocatorPtr(d, ret, static_cast<Dx12Device*>(d->impl)->selfWeak.lock());
-			spdlog::info("DX12 create command allocator complete queue={} handleValid={} outValid={}", static_cast<int>(q), h.valid(), static_cast<bool>(out));
 			return Result::Ok;
 		}
 
@@ -2584,55 +2514,35 @@ namespace rhi {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 			ID3D12Device* createDevice = impl->steamlineInitialized ? impl->pSLProxyDevice.Get() : impl->pNativeDevice.Get();
 			const auto* A = dx12_detail::Alloc(&ca);
-			spdlog::info(
-				"DX12 create command list begin queue={} deviceImpl={} nativeDevice10={} proxyDevice={} createDevice={} sameDevicePointer={} allocatorValid={} allocatorImpl={} allocatorType={} usingProxyDevice={}",
-				static_cast<int>(q),
-				static_cast<const void*>(impl),
-				static_cast<const void*>(impl ? impl->pNativeDevice.Get() : nullptr),
-				static_cast<const void*>(impl ? impl->pSLProxyDevice.Get() : nullptr),
-				static_cast<const void*>(createDevice),
-				impl ? (impl->pNativeDevice.Get() == impl->pSLProxyDevice.Get()) : false,
-				A != nullptr,
-				A ? static_cast<const void*>(A->alloc.Get()) : nullptr,
-				A ? static_cast<int>(A->type) : -1,
-				impl ? impl->steamlineInitialized : false);
 			if (!A) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			ComPtr<ID3D12GraphicsCommandList> cl0; // Needs at least version 10 for work graphs
-			spdlog::info("DX12 create command list before CreateCommandList queue={}", static_cast<int>(q));
-			Dx12LogDeviceState(impl ? impl->pNativeDevice.Get() : nullptr, "before CreateCommandList");
 			if (const auto hr = createDevice->CreateCommandList(0, A->type, A->alloc.Get(), nullptr, IID_PPV_ARGS(&cl0)); FAILED(hr)) {
 				spdlog::error("DX12 create command list CreateCommandList failed queue={} hr=0x{:08X}", static_cast<int>(q), static_cast<unsigned>(hr));
 				RHI_FAIL(ToRHI(hr));
 			}
-			spdlog::info("DX12 create command list CreateCommandList complete queue={} cl0={}", static_cast<int>(q), static_cast<const void*>(cl0.Get()));
 
 			// Attempt upcast to ID3D12GraphicsCommandList10
 			Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList10> cl;
-			spdlog::info("DX12 create command list before As(ID3D12GraphicsCommandList10) queue={}", static_cast<int>(q));
 			if (const auto hr = cl0.As(&cl); FAILED(hr)) {
 				spdlog::error("DX12 create command list As(ID3D12GraphicsCommandList10) failed queue={} hr=0x{:08X}", static_cast<int>(q), static_cast<unsigned>(hr));
 				RHI_FAIL(ToRHI(hr));
 			}
-			spdlog::info("DX12 create command list As(ID3D12GraphicsCommandList10) complete queue={} cl10={}", static_cast<int>(q), static_cast<const void*>(cl.Get()));
 			
 			const Dx12CommandList rec(cl, A->alloc, A->type, impl);
 			Dx12CommandList recWithScratch = rec;
-			spdlog::info("DX12 create command list before EnsureRootCbvScratchPage queue={}", static_cast<int>(q));
 			if (!Dx12EnsureRootCbvScratchPage(impl, recWithScratch, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT)) {
 				spdlog::error("DX12 create command list EnsureRootCbvScratchPage failed queue={}", static_cast<int>(q));
 				RHI_FAIL(Result::Failed);
 			}
-			spdlog::info("DX12 create command list EnsureRootCbvScratchPage complete queue={}", static_cast<int>(q));
 			const auto h = impl->commandLists.alloc(recWithScratch);
 
 			CommandList ret{ h };
 			ret.impl = impl;
 			ret.vt = &g_clvt;
 			out = MakeCommandListPtr(d, ret, static_cast<Dx12Device*>(d->impl)->selfWeak.lock());
-			spdlog::info("DX12 create command list complete queue={} handleValid={} outValid={}", static_cast<int>(q), h.valid(), static_cast<bool>(out));
 			return Result::Ok;
 		}
 
@@ -3407,6 +3317,20 @@ namespace rhi {
 				return;
 			}
 
+			const char* safeMessage = message ? message : "";
+			switch (severity) {
+			case DebugInstrumentationDiagnosticSeverity::Info:
+				spdlog::info("GPU-Reshape: {}", safeMessage);
+				break;
+			case DebugInstrumentationDiagnosticSeverity::Warning:
+				spdlog::warn("GPU-Reshape: {}", safeMessage);
+				break;
+			case DebugInstrumentationDiagnosticSeverity::Error:
+			default:
+				spdlog::error("GPU-Reshape: {}", safeMessage);
+				break;
+			}
+
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
 			auto& diagnostics = impl->debugInstrumentation.diagnostics;
 			if (diagnostics.size() >= 32) {
@@ -3423,6 +3347,8 @@ namespace rhi {
 		static Dx12ReShapeRuntime* Dx12GetReShapeRuntime(Dx12Device* impl) noexcept {
 			return impl ? static_cast<Dx12ReShapeRuntime*>(impl->debugInstrumentation.runtime) : nullptr;
 		}
+
+		static Result Dx12RefreshReShapeFeatures(Dx12Device* impl) noexcept;
 
 		static DebugInstrumentationDiagnosticSeverity Dx12MapReShapeSeverity(uint32_t severity) noexcept {
 			switch (static_cast<LogSeverity>(severity)) {
@@ -3456,9 +3382,43 @@ namespace rhi {
 				features.push_back(feature);
 			}
 
-			std::lock_guard guard(impl->debugInstrumentation.mutex);
-			impl->debugInstrumentation.features = std::move(features);
-			impl->debugInstrumentation.capabilities.featureCount = static_cast<uint32_t>(impl->debugInstrumentation.features.size());
+			uint32_t featureCount = 0;
+			{
+				std::lock_guard guard(impl->debugInstrumentation.mutex);
+				impl->debugInstrumentation.features = std::move(features);
+				impl->debugInstrumentation.featureQueryCompleted = true;
+				impl->debugInstrumentation.capabilities.featureCount = static_cast<uint32_t>(impl->debugInstrumentation.features.size());
+				featureCount = impl->debugInstrumentation.capabilities.featureCount;
+			}
+
+			char infoMessage[128] = {};
+			sprintf_s(infoMessage,
+				sizeof(infoMessage),
+				"Feature discovery completed with %u backend feature(s).",
+				featureCount);
+			Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Info, infoMessage);
+		}
+
+		static void Dx12EnsureReShapeFeatureList(Dx12Device* impl) noexcept {
+			auto* runtime = Dx12GetReShapeRuntime(impl);
+			if (!impl || !runtime || !runtime->bridge) {
+				return;
+			}
+
+			bool shouldRefresh = false;
+			{
+				std::lock_guard guard(impl->debugInstrumentation.mutex);
+				if (!impl->debugInstrumentation.state.active) {
+					return;
+				}
+
+				shouldRefresh = !impl->debugInstrumentation.featureQueryCompleted
+					|| (impl->debugInstrumentation.features.empty() && impl->debugInstrumentation.featureQueryAttempts < 3);
+			}
+
+			if (shouldRefresh) {
+				(void)Dx12RefreshReShapeFeatures(impl);
+			}
 		}
 
 		static void Dx12PollReShapeMessages(Dx12Device* impl) noexcept {
@@ -3522,20 +3482,44 @@ namespace rhi {
 				RHI_FAIL(Result::Unsupported);
 			}
 
-			runtime->bridge->GetOutput()->AddStreamAndSwap(stream);
+			IMessageStorage* storage = runtime->bridge->GetOutput();
+			if (!storage) {
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, "Bridge output storage is unavailable during GPU-Reshape message commit.");
+				RHI_FAIL(Result::Failed);
+			}
+
+			storage->AddStreamAndSwap(stream);
 			runtime->bridge->Commit();
 			Dx12PollReShapeMessages(impl);
 			return Result::Ok;
 		}
 
 		static Result Dx12RefreshReShapeFeatures(Dx12Device* impl) noexcept {
+			uint32_t attempt = 0;
+			{
+				std::lock_guard guard(impl->debugInstrumentation.mutex);
+				attempt = ++impl->debugInstrumentation.featureQueryAttempts;
+			}
+
+			char infoMessage[128] = {};
+			sprintf_s(infoMessage,
+				sizeof(infoMessage),
+				"Requesting backend feature list (attempt %u).",
+				attempt);
+			Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Info, infoMessage);
+
 			MessageStream stream;
 			auto* message = MessageStreamView<>(stream).Add<GetFeaturesMessage>();
 			message->featureBitSet = ~0ull;
-			return Dx12CommitReShapeMessages(impl, stream);
+			const Result result = Dx12CommitReShapeMessages(impl, stream);
+			if (result != Result::Ok) {
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Warning, "Backend feature list request did not complete cleanly.");
+			}
+			return result;
 		}
 
 		static bool Dx12InitializeReShapeRuntime(Dx12Device* impl, const DeviceCreateInfo& ci) noexcept {
+			Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Info, "Initializing GPU-Reshape DX12 runtime.");
 			auto* runtime = new (std::nothrow) Dx12ReShapeRuntime();
 			if (!runtime) {
 				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, "Failed to allocate GPU-Reshape runtime state.");
@@ -3598,6 +3582,8 @@ namespace rhi {
 				std::lock_guard guard(impl->debugInstrumentation.mutex);
 				impl->debugInstrumentation.runtime = runtime;
 				impl->debugInstrumentation.state.active = true;
+				impl->debugInstrumentation.featureQueryAttempts = 0;
+				impl->debugInstrumentation.featureQueryCompleted = false;
 				impl->debugInstrumentation.capabilities.installSupported = false;
 				impl->debugInstrumentation.capabilities.globalInstrumentationSupported = true;
 				impl->debugInstrumentation.capabilities.shaderInstrumentationSupported = false;
@@ -3606,6 +3592,7 @@ namespace rhi {
 			}
 
 			impl->pNativeDevice = reshapeDevice;
+			Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Info, "GPU-Reshape wrapped the D3D12 device successfully.");
 
 			MessageStream configStream;
 			auto* configMessage = MessageStreamView<>(configStream).Add<SetApplicationInstrumentationConfigMessage>();
@@ -3644,6 +3631,7 @@ namespace rhi {
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
 			impl->debugInstrumentation.runtime = nullptr;
 			impl->debugInstrumentation.state.active = false;
+			impl->debugInstrumentation.featureQueryCompleted = false;
 		}
 		#else
 		static void Dx12PollReShapeMessages(Dx12Device*) noexcept {
@@ -3709,6 +3697,7 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
+			Dx12EnsureReShapeFeatureList(impl);
 			Dx12PollReShapeMessages(impl);
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
 			out = impl->debugInstrumentation.capabilities;
@@ -3726,6 +3715,7 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
+			Dx12EnsureReShapeFeatureList(impl);
 			Dx12PollReShapeMessages(impl);
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
 			out = impl->debugInstrumentation.state;
@@ -3742,6 +3732,7 @@ namespace rhi {
 				return 0;
 			}
 
+			Dx12EnsureReShapeFeatureList(impl);
 			Dx12PollReShapeMessages(impl);
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
 			return static_cast<uint32_t>(impl->debugInstrumentation.features.size());
@@ -3765,6 +3756,7 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
+			Dx12EnsureReShapeFeatureList(impl);
 			Dx12PollReShapeMessages(impl);
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
 			const auto& features = impl->debugInstrumentation.features;
@@ -3967,9 +3959,7 @@ namespace rhi {
 
 		static void cl_end(CommandList* cl) noexcept {
 			auto* w = dx12_detail::CL(cl);
-			spdlog::info("DX12 command list end begin cl={} native={}", static_cast<const void*>(w), w ? static_cast<const void*>(w->cl.Get()) : nullptr);
 			w->cl->Close();
-			spdlog::info("DX12 command list end complete cl={}", static_cast<const void*>(w));
 		}
 		static void cl_reset(CommandList* cl, const CommandAllocator& ca) noexcept {
 			auto* l = dx12_detail::CL(cl);
@@ -3991,14 +3981,7 @@ namespace rhi {
 			for (auto& page : l->rootCbvScratchPages) {
 				page.cursor = 0;
 			}
-			spdlog::info(
-				"DX12 command list reset begin cl={} native={} allocator={} nativeAllocator={}",
-				static_cast<const void*>(l),
-				l ? static_cast<const void*>(l->cl.Get()) : nullptr,
-				static_cast<const void*>(a),
-				a ? static_cast<const void*>(a->alloc.Get()) : nullptr);
 			l->cl->Reset(a->alloc.Get(), nullptr);
-			spdlog::info("DX12 command list reset complete cl={}", static_cast<const void*>(l));
 		}
 
 		static bool DxSafeClearRenderTargetView(
@@ -5185,13 +5168,7 @@ namespace rhi {
 				return;
 			}
 			auto* A = dx12_detail::Alloc(ca);
-			spdlog::info(
-				"DX12 command allocator reset begin allocator={} native={} queueType={}",
-				static_cast<const void*>(A),
-				A ? static_cast<const void*>(A->alloc.Get()) : nullptr,
-				A ? static_cast<int>(A->type) : -1);
 			A->alloc->Reset(); // ID3D12CommandAllocator::Reset()
-			spdlog::info("DX12 command allocator reset complete allocator={}", static_cast<const void*>(A));
 		}
 
 		// ------------------ QueryPool vtable funcs ----------------

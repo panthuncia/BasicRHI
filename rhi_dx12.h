@@ -307,6 +307,8 @@ namespace rhi {
 		DebugInstrumentationState state{};
 		std::vector<DebugInstrumentationFeature> features;
 		std::deque<DebugInstrumentationDiagnostic> diagnostics;
+		uint32_t featureQueryAttempts = 0;
+		bool featureQueryCompleted = false;
 		void* runtime = nullptr;
 		std::mutex mutex;
 	};
