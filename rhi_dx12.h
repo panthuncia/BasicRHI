@@ -313,12 +313,15 @@ namespace rhi {
 	struct Dx12PendingInstrumentationShaderIssue {
 		DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
 		uint64_t shaderUid = 0;
+		uint64_t sguid = 0;
 		std::string message;
 	};
 
 	struct Dx12ShaderIssueMetadata {
 		bool requested = false;
 		bool resolved = false;
+		bool nativeBinary = false;
+		bool hasDebugFiles = false;
 		std::vector<std::string> filePaths;
 	};
 

@@ -11,16 +11,17 @@
 #include <sl_core_api.h>
 #include <sl_security.h>
 #endif
+#include <Message/MessageStream.h>
 #if BASICRHI_ENABLE_RESHAPE
 #include <Backends/DX12/Layer.h>
 #include <Backend/Environment.h>
 #include <Backend/EnvironmentInfo.h>
 #include <Backend/StartupContainer.h>
 #include <Bridge/IBridge.h>
+#include <Bridge/IBridgeListener.h>
 #include <Bridge/Log/LogSeverity.h>
 #include <Common/ComRef.h>
 #include <Message/IMessageStorage.h>
-#include <Message/MessageStream.h>
 #include <Schemas/Config.h>
 #include <Schemas/Diagnostic.h>
 #include <Schemas/Feature.h>
@@ -36,6 +37,7 @@
 #include <deque>
 #include <cstring>
 #include <charconv>
+#include <new>
 
 #include "rhi_dx12_casting.h"
 
@@ -50,10 +52,33 @@ namespace rhi {
 			PFN_D3D12_CREATE_DEVICE_GPUOPEN createDeviceGPUOpen{ nullptr };
 			::Backend::Environment environment;
 			ComRef<IBridge> bridge{ nullptr };
+			ComRef<IBridgeListener> bridgeTap{ nullptr };
+			std::mutex capturedStreamMutex;
+			std::deque<MessageStream> capturedStreams;
+		};
+
+		struct Dx12ReShapeBridgeTap final : IBridgeListener {
+			explicit Dx12ReShapeBridgeTap(Dx12ReShapeRuntime* runtime) noexcept
+				: runtime(runtime) {
+				address = this;
+			}
+
+			void Handle(const MessageStream* streams, uint32_t count) override {
+				if (!runtime || !streams || count == 0) {
+					return;
+				}
+
+				std::lock_guard guard(runtime->capturedStreamMutex);
+				for (uint32_t index = 0; index < count; ++index) {
+					runtime->capturedStreams.push_back(streams[index]);
+				}
+			}
+
+			Dx12ReShapeRuntime* runtime = nullptr;
 		};
 
 		static void Dx12PollReShapeMessages(Dx12Device* impl) noexcept;
-			static void Dx12BuildDefaultInstrumentationSpecialization(MessageStream& out) noexcept;
+		static void Dx12BuildDefaultInstrumentationSpecialization(MessageStream& out) noexcept;
 
 		static std::wstring Dx12GetExecutableDirectory() noexcept {
 			wchar_t buffer[MAX_PATH] = {};
@@ -3346,6 +3371,47 @@ namespace rhi {
 			return result.ec == std::errc{};
 		}
 
+		static std::string Dx12NormalizeShaderPath(std::string path) {
+			std::transform(path.begin(), path.end(), path.begin(), [](unsigned char value) {
+				return value == '\\'
+					? '/'
+					: static_cast<char>(std::tolower(value));
+			});
+			return path;
+		}
+
+		static bool Dx12IsPrimaryShaderSourcePath(const std::string& path) {
+			if (path.empty()) {
+				return false;
+			}
+
+			const std::string normalized = Dx12NormalizeShaderPath(path);
+			const auto extensionIndex = normalized.find_last_of('.');
+			const std::string extension = extensionIndex == std::string::npos
+				? std::string{}
+				: normalized.substr(extensionIndex);
+			if (normalized.ends_with(".dxil.txt")
+				|| normalized.ends_with(".module.txt")
+				|| normalized.find("gpu-reshape/") != std::string::npos
+				|| normalized.find("/source/backends/dx12/") != std::string::npos
+				|| normalized.find("/source/backends/vulkan/") != std::string::npos
+				|| normalized.find("/modules/") != std::string::npos
+				|| normalized.find("/generated/") != std::string::npos
+				|| normalized.find("/unknown/") != std::string::npos) {
+				return false;
+			}
+
+			return extension == ".hlsl"
+				|| extension == ".hlsli"
+				|| extension == ".fx"
+				|| extension == ".fxh"
+				|| extension == ".slang"
+				|| extension == ".glsl"
+				|| extension == ".comp"
+				|| extension == ".vert"
+				|| extension == ".frag";
+		}
+
 		static bool Dx12HasPendingPipelineIssueUnlocked(const Dx12DebugInstrumentationSession& session,
 			DebugInstrumentationDiagnosticSeverity severity,
 			uint64_t pipelineUid,
@@ -3361,13 +3427,66 @@ namespace rhi {
 		static bool Dx12HasPendingShaderIssueUnlocked(const Dx12DebugInstrumentationSession& session,
 			DebugInstrumentationDiagnosticSeverity severity,
 			uint64_t shaderUid,
+			uint64_t sguid,
 			const char* message) {
 			for (const Dx12PendingInstrumentationShaderIssue& issue : session.pendingShaderIssues) {
-				if (issue.severity == severity && issue.shaderUid == shaderUid && issue.message == (message ? message : "")) {
+				if (issue.severity == severity
+					&& issue.shaderUid == shaderUid
+					&& issue.sguid == sguid
+					&& issue.message == (message ? message : "")) {
 					return true;
 				}
 			}
 			return false;
+		}
+
+		static void Dx12QueuePendingPipelineIssueUnlocked(Dx12DebugInstrumentationSession& session,
+			DebugInstrumentationDiagnosticSeverity severity,
+			uint64_t pipelineUid,
+			const char* message) {
+			if (!pipelineUid) {
+				return;
+			}
+
+			if (!Dx12HasPendingPipelineIssueUnlocked(session, severity, pipelineUid, message)) {
+				session.pendingPipelineIssues.push_back(Dx12PendingInstrumentationPipelineIssue{
+					.severity = severity,
+					.pipelineUid = pipelineUid,
+					.message = message ? message : ""
+				});
+				session.issuesDirty = true;
+			}
+
+			if (!session.pipelineNames.contains(pipelineUid) && !session.requestedPipelineNames.contains(pipelineUid)) {
+				session.pendingPipelineNameRequests.insert(pipelineUid);
+			}
+		}
+
+		static void Dx12QueuePendingShaderIssueUnlocked(Dx12DebugInstrumentationSession& session,
+			DebugInstrumentationDiagnosticSeverity severity,
+			uint64_t shaderUid,
+			uint64_t sguid,
+			const char* message) {
+			if (!shaderUid && !sguid) {
+				return;
+			}
+
+			if (!Dx12HasPendingShaderIssueUnlocked(session, severity, shaderUid, sguid, message)) {
+				session.pendingShaderIssues.push_back(Dx12PendingInstrumentationShaderIssue{
+					.severity = severity,
+					.shaderUid = shaderUid,
+					.sguid = sguid,
+					.message = message ? message : ""
+				});
+				session.issuesDirty = true;
+			}
+
+			if (shaderUid) {
+				Dx12ShaderIssueMetadata& metadata = session.shaderMetadata[shaderUid];
+				if (!metadata.requested) {
+					session.pendingShaderCodeRequests.insert(shaderUid);
+				}
+			}
 		}
 
 		static void Dx12MarkIssueFromMessageUnlocked(Dx12DebugInstrumentationSession& session,
@@ -3379,33 +3498,12 @@ namespace rhi {
 
 			uint64_t uid = 0;
 			if (Dx12TryParseIssueUid(message, "Pipeline ", uid)) {
-				if (!Dx12HasPendingPipelineIssueUnlocked(session, severity, uid, message)) {
-					session.pendingPipelineIssues.push_back(Dx12PendingInstrumentationPipelineIssue{
-						.severity = severity,
-						.pipelineUid = uid,
-						.message = message
-					});
-					session.issuesDirty = true;
-				}
-				if (!session.pipelineNames.contains(uid) && !session.requestedPipelineNames.contains(uid)) {
-					session.pendingPipelineNameRequests.insert(uid);
-				}
+				Dx12QueuePendingPipelineIssueUnlocked(session, severity, uid, message);
 				return;
 			}
 
 			if (Dx12TryParseIssueUid(message, "Shader ", uid)) {
-				if (!Dx12HasPendingShaderIssueUnlocked(session, severity, uid, message)) {
-					session.pendingShaderIssues.push_back(Dx12PendingInstrumentationShaderIssue{
-						.severity = severity,
-						.shaderUid = uid,
-						.message = message
-					});
-					session.issuesDirty = true;
-				}
-				Dx12ShaderIssueMetadata& metadata = session.shaderMetadata[uid];
-				if (!metadata.requested) {
-					session.pendingShaderCodeRequests.insert(uid);
-				}
+				Dx12QueuePendingShaderIssueUnlocked(session, severity, uid, 0, message);
 			}
 		}
 
@@ -3461,29 +3559,70 @@ namespace rhi {
 			}
 
 			for (const Dx12PendingInstrumentationShaderIssue& pendingIssue : session.pendingShaderIssues) {
-				const auto metadataIt = session.shaderMetadata.find(pendingIssue.shaderUid);
-				const bool hasFilePaths = metadataIt != session.shaderMetadata.end() && !metadataIt->second.filePaths.empty();
+				uint64_t resolvedShaderUid = pendingIssue.shaderUid;
+				if (!resolvedShaderUid && pendingIssue.sguid != 0) {
+					const auto mappingIt = session.shaderSourceMappings.find(pendingIssue.sguid);
+					if (mappingIt != session.shaderSourceMappings.end() && mappingIt->second.resolved && mappingIt->second.shaderGuid != 0) {
+						resolvedShaderUid = mappingIt->second.shaderGuid;
+						Dx12ShaderIssueMetadata& metadata = session.shaderMetadata[resolvedShaderUid];
+						if (!metadata.requested) {
+							session.pendingShaderCodeRequests.insert(resolvedShaderUid);
+						}
+					}
+				}
 
-				if (!hasFilePaths) {
+				const auto metadataIt = resolvedShaderUid != 0
+					? session.shaderMetadata.find(resolvedShaderUid)
+					: session.shaderMetadata.end();
+				std::vector<std::string> primaryFilePaths;
+				bool hasInternalFilePaths = false;
+				bool nativeNoSourceShader = false;
+				if (metadataIt != session.shaderMetadata.end()) {
+					nativeNoSourceShader = metadataIt->second.nativeBinary && !metadataIt->second.hasDebugFiles;
+					for (const std::string& filePath : metadataIt->second.filePaths) {
+						if (Dx12IsPrimaryShaderSourcePath(filePath)) {
+							primaryFilePaths.push_back(filePath);
+						} else {
+							hasInternalFilePaths = true;
+						}
+					}
+				}
+				const bool hasSourceMapping = pendingIssue.sguid != 0
+					&& session.shaderSourceMappings.contains(pendingIssue.sguid)
+					&& session.shaderSourceMappings.find(pendingIssue.sguid)->second.resolved;
+
+				if (primaryFilePaths.empty()) {
+					if (nativeNoSourceShader && !hasSourceMapping && pendingIssue.sguid == 0) {
+						continue;
+					}
+
+					if (hasInternalFilePaths && !hasSourceMapping && pendingIssue.sguid == 0) {
+						continue;
+					}
+
 					DebugInstrumentationIssue issue{};
 					issue.severity = pendingIssue.severity;
 					issue.type = DebugInstrumentationIssueType::ShaderFile;
-					issue.objectUid = pendingIssue.shaderUid;
+					issue.objectUid = resolvedShaderUid != 0 ? resolvedShaderUid : pendingIssue.sguid;
 					char label[64] = {};
-					std::snprintf(label, sizeof(label), "Shader %llu", static_cast<unsigned long long>(pendingIssue.shaderUid));
+					if (resolvedShaderUid != 0) {
+						std::snprintf(label, sizeof(label), "Shader %llu", static_cast<unsigned long long>(resolvedShaderUid));
+					} else {
+						std::snprintf(label, sizeof(label), "Shader SGUID %llu", static_cast<unsigned long long>(pendingIssue.sguid));
+					}
 					Dx12CopyDebugString(issue.label, sizeof(issue.label), label);
 					Dx12CopyDebugString(issue.message, sizeof(issue.message), pendingIssue.message.c_str());
 					tryAppendIssue(issue);
 					continue;
 				}
 
-				for (const std::string& filePath : metadataIt->second.filePaths) {
+				for (const std::string& filePath : primaryFilePaths) {
 					DebugInstrumentationIssue issue{};
 					issue.severity = pendingIssue.severity;
 					issue.type = DebugInstrumentationIssueType::ShaderFile;
-					issue.objectUid = pendingIssue.shaderUid;
+					issue.objectUid = resolvedShaderUid;
 					char label[64] = {};
-					std::snprintf(label, sizeof(label), "Shader %llu", static_cast<unsigned long long>(pendingIssue.shaderUid));
+					std::snprintf(label, sizeof(label), "Shader %llu", static_cast<unsigned long long>(resolvedShaderUid));
 					Dx12CopyDebugString(issue.label, sizeof(issue.label), label);
 					Dx12CopyDebugString(issue.path, sizeof(issue.path), filePath.c_str());
 					Dx12CopyDebugString(issue.message, sizeof(issue.message), pendingIssue.message.c_str());
@@ -3719,6 +3858,243 @@ namespace rhi {
 			Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Info, infoMessage);
 		}
 
+		static void Dx12ProcessReShapeMessageStream(Dx12Device* impl, MessageStream& stream, MessageStream& requestStream) noexcept {
+			const MessageSchema schema = stream.GetSchema();
+
+			if (stream.Is<LogMessage>()) {
+				ConstMessageStreamView<LogMessage> view(stream);
+				for (auto it = view.GetIterator(); it; ++it) {
+					Dx12AppendInstrumentationDiagnostic(impl, Dx12MapReShapeSeverity(it->severity), it->message.View().data());
+				}
+				return;
+			}
+
+			if (schema == OrderedMessageSchema::GetSchema()) {
+				ConstMessageStreamView<> view(stream);
+				for (auto it = view.GetIterator(); it; ++it) {
+					switch (it.GetID()) {
+					case FeatureListMessage::kID:
+						Dx12SetReShapeFeatureList(impl, *it.Get<FeatureListMessage>());
+						break;
+					case InstrumentationDiagnosticMessage::kID: {
+						auto* message = it.Get<InstrumentationDiagnosticMessage>();
+						if (!message) {
+							break;
+						}
+
+						char summary[160] = {};
+						if (message->failedShaders != 0 || message->failedPipelines != 0) {
+							std::snprintf(
+								summary,
+								sizeof(summary),
+								"Instrumentation failed for %u shader(s) and %u pipeline(s).",
+								message->failedShaders,
+								message->failedPipelines);
+							Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, summary);
+						}
+
+						std::snprintf(
+							summary,
+							sizeof(summary),
+							"Instrumented %u shader(s) (%u ms) and %u pipeline(s) (%u ms), total %u ms.",
+							message->passedShaders,
+							message->millisecondsShaders,
+							message->passedPipelines,
+							message->millisecondsPipelines,
+							message->millisecondsTotal);
+						Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Info, summary);
+
+						MessageStream diagnosticStream;
+						message->messages.Transfer(diagnosticStream);
+						ConstMessageStreamView<CompilationDiagnosticMessage> diagnosticsView(diagnosticStream);
+						for (auto diagIt = diagnosticsView.GetIterator(); diagIt; ++diagIt) {
+							Dx12AppendInstrumentationDiagnostic(
+								impl,
+								DebugInstrumentationDiagnosticSeverity::Error,
+								diagIt->content.View().data());
+						}
+						break;
+					}
+					case PipelineNameMessage::kID: {
+						auto* message = it.Get<PipelineNameMessage>();
+						if (!message) {
+							break;
+						}
+
+						std::lock_guard guard(impl->debugInstrumentation.mutex);
+						impl->debugInstrumentation.pipelineNames[message->pipelineUID] = std::string(message->name.View());
+						impl->debugInstrumentation.issuesDirty = true;
+						break;
+					}
+					case ShaderCodeMessage::kID: {
+						auto* message = it.Get<ShaderCodeMessage>();
+						if (!message) {
+							break;
+						}
+
+						std::lock_guard guard(impl->debugInstrumentation.mutex);
+						Dx12ShaderIssueMetadata& metadata = impl->debugInstrumentation.shaderMetadata[message->shaderUID];
+						metadata.requested = true;
+						metadata.resolved = message->found != 0;
+						metadata.nativeBinary = message->native != 0;
+						metadata.hasDebugFiles = message->fileCount != 0;
+						impl->debugInstrumentation.issuesDirty = true;
+						break;
+					}
+					case ShaderCodeFileMessage::kID: {
+						auto* message = it.Get<ShaderCodeFileMessage>();
+						if (!message) {
+							break;
+						}
+
+						const std::string filename(message->filename.View());
+						if (filename.empty()) {
+							break;
+						}
+
+						std::lock_guard guard(impl->debugInstrumentation.mutex);
+						Dx12ShaderIssueMetadata& metadata = impl->debugInstrumentation.shaderMetadata[message->shaderUID];
+						metadata.requested = true;
+						metadata.resolved = true;
+						metadata.hasDebugFiles = true;
+						auto& filePaths = metadata.filePaths;
+						if (std::find(filePaths.begin(), filePaths.end(), filename) == filePaths.end()) {
+							filePaths.push_back(filename);
+							impl->debugInstrumentation.issuesDirty = true;
+						}
+						break;
+					}
+					case SetGlobalInstrumentationMessage::kID: {
+						std::lock_guard guard(impl->debugInstrumentation.mutex);
+						impl->debugInstrumentation.state.globalFeatureMask = it.Get<SetGlobalInstrumentationMessage>()->featureBitSet;
+						break;
+					}
+					default:
+						break;
+					}
+				}
+				return;
+			}
+
+			if (stream.Is<ShaderSourceMappingMessage>()) {
+				ConstMessageStreamView<ShaderSourceMappingMessage> view(stream);
+				for (auto it = view.GetIterator(); it; ++it) {
+					std::lock_guard guard(impl->debugInstrumentation.mutex);
+					Dx12ShaderSourceMappingMetadata& mapping = impl->debugInstrumentation.shaderSourceMappings[it->sguid];
+					mapping.requested = true;
+					mapping.resolved = it->shaderGUID != 0 || !it->contents.Empty();
+					mapping.shaderGuid = it->shaderGUID;
+					mapping.line = it->line;
+					mapping.column = it->column;
+					mapping.sourceLine.assign(it->contents.View());
+					impl->debugInstrumentation.issuesDirty = true;
+				}
+				return;
+			}
+
+			if (stream.Is<ExecutionStackTraceMessage>()) {
+				ConstMessageStreamView<ExecutionStackTraceMessage> view(stream);
+				for (auto it = view.GetIterator(); it; ++it) {
+					if (!it->rollingExecutionUID) {
+						continue;
+					}
+
+					std::lock_guard guard(impl->debugInstrumentation.mutex);
+					impl->debugInstrumentation.executionStacks[it->rollingExecutionUID] = std::string(it->stackTrace.View());
+				}
+				return;
+			}
+
+			if (stream.Is<DescriptorMismatchMessage>()) {
+				ConstMessageStreamView<DescriptorMismatchMessage> view(stream);
+				for (auto it = view.GetIterator(); it; ++it) {
+					const DescriptorMismatchMessage* message = it.Get();
+					const uint32_t chunkMask = Dx12GetChunkMask(*message);
+					const uint8_t* chunkData = reinterpret_cast<const uint8_t*>(message) + sizeof(DescriptorMismatchMessage);
+					const DescriptorMismatchMessage::TracebackChunk* traceback = nullptr;
+
+					if (chunkMask & static_cast<uint32_t>(DescriptorMismatchMessage::Chunk::Detail)) {
+						chunkData += sizeof(DescriptorMismatchMessage::DetailChunk);
+					}
+					if (chunkMask & static_cast<uint32_t>(DescriptorMismatchMessage::Chunk::Traceback)) {
+						traceback = reinterpret_cast<const DescriptorMismatchMessage::TracebackChunk*>(chunkData);
+					}
+
+					std::string formatted;
+					{
+						std::lock_guard guard(impl->debugInstrumentation.mutex);
+						Dx12QueueShaderSourceMappingRequestUnlocked(impl->debugInstrumentation, message->sguid);
+						uint64_t shaderUid = 0;
+						auto mappingIt = impl->debugInstrumentation.shaderSourceMappings.find(message->sguid);
+						if (mappingIt != impl->debugInstrumentation.shaderSourceMappings.end() && mappingIt->second.resolved) {
+							shaderUid = mappingIt->second.shaderGuid;
+						}
+						formatted = Dx12FormatDescriptorMismatchMessage(impl->debugInstrumentation, *message, traceback);
+						Dx12QueuePendingShaderIssueUnlocked(
+							impl->debugInstrumentation,
+							DebugInstrumentationDiagnosticSeverity::Error,
+							shaderUid,
+							message->sguid,
+							formatted.c_str());
+						if (traceback && traceback->pipelineUid != 0) {
+							Dx12QueuePendingPipelineIssueUnlocked(
+								impl->debugInstrumentation,
+								DebugInstrumentationDiagnosticSeverity::Error,
+								traceback->pipelineUid,
+								formatted.c_str());
+						}
+					}
+
+					Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, formatted.c_str());
+				}
+				return;
+			}
+
+			if (stream.Is<ResourceIndexOutOfBoundsMessage>()) {
+				ConstMessageStreamView<ResourceIndexOutOfBoundsMessage> view(stream);
+				for (auto it = view.GetIterator(); it; ++it) {
+					const ResourceIndexOutOfBoundsMessage* message = it.Get();
+					const uint32_t chunkMask = Dx12GetChunkMask(*message);
+					const uint8_t* chunkData = reinterpret_cast<const uint8_t*>(message) + sizeof(ResourceIndexOutOfBoundsMessage);
+					const ResourceIndexOutOfBoundsMessage::TracebackChunk* traceback = nullptr;
+
+					if (chunkMask & static_cast<uint32_t>(ResourceIndexOutOfBoundsMessage::Chunk::Detail)) {
+						chunkData += sizeof(ResourceIndexOutOfBoundsMessage::DetailChunk);
+					}
+					if (chunkMask & static_cast<uint32_t>(ResourceIndexOutOfBoundsMessage::Chunk::Traceback)) {
+						traceback = reinterpret_cast<const ResourceIndexOutOfBoundsMessage::TracebackChunk*>(chunkData);
+					}
+
+					std::string formatted;
+					{
+						std::lock_guard guard(impl->debugInstrumentation.mutex);
+						Dx12QueueShaderSourceMappingRequestUnlocked(impl->debugInstrumentation, message->sguid);
+						uint64_t shaderUid = 0;
+						auto mappingIt = impl->debugInstrumentation.shaderSourceMappings.find(message->sguid);
+						if (mappingIt != impl->debugInstrumentation.shaderSourceMappings.end() && mappingIt->second.resolved) {
+							shaderUid = mappingIt->second.shaderGuid;
+						}
+						formatted = Dx12FormatResourceBoundsMessage(impl->debugInstrumentation, *message, traceback);
+						Dx12QueuePendingShaderIssueUnlocked(
+							impl->debugInstrumentation,
+							DebugInstrumentationDiagnosticSeverity::Warning,
+							shaderUid,
+							message->sguid,
+							formatted.c_str());
+						if (traceback && traceback->pipelineUid != 0) {
+							Dx12QueuePendingPipelineIssueUnlocked(
+								impl->debugInstrumentation,
+								DebugInstrumentationDiagnosticSeverity::Warning,
+								traceback->pipelineUid,
+								formatted.c_str());
+						}
+					}
+
+					Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Warning, formatted.c_str());
+				}
+			}
+		}
+
 		static void Dx12EnsureReShapeFeatureList(Dx12Device* impl) noexcept {
 			auto* runtime = Dx12GetReShapeRuntime(impl);
 			if (!impl || !runtime || !runtime->bridge) {
@@ -3746,209 +4122,32 @@ namespace rhi {
 			if (!runtime || !runtime->bridge) {
 				return;
 			}
-
-			IMessageStorage* storage = runtime->bridge->GetOutput();
-			if (!storage) {
-				return;
-			}
-
-			uint32_t streamCount = 0;
-			storage->ConsumeStreams(&streamCount, nullptr);
-			if (streamCount == 0) {
-				return;
-			}
-
-			std::vector<MessageStream> streams(streamCount);
-			storage->ConsumeStreams(&streamCount, streams.data());
 			MessageStream requestStream;
 
-			for (uint32_t streamIndex = 0; streamIndex < streamCount; ++streamIndex) {
-				MessageStream& stream = streams[streamIndex];
-				const MessageSchema schema = stream.GetSchema();
+			std::deque<MessageStream> capturedStreams;
+			{
+				std::lock_guard guard(runtime->capturedStreamMutex);
+				capturedStreams.swap(runtime->capturedStreams);
+			}
 
-				if (stream.Is<LogMessage>()) {
-					ConstMessageStreamView<LogMessage> view(stream);
-					for (auto it = view.GetIterator(); it; ++it) {
-						Dx12AppendInstrumentationDiagnostic(impl, Dx12MapReShapeSeverity(it->severity), it->message.View().data());
-					}
-					storage->Free(stream);
-					continue;
-				}
+			for (MessageStream& stream : capturedStreams) {
+				Dx12ProcessReShapeMessageStream(impl, stream, requestStream);
+			}
 
-				if (schema == OrderedMessageSchema::GetSchema()) {
-					ConstMessageStreamView<> view(stream);
-					for (auto it = view.GetIterator(); it; ++it) {
-						switch (it.GetID()) {
-						case FeatureListMessage::kID:
-							Dx12SetReShapeFeatureList(impl, *it.Get<FeatureListMessage>());
-							break;
-						case InstrumentationDiagnosticMessage::kID: {
-							auto* message = it.Get<InstrumentationDiagnosticMessage>();
-							if (!message) {
-								break;
-							}
+			IMessageStorage* storage = runtime->bridge->GetOutput();
+			if (storage) {
+				uint32_t streamCount = 0;
+				storage->ConsumeStreams(&streamCount, nullptr);
+				if (streamCount != 0) {
+					std::vector<MessageStream> streams(streamCount);
+					storage->ConsumeStreams(&streamCount, streams.data());
 
-							char summary[160] = {};
-							if (message->failedShaders != 0 || message->failedPipelines != 0) {
-								std::snprintf(
-									summary,
-									sizeof(summary),
-									"Instrumentation failed for %u shader(s) and %u pipeline(s).",
-									message->failedShaders,
-									message->failedPipelines);
-								Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, summary);
-							}
-
-							std::snprintf(
-								summary,
-								sizeof(summary),
-								"Instrumented %u shader(s) (%u ms) and %u pipeline(s) (%u ms), total %u ms.",
-								message->passedShaders,
-								message->millisecondsShaders,
-								message->passedPipelines,
-								message->millisecondsPipelines,
-								message->millisecondsTotal);
-							Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Info, summary);
-
-							MessageStream diagnosticStream;
-							message->messages.Transfer(diagnosticStream);
-							ConstMessageStreamView<CompilationDiagnosticMessage> diagnosticsView(diagnosticStream);
-							for (auto diagIt = diagnosticsView.GetIterator(); diagIt; ++diagIt) {
-								Dx12AppendInstrumentationDiagnostic(
-									impl,
-									DebugInstrumentationDiagnosticSeverity::Error,
-									diagIt->content.View().data());
-							}
-							break;
-						}
-						case PipelineNameMessage::kID: {
-							auto* message = it.Get<PipelineNameMessage>();
-							if (!message) {
-								break;
-							}
-
-							std::lock_guard guard(impl->debugInstrumentation.mutex);
-							impl->debugInstrumentation.pipelineNames[message->pipelineUID] = std::string(message->name.View());
-							impl->debugInstrumentation.issuesDirty = true;
-							break;
-						}
-						case ShaderCodeMessage::kID: {
-							auto* message = it.Get<ShaderCodeMessage>();
-							if (!message) {
-								break;
-							}
-
-							std::lock_guard guard(impl->debugInstrumentation.mutex);
-							Dx12ShaderIssueMetadata& metadata = impl->debugInstrumentation.shaderMetadata[message->shaderUID];
-							metadata.requested = true;
-							metadata.resolved = message->found != 0;
-							impl->debugInstrumentation.issuesDirty = true;
-							break;
-						}
-						case ShaderCodeFileMessage::kID: {
-							auto* message = it.Get<ShaderCodeFileMessage>();
-							if (!message) {
-								break;
-							}
-
-							const std::string filename(message->filename.View());
-							if (filename.empty()) {
-								break;
-							}
-
-							std::lock_guard guard(impl->debugInstrumentation.mutex);
-							Dx12ShaderIssueMetadata& metadata = impl->debugInstrumentation.shaderMetadata[message->shaderUID];
-							metadata.requested = true;
-							metadata.resolved = true;
-							auto& filePaths = metadata.filePaths;
-							if (std::find(filePaths.begin(), filePaths.end(), filename) == filePaths.end()) {
-								filePaths.push_back(filename);
-								impl->debugInstrumentation.issuesDirty = true;
-							}
-							break;
-						}
-						case SetGlobalInstrumentationMessage::kID: {
-							std::lock_guard guard(impl->debugInstrumentation.mutex);
-							impl->debugInstrumentation.state.globalFeatureMask = it.Get<SetGlobalInstrumentationMessage>()->featureBitSet;
-							break;
-						}
-						default:
-							break;
-						}
-					}
-				} else if (stream.Is<ShaderSourceMappingMessage>()) {
-					ConstMessageStreamView<ShaderSourceMappingMessage> view(stream);
-					for (auto it = view.GetIterator(); it; ++it) {
-						std::lock_guard guard(impl->debugInstrumentation.mutex);
-						Dx12ShaderSourceMappingMetadata& mapping = impl->debugInstrumentation.shaderSourceMappings[it->sguid];
-						mapping.requested = true;
-						mapping.resolved = it->shaderGUID != 0 || !it->contents.Empty();
-						mapping.shaderGuid = it->shaderGUID;
-						mapping.line = it->line;
-						mapping.column = it->column;
-						mapping.sourceLine.assign(it->contents.View());
-					}
-				} else if (stream.Is<ExecutionStackTraceMessage>()) {
-					ConstMessageStreamView<ExecutionStackTraceMessage> view(stream);
-					for (auto it = view.GetIterator(); it; ++it) {
-						if (!it->rollingExecutionUID) {
-							continue;
-						}
-
-						std::lock_guard guard(impl->debugInstrumentation.mutex);
-						impl->debugInstrumentation.executionStacks[it->rollingExecutionUID] = std::string(it->stackTrace.View());
-					}
-				} else if (stream.Is<DescriptorMismatchMessage>()) {
-					ConstMessageStreamView<DescriptorMismatchMessage> view(stream);
-					for (auto it = view.GetIterator(); it; ++it) {
-						const DescriptorMismatchMessage* message = it.Get();
-						const uint32_t chunkMask = Dx12GetChunkMask(*message);
-						const uint8_t* chunkData = reinterpret_cast<const uint8_t*>(message) + sizeof(DescriptorMismatchMessage);
-						const DescriptorMismatchMessage::TracebackChunk* traceback = nullptr;
-
-						if (chunkMask & static_cast<uint32_t>(DescriptorMismatchMessage::Chunk::Detail)) {
-							chunkData += sizeof(DescriptorMismatchMessage::DetailChunk);
-						}
-						if (chunkMask & static_cast<uint32_t>(DescriptorMismatchMessage::Chunk::Traceback)) {
-							traceback = reinterpret_cast<const DescriptorMismatchMessage::TracebackChunk*>(chunkData);
-						}
-
-						std::string formatted;
-						{
-							std::lock_guard guard(impl->debugInstrumentation.mutex);
-							Dx12QueueShaderSourceMappingRequestUnlocked(impl->debugInstrumentation, message->sguid);
-							formatted = Dx12FormatDescriptorMismatchMessage(impl->debugInstrumentation, *message, traceback);
-						}
-
-						Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, formatted.c_str());
-					}
-				} else if (stream.Is<ResourceIndexOutOfBoundsMessage>()) {
-					ConstMessageStreamView<ResourceIndexOutOfBoundsMessage> view(stream);
-					for (auto it = view.GetIterator(); it; ++it) {
-						const ResourceIndexOutOfBoundsMessage* message = it.Get();
-						const uint32_t chunkMask = Dx12GetChunkMask(*message);
-						const uint8_t* chunkData = reinterpret_cast<const uint8_t*>(message) + sizeof(ResourceIndexOutOfBoundsMessage);
-						const ResourceIndexOutOfBoundsMessage::TracebackChunk* traceback = nullptr;
-
-						if (chunkMask & static_cast<uint32_t>(ResourceIndexOutOfBoundsMessage::Chunk::Detail)) {
-							chunkData += sizeof(ResourceIndexOutOfBoundsMessage::DetailChunk);
-						}
-						if (chunkMask & static_cast<uint32_t>(ResourceIndexOutOfBoundsMessage::Chunk::Traceback)) {
-							traceback = reinterpret_cast<const ResourceIndexOutOfBoundsMessage::TracebackChunk*>(chunkData);
-						}
-
-						std::string formatted;
-						{
-							std::lock_guard guard(impl->debugInstrumentation.mutex);
-							Dx12QueueShaderSourceMappingRequestUnlocked(impl->debugInstrumentation, message->sguid);
-							formatted = Dx12FormatResourceBoundsMessage(impl->debugInstrumentation, *message, traceback);
-						}
-
-						Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Warning, formatted.c_str());
+					for (uint32_t streamIndex = 0; streamIndex < streamCount; ++streamIndex) {
+						MessageStream& stream = streams[streamIndex];
+						Dx12ProcessReShapeMessageStream(impl, stream, requestStream);
+						storage->Free(stream);
 					}
 				}
-
-				storage->Free(stream);
 			}
 
 			bool queuedDefaultDescriptorMask = false;
@@ -4117,6 +4316,21 @@ namespace rhi {
 				return false;
 			}
 
+			runtime->bridgeTap = ComRef<IBridgeListener>(new (std::nothrow) Dx12ReShapeBridgeTap(runtime));
+			if (!runtime->bridgeTap) {
+				FreeLibrary(runtime->module);
+				delete runtime;
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, "Failed to allocate GPU-Reshape bridge tap for in-process message capture.");
+				return false;
+			}
+
+			runtime->bridge->Register(runtime->bridgeTap);
+			runtime->bridge->Register(LogMessage::kID, runtime->bridgeTap);
+			runtime->bridge->Register(ShaderSourceMappingMessage::kID, runtime->bridgeTap);
+			runtime->bridge->Register(ExecutionStackTraceMessage::kID, runtime->bridgeTap);
+			runtime->bridge->Register(DescriptorMismatchMessage::kID, runtime->bridgeTap);
+			runtime->bridge->Register(ResourceIndexOutOfBoundsMessage::kID, runtime->bridgeTap);
+
 			D3D12_DEVICE_GPUOPEN_GPU_RESHAPE_INFO gpuOpenInfo{};
 			gpuOpenInfo.registry = runtime->environment.GetRegistry();
 
@@ -4127,6 +4341,13 @@ namespace rhi {
 				IID_PPV_ARGS(&reshapeDevice),
 				&gpuOpenInfo);
 			if (FAILED(hr)) {
+				runtime->bridge->Deregister(ResourceIndexOutOfBoundsMessage::kID, runtime->bridgeTap);
+				runtime->bridge->Deregister(DescriptorMismatchMessage::kID, runtime->bridgeTap);
+				runtime->bridge->Deregister(ExecutionStackTraceMessage::kID, runtime->bridgeTap);
+				runtime->bridge->Deregister(ShaderSourceMappingMessage::kID, runtime->bridgeTap);
+				runtime->bridge->Deregister(LogMessage::kID, runtime->bridgeTap);
+				runtime->bridge->Deregister(runtime->bridgeTap);
+				runtime->bridgeTap.Release();
 				FreeLibrary(runtime->module);
 				delete runtime;
 				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Error, "GPU-Reshape failed to wrap the D3D12 device. Falling back to an uninstrumented device.");
@@ -4178,6 +4399,15 @@ namespace rhi {
 			}
 
 			Dx12PollReShapeMessages(impl);
+			if (runtime->bridge && runtime->bridgeTap) {
+				runtime->bridge->Deregister(ResourceIndexOutOfBoundsMessage::kID, runtime->bridgeTap);
+				runtime->bridge->Deregister(DescriptorMismatchMessage::kID, runtime->bridgeTap);
+				runtime->bridge->Deregister(ExecutionStackTraceMessage::kID, runtime->bridgeTap);
+				runtime->bridge->Deregister(ShaderSourceMappingMessage::kID, runtime->bridgeTap);
+				runtime->bridge->Deregister(LogMessage::kID, runtime->bridgeTap);
+				runtime->bridge->Deregister(runtime->bridgeTap);
+				runtime->bridgeTap.Release();
+			}
 			if (runtime->module) {
 				FreeLibrary(runtime->module);
 				runtime->module = nullptr;
@@ -4189,7 +4419,21 @@ namespace rhi {
 			impl->debugInstrumentation.featureQueryCompleted = false;
 		}
 		#else
+		static void Dx12BuildDefaultInstrumentationSpecialization(MessageStream&) noexcept {
+		}
+
 		static void Dx12PollReShapeMessages(Dx12Device*) noexcept {
+		}
+
+		static Result Dx12CommitReShapeMessages(Dx12Device*, MessageStream&) noexcept {
+			return Result::Unsupported;
+		}
+
+		static Result Dx12RefreshReShapeFeatures(Dx12Device*) noexcept {
+			return Result::Unsupported;
+		}
+
+		static void Dx12EnsureReShapeFeatureList(Dx12Device*) noexcept {
 		}
 
 		static bool Dx12InitializeReShapeRuntime(Dx12Device*, const DeviceCreateInfo&) noexcept {
@@ -4457,6 +4701,7 @@ namespace rhi {
 				impl->debugInstrumentation.defaultDescriptorMaskApplied = true;
 			}
 
+			#if BASICRHI_ENABLE_RESHAPE
 			MessageStream stream;
 			MessageStream specializationStream;
 			Dx12BuildDefaultInstrumentationSpecialization(specializationStream);
@@ -4469,6 +4714,10 @@ namespace rhi {
 			if (Dx12CommitReShapeMessages(impl, stream) != Result::Ok) {
 				RHI_FAIL(Result::Failed);
 			}
+			#else
+			(void)featureMask;
+			RHI_FAIL(Result::Unsupported);
+			#endif
 
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
 			impl->debugInstrumentation.state.globalFeatureMask = featureMask;
@@ -4489,6 +4738,7 @@ namespace rhi {
 				RHI_FAIL(Result::Unsupported);
 			}
 
+			#if BASICRHI_ENABLE_RESHAPE
 			MessageStream stream;
 			auto* message = MessageStreamView<>(stream).Add<SetApplicationInstrumentationConfigMessage>();
 			message->synchronousRecording = enabled;
@@ -4496,6 +4746,10 @@ namespace rhi {
 			if (Dx12CommitReShapeMessages(impl, stream) != Result::Ok) {
 				RHI_FAIL(Result::Failed);
 			}
+			#else
+			(void)enabled;
+			RHI_FAIL(Result::Unsupported);
+			#endif
 
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
 			impl->debugInstrumentation.state.synchronousRecording = enabled;
