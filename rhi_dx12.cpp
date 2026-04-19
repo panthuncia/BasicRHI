@@ -3536,100 +3536,15 @@ namespace rhi {
 			return std::string(source.substr(lineStart, lineEnd - lineStart));
 		}
 
-		static std::string Dx12NormalizeSourceLineForComparison(std::string_view line) {
-			size_t begin = 0;
-			while (begin < line.size() && std::isspace(static_cast<unsigned char>(line[begin])) != 0) {
-				++begin;
-			}
-
-			size_t end = line.size();
-			while (end > begin && std::isspace(static_cast<unsigned char>(line[end - 1])) != 0) {
-				--end;
-			}
-
-			std::string normalized;
-			normalized.reserve(end - begin);
-			for (size_t index = begin; index < end; ++index) {
-				const unsigned char value = static_cast<unsigned char>(line[index]);
-				normalized.push_back(static_cast<char>(std::tolower(value)));
-			}
-
-			return normalized;
-		}
-		static constexpr uint32_t kDx12InvalidShaderSourceFileUid = 0xFFFFu;
-
-		static bool Dx12TryResolveMappedShaderFileFallback(
-			const Dx12ShaderIssueMetadata& metadata,
-			const Dx12ShaderSourceMappingMetadata& mapping,
-			uint32_t& resolvedFileUid,
-			std::string* resolvedPath = nullptr,
-			std::string* resolvedContents = nullptr) {
-			if (!mapping.resolved) {
-				return false;
-			}
-
-			if (mapping.fileUid != kDx12InvalidShaderSourceFileUid) {
-				const auto exactPathIt = metadata.filePathsByUid.find(mapping.fileUid);
-				if (exactPathIt != metadata.filePathsByUid.end()) {
-					resolvedFileUid = mapping.fileUid;
-					if (resolvedPath) {
-						*resolvedPath = exactPathIt->second;
-					}
-					if (resolvedContents) {
-						const auto exactContentsIt = metadata.fileContentsByUid.find(mapping.fileUid);
-						resolvedContents->assign(exactContentsIt != metadata.fileContentsByUid.end() ? exactContentsIt->second : std::string{});
-					}
-					return true;
-				}
-			}
-
-			const std::string normalizedMappedLine = Dx12NormalizeSourceLineForComparison(mapping.sourceLine);
-			if (normalizedMappedLine.empty()) {
-				return false;
-			}
-
-			uint32_t matchedFileUid = kDx12InvalidShaderSourceFileUid;
-			const std::string* matchedPath = nullptr;
-			const std::string* matchedContents = nullptr;
-			bool ambiguousMatch = false;
-
-			for (const auto& [fileUid, contents] : metadata.fileContentsByUid) {
-				const std::string candidateLine = Dx12ExtractSourceLineText(contents, mapping.line);
-				if (candidateLine.empty()) {
-					continue;
-				}
-
-				if (Dx12NormalizeSourceLineForComparison(candidateLine) != normalizedMappedLine) {
-					continue;
-				}
-
-				const auto pathIt = metadata.filePathsByUid.find(fileUid);
-				if (pathIt == metadata.filePathsByUid.end()) {
-					continue;
-				}
-
-				if (matchedPath != nullptr) {
-					ambiguousMatch = true;
-					break;
-				}
-
-				matchedFileUid = fileUid;
-				matchedPath = &pathIt->second;
-				matchedContents = &contents;
-			}
-
-			if (!matchedPath || ambiguousMatch) {
-				return false;
-			}
-
-			resolvedFileUid = matchedFileUid;
-			if (resolvedPath) {
-				*resolvedPath = *matchedPath;
-			}
-			if (resolvedContents && matchedContents) {
-				*resolvedContents = *matchedContents;
-			}
-			return true;
+		static std::string Dx12BuildSyntheticShaderSourcePath(uint64_t shaderUid, uint32_t fileUid) {
+			char buffer[96] = {};
+			std::snprintf(
+				buffer,
+				sizeof(buffer),
+				"shader_%llu/file_%u.hlsl",
+				static_cast<unsigned long long>(shaderUid),
+				fileUid);
+			return buffer;
 		}
 
 		static void Dx12AppendInstrumentationDiagnostic(
@@ -3638,8 +3553,10 @@ namespace rhi {
 			const char* message,
 			bool mirrorToSpdlog = true) noexcept;
 
+		static constexpr uint32_t kDx12InvalidShaderSourceFileUid = 0xFFFFu;
 		static constexpr uint32_t kDx12InvalidShaderSguid = (1u << 20u) - 1u;
 		static constexpr uint32_t kDx12MaxShaderSourceMappingRequestAttempts = 4u;
+		static constexpr size_t kDx12MaxRetainedInstrumentationDiagnostics = 2048;
 
 		static void Dx12AppendShaderResolutionInfo(
 			Dx12Device* impl,
@@ -3689,6 +3606,41 @@ namespace rhi {
 			Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Info, message, false);
 		}
 
+		static void Dx12AppendShaderEntryPointDiagnostic(
+			Dx12Device* impl,
+			uint64_t shaderUid,
+			std::string_view entryPoint,
+			bool found,
+			bool native,
+			uint32_t fileCount) {
+			if (!impl || !found) {
+				return;
+			}
+
+			if (!entryPoint.empty()) {
+				char message[256] = {};
+				std::snprintf(
+					message,
+					sizeof(message),
+					"Shader code entry point: shader %llu -> %.*s",
+					static_cast<unsigned long long>(shaderUid),
+					static_cast<int>((std::min)(entryPoint.size(), static_cast<size_t>(160))),
+					entryPoint.data());
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Info, message, false);
+				return;
+			}
+
+			char message[256] = {};
+			std::snprintf(
+				message,
+				sizeof(message),
+				"Shader code response for shader %llu did not include an entry point name (native=%s, fileCount=%u).",
+				static_cast<unsigned long long>(shaderUid),
+				native ? "true" : "false",
+				fileCount);
+			Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Warning, message, false);
+		}
+
 		static bool Dx12HasShaderEntryPointLabel(std::string_view entryPoint) noexcept {
 			return !entryPoint.empty();
 		}
@@ -3712,6 +3664,29 @@ namespace rhi {
 				static_cast<int>((std::min)(filename.size(), static_cast<size_t>(180))),
 				filename.data());
 			Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Info, message, false);
+		}
+
+		static void Dx12AppendShaderCodeSyntheticFilenameInfo(
+			Dx12Device* impl,
+			uint64_t shaderUid,
+			uint32_t fileUid,
+			std::string_view syntheticPath,
+			bool hasPooledSource) {
+			if (!impl) {
+				return;
+			}
+
+			char message[320] = {};
+			std::snprintf(
+				message,
+				sizeof(message),
+				"Shader file response for shader %llu, fileUID %u did not include a filename; using synthetic path %.*s (pooledSource=%s).",
+				static_cast<unsigned long long>(shaderUid),
+				fileUid,
+				static_cast<int>((std::min)(syntheticPath.size(), static_cast<size_t>(160))),
+				syntheticPath.data(),
+				hasPooledSource ? "true" : "false");
+			Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Warning, message, false);
 		}
 
 		static bool Dx12IsPrimaryShaderSourcePath(const std::string& path) {
@@ -3864,6 +3839,100 @@ namespace rhi {
 			}
 
 			return false;
+		}
+
+		static bool Dx12TryFindFallbackShaderFileUid(
+			const Dx12ShaderIssueMetadata& metadata,
+			uint32_t& fileUid) {
+			auto classifyUid = [&](uint32_t uid) {
+				const auto pathIt = metadata.filePathsByUid.find(uid);
+				const auto contentsIt = metadata.fileContentsByUid.find(uid);
+				const bool hasPath = pathIt != metadata.filePathsByUid.end() && !pathIt->second.empty();
+				const bool hasContents = contentsIt != metadata.fileContentsByUid.end() && !contentsIt->second.empty();
+				const bool isPrimary = hasPath && Dx12IsPrimaryShaderSourcePath(pathIt->second);
+				if (isPrimary && hasContents) {
+					return 0;
+				}
+				if (hasPath && hasContents) {
+					return 1;
+				}
+				if (isPrimary && hasPath) {
+					return 2;
+				}
+				if (hasPath) {
+					return 3;
+				}
+				if (hasContents) {
+					return 4;
+				}
+				return 5;
+			};
+
+			bool found = false;
+			int bestClass = 6;
+			auto considerUid = [&](uint32_t uid) {
+				const int candidateClass = classifyUid(uid);
+				if (candidateClass >= bestClass) {
+					return;
+				}
+				bestClass = candidateClass;
+				fileUid = uid;
+				found = candidateClass < 5;
+			};
+
+			for (uint32_t uid : metadata.fileUids) {
+				considerUid(uid);
+				if (bestClass == 0) {
+					return true;
+				}
+			}
+
+			for (const auto& [uid, path] : metadata.filePathsByUid) {
+				(void)path;
+				considerUid(uid);
+				if (bestClass == 0) {
+					return true;
+				}
+			}
+
+			for (const auto& [uid, contents] : metadata.fileContentsByUid) {
+				(void)contents;
+				considerUid(uid);
+				if (bestClass == 0) {
+					return true;
+				}
+			}
+
+			return found;
+		}
+
+		static void Dx12AssignFallbackShaderFile(
+			const Dx12ShaderIssueMetadata& metadata,
+			uint64_t shaderUid,
+			std::string& sourcePath,
+			std::string& sourceContents) {
+			uint32_t fallbackFileUid = kDx12InvalidShaderSourceFileUid;
+			if (!Dx12TryFindFallbackShaderFileUid(metadata, fallbackFileUid)) {
+				return;
+			}
+
+			if (sourcePath.empty()) {
+				const auto pathIt = metadata.filePathsByUid.find(fallbackFileUid);
+				if (pathIt != metadata.filePathsByUid.end() && !pathIt->second.empty()) {
+					sourcePath = pathIt->second;
+				}
+			}
+
+			if (sourceContents.empty()) {
+				const auto contentsIt = metadata.fileContentsByUid.find(fallbackFileUid);
+				if (contentsIt != metadata.fileContentsByUid.end() && !contentsIt->second.empty()) {
+					sourceContents = contentsIt->second;
+				}
+			}
+
+			if (sourcePath.empty() && !sourceContents.empty()) {
+				sourcePath = Dx12BuildSyntheticShaderSourcePath(shaderUid, fallbackFileUid);
+			}
 		}
 
 		static uint64_t Dx12ResolveExecutionDetailShaderUidUnlocked(
@@ -4038,39 +4107,24 @@ namespace rhi {
 						: session.shaderMetadata.end();
 					if (metadataIt != session.shaderMetadata.end()) {
 						snapshot.entryPoint = metadataIt->second.entryPoint;
-						uint32_t resolvedFileUid = kDx12InvalidShaderSourceFileUid;
-						(void)Dx12TryResolveMappedShaderFileFallback(
+						const auto exactPathIt = metadataIt->second.filePathsByUid.find(mappingIt->second.fileUid);
+						if (exactPathIt != metadataIt->second.filePathsByUid.end()) {
+							snapshot.sourcePath = exactPathIt->second;
+						}
+
+						const auto exactContentsIt = metadataIt->second.fileContentsByUid.find(mappingIt->second.fileUid);
+						if (exactContentsIt != metadataIt->second.fileContentsByUid.end()) {
+							snapshot.sourceContents = exactContentsIt->second;
+							if (snapshot.sourcePath.empty() && mappingIt->second.fileUid != kDx12InvalidShaderSourceFileUid) {
+								snapshot.sourcePath = Dx12BuildSyntheticShaderSourcePath(shaderUid, mappingIt->second.fileUid);
+							}
+						}
+
+						Dx12AssignFallbackShaderFile(
 							metadataIt->second,
-							mappingIt->second,
-							resolvedFileUid,
-							&snapshot.sourcePath,
-							&snapshot.sourceContents);
-
-						if (snapshot.sourcePath.empty()) {
-							auto primaryPathIt = std::find_if(
-								metadataIt->second.filePaths.begin(),
-								metadataIt->second.filePaths.end(),
-								[](const std::string& path) {
-									return Dx12IsPrimaryShaderSourcePath(path);
-								});
-							if (primaryPathIt != metadataIt->second.filePaths.end()) {
-								snapshot.sourcePath = *primaryPathIt;
-							} else if (!metadataIt->second.filePaths.empty()) {
-								snapshot.sourcePath = metadataIt->second.filePaths.front();
-							}
-						}
-
-						if (snapshot.sourceContents.empty()) {
-							auto pooledContentsIt = std::find_if(
-								metadataIt->second.fileContentsByUid.begin(),
-								metadataIt->second.fileContentsByUid.end(),
-								[](const auto& entry) {
-									return !entry.second.empty();
-								});
-							if (pooledContentsIt != metadataIt->second.fileContentsByUid.end()) {
-								snapshot.sourceContents = pooledContentsIt->second;
-							}
-						}
+							shaderUid,
+							snapshot.sourcePath,
+							snapshot.sourceContents);
 
 						if (snapshot.sourceText.empty() && !snapshot.sourceContents.empty()) {
 							snapshot.sourceText = Dx12ExtractSourceLineText(snapshot.sourceContents, snapshot.sourceLine);
@@ -4342,15 +4396,20 @@ namespace rhi {
 				if (metadataIt != session.shaderMetadata.end()) {
 					nativeNoSourceShader = metadataIt->second.nativeBinary && !metadataIt->second.hasDebugFiles;
 					shaderEntryPoint = metadataIt->second.entryPoint;
-					if (resolvedMapping) {
-						uint32_t resolvedFileUid = kDx12InvalidShaderSourceFileUid;
-						(void)Dx12TryResolveMappedShaderFileFallback(
-							metadataIt->second,
-							*resolvedMapping,
-							resolvedFileUid,
-							&resolvedFilePath,
-							nullptr);
+					if (resolvedMapping && resolvedMapping->fileUid != kDx12InvalidShaderSourceFileUid) {
+						auto exactPathIt = metadataIt->second.filePathsByUid.find(resolvedMapping->fileUid);
+						if (exactPathIt != metadataIt->second.filePathsByUid.end()) {
+							resolvedFilePath = exactPathIt->second;
+						} else if (metadataIt->second.fileContentsByUid.contains(resolvedMapping->fileUid)) {
+							resolvedFilePath = Dx12BuildSyntheticShaderSourcePath(resolvedShaderUid, resolvedMapping->fileUid);
+						}
 					}
+					std::string fallbackContents;
+					Dx12AssignFallbackShaderFile(
+						metadataIt->second,
+						resolvedShaderUid,
+						resolvedFilePath,
+						fallbackContents);
 					for (const std::string& filePath : metadataIt->second.filePaths) {
 						if (Dx12IsPrimaryShaderSourcePath(filePath)) {
 							if (resolvedFilePath.empty()) {
@@ -4364,10 +4423,6 @@ namespace rhi {
 				const bool hasSourceMapping = pendingIssue.sguid != 0
 					&& session.shaderSourceMappings.contains(pendingIssue.sguid)
 					&& session.shaderSourceMappings.find(pendingIssue.sguid)->second.resolved;
-
-				if (resolvedFilePath.empty() && metadataIt != session.shaderMetadata.end() && !metadataIt->second.filePaths.empty()) {
-					resolvedFilePath = metadataIt->second.filePaths.front();
-				}
 
 				if (resolvedFilePath.empty()) {
 					if (nativeNoSourceShader && !hasSourceMapping && pendingIssue.sguid == 0) {
@@ -4451,7 +4506,7 @@ namespace rhi {
 				}
 			}
 
-			if (diagnostics.size() >= 32) {
+			if (diagnostics.size() >= kDx12MaxRetainedInstrumentationDiagnostics) {
 				diagnostics.pop_front();
 			}
 
@@ -4854,6 +4909,13 @@ namespace rhi {
 							message->found != 0,
 							message->native != 0,
 							message->fileCount);
+						Dx12AppendShaderEntryPointDiagnostic(
+							impl,
+							message->shaderUID,
+							message->entryPoint.View(),
+							message->found != 0,
+							message->native != 0,
+							message->fileCount);
 						break;
 					}
 					case ShaderCodeFileMessage::kID: {
@@ -4862,13 +4924,14 @@ namespace rhi {
 							break;
 						}
 
-						const std::string filename(message->filename.View());
-						if (filename.empty()) {
-							break;
-						}
+						std::string filename(message->filename.View());
 						const std::string sourceContents = message->poolCode != 0
 							? std::string(message->code.View())
 							: std::string{};
+						const bool hadFilename = !filename.empty();
+						if (!hadFilename) {
+							filename = Dx12BuildSyntheticShaderSourcePath(message->shaderUID, message->fileUID);
+						}
 
 						{
 							std::lock_guard guard(impl->debugInstrumentation.mutex);
@@ -4880,6 +4943,10 @@ namespace rhi {
 							auto pathIt = metadata.filePathsByUid.find(message->fileUID);
 							if (pathIt == metadata.filePathsByUid.end() || pathIt->second != filename) {
 								metadata.filePathsByUid[message->fileUID] = filename;
+								metadataChanged = true;
+							}
+							if (std::find(metadata.fileUids.begin(), metadata.fileUids.end(), message->fileUID) == metadata.fileUids.end()) {
+								metadata.fileUids.push_back(message->fileUID);
 								metadataChanged = true;
 							}
 							if (!sourceContents.empty()) {
@@ -4895,6 +4962,14 @@ namespace rhi {
 								metadataChanged = true;
 							}
 							impl->debugInstrumentation.issuesDirty = impl->debugInstrumentation.issuesDirty || metadataChanged;
+						}
+						if (!hadFilename) {
+							Dx12AppendShaderCodeSyntheticFilenameInfo(
+								impl,
+								message->shaderUID,
+								message->fileUID,
+								filename,
+								!sourceContents.empty());
 						}
 						Dx12AppendShaderCodeFileInfo(impl, message->shaderUID, message->fileUID, filename);
 						break;
@@ -5466,7 +5541,7 @@ namespace rhi {
 				impl->debugInstrumentation.capabilities.installSupported = false;
 				impl->debugInstrumentation.capabilities.globalInstrumentationSupported = true;
 				impl->debugInstrumentation.capabilities.shaderInstrumentationSupported = false;
-				impl->debugInstrumentation.capabilities.pipelineInstrumentationSupported = false;
+				impl->debugInstrumentation.capabilities.pipelineInstrumentationSupported = true;
 				impl->debugInstrumentation.capabilities.synchronousRecordingSupported = true;
 			}
 
@@ -5564,7 +5639,7 @@ namespace rhi {
 			instrumentation.capabilities.installSupported = false;
 			instrumentation.capabilities.globalInstrumentationSupported = ci.instrumentation.enableRuntimeInstrumentation && (BASICRHI_ENABLE_RESHAPE != 0);
 			instrumentation.capabilities.shaderInstrumentationSupported = false;
-			instrumentation.capabilities.pipelineInstrumentationSupported = false;
+			instrumentation.capabilities.pipelineInstrumentationSupported = ci.instrumentation.enableRuntimeInstrumentation && (BASICRHI_ENABLE_RESHAPE != 0);
 			instrumentation.capabilities.synchronousRecordingSupported = ci.instrumentation.enableRuntimeInstrumentation && (BASICRHI_ENABLE_RESHAPE != 0);
 			instrumentation.capabilities.featureCount = 0;
 

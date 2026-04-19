@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 
 #include "ImGuiColorTextEdit/TextEditor.h"
 #include "rhi.h"
@@ -29,6 +30,9 @@ namespace rhi::debug {
         bool showDiagnostics_ = false;
         std::string selectedIssueKey_;
         uint64_t selectedExecutionDetailId_ = 0;
+        uint64_t selectedFeatureMask_ = 0;
+        bool selectedFeatureMaskInitialized_ = false;
+        std::unordered_set<uint64_t> selectedPipelineUids_;
         ShaderSourceViewerState shaderSourceViewer_;
     };
 

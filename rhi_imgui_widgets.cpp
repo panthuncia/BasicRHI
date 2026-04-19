@@ -16,6 +16,7 @@
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "rhi_debug.h"
@@ -482,16 +483,45 @@ namespace rhi::debug {
             return true;
         }
 
+        uint32_t ApplySelectedPipelineMask(
+            Device device,
+            std::vector<DebugInstrumentationPipeline>& pipelines,
+            const std::unordered_set<uint64_t>& selectedPipelineUids,
+            uint64_t featureMask,
+            std::string& lastStatus,
+            bool& lastStatusWasError) {
+            uint32_t updatedPipelineCount = 0;
+            for (DebugInstrumentationPipeline& pipeline : pipelines) {
+                if (selectedPipelineUids.find(pipeline.pipelineUid) == selectedPipelineUids.end()) {
+                    continue;
+                }
+
+                if (ApplyPipelineMask(device, pipeline, featureMask, lastStatus, lastStatusWasError)) {
+                    ++updatedPipelineCount;
+                }
+            }
+
+            return updatedPipelineCount;
+        }
+
         void DrawPipelineToggleLine(
             Device device,
             DebugInstrumentationPipeline& pipeline,
+            std::unordered_set<uint64_t>& selectedPipelineUids,
             uint64_t enableMask,
             std::string& lastStatus,
             bool& lastStatusWasError) {
             ImGui::PushID(static_cast<int>(pipeline.pipelineUid));
-            bool explicitlyEnabled = pipeline.explicitlyInstrumented;
+            const bool pipelineSelected = selectedPipelineUids.find(pipeline.pipelineUid) != selectedPipelineUids.end();
+            bool explicitlyEnabled = pipelineSelected;
             if (ImGui::Checkbox("##explicit", &explicitlyEnabled)) {
-                (void)ApplyPipelineMask(device, pipeline, explicitlyEnabled ? enableMask : 0, lastStatus, lastStatusWasError);
+                if (ApplyPipelineMask(device, pipeline, explicitlyEnabled ? enableMask : 0, lastStatus, lastStatusWasError)) {
+                    if (explicitlyEnabled) {
+                        selectedPipelineUids.insert(pipeline.pipelineUid);
+                    } else {
+                        selectedPipelineUids.erase(pipeline.pipelineUid);
+                    }
+                }
             }
             ImGui::SameLine();
             ImGui::TextUnformatted(PipelineLabel(pipeline).c_str());
@@ -512,6 +542,7 @@ namespace rhi::debug {
             Device device,
             TechniquePipelineTreeNode& node,
             std::vector<DebugInstrumentationPipeline>& pipelines,
+            std::unordered_set<uint64_t>& selectedPipelineUids,
             uint64_t enableMask,
             std::string& lastStatus,
             bool& lastStatusWasError) {
@@ -533,7 +564,7 @@ namespace rhi::debug {
             if (!subtreePipelineIndices.empty()) {
                 size_t enabledPipelineCount = 0;
                 for (size_t pipelineIndex : subtreePipelineIndices) {
-                    if (pipelines[pipelineIndex].explicitlyInstrumented) {
+                    if (selectedPipelineUids.find(pipelines[pipelineIndex].pipelineUid) != selectedPipelineUids.end()) {
                         ++enabledPipelineCount;
                     }
                 }
@@ -543,7 +574,13 @@ namespace rhi::debug {
                 if (ImGui::Checkbox("##technique_toggle", &subtreeEnabled)) {
                     const uint64_t subtreeMask = subtreeEnabled ? enableMask : 0;
                     for (size_t pipelineIndex : subtreePipelineIndices) {
-                        (void)ApplyPipelineMask(device, pipelines[pipelineIndex], subtreeMask, lastStatus, lastStatusWasError);
+                        if (ApplyPipelineMask(device, pipelines[pipelineIndex], subtreeMask, lastStatus, lastStatusWasError)) {
+                            if (subtreeEnabled) {
+                                selectedPipelineUids.insert(pipelines[pipelineIndex].pipelineUid);
+                            } else {
+                                selectedPipelineUids.erase(pipelines[pipelineIndex].pipelineUid);
+                            }
+                        }
                     }
                 }
 
@@ -553,10 +590,10 @@ namespace rhi::debug {
 
             if (open) {
                 for (TechniquePipelineTreeNode& child : node.children) {
-                    DrawTechniquePipelineNode(device, child, pipelines, enableMask, lastStatus, lastStatusWasError);
+                    DrawTechniquePipelineNode(device, child, pipelines, selectedPipelineUids, enableMask, lastStatus, lastStatusWasError);
                 }
                 for (size_t pipelineIndex : node.pipelineIndices) {
-                    DrawPipelineToggleLine(device, pipelines[pipelineIndex], enableMask, lastStatus, lastStatusWasError);
+                    DrawPipelineToggleLine(device, pipelines[pipelineIndex], selectedPipelineUids, enableMask, lastStatus, lastStatusWasError);
                 }
                 ImGui::TreePop();
             }
@@ -1005,6 +1042,42 @@ namespace rhi::debug {
         std::vector<size_t> unobservedPipelineIndices;
         TechniquePipelineTreeNode techniquePipelineTree = BuildTechniquePipelineTree(pipelines, pipelineUsages, unobservedPipelineIndices);
 
+        {
+            std::unordered_set<uint64_t> availablePipelineUids;
+            uint64_t explicitFeatureMaskUnion = 0;
+            availablePipelineUids.reserve(pipelines.size());
+            for (const DebugInstrumentationPipeline& pipeline : pipelines) {
+                availablePipelineUids.insert(pipeline.pipelineUid);
+                if (pipeline.explicitlyInstrumented) {
+                    selectedPipelineUids_.insert(pipeline.pipelineUid);
+                    explicitFeatureMaskUnion |= pipeline.explicitFeatureMask;
+                }
+            }
+
+            for (auto it = selectedPipelineUids_.begin(); it != selectedPipelineUids_.end();) {
+                if (availablePipelineUids.find(*it) == availablePipelineUids.end()) {
+                    it = selectedPipelineUids_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            if (!selectedFeatureMaskInitialized_) {
+                selectedFeatureMask_ = state.globalFeatureMask != 0 ? state.globalFeatureMask : explicitFeatureMaskUnion;
+                selectedFeatureMaskInitialized_ = true;
+            }
+        }
+
+        if (state.active && capabilities.globalInstrumentationSupported && state.globalFeatureMask != 0) {
+            const Result result = SetGlobalInstrumentationMask(device, 0);
+            if (IsOk(result)) {
+                state.globalFeatureMask = 0;
+            } else {
+                lastStatus_ = FormatActionResult("Disable backend global instrumentation", result);
+                lastStatusWasError_ = !IsOk(result);
+            }
+        }
+
         if (!selectedIssueKey_.empty() && !FindIssueByIdentityKey(issues, selectedIssueKey_)) {
             selectedIssueKey_.clear();
             selectedExecutionDetailId_ = 0;
@@ -1054,9 +1127,9 @@ namespace rhi::debug {
 
         ImGui::Separator();
 
-        uint64_t workingMask = state.globalFeatureMask;
+        uint64_t workingMask = selectedFeatureMask_;
         const uint64_t pipelineEnableMask = workingMask;
-        const bool allowFeatureEditing = state.active && capabilities.globalInstrumentationSupported && !features.empty();
+        const bool allowFeatureEditing = state.active && capabilities.pipelineInstrumentationSupported && !features.empty();
 
         if (ImGui::BeginTable("InstrumentationLayout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
             ImGui::TableNextColumn();
@@ -1069,23 +1142,28 @@ namespace rhi::debug {
                 for (const DebugInstrumentationFeature& feature : features) {
                     fullMask |= feature.featureBit;
                 }
+                workingMask = fullMask;
+                selectedFeatureMask_ = fullMask;
 
-                const Result result = SetGlobalInstrumentationMask(device, fullMask);
-                lastStatus_ = FormatActionResult("Enable all features", result);
-                lastStatusWasError_ = !IsOk(result);
-                if (IsOk(result)) {
-                    workingMask = fullMask;
-                    state.globalFeatureMask = fullMask;
+                const uint32_t updatedPipelineCount = ApplySelectedPipelineMask(device, pipelines, selectedPipelineUids_, workingMask, lastStatus_, lastStatusWasError_);
+                if (selectedPipelineUids_.empty()) {
+                    lastStatus_ = "Selected feature set updated for future pipeline selections.";
+                    lastStatusWasError_ = false;
+                } else if (!lastStatusWasError_) {
+                    lastStatus_ = "Updated selected feature set for " + std::to_string(updatedPipelineCount) + " selected pipeline(s).";
                 }
             }
             ImGui::SameLine();
             if (ImGui::Button("Disable All Features")) {
-                const Result result = SetGlobalInstrumentationMask(device, 0);
-                lastStatus_ = FormatActionResult("Disable all features", result);
-                lastStatusWasError_ = !IsOk(result);
-                if (IsOk(result)) {
-                    workingMask = 0;
-                    state.globalFeatureMask = 0;
+                workingMask = 0;
+                selectedFeatureMask_ = 0;
+
+                const uint32_t updatedPipelineCount = ApplySelectedPipelineMask(device, pipelines, selectedPipelineUids_, workingMask, lastStatus_, lastStatusWasError_);
+                if (selectedPipelineUids_.empty()) {
+                    lastStatus_ = "Cleared selected feature set.";
+                    lastStatusWasError_ = false;
+                } else if (!lastStatusWasError_) {
+                    lastStatus_ = "Disabled instrumentation for " + std::to_string(updatedPipelineCount) + " selected pipeline(s).";
                 }
             }
             if (!allowFeatureEditing) {
@@ -1099,7 +1177,7 @@ namespace rhi::debug {
                 }
             }
 
-            ImGui::Text("Enabled Features: %d / %u", enabledFeatureCount, static_cast<unsigned>(features.size()));
+            ImGui::Text("Selected Features: %d / %u", enabledFeatureCount, static_cast<unsigned>(features.size()));
 
             if (ImGui::BeginChild("InstrumentationFeatures", ImVec2(0.0f, 220.0f), true)) {
                 if (features.empty()) {
@@ -1118,12 +1196,15 @@ namespace rhi::debug {
                     std::snprintf(checkboxLabel.data(), checkboxLabel.size(), "%s##feature_%zu", feature.name, index);
                     if (ImGui::Checkbox(checkboxLabel.data(), &enabled)) {
                         const uint64_t updatedMask = UpdateInstrumentationFeatureMask(workingMask, feature, enabled);
-                        const Result result = SetGlobalInstrumentationMask(device, updatedMask);
-                        lastStatus_ = FormatActionResult(feature.name, result);
-                        lastStatusWasError_ = !IsOk(result);
-                        if (IsOk(result)) {
-                            workingMask = updatedMask;
-                            state.globalFeatureMask = updatedMask;
+                        workingMask = updatedMask;
+                        selectedFeatureMask_ = updatedMask;
+
+                        const uint32_t updatedPipelineCount = ApplySelectedPipelineMask(device, pipelines, selectedPipelineUids_, workingMask, lastStatus_, lastStatusWasError_);
+                        if (selectedPipelineUids_.empty()) {
+                            lastStatus_ = std::string(feature.name) + ": feature selection updated for future pipeline selections.";
+                            lastStatusWasError_ = false;
+                        } else if (!lastStatusWasError_) {
+                            lastStatus_ = std::string(feature.name) + ": updated " + std::to_string(updatedPipelineCount) + " selected pipeline(s).";
                         }
                     }
 
@@ -1152,7 +1233,7 @@ namespace rhi::debug {
                 }
 
                 if (!haveEnabledFeature) {
-                    ImGui::TextDisabled("No instrumentation features are currently enabled.");
+                    ImGui::TextDisabled("No instrumentation features are currently selected.");
                 }
             }
 
@@ -1160,8 +1241,9 @@ namespace rhi::debug {
                 ImGui::Text("Pipelines: %u", static_cast<unsigned>(pipelines.size()));
                 ImGui::Text("Technique Bindings: %u", static_cast<unsigned>(pipelineUsages.size()));
                 if (pipelineEnableMask == 0) {
-                    ImGui::TextDisabled("No instrumentation feature mask is available. Enable at least one feature globally first.");
+                    ImGui::TextDisabled("No feature set is currently selected. You can still select pipelines now; they will be instrumented once features are selected.");
                 }
+                ImGui::TextDisabled("The feature checklist above is applied only to the selected pipelines below. Backend global instrumentation is forced off.");
 
                 if (ImGui::BeginChild("InstrumentationPipelines", ImVec2(0.0f, 260.0f), true)) {
                     if (pipelines.empty()) {
@@ -1169,13 +1251,13 @@ namespace rhi::debug {
                     }
 
                     for (TechniquePipelineTreeNode& node : techniquePipelineTree.children) {
-                        DrawTechniquePipelineNode(device, node, pipelines, pipelineEnableMask, lastStatus_, lastStatusWasError_);
+                        DrawTechniquePipelineNode(device, node, pipelines, selectedPipelineUids_, pipelineEnableMask, lastStatus_, lastStatusWasError_);
                     }
 
                     if (!unobservedPipelineIndices.empty()) {
                         if (ImGui::TreeNodeEx("Unobserved Pipelines", ImGuiTreeNodeFlags_SpanAvailWidth)) {
                             for (size_t pipelineIndex : unobservedPipelineIndices) {
-                                DrawPipelineToggleLine(device, pipelines[pipelineIndex], pipelineEnableMask, lastStatus_, lastStatusWasError_);
+                                DrawPipelineToggleLine(device, pipelines[pipelineIndex], selectedPipelineUids_, pipelineEnableMask, lastStatus_, lastStatusWasError_);
                             }
                             ImGui::TreePop();
                         }

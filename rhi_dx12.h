@@ -378,6 +378,7 @@ namespace rhi {
 		bool hasDebugFiles = false;
 		std::string entryPoint;
 		std::vector<std::string> filePaths;
+		std::vector<uint32_t> fileUids;
 		std::unordered_map<uint32_t, std::string> filePathsByUid;
 		std::unordered_map<uint32_t, std::string> fileContentsByUid;
 	};
