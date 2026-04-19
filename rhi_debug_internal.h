@@ -52,6 +52,7 @@ namespace rhi::debug {
         DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
         InstrumentationExecutionDetailKind kind = InstrumentationExecutionDetailKind::Unknown;
         std::string pipelineLabel;
+        std::string entryPoint;
         std::string sourcePath;
         uint32_t sourceLine = 0;
         uint32_t sourceColumn = 0;

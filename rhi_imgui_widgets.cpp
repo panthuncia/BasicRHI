@@ -55,6 +55,10 @@ namespace rhi::debug {
             return value ? "Yes" : "No";
         }
 
+        bool HasShaderEntryPointLabel(const DebugInstrumentationIssue& issue) noexcept {
+            return issue.label[0] != '\0';
+        }
+
         std::string FormatActionResult(const char* action, Result result) {
             std::string message = action;
             message += ": ";
@@ -610,6 +614,13 @@ namespace rhi::debug {
                     shaderFullPath = issue.path;
                     shaderDisplayName = std::string(ShaderFilename(shaderFullPath));
                     shaderKey = shaderFullPath;
+                    if (HasShaderEntryPointLabel(issue)) {
+                        shaderDisplayName += " (";
+                        shaderDisplayName += issue.label;
+                        shaderDisplayName += ")";
+                        shaderKey += "|";
+                        shaderKey += issue.label;
+                    }
                 } else if (issue.label[0] != '\0') {
                     shaderDisplayName = issue.label;
                     shaderKey = issue.label;
@@ -838,6 +849,9 @@ namespace rhi::debug {
                 row("Severity", SeverityLabel(detail.severity));
                 row("Operation", ExecutionKindLabel(detail.kind));
                 row("Pipeline", detail.pipelineLabel.empty() ? DefaultPipelineLabel(detail.pipelineUid) : detail.pipelineLabel);
+                if (!detail.entryPoint.empty()) {
+                    row("Entry Point", detail.entryPoint);
+                }
                 if (!effectiveSourcePath.empty()) {
                     row("Shader File", std::string(ShaderFilename(effectiveSourcePath)));
 
