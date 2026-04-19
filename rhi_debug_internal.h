@@ -56,6 +56,7 @@ namespace rhi::debug {
         uint32_t sourceLine = 0;
         uint32_t sourceColumn = 0;
         std::string sourceText;
+        std::string sourceContents;
         std::string message;
         InstrumentationExecutionTracebackSnapshot traceback;
         InstrumentationDescriptorMismatchSnapshot descriptorMismatch;

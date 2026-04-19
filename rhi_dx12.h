@@ -378,15 +378,19 @@ namespace rhi {
 		bool hasDebugFiles = false;
 		std::vector<std::string> filePaths;
 		std::unordered_map<uint32_t, std::string> filePathsByUid;
+		std::unordered_map<uint32_t, std::string> fileContentsByUid;
 	};
 
 	struct Dx12ShaderSourceMappingMetadata {
 		bool requested = false;
 		bool resolved = false;
 		uint64_t shaderGuid = 0;
-		uint32_t fileUid = UINT32_MAX;
+		uint32_t fileUid = 0xFFFFu;
 		uint32_t line = 0;
 		uint32_t column = 0;
+		uint32_t basicBlockId = 0;
+		uint32_t instructionIndex = 0;
+		uint32_t requestAttempts = 0;
 		std::string sourceLine;
 	};
 

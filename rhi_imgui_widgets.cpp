@@ -10,8 +10,10 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <limits>
+#include <sstream>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -84,6 +86,133 @@ namespace rhi::debug {
                 return path;
             }
             return path.substr(split + 1);
+        }
+
+        bool LoadTextFile(std::string_view path, std::string& text, std::string& error) {
+            text.clear();
+            error.clear();
+
+            if (path.empty()) {
+                error = "No shader source file is available for this execution.";
+                return false;
+            }
+
+            std::ifstream stream(std::string(path), std::ios::binary);
+            if (!stream) {
+                error = "Failed to open shader source file.";
+                return false;
+            }
+
+            stream.seekg(0, std::ios::end);
+            const std::streampos end = stream.tellg();
+            if (end < 0) {
+                error = "Failed to read shader source file.";
+                return false;
+            }
+
+            text.resize(static_cast<size_t>(end));
+            stream.seekg(0, std::ios::beg);
+            if (!text.empty()) {
+                stream.read(text.data(), static_cast<std::streamsize>(text.size()));
+            }
+            if (!stream && !stream.eof()) {
+                text.clear();
+                error = "Failed while reading shader source file.";
+                return false;
+            }
+
+            return true;
+        }
+
+        const TextEditor::Language* GetTextEditorLanguageForPath(std::string_view path) {
+            const size_t extensionOffset = path.find_last_of('.');
+            if (extensionOffset == std::string_view::npos) {
+                return TextEditor::Language::Hlsl();
+            }
+
+            std::string extension(path.substr(extensionOffset));
+            std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+
+            if (extension == ".hlsl" || extension == ".hlsli" || extension == ".fx" || extension == ".fxh") {
+                return TextEditor::Language::Hlsl();
+            }
+            if (extension == ".glsl" || extension == ".vert" || extension == ".frag" || extension == ".comp") {
+                return TextEditor::Language::Glsl();
+            }
+            if (extension == ".c" || extension == ".h") {
+                return TextEditor::Language::C();
+            }
+            if (extension == ".cpp" || extension == ".cxx" || extension == ".cc" || extension == ".hpp" || extension == ".hh") {
+                return TextEditor::Language::Cpp();
+            }
+
+            return TextEditor::Language::Hlsl();
+        }
+
+        void EnsureShaderSourceViewerConfigured(InstrumentationWidget::ShaderSourceViewerState& viewer) {
+            if (viewer.configured) {
+                return;
+            }
+
+            viewer.editor.SetReadOnlyEnabled(true);
+            viewer.editor.SetShowLineNumbersEnabled(true);
+            viewer.editor.SetShowScrollbarMiniMapEnabled(false);
+            viewer.editor.SetShowPanScrollIndicatorEnabled(false);
+            viewer.editor.SetTabSize(4);
+            viewer.editor.SetLanguage(TextEditor::Language::Hlsl());
+            viewer.configured = true;
+        }
+
+        void UpdateShaderSourceViewer(
+            InstrumentationWidget::ShaderSourceViewerState& viewer,
+            const std::string& sourcePath,
+            const InstrumentationExecutionDetailSnapshot& detail,
+            const char* markerTooltip) {
+            EnsureShaderSourceViewerConfigured(viewer);
+
+            if (viewer.loadedPath != sourcePath || viewer.loadedSourceContents != detail.sourceContents) {
+                viewer.loadedPath = sourcePath;
+                viewer.loadedSourceContents = detail.sourceContents;
+                viewer.loadedDetailId = 0;
+                viewer.highlightedLine = 0;
+                viewer.editor.ClearMarkers();
+                viewer.loadError.clear();
+
+                if (!detail.sourceContents.empty()) {
+                    viewer.editor.SetLanguage(GetTextEditorLanguageForPath(sourcePath));
+                    viewer.editor.SetText(detail.sourceContents);
+                } else {
+                    std::string text;
+                    if (LoadTextFile(sourcePath, text, viewer.loadError)) {
+                        viewer.editor.SetLanguage(GetTextEditorLanguageForPath(sourcePath));
+                        viewer.editor.SetText(text);
+                    } else {
+                        viewer.editor.SetText("");
+                    }
+                }
+            }
+
+            if (!viewer.loadError.empty()) {
+                return;
+            }
+
+            if (viewer.loadedDetailId == detail.detailId && viewer.highlightedLine == detail.sourceLine) {
+                return;
+            }
+
+            viewer.editor.ClearMarkers();
+            viewer.editor.AddMarker(
+                static_cast<int>(detail.sourceLine),
+                IM_COL32(255, 96, 96, 160),
+                IM_COL32(255, 96, 96, 80),
+                markerTooltip ? markerTooltip : "",
+                markerTooltip ? markerTooltip : "");
+            viewer.editor.SetCursor(static_cast<int>(detail.sourceLine), static_cast<int>(detail.sourceColumn));
+            viewer.editor.ScrollToLine(static_cast<int>(detail.sourceLine), TextEditor::Scroll::alignMiddle);
+            viewer.loadedDetailId = detail.detailId;
+            viewer.highlightedLine = detail.sourceLine;
         }
 
         std::string DefaultPipelineLabel(uint64_t pipelineUid) {
@@ -612,7 +741,8 @@ namespace rhi::debug {
             Device device,
             const std::vector<DebugInstrumentationIssue>& issues,
             const std::string& selectedIssueKey,
-            uint64_t& selectedExecutionDetailId) {
+            uint64_t& selectedExecutionDetailId,
+            InstrumentationWidget::ShaderSourceViewerState& shaderSourceViewer) {
             const DebugInstrumentationIssue* selectedIssue = FindIssueByIdentityKey(issues, selectedIssueKey);
             if (!selectedIssue) {
                 ImGui::TextDisabled("Select an issue to inspect captured executions.");
@@ -691,6 +821,9 @@ namespace rhi::debug {
             }
 
             const InstrumentationExecutionDetailSnapshot& detail = *selectedIt;
+            const std::string effectiveSourcePath = !detail.sourcePath.empty()
+                ? detail.sourcePath
+                : (selectedIssue->path[0] != '\0' ? std::string(selectedIssue->path) : std::string());
 
             ImGui::Separator();
             if (ImGui::BeginTable("InstrumentationExecutionDetails", 2, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp)) {
@@ -705,8 +838,10 @@ namespace rhi::debug {
                 row("Severity", SeverityLabel(detail.severity));
                 row("Operation", ExecutionKindLabel(detail.kind));
                 row("Pipeline", detail.pipelineLabel.empty() ? DefaultPipelineLabel(detail.pipelineUid) : detail.pipelineLabel);
-                if (!detail.sourcePath.empty()) {
-                    std::string sourceLocation = detail.sourcePath;
+                if (!effectiveSourcePath.empty()) {
+                    row("Shader File", std::string(ShaderFilename(effectiveSourcePath)));
+
+                    std::string sourceLocation = effectiveSourcePath;
                     char lineColumn[48] = {};
                     std::snprintf(lineColumn, sizeof(lineColumn), " (%u:%u)", detail.sourceLine + 1, detail.sourceColumn + 1);
                     sourceLocation += lineColumn;
@@ -776,8 +911,29 @@ namespace rhi::debug {
 
             if (!detail.sourceText.empty()) {
                 ImGui::Separator();
-                ImGui::TextDisabled("Source Line");
+                ImGui::TextDisabled("Offending Line");
                 ImGui::TextWrapped("%s", detail.sourceText.c_str());
+            }
+
+            if (!effectiveSourcePath.empty() || !detail.sourceContents.empty()) {
+                ImGui::Separator();
+                ImGui::TextDisabled("Shader Source Viewer");
+
+                UpdateShaderSourceViewer(
+                    shaderSourceViewer,
+                    effectiveSourcePath,
+                    detail,
+                    selectedIssue->message);
+
+                if (!shaderSourceViewer.loadError.empty()) {
+                    ImGui::TextColored(
+                        ImVec4(0.95f, 0.40f, 0.40f, 1.0f),
+                        "%s: %s",
+                        shaderSourceViewer.loadError.c_str(),
+                        effectiveSourcePath.c_str());
+                } else {
+                    shaderSourceViewer.editor.Render("InstrumentationShaderSource", ImVec2(0.0f, 260.0f), true);
+                }
             }
 
             if (!detail.traceback.hostStackTrace.empty()) {
@@ -1046,7 +1202,7 @@ namespace rhi::debug {
 
                         ImGui::TableNextColumn();
                         if (ImGui::BeginChild("InstrumentationIssueDetails", ImVec2(0.0f, 0.0f), false)) {
-                            DrawExecutionDetailPane(device, issues, selectedIssueKey_, selectedExecutionDetailId_);
+                            DrawExecutionDetailPane(device, issues, selectedIssueKey_, selectedExecutionDetailId_, shaderSourceViewer_);
                         }
                         ImGui::EndChild();
 

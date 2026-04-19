@@ -72,6 +72,7 @@ endif()
 add_library(BasicRHI STATIC 
     rhi_dx12.cpp
     rhi_imgui_widgets.cpp
+    ImGuiColorTextEdit/TextEditor.cpp
     "rhi_interop.h" 
     "rhi_dx12.h"  
     "rhi_interop_dx12.h" 
@@ -81,6 +82,7 @@ add_library(BasicRHI STATIC
     "rhi_conversions_dx12.h" 
     "rhi_debug.h"
     "rhi_imgui_widgets.h"
+    "ImGuiColorTextEdit/TextEditor.h"
     "rhi_colors.h"
     "rhi_allocator.h" 
     "rhi_allocator.cpp" "rhi_feature_info.h" "rhi_dx12_casting.h")
