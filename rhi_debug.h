@@ -109,6 +109,80 @@ namespace rhi::debug {
         return features;
     }
 
+    inline uint32_t GetInstrumentationPipelineCount(Device d) noexcept {
+        if (!d || !d.vt || !d.vt->getDebugInstrumentationPipelineCount) {
+            return 0;
+        }
+        return d.vt->getDebugInstrumentationPipelineCount(&d);
+    }
+
+    inline Result CopyInstrumentationPipelines(Device d,
+        uint32_t first,
+        DebugInstrumentationPipeline* outPipelines,
+        uint32_t capacity,
+        uint32_t* copied = nullptr) noexcept {
+        if (!d || !d.vt || !d.vt->copyDebugInstrumentationPipelines) {
+            if (copied) {
+                *copied = 0;
+            }
+            return Result::Unsupported;
+        }
+        return d.vt->copyDebugInstrumentationPipelines(&d, first, outPipelines, capacity, copied);
+    }
+
+    inline std::vector<DebugInstrumentationPipeline> GetInstrumentationPipelines(Device d) {
+        std::vector<DebugInstrumentationPipeline> pipelines(GetInstrumentationPipelineCount(d));
+        if (pipelines.empty()) {
+            return pipelines;
+        }
+
+        uint32_t copied = 0;
+        if (!IsOk(CopyInstrumentationPipelines(d, 0, pipelines.data(), static_cast<uint32_t>(pipelines.size()), &copied))) {
+            pipelines.clear();
+            return pipelines;
+        }
+
+        pipelines.resize(copied);
+        return pipelines;
+    }
+
+    inline uint32_t GetInstrumentationPipelineUsageCount(Device d) noexcept {
+        if (!d || !d.vt || !d.vt->getDebugInstrumentationPipelineUsageCount) {
+            return 0;
+        }
+        return d.vt->getDebugInstrumentationPipelineUsageCount(&d);
+    }
+
+    inline Result CopyInstrumentationPipelineUsages(Device d,
+        uint32_t first,
+        DebugInstrumentationPipelineUsage* outUsages,
+        uint32_t capacity,
+        uint32_t* copied = nullptr) noexcept {
+        if (!d || !d.vt || !d.vt->copyDebugInstrumentationPipelineUsages) {
+            if (copied) {
+                *copied = 0;
+            }
+            return Result::Unsupported;
+        }
+        return d.vt->copyDebugInstrumentationPipelineUsages(&d, first, outUsages, capacity, copied);
+    }
+
+    inline std::vector<DebugInstrumentationPipelineUsage> GetInstrumentationPipelineUsages(Device d) {
+        std::vector<DebugInstrumentationPipelineUsage> usages(GetInstrumentationPipelineUsageCount(d));
+        if (usages.empty()) {
+            return usages;
+        }
+
+        uint32_t copied = 0;
+        if (!IsOk(CopyInstrumentationPipelineUsages(d, 0, usages.data(), static_cast<uint32_t>(usages.size()), &copied))) {
+            usages.clear();
+            return usages;
+        }
+
+        usages.resize(copied);
+        return usages;
+    }
+
     inline uint32_t GetInstrumentationDiagnosticCount(Device d) noexcept {
         if (!d || !d.vt || !d.vt->getDebugInstrumentationDiagnosticCount) {
             return 0;
@@ -190,6 +264,13 @@ namespace rhi::debug {
         return d.vt->setDebugGlobalInstrumentationMask(&d, featureMask);
     }
 
+    inline Result SetPipelineInstrumentationMask(Device d, uint64_t pipelineUid, uint64_t featureMask) noexcept {
+        if (!d || !d.vt || !d.vt->setDebugPipelineInstrumentationMask) {
+            return Result::Unsupported;
+        }
+        return d.vt->setDebugPipelineInstrumentationMask(&d, pipelineUid, featureMask);
+    }
+
     inline bool IsInstrumentationFeatureEnabled(uint64_t featureMask, const DebugInstrumentationFeature& feature) noexcept {
         return feature.featureBit != 0 && (featureMask & feature.featureBit) == feature.featureBit;
     }
@@ -219,6 +300,21 @@ namespace rhi::debug {
             return Result::Unsupported;
         }
         return d.vt->setDebugSynchronousRecording(&d, enabled);
+    }
+
+    inline Result SetTexelAddressing(Device d, bool enabled) noexcept {
+        if (!d || !d.vt || !d.vt->setDebugTexelAddressing) {
+            return Result::Unsupported;
+        }
+        return d.vt->setDebugTexelAddressing(&d, enabled);
+    }
+
+    inline Result SetInstrumentationContext(CommandList cmd, const char* passName, const char* techniquePath) noexcept {
+        if (!cmd || !cmd.vt || !cmd.vt->setDebugInstrumentationContext) {
+            return Result::Unsupported;
+        }
+        cmd.vt->setDebugInstrumentationContext(&cmd, passName, techniquePath);
+        return Result::Ok;
     }
 
     // Command list markers

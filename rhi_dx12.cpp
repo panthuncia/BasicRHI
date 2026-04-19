@@ -27,11 +27,13 @@
 #include <Schemas/Feature.h>
 #include <Schemas/Instrumentation.h>
 #include <Schemas/Log.h>
+#include <Schemas/Object.h>
 #include <Schemas/PipelineMetadata.h>
 #include <Schemas/SGUID.h>
 #include <Schemas/ShaderMetadata.h>
 #include <Schemas/Features/Descriptor.h>
 #include <Schemas/Features/ResourceBounds.h>
+#include <Backends/DX12/States/PipelineState.h>
 #endif
 #include <string>
 #include <algorithm>
@@ -52,6 +54,7 @@ namespace rhi {
 		static void Dx12PollReShapeMessages(Dx12Device* impl) noexcept;
 		static Result Dx12RefreshReShapeFeatures(Dx12Device* impl) noexcept;
 		static void Dx12EnsureReShapeFeatureList(Dx12Device* impl) noexcept;
+		static void Dx12EnsureReShapePipelineInventory(Dx12Device* impl) noexcept;
 		static bool Dx12InitializeReShapeRuntime(Dx12Device* impl, const DeviceCreateInfo& ci) noexcept;
 		static void Dx12ShutdownReShapeRuntime(Dx12Device* impl) noexcept;
 	}
@@ -87,6 +90,8 @@ namespace rhi {
 			Dx12ReShapeRuntime* runtime = nullptr;
 		};
 
+		static Dx12ReShapeRuntime* Dx12GetReShapeRuntime(Dx12Device* impl) noexcept;
+
 		static void Dx12BuildDefaultInstrumentationSpecialization(MessageStream& out) noexcept;
 
 		static std::wstring Dx12GetExecutableDirectory() noexcept {
@@ -117,6 +122,29 @@ namespace rhi {
 		}
 	}
 	#endif
+
+	namespace {
+		#if BASICRHI_ENABLE_RESHAPE
+		static void Dx12EnsureReShapePipelineInventory(Dx12Device* impl) noexcept {
+			auto* runtime = Dx12GetReShapeRuntime(impl);
+			if (!impl || !runtime || !runtime->bridge) {
+				return;
+			}
+
+			{
+				std::lock_guard guard(impl->debugInstrumentation.mutex);
+				if (!impl->debugInstrumentation.state.active) {
+					return;
+				}
+				impl->debugInstrumentation.pipelineInventoryRefreshRequested = true;
+			}
+		}
+		#else
+		static void Dx12EnsureReShapePipelineInventory(Dx12Device* impl) noexcept {
+			(void)impl;
+		}
+		#endif
+	}
 
 	// ---- DRED (Device Removed Extended Data) support ----
 
@@ -3356,6 +3384,74 @@ namespace rhi {
 			dst[copyLen] = '\0';
 		}
 
+		static DebugInstrumentationPipelineKind Dx12MapReShapePipelineKind(uint32_t type) noexcept {
+			switch (type) {
+			case 2u:
+				return DebugInstrumentationPipelineKind::Graphics;
+			case 4u:
+				return DebugInstrumentationPipelineKind::Compute;
+			case 8u:
+				return DebugInstrumentationPipelineKind::StateObject;
+			default:
+				return DebugInstrumentationPipelineKind::Unknown;
+			}
+		}
+
+		static std::string Dx12MakePipelineUsageKey(uint64_t pipelineUid, std::string_view techniquePath) {
+			std::string key = std::to_string(pipelineUid);
+			key.push_back('|');
+			key.append(techniquePath.data(), techniquePath.size());
+			return key;
+		}
+
+		static Dx12InstrumentationPipelineMetadata& Dx12GetOrCreatePipelineMetadataUnlocked(
+			Dx12DebugInstrumentationSession& session,
+			uint64_t pipelineUid) {
+			auto [it, inserted] = session.pipelines.try_emplace(pipelineUid);
+			if (inserted) {
+				session.pipelineOrder.push_back(pipelineUid);
+			}
+			return it->second;
+		}
+
+		static void Dx12ObservePipelineUsageUnlocked(
+			Dx12DebugInstrumentationSession& session,
+			uint64_t pipelineUid,
+			DebugInstrumentationPipelineKind kind,
+			const char* label,
+			const char* passName,
+			const char* techniquePath) {
+			if (pipelineUid == 0 || pipelineUid == ~0ull) {
+				return;
+			}
+
+			auto& metadata = Dx12GetOrCreatePipelineMetadataUnlocked(session, pipelineUid);
+			if (metadata.kind == DebugInstrumentationPipelineKind::Unknown && kind != DebugInstrumentationPipelineKind::Unknown) {
+				metadata.kind = kind;
+			}
+			if (label && *label) {
+				metadata.label = label;
+				session.pipelineNames[pipelineUid] = label;
+			}
+			if (passName && *passName) {
+				metadata.lastPassName = passName;
+			}
+			if (techniquePath && *techniquePath) {
+				const std::string key = Dx12MakePipelineUsageKey(pipelineUid, techniquePath);
+				auto usageIt = session.pipelineUsageIndexByKey.find(key);
+				if (usageIt == session.pipelineUsageIndexByKey.end()) {
+					session.pipelineUsageIndexByKey.emplace(key, session.pipelineUsages.size());
+					session.pipelineUsages.push_back(Dx12InstrumentationPipelineUsage{
+						.pipelineUid = pipelineUid,
+						.techniquePath = techniquePath,
+						.passName = passName ? passName : ""
+					});
+				} else if (passName && *passName) {
+					session.pipelineUsages[usageIt->second].passName = passName;
+				}
+			}
+		}
+
 		static bool Dx12TryParseIssueUid(const char* message, const char* prefix, uint64_t& uid) noexcept {
 			if (!message || !prefix) {
 				return false;
@@ -4128,22 +4224,6 @@ namespace rhi {
 			return 0;
 		}
 
-		static uint64_t Dx12BuildDefaultInstrumentationFeatureMaskUnlocked(const Dx12DebugInstrumentationSession& session) noexcept {
-			static constexpr const char* kDefaultFeatureNames[] = {
-				"Descriptor",
-				"Resource Bounds",
-				"Initialization",
-				"Concurrency",
-			};
-
-			uint64_t featureMask = 0;
-			for (const char* featureName : kDefaultFeatureNames) {
-				featureMask |= Dx12FindFeatureBitByNameUnlocked(session, featureName);
-			}
-
-			return featureMask;
-		}
-
 		static void Dx12BuildDefaultInstrumentationSpecialization(MessageStream& out) noexcept {
 			auto* config = MessageStreamView<>(out).Add<SetInstrumentationConfigMessage>();
 			config->validationCoverage = 0;
@@ -4421,8 +4501,56 @@ namespace rhi {
 						}
 
 						std::lock_guard guard(impl->debugInstrumentation.mutex);
-						impl->debugInstrumentation.pipelineNames[message->pipelineUID] = std::string(message->name.View());
+						auto& metadata = Dx12GetOrCreatePipelineMetadataUnlocked(impl->debugInstrumentation, message->pipelineUID);
+						metadata.kind = Dx12MapReShapePipelineKind(message->type);
+						metadata.label = std::string(message->name.View());
+						impl->debugInstrumentation.pipelineNames[message->pipelineUID] = metadata.label;
 						impl->debugInstrumentation.issuesDirty = true;
+						break;
+					}
+					case ObjectStatesMessage::kID: {
+						auto* message = it.Get<ObjectStatesMessage>();
+						if (!message) {
+							break;
+						}
+
+						std::lock_guard guard(impl->debugInstrumentation.mutex);
+						impl->debugInstrumentation.knownPipelineCount = message->pipelineCount;
+						impl->debugInstrumentation.pipelineInventoryRefreshRequested = false;
+						break;
+					}
+					case PipelineUIDRangeMessage::kID: {
+						auto* message = it.Get<PipelineUIDRangeMessage>();
+						if (!message) {
+							break;
+						}
+
+						std::lock_guard guard(impl->debugInstrumentation.mutex);
+						for (uint64_t index = 0; index < message->pipelineUID.count; ++index) {
+							const uint64_t pipelineUid = message->pipelineUID[index];
+							(void)Dx12GetOrCreatePipelineMetadataUnlocked(impl->debugInstrumentation, pipelineUid);
+							if (impl->debugInstrumentation.pipelineNames.find(pipelineUid) == impl->debugInstrumentation.pipelineNames.end()) {
+								impl->debugInstrumentation.pendingPipelineNameRequests.insert(pipelineUid);
+							}
+							impl->debugInstrumentation.pendingPipelineStatusRequests.insert(pipelineUid);
+						}
+						break;
+					}
+					case PipelineStatusCollectionMessage::kID: {
+						auto* message = it.Get<PipelineStatusCollectionMessage>();
+						if (!message) {
+							break;
+						}
+
+						MessageStream statusStream;
+						message->status.Transfer(statusStream);
+						ConstMessageStreamView<PipelineStatusMessage> statusView(statusStream);
+						std::lock_guard guard(impl->debugInstrumentation.mutex);
+						for (auto statusIt = statusView.GetIterator(); statusIt; ++statusIt) {
+							auto& metadata = Dx12GetOrCreatePipelineMetadataUnlocked(impl->debugInstrumentation, statusIt->pipelineUID);
+							metadata.active = statusIt->active != 0;
+							metadata.instrumented = statusIt->instrumented != 0;
+						}
 						break;
 					}
 					case ShaderCodeMessage::kID: {
@@ -4647,101 +4775,131 @@ namespace rhi {
 			if (!runtime || !runtime->bridge) {
 				return;
 			}
-			MessageStream requestStream;
-
-			std::deque<MessageStream> capturedStreams;
-			{
-				std::lock_guard guard(runtime->capturedStreamMutex);
-				capturedStreams.swap(runtime->capturedStreams);
-			}
-
-			for (MessageStream& stream : capturedStreams) {
-				Dx12ProcessReShapeMessageStream(impl, stream, requestStream);
-			}
-
-			IMessageStorage* storage = runtime->bridge->GetOutput();
-			if (storage) {
-				uint32_t streamCount = 0;
-				storage->ConsumeStreams(&streamCount, nullptr);
-				if (streamCount != 0) {
-					std::vector<MessageStream> streams(streamCount);
-					storage->ConsumeStreams(&streamCount, streams.data());
-
-					for (uint32_t streamIndex = 0; streamIndex < streamCount; ++streamIndex) {
-						MessageStream& stream = streams[streamIndex];
-						Dx12ProcessReShapeMessageStream(impl, stream, requestStream);
-						storage->Free(stream);
-					}
-				}
-			}
-
-			bool queuedDefaultFeatureMask = false;
+			static constexpr uint32_t kMaxPollRoundsPerCall = 2;
+			static constexpr uint32_t kMaxPipelineUidRangePerRound = 128;
+			static constexpr size_t kMaxPipelineNamesPerRound = 64;
+			static constexpr size_t kMaxPipelineStatusesPerRound = 64;
 			{
 				std::lock_guard guard(impl->debugInstrumentation.mutex);
-				if (impl->debugInstrumentation.state.active
-					&& impl->debugInstrumentation.featureQueryCompleted
-					&& !impl->debugInstrumentation.defaultDescriptorMaskApplied
-					&& !impl->debugInstrumentation.explicitGlobalFeatureMaskConfigured
-					&& impl->debugInstrumentation.state.globalFeatureMask == 0) {
-					const uint64_t defaultFeatureMask = Dx12BuildDefaultInstrumentationFeatureMaskUnlocked(impl->debugInstrumentation);
-					if (defaultFeatureMask != 0) {
-						MessageStream specializationStream;
-						Dx12BuildDefaultInstrumentationSpecialization(specializationStream);
-						auto* message = MessageStreamView<>(requestStream).Add<SetGlobalInstrumentationMessage>(SetGlobalInstrumentationMessage::AllocationInfo{
-							.specializationByteSize = specializationStream.GetByteSize()
+				if (impl->debugInstrumentation.pollInProgress) {
+					return;
+				}
+				impl->debugInstrumentation.pollInProgress = true;
+			}
+
+			struct PollScopeReset {
+				Dx12DebugInstrumentationSession& session;
+				~PollScopeReset() {
+					std::lock_guard guard(session.mutex);
+					session.pollInProgress = false;
+				}
+			} pollScopeReset{ impl->debugInstrumentation };
+
+			bool shouldContinuePolling = true;
+			uint32_t pollRound = 0;
+			while (shouldContinuePolling && pollRound < kMaxPollRoundsPerCall) {
+				++pollRound;
+				shouldContinuePolling = false;
+				MessageStream requestStream;
+				bool issuedRequests = false;
+
+				std::deque<MessageStream> capturedStreams;
+				{
+					std::lock_guard guard(runtime->capturedStreamMutex);
+					capturedStreams.swap(runtime->capturedStreams);
+				}
+
+				for (MessageStream& stream : capturedStreams) {
+					Dx12ProcessReShapeMessageStream(impl, stream, requestStream);
+				}
+
+				IMessageStorage* storage = runtime->bridge->GetOutput();
+				if (storage) {
+					uint32_t streamCount = 0;
+					storage->ConsumeStreams(&streamCount, nullptr);
+					if (streamCount != 0) {
+						std::vector<MessageStream> streams(streamCount);
+						storage->ConsumeStreams(&streamCount, streams.data());
+
+						for (uint32_t streamIndex = 0; streamIndex < streamCount; ++streamIndex) {
+							MessageStream& stream = streams[streamIndex];
+							Dx12ProcessReShapeMessageStream(impl, stream, requestStream);
+							storage->Free(stream);
+						}
+					}
+				}
+
+				{
+					std::lock_guard guard(impl->debugInstrumentation.mutex);
+					Dx12RebuildInstrumentationIssuesUnlocked(impl->debugInstrumentation);
+				}
+
+				{
+					std::lock_guard guard(impl->debugInstrumentation.mutex);
+					if (impl->debugInstrumentation.pipelineInventoryRefreshRequested) {
+						auto* message = MessageStreamView<>(requestStream).Add<GetObjectStatesMessage>();
+						message->ignore = 0;
+						impl->debugInstrumentation.pipelineInventoryRefreshRequested = false;
+					}
+
+					const uint32_t knownPipelineCount = impl->debugInstrumentation.knownPipelineCount;
+					const uint32_t enumeratedPipelineCount = static_cast<uint32_t>(impl->debugInstrumentation.pipelineOrder.size());
+					if (knownPipelineCount > enumeratedPipelineCount) {
+						auto* message = MessageStreamView<>(requestStream).Add<GetPipelineUIDRangeMessage>();
+						message->start = enumeratedPipelineCount;
+						message->limit = (std::min)(knownPipelineCount - enumeratedPipelineCount, kMaxPipelineUidRangePerRound);
+					}
+
+					size_t pipelineNameCount = 0;
+					for (auto it = impl->debugInstrumentation.pendingPipelineNameRequests.begin();
+						it != impl->debugInstrumentation.pendingPipelineNameRequests.end() && pipelineNameCount < kMaxPipelineNamesPerRound;) {
+						const uint64_t pipelineUid = *it;
+						auto* message = MessageStreamView<>(requestStream).Add<GetPipelineNameMessage>();
+						message->pipelineUID = pipelineUid;
+						impl->debugInstrumentation.requestedPipelineNames.insert(pipelineUid);
+						it = impl->debugInstrumentation.pendingPipelineNameRequests.erase(it);
+						++pipelineNameCount;
+					}
+
+					if (!impl->debugInstrumentation.pendingPipelineStatusRequests.empty()) {
+						std::vector<uint64_t> pipelineStatusBatch;
+						pipelineStatusBatch.reserve((std::min)(impl->debugInstrumentation.pendingPipelineStatusRequests.size(), kMaxPipelineStatusesPerRound));
+						for (auto it = impl->debugInstrumentation.pendingPipelineStatusRequests.begin();
+							it != impl->debugInstrumentation.pendingPipelineStatusRequests.end() && pipelineStatusBatch.size() < kMaxPipelineStatusesPerRound;) {
+							pipelineStatusBatch.push_back(*it);
+							it = impl->debugInstrumentation.pendingPipelineStatusRequests.erase(it);
+						}
+						auto* message = MessageStreamView<>(requestStream).Add<GetPipelineStatusMessage>(GetPipelineStatusMessage::AllocationInfo{
+							.pipelineUIDsCount = pipelineStatusBatch.size()
 						});
-						message->featureBitSet = defaultFeatureMask;
-						message->specialization.Set(specializationStream);
-						impl->debugInstrumentation.state.globalFeatureMask = defaultFeatureMask;
-						impl->debugInstrumentation.defaultDescriptorMaskApplied = true;
-						queuedDefaultFeatureMask = true;
+						size_t pipelineUidIndex = 0;
+						for (uint64_t pipelineUid : pipelineStatusBatch) {
+							message->pipelineUIDs[pipelineUidIndex++] = pipelineUid;
+						}
 					}
-				}
 
-				Dx12RebuildInstrumentationIssuesUnlocked(impl->debugInstrumentation);
-			}
-
-			{
-				std::lock_guard guard(impl->debugInstrumentation.mutex);
-				for (uint64_t pipelineUid : impl->debugInstrumentation.pendingPipelineNameRequests) {
-					auto* message = MessageStreamView<>(requestStream).Add<GetPipelineNameMessage>();
-					message->pipelineUID = pipelineUid;
-					impl->debugInstrumentation.requestedPipelineNames.insert(pipelineUid);
-				}
-				impl->debugInstrumentation.pendingPipelineNameRequests.clear();
-
-				for (uint64_t shaderUid : impl->debugInstrumentation.pendingShaderCodeRequests) {
-					auto* message = MessageStreamView<>(requestStream).Add<GetShaderCodeMessage>();
-					message->shaderUID = shaderUid;
-					message->poolCode = 0;
-					message->deferred = 0;
-					impl->debugInstrumentation.shaderMetadata[shaderUid].requested = true;
-				}
-				impl->debugInstrumentation.pendingShaderCodeRequests.clear();
-
-				for (uint64_t sguid : impl->debugInstrumentation.pendingShaderSourceMappingRequests) {
-					auto* message = MessageStreamView<>(requestStream).Add<GetShaderSourceMappingMessage>();
-					message->sguid = sguid;
-					impl->debugInstrumentation.requestedShaderSourceMappings.insert(sguid);
-					impl->debugInstrumentation.shaderSourceMappings[sguid].requested = true;
-				}
-				impl->debugInstrumentation.pendingShaderSourceMappingRequests.clear();
-			}
-
-			if (requestStream.GetByteSize() != 0) {
-				const Result result = Dx12CommitReShapeMessages(impl, requestStream);
-				if (queuedDefaultFeatureMask) {
-					if (IsOk(result)) {
-						Dx12AppendInstrumentationDiagnostic(
-							impl,
-							DebugInstrumentationDiagnosticSeverity::Info,
-							"Default GPU-Reshape instrumentation features are now enabled by default (Descriptor, Resource Bounds, Initialization, Concurrency) as shaders and pipelines are discovered.");
-					} else {
-						Dx12AppendInstrumentationDiagnostic(
-							impl,
-							DebugInstrumentationDiagnosticSeverity::Warning,
-							"Default GPU-Reshape instrumentation feature enable failed; shader instrumentation may remain inactive until a feature mask is set.");
+					for (uint64_t shaderUid : impl->debugInstrumentation.pendingShaderCodeRequests) {
+						auto* message = MessageStreamView<>(requestStream).Add<GetShaderCodeMessage>();
+						message->shaderUID = shaderUid;
+						message->poolCode = 0;
+						message->deferred = 0;
+						impl->debugInstrumentation.shaderMetadata[shaderUid].requested = true;
 					}
+					impl->debugInstrumentation.pendingShaderCodeRequests.clear();
+
+					for (uint64_t sguid : impl->debugInstrumentation.pendingShaderSourceMappingRequests) {
+						auto* message = MessageStreamView<>(requestStream).Add<GetShaderSourceMappingMessage>();
+						message->sguid = sguid;
+						impl->debugInstrumentation.requestedShaderSourceMappings.insert(sguid);
+						impl->debugInstrumentation.shaderSourceMappings[sguid].requested = true;
+					}
+					impl->debugInstrumentation.pendingShaderSourceMappingRequests.clear();
+				}
+
+				issuedRequests = requestStream.GetByteSize() != 0;
+				if (issuedRequests) {
+					const Result result = Dx12CommitReShapeMessages(impl, requestStream);
+					shouldContinuePolling = IsOk(result);
 				}
 			}
 		}
@@ -4760,7 +4918,14 @@ namespace rhi {
 
 			storage->AddStreamAndSwap(stream);
 			runtime->bridge->Commit();
-			Dx12PollReShapeMessages(impl);
+			bool shouldPollImmediately = false;
+			{
+				std::lock_guard guard(impl->debugInstrumentation.mutex);
+				shouldPollImmediately = !impl->debugInstrumentation.pollInProgress;
+			}
+			if (shouldPollImmediately) {
+				Dx12PollReShapeMessages(impl);
+			}
 			return Result::Ok;
 		}
 
@@ -4826,11 +4991,13 @@ namespace rhi {
 
 			if (auto startupContainer = runtime->environment.GetRegistry()->Get<::Backend::StartupContainer>()) {
 				auto* texelAddressingMessage = MessageStreamView<>(startupContainer->stream).Add<SetTexelAddressingMessage>();
-				texelAddressingMessage->enabled = true;
+				texelAddressingMessage->enabled = ci.instrumentation.enableTexelAddressing ? 1u : 0u;
 				Dx12AppendInstrumentationDiagnostic(
 					impl,
 					DebugInstrumentationDiagnosticSeverity::Info,
-					"GPU-Reshape startup config enabled texel addressing for the in-process BasicRHI runtime.");
+					ci.instrumentation.enableTexelAddressing
+						? "GPU-Reshape startup config enabled texel addressing for the in-process BasicRHI runtime."
+						: "GPU-Reshape startup config disabled texel addressing for the in-process BasicRHI runtime.");
 			}
 
 			runtime->bridge = runtime->environment.GetRegistry()->Get<IBridge>();
@@ -4898,8 +5065,15 @@ namespace rhi {
 			MessageStream configStream;
 			auto* configMessage = MessageStreamView<>(configStream).Add<SetApplicationInstrumentationConfigMessage>();
 			configMessage->synchronousRecording = ci.instrumentation.enableSynchronousRecording;
+			MessageStream zeroMaskSpecializationStream;
+			Dx12BuildDefaultInstrumentationSpecialization(zeroMaskSpecializationStream);
+			auto* zeroMaskMessage = MessageStreamView<>(configStream).Add<SetGlobalInstrumentationMessage>(SetGlobalInstrumentationMessage::AllocationInfo{
+				.specializationByteSize = zeroMaskSpecializationStream.GetByteSize()
+			});
+			zeroMaskMessage->featureBitSet = 0;
+			zeroMaskMessage->specialization.Set(zeroMaskSpecializationStream);
 			if (Dx12CommitReShapeMessages(impl, configStream) != Result::Ok) {
-				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Warning, "GPU-Reshape synchronous recording setup did not complete cleanly.");
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Warning, "GPU-Reshape startup instrumentation configuration did not complete cleanly; the backend may not have honored the default zero feature mask.");
 			}
 
 			if (Dx12RefreshReShapeFeatures(impl) != Result::Ok) {
@@ -4971,6 +5145,7 @@ namespace rhi {
 			instrumentation.state.requested = ci.instrumentation.enableRuntimeInstrumentation;
 			instrumentation.state.active = false;
 			instrumentation.state.synchronousRecording = ci.instrumentation.enableSynchronousRecording;
+			instrumentation.state.texelAddressingEnabled = ci.instrumentation.enableTexelAddressing;
 			instrumentation.state.globalFeatureMask = 0;
 			instrumentation.capabilities.backendBuildEnabled = BASICRHI_ENABLE_RESHAPE != 0;
 			instrumentation.capabilities.installSupported = false;
@@ -5085,6 +5260,128 @@ namespace rhi {
 			const uint32_t toCopy = (std::min)(capacity, available);
 			for (uint32_t index = 0; index < toCopy; ++index) {
 				outFeatures[index] = features[first + index];
+			}
+
+			if (copied) {
+				*copied = toCopy;
+			}
+			return Result::Ok;
+		}
+
+		static uint32_t d_getDebugInstrumentationPipelineCount(const Device* d) noexcept {
+			if (!d) {
+				return 0;
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				return 0;
+			}
+
+			Dx12EnsureReShapePipelineInventory(impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			return static_cast<uint32_t>(impl->debugInstrumentation.pipelineOrder.size());
+		}
+
+		static Result d_copyDebugInstrumentationPipelines(const Device* d,
+			uint32_t first,
+			DebugInstrumentationPipeline* outPipelines,
+			uint32_t capacity,
+			uint32_t* copied) noexcept {
+			if (copied) {
+				*copied = 0;
+			}
+
+			if (!d) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			Dx12EnsureReShapePipelineInventory(impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			const auto& pipelineOrder = impl->debugInstrumentation.pipelineOrder;
+			if (first >= pipelineOrder.size() || capacity == 0 || !outPipelines) {
+				return Result::Ok;
+			}
+
+			const uint32_t available = static_cast<uint32_t>(pipelineOrder.size() - first);
+			const uint32_t toCopy = (std::min)(capacity, available);
+			for (uint32_t index = 0; index < toCopy; ++index) {
+				const uint64_t pipelineUid = pipelineOrder[first + index];
+				DebugInstrumentationPipeline pipeline{};
+				pipeline.pipelineUid = pipelineUid;
+				auto metadataIt = impl->debugInstrumentation.pipelines.find(pipelineUid);
+				if (metadataIt != impl->debugInstrumentation.pipelines.end()) {
+					const auto& metadata = metadataIt->second;
+					pipeline.kind = metadata.kind;
+					pipeline.active = metadata.active;
+					pipeline.instrumented = metadata.instrumented;
+					pipeline.explicitlyInstrumented = metadata.explicitlyInstrumented;
+					pipeline.explicitFeatureMask = metadata.explicitFeatureMask;
+					Dx12CopyDebugString(pipeline.label, sizeof(pipeline.label), metadata.label.c_str());
+					Dx12CopyDebugString(pipeline.lastPassName, sizeof(pipeline.lastPassName), metadata.lastPassName.c_str());
+				}
+				outPipelines[index] = pipeline;
+			}
+
+			if (copied) {
+				*copied = toCopy;
+			}
+			return Result::Ok;
+		}
+
+		static uint32_t d_getDebugInstrumentationPipelineUsageCount(const Device* d) noexcept {
+			if (!d) {
+				return 0;
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				return 0;
+			}
+
+			Dx12EnsureReShapePipelineInventory(impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			return static_cast<uint32_t>(impl->debugInstrumentation.pipelineUsages.size());
+		}
+
+		static Result d_copyDebugInstrumentationPipelineUsages(const Device* d,
+			uint32_t first,
+			DebugInstrumentationPipelineUsage* outUsages,
+			uint32_t capacity,
+			uint32_t* copied) noexcept {
+			if (copied) {
+				*copied = 0;
+			}
+
+			if (!d) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			Dx12EnsureReShapePipelineInventory(impl);
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			const auto& usages = impl->debugInstrumentation.pipelineUsages;
+			if (first >= usages.size() || capacity == 0 || !outUsages) {
+				return Result::Ok;
+			}
+
+			const uint32_t available = static_cast<uint32_t>(usages.size() - first);
+			const uint32_t toCopy = (std::min)(capacity, available);
+			for (uint32_t index = 0; index < toCopy; ++index) {
+				DebugInstrumentationPipelineUsage usage{};
+				usage.pipelineUid = usages[first + index].pipelineUid;
+				Dx12CopyDebugString(usage.techniquePath, sizeof(usage.techniquePath), usages[first + index].techniquePath.c_str());
+				Dx12CopyDebugString(usage.passName, sizeof(usage.passName), usages[first + index].passName.c_str());
+				outUsages[index] = usage;
 			}
 
 			if (copied) {
@@ -5242,6 +5539,47 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		static Result d_setDebugPipelineInstrumentationMask(Device* d, uint64_t pipelineUid, uint64_t featureMask) noexcept {
+			if (!d || pipelineUid == 0) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			if (!impl->debugInstrumentation.state.active) {
+				RHI_FAIL(Result::Unsupported);
+			}
+
+			#if BASICRHI_ENABLE_RESHAPE
+			MessageStream stream;
+			MessageStream specializationStream;
+			Dx12BuildDefaultInstrumentationSpecialization(specializationStream);
+			auto* message = MessageStreamView<>(stream).Add<SetPipelineInstrumentationMessage>(SetPipelineInstrumentationMessage::AllocationInfo{
+				.specializationByteSize = specializationStream.GetByteSize()
+			});
+			message->pipelineUID = pipelineUid;
+			message->featureBitSet = featureMask;
+			message->specialization.Set(specializationStream);
+
+			if (Dx12CommitReShapeMessages(impl, stream) != Result::Ok) {
+				RHI_FAIL(Result::Failed);
+			}
+			#else
+			(void)featureMask;
+			RHI_FAIL(Result::Unsupported);
+			#endif
+
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			auto& metadata = Dx12GetOrCreatePipelineMetadataUnlocked(impl->debugInstrumentation, pipelineUid);
+			metadata.explicitlyInstrumented = featureMask != 0;
+			metadata.explicitFeatureMask = featureMask;
+			impl->debugInstrumentation.pendingPipelineStatusRequests.insert(pipelineUid);
+			return Result::Ok;
+		}
+
 		static Result d_setDebugSynchronousRecording(Device* d, bool enabled) noexcept {
 			if (!d) {
 				RHI_FAIL(Result::InvalidArgument);
@@ -5272,6 +5610,24 @@ namespace rhi {
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
 			impl->debugInstrumentation.state.synchronousRecording = enabled;
 			return Result::Ok;
+		}
+
+		static Result d_setDebugTexelAddressing(Device* d, bool enabled) noexcept {
+			if (!d) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			(void)enabled;
+			Dx12AppendInstrumentationDiagnostic(
+				impl,
+				DebugInstrumentationDiagnosticSeverity::Warning,
+				"Texel addressing selects the GPU-Reshape initialization/concurrency feature set at device creation. Change the startup setting and recreate the device to apply a different mode.",
+				false);
+			RHI_FAIL(Result::Unsupported);
 		}
 
 		static Result q_signal(Queue* q, const TimelinePoint& p) noexcept {
@@ -5522,6 +5878,29 @@ namespace rhi {
 				l->boundPipeline = P;
 #endif
 				l->cl->SetPipelineState(P->pso.Get());
+				#if BASICRHI_ENABLE_RESHAPE
+				if (dev->debugInstrumentation.state.active && P->pso) {
+					::PipelineState* pipelineState = nullptr;
+					if (SUCCEEDED(P->pso->QueryInterface(__uuidof(::PipelineState), reinterpret_cast<void**>(&pipelineState)))
+						&& pipelineState
+						&& pipelineState->uid != kInvalidPipelineUID) {
+						std::lock_guard guard(dev->debugInstrumentation.mutex);
+						Dx12ObservePipelineUsageUnlocked(
+							dev->debugInstrumentation,
+							pipelineState->uid,
+							Dx12MapReShapePipelineKind(static_cast<uint32_t>(pipelineState->type)),
+							pipelineState->debugName,
+							l->instrumentationPassName.c_str(),
+							l->instrumentationTechniquePath.c_str());
+						dev->debugInstrumentation.pendingPipelineStatusRequests.insert(pipelineState->uid);
+						if (pipelineState->debugName && *pipelineState->debugName) {
+							dev->debugInstrumentation.pipelineNames[pipelineState->uid] = pipelineState->debugName;
+						} else if (dev->debugInstrumentation.pipelineNames.find(pipelineState->uid) == dev->debugInstrumentation.pipelineNames.end()) {
+							dev->debugInstrumentation.pendingPipelineNameRequests.insert(pipelineState->uid);
+						}
+					}
+				}
+				#endif
 				return;
 			}
 #if BUILD_TYPE == BUILD_DEBUG
@@ -6023,6 +6402,16 @@ namespace rhi {
 				return;
 			}
 			l->cl->SetName(std::wstring(n, n + ::strlen(n)).c_str());
+		}
+
+		static void cl_setDebugInstrumentationContext(CommandList* cl, const char* passName, const char* techniquePath) noexcept {
+			auto* impl = dx12_detail::CL(cl);
+			if (!impl) {
+				return;
+			}
+
+			impl->instrumentationPassName = passName ? passName : "";
+			impl->instrumentationTechniquePath = techniquePath ? techniquePath : "";
 		}
 
 		static void cl_writeTimestamp(CommandList* cl, QueryPoolHandle pool, uint32_t index, Stage /*ignored*/) noexcept {
@@ -7039,14 +7428,20 @@ namespace rhi {
 		&d_getDebugInstrumentationState,
 		&d_getDebugInstrumentationFeatureCount,
 		&d_copyDebugInstrumentationFeatures,
+		&d_getDebugInstrumentationPipelineCount,
+		&d_copyDebugInstrumentationPipelines,
+		&d_getDebugInstrumentationPipelineUsageCount,
+		&d_copyDebugInstrumentationPipelineUsages,
 		&d_getDebugInstrumentationDiagnosticCount,
 		&d_copyDebugInstrumentationDiagnostics,
 		&d_getDebugInstrumentationIssueCount,
 		&d_copyDebugInstrumentationIssues,
 		&d_setDebugGlobalInstrumentationMask,
+		&d_setDebugPipelineInstrumentationMask,
 		&d_setDebugSynchronousRecording,
+		&d_setDebugTexelAddressing,
 		&d_destroyDevice,
-		6u
+		8u
 	};
 
 	const QueueVTable g_qvt = {
@@ -7096,7 +7491,8 @@ namespace rhi {
 		&cl_setWorkGraph,
 		&cl_dispatchWorkGraph,
 		&cl_setName,
-		1u
+		&cl_setDebugInstrumentationContext,
+		2u
 	};
 	const SwapchainVTable g_scvt = {
 		&sc_count,

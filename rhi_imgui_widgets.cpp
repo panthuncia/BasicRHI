@@ -10,6 +10,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <string_view>
 #include <unordered_map>
@@ -89,6 +90,25 @@ namespace rhi::debug {
             char label[64] = {};
             std::snprintf(label, sizeof(label), "Pipeline %llu", static_cast<unsigned long long>(pipelineUid));
             return label;
+        }
+
+        const char* PipelineKindLabel(DebugInstrumentationPipelineKind kind) noexcept {
+            switch (kind) {
+            case DebugInstrumentationPipelineKind::Graphics:
+                return "Graphics";
+            case DebugInstrumentationPipelineKind::Compute:
+                return "Compute";
+            case DebugInstrumentationPipelineKind::StateObject:
+                return "StateObject";
+            default:
+                return "Unknown";
+            }
+        }
+
+        std::string PipelineLabel(const DebugInstrumentationPipeline& pipeline) {
+            return pipeline.label[0] != '\0'
+                ? std::string(pipeline.label)
+                : DefaultPipelineLabel(pipeline.pipelineUid);
         }
 
         std::string NormalizeIssueMessageForDeduplication(std::string_view input) {
@@ -206,6 +226,209 @@ namespace rhi::debug {
             std::vector<const DebugInstrumentationIssue*> pipelineIssues;
             std::vector<ShaderIssueTreeNode> shaderIssues;
         };
+
+        struct TechniquePipelineTreeNode {
+            std::string label;
+            std::string fullPath;
+            std::vector<TechniquePipelineTreeNode> children;
+            std::vector<size_t> pipelineIndices;
+        };
+
+        TechniquePipelineTreeNode& EnsureTechniquePipelineNode(TechniquePipelineTreeNode& root, std::string_view techniquePath) {
+            TechniquePipelineTreeNode* node = &root;
+            size_t offset = 0;
+            while (offset <= techniquePath.size()) {
+                const size_t separator = techniquePath.find("::", offset);
+                const size_t tokenEnd = separator == std::string_view::npos ? techniquePath.size() : separator;
+                const std::string_view token = techniquePath.substr(offset, tokenEnd - offset);
+                if (!token.empty()) {
+                    auto childIt = std::find_if(
+                        node->children.begin(),
+                        node->children.end(),
+                        [&](const TechniquePipelineTreeNode& child) {
+                            return child.label == token;
+                        });
+                    if (childIt == node->children.end()) {
+                        TechniquePipelineTreeNode child{};
+                        child.label.assign(token.data(), token.size());
+                        child.fullPath = node->fullPath.empty()
+                            ? child.label
+                            : node->fullPath + "::" + child.label;
+                        node->children.push_back(std::move(child));
+                        childIt = std::prev(node->children.end());
+                    }
+                    node = &(*childIt);
+                }
+
+                if (separator == std::string_view::npos) {
+                    break;
+                }
+                offset = separator + 2;
+            }
+            return *node;
+        }
+
+        void SortTechniquePipelineTree(TechniquePipelineTreeNode& node, const std::vector<DebugInstrumentationPipeline>& pipelines) {
+            std::sort(
+                node.children.begin(),
+                node.children.end(),
+                [](const TechniquePipelineTreeNode& lhs, const TechniquePipelineTreeNode& rhs) {
+                    return lhs.label < rhs.label;
+                });
+            std::sort(
+                node.pipelineIndices.begin(),
+                node.pipelineIndices.end(),
+                [&](size_t lhs, size_t rhs) {
+                    return PipelineLabel(pipelines[lhs]) < PipelineLabel(pipelines[rhs]);
+                });
+            for (TechniquePipelineTreeNode& child : node.children) {
+                SortTechniquePipelineTree(child, pipelines);
+            }
+        }
+
+        TechniquePipelineTreeNode BuildTechniquePipelineTree(
+            const std::vector<DebugInstrumentationPipeline>& pipelines,
+            const std::vector<DebugInstrumentationPipelineUsage>& usages,
+            std::vector<size_t>& unobservedPipelineIndices) {
+            TechniquePipelineTreeNode root{};
+            std::unordered_map<uint64_t, size_t> pipelineIndexByUid;
+            for (size_t pipelineIndex = 0; pipelineIndex < pipelines.size(); ++pipelineIndex) {
+                pipelineIndexByUid.emplace(pipelines[pipelineIndex].pipelineUid, pipelineIndex);
+            }
+
+            std::vector<bool> observed(pipelines.size(), false);
+            for (const DebugInstrumentationPipelineUsage& usage : usages) {
+                const auto pipelineIt = pipelineIndexByUid.find(usage.pipelineUid);
+                if (pipelineIt == pipelineIndexByUid.end()) {
+                    continue;
+                }
+
+                const size_t pipelineIndex = pipelineIt->second;
+                observed[pipelineIndex] = true;
+
+                TechniquePipelineTreeNode& node = EnsureTechniquePipelineNode(root, usage.techniquePath);
+                if (std::find(node.pipelineIndices.begin(), node.pipelineIndices.end(), pipelineIndex) == node.pipelineIndices.end()) {
+                    node.pipelineIndices.push_back(pipelineIndex);
+                }
+            }
+
+            for (size_t pipelineIndex = 0; pipelineIndex < observed.size(); ++pipelineIndex) {
+                if (!observed[pipelineIndex]) {
+                    unobservedPipelineIndices.push_back(pipelineIndex);
+                }
+            }
+
+            SortTechniquePipelineTree(root, pipelines);
+            std::sort(
+                unobservedPipelineIndices.begin(),
+                unobservedPipelineIndices.end(),
+                [&](size_t lhs, size_t rhs) {
+                    return PipelineLabel(pipelines[lhs]) < PipelineLabel(pipelines[rhs]);
+                });
+            return root;
+        }
+
+        bool ApplyPipelineMask(
+            Device device,
+            DebugInstrumentationPipeline& pipeline,
+            uint64_t featureMask,
+            std::string& lastStatus,
+            bool& lastStatusWasError) {
+            const Result result = SetPipelineInstrumentationMask(device, pipeline.pipelineUid, featureMask);
+            lastStatus = FormatActionResult(PipelineLabel(pipeline).c_str(), result);
+            lastStatusWasError = !IsOk(result);
+            if (!IsOk(result)) {
+                return false;
+            }
+
+            pipeline.explicitlyInstrumented = featureMask != 0;
+            pipeline.explicitFeatureMask = featureMask;
+            if (featureMask != 0) {
+                pipeline.instrumented = true;
+            }
+            return true;
+        }
+
+        void DrawPipelineToggleLine(
+            Device device,
+            DebugInstrumentationPipeline& pipeline,
+            uint64_t enableMask,
+            std::string& lastStatus,
+            bool& lastStatusWasError) {
+            ImGui::PushID(static_cast<int>(pipeline.pipelineUid));
+            bool explicitlyEnabled = pipeline.explicitlyInstrumented;
+            if (ImGui::Checkbox("##explicit", &explicitlyEnabled)) {
+                (void)ApplyPipelineMask(device, pipeline, explicitlyEnabled ? enableMask : 0, lastStatus, lastStatusWasError);
+            }
+            ImGui::SameLine();
+            ImGui::TextUnformatted(PipelineLabel(pipeline).c_str());
+            ImGui::SameLine();
+            ImGui::TextDisabled("[%s | active: %s | instrumented: %s]",
+                PipelineKindLabel(pipeline.kind),
+                BoolLabel(pipeline.active),
+                BoolLabel(pipeline.instrumented));
+            if (pipeline.lastPassName[0] != '\0') {
+                ImGui::Indent();
+                ImGui::TextDisabled("Last pass: %s", pipeline.lastPassName);
+                ImGui::Unindent();
+            }
+            ImGui::PopID();
+        }
+
+        void DrawTechniquePipelineNode(
+            Device device,
+            TechniquePipelineTreeNode& node,
+            std::vector<DebugInstrumentationPipeline>& pipelines,
+            uint64_t enableMask,
+            std::string& lastStatus,
+            bool& lastStatusWasError) {
+            std::vector<size_t> subtreePipelineIndices = node.pipelineIndices;
+            std::function<void(const TechniquePipelineTreeNode&)> collectPipelineIndices = [&](const TechniquePipelineTreeNode& current) {
+                for (const TechniquePipelineTreeNode& child : current.children) {
+                    subtreePipelineIndices.insert(subtreePipelineIndices.end(), child.pipelineIndices.begin(), child.pipelineIndices.end());
+                    collectPipelineIndices(child);
+                }
+            };
+            collectPipelineIndices(node);
+
+            std::sort(subtreePipelineIndices.begin(), subtreePipelineIndices.end());
+            subtreePipelineIndices.erase(std::unique(subtreePipelineIndices.begin(), subtreePipelineIndices.end()), subtreePipelineIndices.end());
+
+            ImGui::PushID(node.fullPath.c_str());
+            ImGui::SetNextItemAllowOverlap();
+            const bool open = ImGui::TreeNodeEx(node.label.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_AllowItemOverlap);
+            if (!subtreePipelineIndices.empty()) {
+                size_t enabledPipelineCount = 0;
+                for (size_t pipelineIndex : subtreePipelineIndices) {
+                    if (pipelines[pipelineIndex].explicitlyInstrumented) {
+                        ++enabledPipelineCount;
+                    }
+                }
+
+                bool subtreeEnabled = enabledPipelineCount == subtreePipelineIndices.size();
+                ImGui::SameLine();
+                if (ImGui::Checkbox("##technique_toggle", &subtreeEnabled)) {
+                    const uint64_t subtreeMask = subtreeEnabled ? enableMask : 0;
+                    for (size_t pipelineIndex : subtreePipelineIndices) {
+                        (void)ApplyPipelineMask(device, pipelines[pipelineIndex], subtreeMask, lastStatus, lastStatusWasError);
+                    }
+                }
+
+                ImGui::SameLine();
+                ImGui::TextDisabled("%u pipeline(s)", static_cast<unsigned>(subtreePipelineIndices.size()));
+            }
+
+            if (open) {
+                for (TechniquePipelineTreeNode& child : node.children) {
+                    DrawTechniquePipelineNode(device, child, pipelines, enableMask, lastStatus, lastStatusWasError);
+                }
+                for (size_t pipelineIndex : node.pipelineIndices) {
+                    DrawPipelineToggleLine(device, pipelines[pipelineIndex], enableMask, lastStatus, lastStatusWasError);
+                }
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
 
         std::vector<PipelineIssueTreeNode> BuildIssueTree(const std::vector<DebugInstrumentationIssue>& issues) {
             static constexpr uint64_t kUnattributedPipelineUid = (std::numeric_limits<uint64_t>::max)();
@@ -598,8 +821,19 @@ namespace rhi::debug {
         }
 
         const std::vector<DebugInstrumentationFeature> features = GetInstrumentationFeatures(device);
-        const std::vector<DebugInstrumentationIssue> issues = GetInstrumentationIssues(device);
-        const std::vector<DebugInstrumentationDiagnostic> diagnostics = GetInstrumentationDiagnostics(device);
+        std::vector<DebugInstrumentationPipeline> pipelines = GetInstrumentationPipelines(device);
+        const std::vector<DebugInstrumentationPipelineUsage> pipelineUsages = GetInstrumentationPipelineUsages(device);
+        std::vector<DebugInstrumentationIssue> issues;
+        if (showIssues_ || !selectedIssueKey_.empty() || selectedExecutionDetailId_ != 0) {
+            issues = GetInstrumentationIssues(device);
+        }
+        std::vector<DebugInstrumentationDiagnostic> diagnostics;
+        if (showDiagnostics_) {
+            diagnostics = GetInstrumentationDiagnostics(device);
+        }
+
+        std::vector<size_t> unobservedPipelineIndices;
+        TechniquePipelineTreeNode techniquePipelineTree = BuildTechniquePipelineTree(pipelines, pipelineUsages, unobservedPipelineIndices);
 
         if (!selectedIssueKey_.empty() && !FindIssueByIdentityKey(issues, selectedIssueKey_)) {
             selectedIssueKey_.clear();
@@ -637,6 +871,13 @@ namespace rhi::debug {
             ImGui::EndDisabled();
         }
 
+        bool texelAddressingEnabled = state.texelAddressingEnabled;
+        ImGui::BeginDisabled();
+        ImGui::Checkbox("Texel Addressing (requires device recreation)", &texelAddressingEnabled);
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("Texel addressing improves initialization/concurrency accuracy, but adds heavy memory and runtime overhead.");
+        ImGui::TextDisabled("This selects the GPU-Reshape initialization/concurrency backend at device creation, so it cannot be changed live from this widget.");
+
         if (!state.active) {
             ImGui::TextDisabled("Runtime instrumentation is inactive. Enable the ReShape-backed debug mode at device creation to use feature toggles.");
         }
@@ -644,6 +885,7 @@ namespace rhi::debug {
         ImGui::Separator();
 
         uint64_t workingMask = state.globalFeatureMask;
+        const uint64_t pipelineEnableMask = workingMask;
         const bool allowFeatureEditing = state.active && capabilities.globalInstrumentationSupported && !features.empty();
 
         if (ImGui::BeginTable("InstrumentationLayout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
@@ -742,6 +984,34 @@ namespace rhi::debug {
                 if (!haveEnabledFeature) {
                     ImGui::TextDisabled("No instrumentation features are currently enabled.");
                 }
+            }
+
+            if (ImGui::CollapsingHeader("Technique And Pipeline Targeting", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Text("Pipelines: %u", static_cast<unsigned>(pipelines.size()));
+                ImGui::Text("Technique Bindings: %u", static_cast<unsigned>(pipelineUsages.size()));
+                if (pipelineEnableMask == 0) {
+                    ImGui::TextDisabled("No instrumentation feature mask is available. Enable at least one feature globally first.");
+                }
+
+                if (ImGui::BeginChild("InstrumentationPipelines", ImVec2(0.0f, 260.0f), true)) {
+                    if (pipelines.empty()) {
+                        ImGui::TextDisabled("No pipeline inventory is available yet.");
+                    }
+
+                    for (TechniquePipelineTreeNode& node : techniquePipelineTree.children) {
+                        DrawTechniquePipelineNode(device, node, pipelines, pipelineEnableMask, lastStatus_, lastStatusWasError_);
+                    }
+
+                    if (!unobservedPipelineIndices.empty()) {
+                        if (ImGui::TreeNodeEx("Unobserved Pipelines", ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                            for (size_t pipelineIndex : unobservedPipelineIndices) {
+                                DrawPipelineToggleLine(device, pipelines[pipelineIndex], pipelineEnableMask, lastStatus_, lastStatusWasError_);
+                            }
+                            ImGui::TreePop();
+                        }
+                    }
+                }
+                ImGui::EndChild();
             }
 
             ImGui::Separator();

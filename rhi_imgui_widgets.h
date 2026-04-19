@@ -13,8 +13,8 @@ namespace rhi::debug {
     private:
         std::string lastStatus_;
         bool lastStatusWasError_ = false;
-        bool showIssues_ = true;
-        bool showDiagnostics_ = true;
+        bool showIssues_ = false;
+        bool showDiagnostics_ = false;
         std::string selectedIssueKey_;
         uint64_t selectedExecutionDetailId_ = 0;
     };

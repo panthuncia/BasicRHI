@@ -180,6 +180,8 @@ namespace rhi {
 		Dx12PipelineLayout* boundLayoutPtr = nullptr;
 		Dx12Device* dev = nullptr;
 		Dx12Pipeline* boundPipeline = nullptr; // For debug validation
+		std::string instrumentationPassName;
+		std::string instrumentationTechniquePath;
 		std::vector<RootCbvScratchPage> rootCbvScratchPages;
 		std::vector<RootCbvShadowState> rootCbvShadowStates;
 	};
@@ -388,6 +390,22 @@ namespace rhi {
 		std::string sourceLine;
 	};
 
+	struct Dx12InstrumentationPipelineMetadata {
+		DebugInstrumentationPipelineKind kind = DebugInstrumentationPipelineKind::Unknown;
+		bool active = false;
+		bool instrumented = false;
+		bool explicitlyInstrumented = false;
+		uint64_t explicitFeatureMask = 0;
+		std::string label;
+		std::string lastPassName;
+	};
+
+	struct Dx12InstrumentationPipelineUsage {
+		uint64_t pipelineUid = 0;
+		std::string techniquePath;
+		std::string passName;
+	};
+
 	struct Dx12DebugInstrumentationSession {
 		DebugInstrumentationCapabilities capabilities{};
 		DebugInstrumentationState state{};
@@ -397,6 +415,10 @@ namespace rhi {
 		std::vector<Dx12PendingInstrumentationPipelineIssue> pendingPipelineIssues;
 		std::vector<Dx12PendingInstrumentationShaderIssue> pendingShaderIssues;
 		std::unordered_map<uint64_t, std::string> pipelineNames;
+		std::unordered_map<uint64_t, Dx12InstrumentationPipelineMetadata> pipelines;
+		std::vector<uint64_t> pipelineOrder;
+		std::vector<Dx12InstrumentationPipelineUsage> pipelineUsages;
+		std::unordered_map<std::string, size_t> pipelineUsageIndexByKey;
 		std::unordered_map<uint64_t, Dx12ShaderIssueMetadata> shaderMetadata;
 		std::unordered_map<uint64_t, Dx12ShaderSourceMappingMetadata> shaderSourceMappings;
 		std::unordered_map<uint32_t, std::string> executionStacks;
@@ -405,11 +427,15 @@ namespace rhi {
 		std::unordered_map<uint64_t, Dx12InstrumentationExecutionDetail> retainedExecutionDetails;
 		std::unordered_set<uint64_t> requestedPipelineNames;
 		std::unordered_set<uint64_t> pendingPipelineNameRequests;
+		std::unordered_set<uint64_t> pendingPipelineStatusRequests;
+		uint32_t knownPipelineCount = 0;
+		bool pipelineInventoryRefreshRequested = false;
 		std::unordered_set<uint64_t> pendingShaderCodeRequests;
 		std::unordered_set<uint64_t> requestedShaderSourceMappings;
 		std::unordered_set<uint64_t> pendingShaderSourceMappingRequests;
 		uint64_t nextExecutionDetailId = 1;
 		bool issuesDirty = false;
+		bool pollInProgress = false;
 		bool defaultDescriptorMaskApplied = false;
 		bool explicitGlobalFeatureMaskConfigured = false;
 		uint32_t featureQueryAttempts = 0;

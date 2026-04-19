@@ -269,6 +269,7 @@ namespace rhi {
 	struct DebugInstrumentationCreateInfo {
 		bool enableRuntimeInstrumentation = false;
 		bool enableSynchronousRecording = false;
+		bool enableTexelAddressing = true;
 	};
 
 	struct DebugInstrumentationCapabilities {
@@ -285,13 +286,38 @@ namespace rhi {
 		bool requested = false;
 		bool active = false;
 		bool synchronousRecording = false;
+		bool texelAddressingEnabled = false;
 		uint64_t globalFeatureMask = 0;
+	};
+
+	enum class DebugInstrumentationPipelineKind : uint32_t {
+		Unknown = 0,
+		Graphics = 1,
+		Compute = 2,
+		StateObject = 3,
 	};
 
 	struct DebugInstrumentationFeature {
 		uint64_t featureBit = 0;
 		char name[64]{};
 		char description[192]{};
+	};
+
+	struct DebugInstrumentationPipeline {
+		uint64_t pipelineUid = 0;
+		uint64_t explicitFeatureMask = 0;
+		DebugInstrumentationPipelineKind kind = DebugInstrumentationPipelineKind::Unknown;
+		bool active = false;
+		bool instrumented = false;
+		bool explicitlyInstrumented = false;
+		char label[128]{};
+		char lastPassName[128]{};
+	};
+
+	struct DebugInstrumentationPipelineUsage {
+		uint64_t pipelineUid = 0;
+		char techniquePath[192]{};
+		char passName[128]{};
 	};
 
 	struct DebugInstrumentationDiagnostic {
@@ -1967,7 +1993,8 @@ namespace rhi {
 		void (*setWorkGraph)(CommandList*, const WorkGraphHandle& wg, const ResourceHandle& backingMemory, bool resetBackingMemory) noexcept; // if supported by the backend
 		void (*dispatchWorkGraph)(CommandList*, const WorkGraphDispatchDesc& desc) noexcept; // if supported by the backend
 		void (*setName)(CommandList*, const char*) noexcept;
-		uint32_t abi_version = 1;
+		void (*setDebugInstrumentationContext)(CommandList*, const char* passName, const char* techniquePath) noexcept;
+		uint32_t abi_version = 2;
 	};
 
 	class CommandList {
@@ -2154,15 +2181,21 @@ namespace rhi {
 		Result(*getDebugInstrumentationState)(const Device*, DebugInstrumentationState&) noexcept;
 		uint32_t(*getDebugInstrumentationFeatureCount)(const Device*) noexcept;
 		Result(*copyDebugInstrumentationFeatures)(const Device*, uint32_t first, DebugInstrumentationFeature*, uint32_t capacity, uint32_t* copied) noexcept;
+		uint32_t(*getDebugInstrumentationPipelineCount)(const Device*) noexcept;
+		Result(*copyDebugInstrumentationPipelines)(const Device*, uint32_t first, DebugInstrumentationPipeline*, uint32_t capacity, uint32_t* copied) noexcept;
+		uint32_t(*getDebugInstrumentationPipelineUsageCount)(const Device*) noexcept;
+		Result(*copyDebugInstrumentationPipelineUsages)(const Device*, uint32_t first, DebugInstrumentationPipelineUsage*, uint32_t capacity, uint32_t* copied) noexcept;
 		uint32_t(*getDebugInstrumentationDiagnosticCount)(const Device*) noexcept;
 		Result(*copyDebugInstrumentationDiagnostics)(const Device*, uint32_t first, DebugInstrumentationDiagnostic*, uint32_t capacity, uint32_t* copied) noexcept;
 		uint32_t(*getDebugInstrumentationIssueCount)(const Device*) noexcept;
 		Result(*copyDebugInstrumentationIssues)(const Device*, uint32_t first, DebugInstrumentationIssue*, uint32_t capacity, uint32_t* copied) noexcept;
 		Result(*setDebugGlobalInstrumentationMask)(Device*, uint64_t) noexcept;
+		Result(*setDebugPipelineInstrumentationMask)(Device*, uint64_t pipelineUid, uint64_t featureMask) noexcept;
 		Result(*setDebugSynchronousRecording)(Device*, bool) noexcept;
+		Result(*setDebugTexelAddressing)(Device*, bool) noexcept;
 
 		void (*destroyDevice)(Device*) noexcept;
-		uint32_t abi_version = 7;
+		uint32_t abi_version = 9;
 	};
 
 
