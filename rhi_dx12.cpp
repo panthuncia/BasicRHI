@@ -171,6 +171,7 @@ namespace rhi {
 		}
 		#endif
 
+		#if BASICRHI_ENABLE_RESHAPE
 		static uint64_t Dx12HashBytesStable(const void* data, uint32_t size) noexcept {
 			const uint8_t* bytes = static_cast<const uint8_t*>(data);
 			uint64_t hash = 14695981039346656037ull;
@@ -308,6 +309,12 @@ namespace rhi {
 				break;
 			}
 		}
+		#else
+		static void Dx12TrackLocalShaderEntryPoint(Dx12Device* impl, const SubobjShader& shader) noexcept {
+			(void)impl;
+			(void)shader;
+		}
+		#endif
 	}
 
 	// ---- DRED (Device Removed Extended Data) support ----
