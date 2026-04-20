@@ -35,6 +35,7 @@
 #include <Schemas/Features/Descriptor.h>
 #include <Schemas/Features/ResourceBounds.h>
 #include <Backends/DX12/States/PipelineState.h>
+#include <Backends/DX12/States/ShaderState.h>
 #endif
 #include <string>
 #include <algorithm>
@@ -169,6 +170,144 @@ namespace rhi {
 			(void)impl;
 		}
 		#endif
+
+		static uint64_t Dx12HashBytesStable(const void* data, uint32_t size) noexcept {
+			const uint8_t* bytes = static_cast<const uint8_t*>(data);
+			uint64_t hash = 14695981039346656037ull;
+			for (uint32_t index = 0; index < size; ++index) {
+				hash ^= bytes[index];
+				hash *= 1099511628211ull;
+			}
+			hash ^= static_cast<uint64_t>(size);
+			hash *= 1099511628211ull;
+			return hash;
+		}
+
+		static Dx12LocalShaderBlobKey Dx12MakeLocalShaderBlobKey(const ShaderBinary& bytecode) noexcept {
+			Dx12LocalShaderBlobKey key{};
+			key.bytecodeLength = bytecode.size;
+			if (bytecode.data && bytecode.size != 0) {
+				key.hash = Dx12HashBytesStable(bytecode.data, bytecode.size);
+			}
+			return key;
+		}
+
+		static void Dx12TrackLocalShaderEntryPoint(Dx12Device* impl, const SubobjShader& shader) noexcept {
+			if (!impl || !shader.bytecode.data || shader.bytecode.size == 0 || shader.entryPoint.empty()) {
+				return;
+			}
+
+			const Dx12LocalShaderBlobKey blobKey = Dx12MakeLocalShaderBlobKey(shader.bytecode);
+
+			std::lock_guard guard(impl->debugInstrumentation.mutex);
+			auto [it, inserted] = impl->debugInstrumentation.localShaderMetadataByBlobKey.try_emplace(
+				blobKey,
+				Dx12LocalShaderEntryPointMetadata{
+					.stage = shader.stage,
+					.entryPoint = shader.entryPoint,
+				});
+			if (inserted) {
+				impl->debugInstrumentation.localShaderDiscoveryOrder.push_back(blobKey);
+				return;
+			}
+
+			if (it->second.entryPoint.empty()) {
+				it->second.stage = shader.stage;
+				it->second.entryPoint = shader.entryPoint;
+			}
+		}
+
+		static bool Dx12ApplyLocalShaderEntryPointFallbackUnlocked(
+			Dx12DebugInstrumentationSession& session,
+			uint64_t shaderUid,
+			Dx12ShaderIssueMetadata& metadata) {
+			if (!metadata.entryPoint.empty()) {
+				return true;
+			}
+
+			auto blobKeyIt = session.localShaderBlobKeyByShaderUid.find(shaderUid);
+			if (blobKeyIt == session.localShaderBlobKeyByShaderUid.end()) {
+				return false;
+			}
+
+			auto localIt = session.localShaderMetadataByBlobKey.find(blobKeyIt->second);
+			if (localIt == session.localShaderMetadataByBlobKey.end() || localIt->second.entryPoint.empty()) {
+				return false;
+			}
+
+			metadata.entryPoint = localIt->second.entryPoint;
+			session.issuesDirty = true;
+			return true;
+		}
+
+		static void Dx12BindShaderUidToLocalBlobUnlocked(
+			Dx12DebugInstrumentationSession& session,
+			uint32_t linearIndex,
+			uint64_t shaderUid) {
+			if (session.shaderOrder.size() <= linearIndex) {
+				session.shaderOrder.resize(static_cast<size_t>(linearIndex) + 1u, 0);
+			}
+			session.shaderOrder[linearIndex] = shaderUid;
+
+			if (linearIndex >= session.localShaderDiscoveryOrder.size()) {
+				return;
+			}
+
+			const Dx12LocalShaderBlobKey& blobKey = session.localShaderDiscoveryOrder[linearIndex];
+			session.localShaderBlobKeyByShaderUid[shaderUid] = blobKey;
+			Dx12ShaderIssueMetadata& metadata = session.shaderMetadata[shaderUid];
+			Dx12ApplyLocalShaderEntryPointFallbackUnlocked(session, shaderUid, metadata);
+		}
+
+		static void Dx12ObserveBoundShaderStateUnlocked(
+			Dx12DebugInstrumentationSession& session,
+			const ::ShaderState* shaderState) {
+			if (!shaderState || shaderState->uid == 0 || shaderState->uid == ~0ull) {
+				return;
+			}
+
+			ShaderBinary shaderBinary{};
+			shaderBinary.data = shaderState->byteCode.pShaderBytecode;
+			shaderBinary.size = static_cast<uint32_t>(shaderState->byteCode.BytecodeLength);
+			if (!shaderBinary.data || shaderBinary.size == 0) {
+				return;
+			}
+
+			const Dx12LocalShaderBlobKey blobKey = Dx12MakeLocalShaderBlobKey(shaderBinary);
+			session.localShaderBlobKeyByShaderUid[shaderState->uid] = blobKey;
+
+			Dx12ShaderIssueMetadata& metadata = session.shaderMetadata[shaderState->uid];
+			Dx12ApplyLocalShaderEntryPointFallbackUnlocked(session, shaderState->uid, metadata);
+		}
+
+		static void Dx12ObserveBoundPipelineShadersUnlocked(
+			Dx12DebugInstrumentationSession& session,
+			const ::PipelineState* pipelineState) {
+			if (!pipelineState) {
+				return;
+			}
+
+			switch (pipelineState->type) {
+			case PipelineType::Graphics: {
+				auto* graphicsPipelineState = static_cast<const ::GraphicsPipelineState*>(pipelineState);
+				Dx12ObserveBoundShaderStateUnlocked(session, graphicsPipelineState->vs);
+				Dx12ObserveBoundShaderStateUnlocked(session, graphicsPipelineState->hs);
+				Dx12ObserveBoundShaderStateUnlocked(session, graphicsPipelineState->ds);
+				Dx12ObserveBoundShaderStateUnlocked(session, graphicsPipelineState->gs);
+				Dx12ObserveBoundShaderStateUnlocked(session, graphicsPipelineState->ps);
+				Dx12ObserveBoundShaderStateUnlocked(session, graphicsPipelineState->as);
+				Dx12ObserveBoundShaderStateUnlocked(session, graphicsPipelineState->ms);
+				break;
+			}
+			case PipelineType::Compute: {
+				auto* computePipelineState = static_cast<const ::ComputePipelineState*>(pipelineState);
+				Dx12ObserveBoundShaderStateUnlocked(session, computePipelineState->cs);
+				break;
+			}
+			default:
+				break;
+			}
+		}
 	}
 
 	// ---- DRED (Device Removed Extended Data) support ----
@@ -469,6 +608,7 @@ namespace rhi {
 				} break;
 				case PsoSubobj::Shader: {
 					auto& S = *static_cast<const SubobjShader*>(items[i].data);
+					Dx12TrackLocalShaderEntryPoint(dimpl, S);
 					D3D12_SHADER_BYTECODE bc{ S.bytecode.data, S.bytecode.size };
 					switch (S.stage) {
 					case ShaderStage::Compute: cs = bc; hasCS = true; break;
@@ -4845,8 +4985,24 @@ namespace rhi {
 						}
 
 						std::lock_guard guard(impl->debugInstrumentation.mutex);
+						impl->debugInstrumentation.knownShaderCount = message->shaderCount;
 						impl->debugInstrumentation.knownPipelineCount = message->pipelineCount;
 						impl->debugInstrumentation.pipelineInventoryRefreshRequested = false;
+						break;
+					}
+					case ShaderUIDRangeMessage::kID: {
+						auto* message = it.Get<ShaderUIDRangeMessage>();
+						if (!message) {
+							break;
+						}
+
+						std::lock_guard guard(impl->debugInstrumentation.mutex);
+						for (uint32_t index = 0; index < message->shaderUID.count; ++index) {
+							Dx12BindShaderUidToLocalBlobUnlocked(
+								impl->debugInstrumentation,
+								message->start + index,
+								message->shaderUID[index]);
+						}
 						break;
 					}
 					case PipelineUIDRangeMessage::kID: {
@@ -4889,6 +5045,8 @@ namespace rhi {
 							break;
 						}
 
+						std::string effectiveEntryPoint;
+
 						{
 							std::lock_guard guard(impl->debugInstrumentation.mutex);
 							Dx12ShaderIssueMetadata& metadata = impl->debugInstrumentation.shaderMetadata[message->shaderUID];
@@ -4897,10 +5055,16 @@ namespace rhi {
 							metadata.nativeBinary = message->native != 0;
 							metadata.hasDebugFiles = message->fileCount != 0;
 							const std::string entryPoint(message->entryPoint.View());
-							if (metadata.entryPoint != entryPoint) {
+							if (!entryPoint.empty() && metadata.entryPoint != entryPoint) {
 								metadata.entryPoint = entryPoint;
 								impl->debugInstrumentation.issuesDirty = true;
+							} else if (entryPoint.empty()) {
+								Dx12ApplyLocalShaderEntryPointFallbackUnlocked(
+									impl->debugInstrumentation,
+									message->shaderUID,
+									metadata);
 							}
+							effectiveEntryPoint = metadata.entryPoint;
 							impl->debugInstrumentation.issuesDirty = true;
 						}
 						Dx12AppendShaderCodeInfo(
@@ -4912,7 +5076,7 @@ namespace rhi {
 						Dx12AppendShaderEntryPointDiagnostic(
 							impl,
 							message->shaderUID,
-							message->entryPoint.View(),
+							effectiveEntryPoint,
 							message->found != 0,
 							message->native != 0,
 							message->fileCount);
@@ -5209,6 +5373,7 @@ namespace rhi {
 				return;
 			}
 			static constexpr uint32_t kMaxPollRoundsPerCall = 2;
+			static constexpr uint32_t kMaxShaderUidRangePerRound = 128;
 			static constexpr uint32_t kMaxPipelineUidRangePerRound = 128;
 			static constexpr size_t kMaxPipelineNamesPerRound = 64;
 			static constexpr size_t kMaxPipelineStatusesPerRound = 64;
@@ -5275,8 +5440,15 @@ namespace rhi {
 						impl->debugInstrumentation.pipelineInventoryRefreshRequested = false;
 					}
 
+					const uint32_t knownShaderCount = impl->debugInstrumentation.knownShaderCount;
+					const uint32_t enumeratedShaderCount = static_cast<uint32_t>(impl->debugInstrumentation.shaderOrder.size());
 					const uint32_t knownPipelineCount = impl->debugInstrumentation.knownPipelineCount;
 					const uint32_t enumeratedPipelineCount = static_cast<uint32_t>(impl->debugInstrumentation.pipelineOrder.size());
+					if (knownShaderCount > enumeratedShaderCount) {
+						auto* message = MessageStreamView<>(requestStream).Add<GetShaderUIDRangeMessage>();
+						message->start = enumeratedShaderCount;
+						message->limit = (std::min)(knownShaderCount - enumeratedShaderCount, kMaxShaderUidRangePerRound);
+					}
 					if (knownPipelineCount > enumeratedPipelineCount) {
 						auto* message = MessageStreamView<>(requestStream).Add<GetPipelineUIDRangeMessage>();
 						message->start = enumeratedPipelineCount;
@@ -6373,6 +6545,7 @@ namespace rhi {
 						&& pipelineState
 						&& pipelineState->uid != kInvalidPipelineUID) {
 						std::lock_guard guard(dev->debugInstrumentation.mutex);
+						Dx12ObserveBoundPipelineShadersUnlocked(dev->debugInstrumentation, pipelineState);
 						Dx12ObservePipelineUsageUnlocked(
 							dev->debugInstrumentation,
 							pipelineState->uid,

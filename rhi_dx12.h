@@ -371,6 +371,32 @@ namespace rhi {
 		Dx12InstrumentationResourceBoundsDetail resourceBounds;
 	};
 
+	struct Dx12LocalShaderBlobKey {
+		uint64_t hash = 0;
+		uint32_t bytecodeLength = 0;
+
+		bool operator==(const Dx12LocalShaderBlobKey& rhs) const noexcept {
+			return hash == rhs.hash && bytecodeLength == rhs.bytecodeLength;
+		}
+	};
+
+	struct Dx12LocalShaderBlobKeyHasher {
+		std::size_t operator()(const Dx12LocalShaderBlobKey& key) const noexcept {
+			uint64_t mixed = key.hash ^ (static_cast<uint64_t>(key.bytecodeLength) << 32u);
+			mixed ^= mixed >> 33u;
+			mixed *= 0xff51afd7ed558ccdull;
+			mixed ^= mixed >> 33u;
+			mixed *= 0xc4ceb9fe1a85ec53ull;
+			mixed ^= mixed >> 33u;
+			return static_cast<std::size_t>(mixed);
+		}
+	};
+
+	struct Dx12LocalShaderEntryPointMetadata {
+		ShaderStage stage = ShaderStage::All;
+		std::string entryPoint;
+	};
+
 	struct Dx12ShaderIssueMetadata {
 		bool requested = false;
 		bool resolved = false;
@@ -426,6 +452,10 @@ namespace rhi {
 		std::vector<Dx12InstrumentationPipelineUsage> pipelineUsages;
 		std::unordered_map<std::string, size_t> pipelineUsageIndexByKey;
 		std::unordered_map<uint64_t, Dx12ShaderIssueMetadata> shaderMetadata;
+		std::unordered_map<Dx12LocalShaderBlobKey, Dx12LocalShaderEntryPointMetadata, Dx12LocalShaderBlobKeyHasher> localShaderMetadataByBlobKey;
+		std::vector<Dx12LocalShaderBlobKey> localShaderDiscoveryOrder;
+		std::vector<uint64_t> shaderOrder;
+		std::unordered_map<uint64_t, Dx12LocalShaderBlobKey> localShaderBlobKeyByShaderUid;
 		std::unordered_map<uint64_t, Dx12ShaderSourceMappingMetadata> shaderSourceMappings;
 		std::unordered_map<uint32_t, std::string> executionStacks;
 		std::deque<Dx12InstrumentationExecutionDetail> executionDetails;
@@ -434,6 +464,7 @@ namespace rhi {
 		std::unordered_set<uint64_t> requestedPipelineNames;
 		std::unordered_set<uint64_t> pendingPipelineNameRequests;
 		std::unordered_set<uint64_t> pendingPipelineStatusRequests;
+		uint32_t knownShaderCount = 0;
 		uint32_t knownPipelineCount = 0;
 		bool pipelineInventoryRefreshRequested = false;
 		std::unordered_set<uint64_t> pendingShaderCodeRequests;
