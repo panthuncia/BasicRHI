@@ -470,6 +470,7 @@ namespace rhi {
 		std::unordered_set<uint64_t> pendingShaderCodeRequests;
 		std::unordered_set<uint64_t> requestedShaderSourceMappings;
 		std::unordered_set<uint64_t> pendingShaderSourceMappingRequests;
+		std::unordered_set<uint64_t> suspiciousShaderFileResolutionTelemetrySguids;
 		uint64_t nextExecutionDetailId = 1;
 		bool issuesDirty = false;
 		bool pollInProgress = false;
