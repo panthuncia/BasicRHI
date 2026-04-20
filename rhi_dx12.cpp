@@ -5237,6 +5237,10 @@ namespace rhi {
 							metadata.resolved = message->found != 0;
 							metadata.nativeBinary = message->native != 0;
 							metadata.hasDebugFiles = message->fileCount != 0;
+							metadata.filePaths.clear();
+							metadata.fileUids.clear();
+							metadata.filePathsByUid.clear();
+							metadata.fileContentsByUid.clear();
 							const std::string entryPoint(message->entryPoint.View());
 							if (!entryPoint.empty() && metadata.entryPoint != entryPoint) {
 								metadata.entryPoint = entryPoint;
