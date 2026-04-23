@@ -544,19 +544,19 @@ namespace rhi {
             case Format::R8_Typeless: return 1;
             case Format::R8G8_UNorm: case Format::R8G8_UInt: case Format::R8G8_SNorm: case Format::R8G8_SInt:
             case Format::R8G8_Typeless: return 2;
+                case Format::R16_UNorm: case Format::R16_UInt: case Format::R16_SNorm: case Format::R16_SInt:
+                case Format::R16_Float: case Format::R16_Typeless:
+                    return 2; // 16bpp
             case Format::R8G8B8A8_UNorm: case Format::R8G8B8A8_UNorm_sRGB: case Format::R8G8B8A8_UInt:
             case Format::R8G8B8A8_SNorm: case Format::R8G8B8A8_SInt: case Format::R8G8B8A8_Typeless:
             case Format::B8G8R8A8_Typeless: case Format::B8G8R8A8_UNorm: case Format::B8G8R8A8_UNorm_sRGB:
-            case Format::R16_UNorm: case Format::R16_UInt: case Format::R16_SNorm: case Format::R16_SInt:
-            case Format::R16_Float: case Format::R16_Typeless:
-                return 4; // 32bpp (either RGBA8 or R16)
-            case Format::R16G16_UNorm: case Format::R16G16_UInt: case Format::R16G16_SNorm: case Format::R16G16_SInt:
-            case Format::R16G16_Float: case Format::R16G16_Typeless:
-            case Format::R32_Float: case Format::R32_UInt: case Format::R32_SInt: case Format::R32_Typeless:
-                return 8; // 64bpp
-            case Format::R10G10B10A2_UNorm: case Format::R10G10B10A2_UInt: case Format::R10G10B10A2_Typeless:
-            case Format::R11G11B10_Float:
-                return 4; // packed 32bpp
+                case Format::R10G10B10A2_UNorm: case Format::R10G10B10A2_UInt: case Format::R10G10B10A2_Typeless:
+                case Format::R11G11B10_Float:
+                case Format::R16G16_UNorm: case Format::R16G16_UInt: case Format::R16G16_SNorm: case Format::R16G16_SInt:
+                case Format::R16G16_Float: case Format::R16G16_Typeless:
+                case Format::R32_Float: case Format::R32_UInt: case Format::R32_SInt: case Format::R32_Typeless:
+                case Format::D32_Float:
+                    return 4; // 32bpp
             case Format::R32G32_Float: case Format::R32G32_UInt: case Format::R32G32_SInt: case Format::R32G32_Typeless:
             case Format::R16G16B16A16_UNorm: case Format::R16G16B16A16_UInt: case Format::R16G16B16A16_SNorm:
             case Format::R16G16B16A16_SInt: case Format::R16G16B16A16_Float: case Format::R16G16B16A16_Typeless:
