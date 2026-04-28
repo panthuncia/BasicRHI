@@ -193,67 +193,73 @@ namespace rhi {
 
 
 	inline ResourceSyncState ComputeSyncFromAccess(ResourceAccessType access) {
-		ResourceSyncState sync = ResourceSyncState::None;
+		bool needsIndirect = (access & ResourceAccessType::IndirectArgument) != 0;
 
-		if ((access & ResourceAccessType::Common) != 0) {
-			return ResourceSyncState::All;
-		}
-		if ((access & (ResourceAccessType::VertexBuffer
-			| ResourceAccessType::ConstantBuffer
-			| ResourceAccessType::ShaderResource
-			| ResourceAccessType::UnorderedAccess)) != 0) {
-			sync |= ResourceSyncState::ComputeShading;
-		}
-		if ((access & (ResourceAccessType::CopySource | ResourceAccessType::CopyDest)) != 0) {
-			sync |= ResourceSyncState::Copy;
-		}
-		if ((access & ResourceAccessType::IndirectArgument) != 0) {
-			sync |= ResourceSyncState::ExecuteIndirect;
-		}
-		if ((access & ResourceAccessType::RaytracingAccelerationStructureRead) != 0) {
-			sync |= ResourceSyncState::Raytracing;
-		}
-		if ((access & ResourceAccessType::RaytracingAccelerationStructureWrite) != 0) {
-			sync |= ResourceSyncState::BuildRaytracingAccelerationStructure;
+		if (needsIndirect) {
+			return ResourceSyncState::ExecuteIndirect;
 		}
 
-		return sync;
+		return ResourceSyncState::ComputeShading;
 	}
 
 	inline ResourceSyncState RenderSyncFromAccess(ResourceAccessType access)
 	{
-		ResourceSyncState sync = ResourceSyncState::None;
-		if ((access & ResourceAccessType::Common) != 0) {
-			return ResourceSyncState::All;
-		}
-		if ((access & (ResourceAccessType::VertexBuffer
+		// pick out each distinct sync category
+		bool needsCommon = (access & ResourceAccessType::Common) != 0;
+		bool needsShading = (access & (ResourceAccessType::VertexBuffer
 			| ResourceAccessType::ConstantBuffer
 			| ResourceAccessType::ShaderResource
-			| ResourceAccessType::UnorderedAccess)) != 0) {
-			sync |= ResourceSyncState::AllShading;
-		}
-		if ((access & ResourceAccessType::IndexBuffer) != 0) {
-			sync |= ResourceSyncState::IndexInput;
-		}
-		if ((access & ResourceAccessType::RenderTarget) != 0) {
-			sync |= ResourceSyncState::RenderTarget;
-		}
-		if ((access & (ResourceAccessType::DepthRead | ResourceAccessType::DepthReadWrite)) != 0) {
-			sync |= ResourceSyncState::DepthStencil;
-		}
-		if ((access & (ResourceAccessType::CopySource | ResourceAccessType::CopyDest)) != 0) {
-			sync |= ResourceSyncState::Copy;
-		}
-		if ((access & ResourceAccessType::IndirectArgument) != 0) {
-			sync |= ResourceSyncState::ExecuteIndirect;
-		}
-		if ((access & ResourceAccessType::RaytracingAccelerationStructureRead) != 0) {
-			sync |= ResourceSyncState::Raytracing;
-		}
-		if ((access & ResourceAccessType::RaytracingAccelerationStructureWrite) != 0) {
-			sync |= ResourceSyncState::BuildRaytracingAccelerationStructure;
-		}
-		return sync;
+			| ResourceAccessType::UnorderedAccess)) != 0;
+		bool needsIndexInput = (access & ResourceAccessType::IndexBuffer) != 0;
+		bool needsRenderTarget = (access & ResourceAccessType::RenderTarget) != 0;
+		bool needsDepthStencil = (access & (ResourceAccessType::DepthRead
+			| ResourceAccessType::DepthReadWrite)) != 0;
+		bool needsCopy = (access & (ResourceAccessType::CopySource
+			| ResourceAccessType::CopyDest)) != 0;
+		bool needsIndirect = (access & ResourceAccessType::IndirectArgument) != 0;
+		bool needsRayTracing = (access & ResourceAccessType::RaytracingAccelerationStructureRead) != 0;
+		bool needsBuildAS = (access & ResourceAccessType::RaytracingAccelerationStructureWrite) != 0;
+
+		// count how many distinct categories are requested
+		int categoryCount =
+			(int)needsCommon
+			+ (int)needsShading
+			+ (int)needsIndexInput
+			+ (int)needsRenderTarget
+			+ (int)needsDepthStencil
+			+ (int)needsCopy
+			+ (int)needsIndirect
+			+ (int)needsRayTracing
+			+ (int)needsBuildAS;
+
+		// zero categories = no sync
+		if (categoryCount == 0)
+			return ResourceSyncState::None;
+		// Mixed graphics-pipeline categories can use the DRAW aggregate scope.
+		if (categoryCount > 1
+			&& !needsCommon
+			&& !needsCopy
+			&& !needsIndirect
+			&& !needsRayTracing
+			&& !needsBuildAS)
+			return ResourceSyncState::Draw;
+		// Other mixed categories still need the conservative full-pipeline fallback.
+		if (categoryCount > 1)
+			return ResourceSyncState::All;
+
+		// exactly one category = pick it
+		if (needsCommon)        return ResourceSyncState::All;
+		if (needsShading)       return ResourceSyncState::AllShading;
+		if (needsIndexInput)    return ResourceSyncState::IndexInput;
+		if (needsRenderTarget)  return ResourceSyncState::RenderTarget;
+		if (needsDepthStencil)  return ResourceSyncState::DepthStencil;
+		if (needsCopy)          return ResourceSyncState::Copy;
+		if (needsIndirect)      return ResourceSyncState::ExecuteIndirect;
+		if (needsBuildAS)       return ResourceSyncState::BuildRaytracingAccelerationStructure;
+		if (needsRayTracing)    return ResourceSyncState::Raytracing;
+
+		// (should never get here)
+		return ResourceSyncState::All;
 	}
 
 	inline bool AccessTypeIsWriteType(ResourceAccessType access) {
