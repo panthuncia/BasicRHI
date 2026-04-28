@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 
 namespace rhi {
 
@@ -65,32 +66,68 @@ namespace rhi {
 			layout == ResourceLayout::ComputeUnorderedAccess;
 	}
 
-	enum class ResourceSyncState {
-		None,
-		All,
-		Draw,
-		IndexInput,
-		VertexShading,
-		PixelShading,
-		DepthStencil,
-		RenderTarget,
-		ComputeShading,
-		Raytracing,
-		Copy,
-		Resolve,
-		ExecuteIndirect,
-		Predication,
-		AllShading,
-		NonPixelShading,
-		EmitRaytracingAccelerationStructurePostbuildInfo,
-		ClearUnorderedAccessView,
-		VideoDecode,
-		VideoProcess,
-		VideoEncode,
-		BuildRaytracingAccelerationStructure,
-		CopyRatracingAccelerationStructure,
-		SyncSplit,
+	enum class ResourceSyncState : uint32_t {
+		None = 0x0,
+		All = 0x1,
+		Draw = 0x2,
+		IndexInput = 0x4,
+		VertexShading = 0x8,
+		PixelShading = 0x10,
+		DepthStencil = 0x20,
+		RenderTarget = 0x40,
+		ComputeShading = 0x80,
+		Raytracing = 0x100,
+		Copy = 0x200,
+		Resolve = 0x400,
+		ExecuteIndirect = 0x800,
+		Predication = 0x800,
+		AllShading = 0x1000,
+		NonPixelShading = 0x2000,
+		EmitRaytracingAccelerationStructurePostbuildInfo = 0x4000,
+		ClearUnorderedAccessView = 0x8000,
+		VideoDecode = 0x100000,
+		VideoProcess = 0x200000,
+		VideoEncode = 0x400000,
+		BuildRaytracingAccelerationStructure = 0x800000,
+		CopyRatracingAccelerationStructure = 0x1000000,
+		SyncSplit = 0x80000000u,
 	};
+
+	inline constexpr ResourceSyncState operator|(ResourceSyncState a, ResourceSyncState b) noexcept
+	{
+		using U = std::underlying_type_t<ResourceSyncState>;
+		return static_cast<ResourceSyncState>(static_cast<U>(a) | static_cast<U>(b));
+	}
+
+	inline constexpr ResourceSyncState operator&(ResourceSyncState a, ResourceSyncState b) noexcept
+	{
+		using U = std::underlying_type_t<ResourceSyncState>;
+		return static_cast<ResourceSyncState>(static_cast<U>(a) & static_cast<U>(b));
+	}
+
+	inline constexpr ResourceSyncState operator~(ResourceSyncState a) noexcept
+	{
+		using U = std::underlying_type_t<ResourceSyncState>;
+		return static_cast<ResourceSyncState>(~static_cast<U>(a));
+	}
+
+	inline constexpr ResourceSyncState& operator|=(ResourceSyncState& a, ResourceSyncState b) noexcept
+	{
+		a = a | b;
+		return a;
+	}
+
+	inline constexpr bool ResourceSyncStateHasAny(ResourceSyncState value, ResourceSyncState bits) noexcept
+	{
+		using U = std::underlying_type_t<ResourceSyncState>;
+		return (static_cast<U>(value) & static_cast<U>(bits)) != 0;
+	}
+
+	inline constexpr bool ResourceSyncStateHasOnly(ResourceSyncState value, ResourceSyncState allowed) noexcept
+	{
+		using U = std::underlying_type_t<ResourceSyncState>;
+		return (static_cast<U>(value) & ~static_cast<U>(allowed)) == 0;
+	}
 
 	inline unsigned int ResourceAccessGetNumReadStates(ResourceAccessType access) {
 		int num = 0;
@@ -156,65 +193,67 @@ namespace rhi {
 
 
 	inline ResourceSyncState ComputeSyncFromAccess(ResourceAccessType access) {
-		bool needsIndirect = (access & ResourceAccessType::IndirectArgument) != 0;
+		ResourceSyncState sync = ResourceSyncState::None;
 
-		if (needsIndirect) {
-			return ResourceSyncState::ExecuteIndirect;
+		if ((access & ResourceAccessType::Common) != 0) {
+			return ResourceSyncState::All;
+		}
+		if ((access & (ResourceAccessType::VertexBuffer
+			| ResourceAccessType::ConstantBuffer
+			| ResourceAccessType::ShaderResource
+			| ResourceAccessType::UnorderedAccess)) != 0) {
+			sync |= ResourceSyncState::ComputeShading;
+		}
+		if ((access & (ResourceAccessType::CopySource | ResourceAccessType::CopyDest)) != 0) {
+			sync |= ResourceSyncState::Copy;
+		}
+		if ((access & ResourceAccessType::IndirectArgument) != 0) {
+			sync |= ResourceSyncState::ExecuteIndirect;
+		}
+		if ((access & ResourceAccessType::RaytracingAccelerationStructureRead) != 0) {
+			sync |= ResourceSyncState::Raytracing;
+		}
+		if ((access & ResourceAccessType::RaytracingAccelerationStructureWrite) != 0) {
+			sync |= ResourceSyncState::BuildRaytracingAccelerationStructure;
 		}
 
-		return ResourceSyncState::ComputeShading;
+		return sync;
 	}
 
 	inline ResourceSyncState RenderSyncFromAccess(ResourceAccessType access)
 	{
-		// pick out each distinct sync category
-		bool needsCommon = (access & ResourceAccessType::Common) != 0;
-		bool needsShading = (access & (ResourceAccessType::VertexBuffer
+		ResourceSyncState sync = ResourceSyncState::None;
+		if ((access & ResourceAccessType::Common) != 0) {
+			return ResourceSyncState::All;
+		}
+		if ((access & (ResourceAccessType::VertexBuffer
 			| ResourceAccessType::ConstantBuffer
 			| ResourceAccessType::ShaderResource
-			| ResourceAccessType::UnorderedAccess)) != 0;
-		bool needsIndexInput = (access & ResourceAccessType::IndexBuffer) != 0;
-		bool needsRenderTarget = (access & ResourceAccessType::RenderTarget) != 0;
-		bool needsDepthStencil = (access & (ResourceAccessType::DepthRead
-			| ResourceAccessType::DepthReadWrite)) != 0;
-		bool needsCopy = (access & (ResourceAccessType::CopySource
-			| ResourceAccessType::CopyDest)) != 0;
-		bool needsIndirect = (access & ResourceAccessType::IndirectArgument) != 0;
-		bool needsRayTracing = (access & ResourceAccessType::RaytracingAccelerationStructureRead) != 0;
-		bool needsBuildAS = (access & ResourceAccessType::RaytracingAccelerationStructureWrite) != 0;
-
-		// count how many distinct categories are requested
-		int categoryCount =
-			(int)needsCommon
-			+ (int)needsShading
-			+ (int)needsIndexInput
-			+ (int)needsRenderTarget
-			+ (int)needsDepthStencil
-			+ (int)needsCopy
-			+ (int)needsIndirect
-			+ (int)needsRayTracing
-			+ (int)needsBuildAS;
-
-		// zero categories = no sync
-		if (categoryCount == 0)
-			return ResourceSyncState::None;
-		// more than one category = full pipeline sync
-		if (categoryCount > 1)
-			return ResourceSyncState::All;
-
-		// exactly one category = pick it
-		if (needsCommon)        return ResourceSyncState::All;
-		if (needsShading)       return ResourceSyncState::AllShading;
-		if (needsIndexInput)    return ResourceSyncState::IndexInput;
-		if (needsRenderTarget)  return ResourceSyncState::RenderTarget;
-		if (needsDepthStencil)  return ResourceSyncState::DepthStencil;
-		if (needsCopy)          return ResourceSyncState::Copy;
-		if (needsIndirect)      return ResourceSyncState::ExecuteIndirect;
-		if (needsBuildAS)       return ResourceSyncState::BuildRaytracingAccelerationStructure;
-		if (needsRayTracing)    return ResourceSyncState::Raytracing;
-
-		// (should never get here)
-		return ResourceSyncState::All;
+			| ResourceAccessType::UnorderedAccess)) != 0) {
+			sync |= ResourceSyncState::AllShading;
+		}
+		if ((access & ResourceAccessType::IndexBuffer) != 0) {
+			sync |= ResourceSyncState::IndexInput;
+		}
+		if ((access & ResourceAccessType::RenderTarget) != 0) {
+			sync |= ResourceSyncState::RenderTarget;
+		}
+		if ((access & (ResourceAccessType::DepthRead | ResourceAccessType::DepthReadWrite)) != 0) {
+			sync |= ResourceSyncState::DepthStencil;
+		}
+		if ((access & (ResourceAccessType::CopySource | ResourceAccessType::CopyDest)) != 0) {
+			sync |= ResourceSyncState::Copy;
+		}
+		if ((access & ResourceAccessType::IndirectArgument) != 0) {
+			sync |= ResourceSyncState::ExecuteIndirect;
+		}
+		if ((access & ResourceAccessType::RaytracingAccelerationStructureRead) != 0) {
+			sync |= ResourceSyncState::Raytracing;
+		}
+		if ((access & ResourceAccessType::RaytracingAccelerationStructureWrite) != 0) {
+			sync |= ResourceSyncState::BuildRaytracingAccelerationStructure;
+		}
+		return sync;
 	}
 
 	inline bool AccessTypeIsWriteType(ResourceAccessType access) {
@@ -297,15 +336,22 @@ namespace rhi {
 	}
 
 	inline bool ResourceSyncStateIsNotComputeSyncState(ResourceSyncState state) {
-		switch (state) { // TODO: What states can the compute queue actually work with?
-		case ResourceSyncState::None:
-		case ResourceSyncState::All:
-		case ResourceSyncState::ComputeShading:
-		case ResourceSyncState::ExecuteIndirect:
-			return false;
-		default:
-			break;
-		}
-		return true;
+		constexpr ResourceSyncState kComputeSupported =
+			ResourceSyncState::None
+			| ResourceSyncState::All
+			| ResourceSyncState::ComputeShading
+			| ResourceSyncState::Copy
+			| ResourceSyncState::Resolve
+			| ResourceSyncState::ExecuteIndirect
+			| ResourceSyncState::Predication
+			| ResourceSyncState::AllShading
+			| ResourceSyncState::NonPixelShading
+			| ResourceSyncState::Raytracing
+			| ResourceSyncState::BuildRaytracingAccelerationStructure
+			| ResourceSyncState::CopyRatracingAccelerationStructure
+			| ResourceSyncState::EmitRaytracingAccelerationStructurePostbuildInfo
+			| ResourceSyncState::ClearUnorderedAccessView
+			| ResourceSyncState::SyncSplit;
+		return !ResourceSyncStateHasOnly(state, kComputeSupported);
 	}
 }

@@ -11,7 +11,10 @@ namespace rhi {
 		if (state == ResourceAccessType::None) {
 			return D3D12_BARRIER_ACCESS_NO_ACCESS;
 		}
-		D3D12_BARRIER_ACCESS access = D3D12_BARRIER_ACCESS_COMMON;
+		D3D12_BARRIER_ACCESS access = D3D12_BARRIER_ACCESS{};
+		if (state & ResourceAccessType::Common) {
+			access |= D3D12_BARRIER_ACCESS_COMMON;
+		}
 		if (state & ResourceAccessType::IndexBuffer) {
 			access |= D3D12_BARRIER_ACCESS_INDEX_BUFFER;
 		}
@@ -87,57 +90,7 @@ namespace rhi {
 	}
 
 	static inline D3D12_BARRIER_SYNC ToDX(const ResourceSyncState state) {
-		switch (state) {
-		case ResourceSyncState::None:
-			return D3D12_BARRIER_SYNC_NONE;
-		case ResourceSyncState::All:
-			return D3D12_BARRIER_SYNC_ALL;
-		case ResourceSyncState::Draw:
-			return D3D12_BARRIER_SYNC_DRAW;
-		case ResourceSyncState::IndexInput:
-			return D3D12_BARRIER_SYNC_INDEX_INPUT;
-		case ResourceSyncState::VertexShading:
-			return D3D12_BARRIER_SYNC_VERTEX_SHADING;
-		case ResourceSyncState::PixelShading:
-			return D3D12_BARRIER_SYNC_PIXEL_SHADING;
-		case ResourceSyncState::DepthStencil:
-			return D3D12_BARRIER_SYNC_DEPTH_STENCIL;
-		case ResourceSyncState::RenderTarget:
-			return D3D12_BARRIER_SYNC_RENDER_TARGET;
-		case ResourceSyncState::ComputeShading:
-			return D3D12_BARRIER_SYNC_COMPUTE_SHADING;
-		case ResourceSyncState::Raytracing:
-			return D3D12_BARRIER_SYNC_RAYTRACING;
-		case ResourceSyncState::Copy:
-			return D3D12_BARRIER_SYNC_COPY;
-		case ResourceSyncState::Resolve:
-			return D3D12_BARRIER_SYNC_RESOLVE;
-		case ResourceSyncState::ExecuteIndirect:
-			return D3D12_BARRIER_SYNC_EXECUTE_INDIRECT;
-		case ResourceSyncState::Predication:
-			return D3D12_BARRIER_SYNC_PREDICATION;
-		case ResourceSyncState::AllShading:
-			return D3D12_BARRIER_SYNC_ALL_SHADING;
-		case ResourceSyncState::NonPixelShading:
-			return D3D12_BARRIER_SYNC_NON_PIXEL_SHADING;
-		case ResourceSyncState::EmitRaytracingAccelerationStructurePostbuildInfo:
-			return D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO;
-		case ResourceSyncState::ClearUnorderedAccessView:
-			return D3D12_BARRIER_SYNC_CLEAR_UNORDERED_ACCESS_VIEW;
-		case ResourceSyncState::VideoDecode:
-			return D3D12_BARRIER_SYNC_VIDEO_DECODE;
-		case ResourceSyncState::VideoProcess:
-			return D3D12_BARRIER_SYNC_VIDEO_PROCESS;
-		case ResourceSyncState::VideoEncode:
-			return D3D12_BARRIER_SYNC_VIDEO_ENCODE;
-		case ResourceSyncState::BuildRaytracingAccelerationStructure:
-			return D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE;
-		case ResourceSyncState::CopyRatracingAccelerationStructure:
-			return D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE;
-		case ResourceSyncState::SyncSplit:
-			return D3D12_BARRIER_SYNC_SPLIT;
-		}
-		return D3D12_BARRIER_SYNC_ALL;
+		return static_cast<D3D12_BARRIER_SYNC>(static_cast<std::underlying_type_t<ResourceSyncState>>(state));
 	}
 
 	static inline D3D12_FILL_MODE ToDX(const FillMode f) { return f == FillMode::Wireframe ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID; }

@@ -957,40 +957,46 @@ namespace rhi {
             return out;
         }
 
-        inline const char* ResourceSyncToString(ResourceSyncState sync)
+        inline std::string ResourceSyncToString(ResourceSyncState sync)
         {
-            switch (sync)
-            {
-            case ResourceSyncState::None:          return "NONE";
-            case ResourceSyncState::All:           return "ALL";
-            case ResourceSyncState::Draw:          return "DRAW";
-            case ResourceSyncState::IndexInput:    return "INDEX_INPUT";
-            case ResourceSyncState::VertexShading: return "VERTEX_SHADING";
-            case ResourceSyncState::PixelShading:  return "PIXEL_SHADING";
-            case ResourceSyncState::DepthStencil:  return "DEPTH_STENCIL";
-            case ResourceSyncState::RenderTarget:  return "RENDER_TARGET";
-            case ResourceSyncState::ComputeShading:return "COMPUTE_SHADING";
-            case ResourceSyncState::Raytracing:    return "RAYTRACING";
-            case ResourceSyncState::Copy:          return "COPY";
-            case ResourceSyncState::Resolve:       return "RESOLVE";
-            case ResourceSyncState::ExecuteIndirect:return "EXECUTE_INDIRECT";
-            case ResourceSyncState::Predication:   return "PREDICATION";
-            case ResourceSyncState::AllShading:    return "ALL_SHADING";
-            case ResourceSyncState::NonPixelShading:return "NON_PIXEL_SHADING";
-            case ResourceSyncState::EmitRaytracingAccelerationStructurePostbuildInfo:
-                return "EMIT_RTAS_POSTBUILD_INFO";
-            case ResourceSyncState::ClearUnorderedAccessView:
-                return "CLEAR_UNORDERED_ACCESS_VIEW";
-            case ResourceSyncState::VideoDecode:   return "VIDEO_DECODE";
-            case ResourceSyncState::VideoProcess:  return "VIDEO_PROCESS";
-            case ResourceSyncState::VideoEncode:   return "VIDEO_ENCODE";
-            case ResourceSyncState::BuildRaytracingAccelerationStructure:
-                return "BUILD_RAYTRACING_ACCELERATION_STRUCTURE";
-            case ResourceSyncState::CopyRatracingAccelerationStructure:
-                return "COPY_RAYTRACING_ACCELERATION_STRUCTURE";
-            case ResourceSyncState::SyncSplit:     return "SPLIT";
-            default:                               return "UNKNOWN";
-            }
+            using U = std::underlying_type_t<ResourceSyncState>;
+            const U value = static_cast<U>(sync);
+            if (value == 0) return "NONE";
+
+            std::string out;
+            auto add = [&](const char* s, ResourceSyncState bit) {
+                if (!ResourceSyncStateHasAny(sync, bit)) {
+                    return;
+                }
+                if (!out.empty()) out += '|';
+                out += s;
+            };
+
+            add("ALL", ResourceSyncState::All);
+            add("DRAW", ResourceSyncState::Draw);
+            add("INDEX_INPUT", ResourceSyncState::IndexInput);
+            add("VERTEX_SHADING", ResourceSyncState::VertexShading);
+            add("PIXEL_SHADING", ResourceSyncState::PixelShading);
+            add("DEPTH_STENCIL", ResourceSyncState::DepthStencil);
+            add("RENDER_TARGET", ResourceSyncState::RenderTarget);
+            add("COMPUTE_SHADING", ResourceSyncState::ComputeShading);
+            add("RAYTRACING", ResourceSyncState::Raytracing);
+            add("COPY", ResourceSyncState::Copy);
+            add("RESOLVE", ResourceSyncState::Resolve);
+            add("EXECUTE_INDIRECT", ResourceSyncState::ExecuteIndirect);
+            add("ALL_SHADING", ResourceSyncState::AllShading);
+            add("NON_PIXEL_SHADING", ResourceSyncState::NonPixelShading);
+            add("EMIT_RTAS_POSTBUILD_INFO", ResourceSyncState::EmitRaytracingAccelerationStructurePostbuildInfo);
+            add("CLEAR_UNORDERED_ACCESS_VIEW", ResourceSyncState::ClearUnorderedAccessView);
+            add("VIDEO_DECODE", ResourceSyncState::VideoDecode);
+            add("VIDEO_PROCESS", ResourceSyncState::VideoProcess);
+            add("VIDEO_ENCODE", ResourceSyncState::VideoEncode);
+            add("BUILD_RAYTRACING_ACCELERATION_STRUCTURE", ResourceSyncState::BuildRaytracingAccelerationStructure);
+            add("COPY_RAYTRACING_ACCELERATION_STRUCTURE", ResourceSyncState::CopyRatracingAccelerationStructure);
+            add("SPLIT", ResourceSyncState::SyncSplit);
+
+            if (out.empty()) out = "UNKNOWN";
+            return out;
         }
     } // namespace helpers
 } // namespace rhi
