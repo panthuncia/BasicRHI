@@ -2,8 +2,7 @@
 #pragma once
 #include "rhi.h"
 #include "rhi_interop.h"
-#include <d3d12.h>
-#include <dxgi1_6.h>
+#include "rhi_dx12_headers.h"
 
 namespace rhi::dx12 {
 

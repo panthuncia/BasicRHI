@@ -1,11 +1,11 @@
 ﻿#pragma once
 #include "rhi.h"
+#include "rhi_reshape_shared.h"
+#include "rhi_dx12_headers.h"
 
 #ifdef _WIN32
-#include <directx/d3dx12.h>
 #include <Windows.h>
 #include <string>
-#include <dxgi1_6.h>
 #include <wrl.h>
 #include <vector>
 #include <mutex>
@@ -307,69 +307,13 @@ namespace rhi {
 		Dx12Device* dev = nullptr;
 	};
 
-	struct Dx12PendingInstrumentationPipelineIssue {
-		DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
-		uint64_t pipelineUid = 0;
-		std::string message;
-		std::vector<uint32_t> rollingExecutionUids;
-	};
-
-	struct Dx12PendingInstrumentationShaderIssue {
-		DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
-		uint64_t shaderUid = 0;
-		uint64_t pipelineUid = 0;
-		uint64_t sguid = 0;
-		std::string message;
-		std::vector<uint32_t> rollingExecutionUids;
-	};
-
-	enum class Dx12InstrumentationExecutionKind : uint8_t {
-		Unknown,
-		DescriptorMismatch,
-		ResourceIndexOutOfBounds,
-	};
-
-	struct Dx12InstrumentationTracebackDetail {
-		bool valid = false;
-		uint32_t executionFlag = 0;
-		uint32_t rollingExecutionUid = 0;
-		uint32_t pipelineUid = 0;
-		std::array<uint32_t, 5> markerHashes32{};
-		uint32_t queueUid = 0;
-		std::array<uint32_t, 3> kernelLaunch{};
-		std::array<uint32_t, 3> thread{};
-	};
-
-	struct Dx12InstrumentationDescriptorMismatchDetail {
-		bool hasDetail = false;
-		uint32_t token = 0;
-		uint32_t compileType = 0;
-		uint32_t runtimeType = 0;
-		bool isUndefined = false;
-		bool isOutOfBounds = false;
-		bool isTableNotBound = false;
-	};
-
-	struct Dx12InstrumentationResourceBoundsDetail {
-		bool hasDetail = false;
-		uint32_t token = 0;
-		std::array<uint32_t, 3> coordinate{};
-		bool isTexture = false;
-		bool isWrite = false;
-	};
-
-	struct Dx12InstrumentationExecutionDetail {
-		uint64_t detailId = 0;
-		DebugInstrumentationDiagnosticSeverity severity = DebugInstrumentationDiagnosticSeverity::Info;
-		Dx12InstrumentationExecutionKind kind = Dx12InstrumentationExecutionKind::Unknown;
-		uint64_t shaderUid = 0;
-		uint64_t pipelineUid = 0;
-		uint64_t sguid = 0;
-		std::string message;
-		Dx12InstrumentationTracebackDetail traceback;
-		Dx12InstrumentationDescriptorMismatchDetail descriptorMismatch;
-		Dx12InstrumentationResourceBoundsDetail resourceBounds;
-	};
+	using Dx12PendingInstrumentationPipelineIssue = ReShapePendingInstrumentationPipelineIssue;
+	using Dx12PendingInstrumentationShaderIssue = ReShapePendingInstrumentationShaderIssue;
+	using Dx12InstrumentationExecutionKind = ReShapeInstrumentationExecutionKind;
+	using Dx12InstrumentationTracebackDetail = ReShapeInstrumentationTracebackDetail;
+	using Dx12InstrumentationDescriptorMismatchDetail = ReShapeInstrumentationDescriptorMismatchDetail;
+	using Dx12InstrumentationResourceBoundsDetail = ReShapeInstrumentationResourceBoundsDetail;
+	using Dx12InstrumentationExecutionDetail = ReShapeInstrumentationExecutionDetail;
 
 	struct Dx12LocalShaderBlobKey {
 		uint64_t hash = 0;
@@ -422,64 +366,16 @@ namespace rhi {
 		std::string sourceLine;
 	};
 
-	struct Dx12InstrumentationPipelineMetadata {
-		DebugInstrumentationPipelineKind kind = DebugInstrumentationPipelineKind::Unknown;
-		bool active = false;
-		bool instrumented = false;
-		bool explicitlyInstrumented = false;
-		uint64_t explicitFeatureMask = 0;
-		std::string label;
-		std::string lastPassName;
-	};
+	using Dx12InstrumentationPipelineMetadata = ReShapeInstrumentationPipelineMetadata;
+	using Dx12InstrumentationPipelineUsage = ReShapeInstrumentationPipelineUsage;
 
-	struct Dx12InstrumentationPipelineUsage {
-		uint64_t pipelineUid = 0;
-		std::string techniquePath;
-		std::string passName;
-	};
-
-	struct Dx12DebugInstrumentationSession {
-		DebugInstrumentationCapabilities capabilities{};
-		DebugInstrumentationState state{};
-		std::vector<DebugInstrumentationFeature> features;
-		std::deque<DebugInstrumentationDiagnostic> diagnostics;
-		std::vector<DebugInstrumentationIssue> issues;
-		std::vector<Dx12PendingInstrumentationPipelineIssue> pendingPipelineIssues;
-		std::vector<Dx12PendingInstrumentationShaderIssue> pendingShaderIssues;
-		std::unordered_map<uint64_t, std::string> pipelineNames;
-		std::unordered_map<uint64_t, Dx12InstrumentationPipelineMetadata> pipelines;
-		std::vector<uint64_t> pipelineOrder;
-		std::vector<Dx12InstrumentationPipelineUsage> pipelineUsages;
-		std::unordered_map<std::string, size_t> pipelineUsageIndexByKey;
+	struct Dx12DebugInstrumentationSession : ReShapeDebugInstrumentationSessionCore {
 		std::unordered_map<uint64_t, Dx12ShaderIssueMetadata> shaderMetadata;
 		std::unordered_map<Dx12LocalShaderBlobKey, Dx12LocalShaderEntryPointMetadata, Dx12LocalShaderBlobKeyHasher> localShaderMetadataByBlobKey;
 		std::vector<Dx12LocalShaderBlobKey> localShaderDiscoveryOrder;
 		std::vector<uint64_t> shaderOrder;
 		std::unordered_map<uint64_t, Dx12LocalShaderBlobKey> localShaderBlobKeyByShaderUid;
 		std::unordered_map<uint64_t, Dx12ShaderSourceMappingMetadata> shaderSourceMappings;
-		std::unordered_map<uint32_t, std::string> executionStacks;
-		std::deque<Dx12InstrumentationExecutionDetail> executionDetails;
-		std::unordered_map<std::string, std::deque<Dx12InstrumentationExecutionDetail>> archivedExecutionDetailsByKey;
-		std::unordered_map<uint64_t, Dx12InstrumentationExecutionDetail> retainedExecutionDetails;
-		std::unordered_set<uint64_t> requestedPipelineNames;
-		std::unordered_set<uint64_t> pendingPipelineNameRequests;
-		std::unordered_set<uint64_t> pendingPipelineStatusRequests;
-		uint32_t knownShaderCount = 0;
-		uint32_t knownPipelineCount = 0;
-		bool pipelineInventoryRefreshRequested = false;
-		std::unordered_set<uint64_t> pendingShaderCodeRequests;
-		std::unordered_set<uint64_t> requestedShaderSourceMappings;
-		std::unordered_set<uint64_t> pendingShaderSourceMappingRequests;
-		std::unordered_set<uint64_t> suspiciousShaderFileResolutionTelemetrySguids;
-		uint64_t nextExecutionDetailId = 1;
-		bool issuesDirty = false;
-		bool pollInProgress = false;
-		bool defaultDescriptorMaskApplied = false;
-		bool explicitGlobalFeatureMaskConfigured = false;
-		uint32_t featureQueryAttempts = 0;
-		bool featureQueryCompleted = false;
-		void* runtime = nullptr;
-		std::mutex mutex;
 	};
 
 	// tiny handle registry

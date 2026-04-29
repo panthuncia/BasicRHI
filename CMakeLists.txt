@@ -74,6 +74,7 @@ add_library(BasicRHI STATIC
     rhi_imgui_widgets.cpp
     ImGuiColorTextEdit/TextEditor.cpp
     "rhi_interop.h" 
+    "rhi_reshape_shared.h"
     "rhi_dx12.h"  
     "rhi_interop_dx12.h" 
     "resource_states.h" 
@@ -122,15 +123,7 @@ endif()
 if(_basicrhi_reshape_available)
     set(_basicrhi_reshape_source_root "${CMAKE_CURRENT_LIST_DIR}/../GPU-Reshape/Source")
     set(_basicrhi_reshape_binary_root "${CMAKE_BINARY_DIR}/GPU-Reshape/Source")
-    get_target_property(_basicrhi_fmt_include_dirs fmt::fmt INTERFACE_INCLUDE_DIRECTORIES)
-
-    if(_basicrhi_fmt_include_dirs)
-        target_include_directories(BasicRHI BEFORE PRIVATE ${_basicrhi_fmt_include_dirs})
-    endif()
-
-    target_include_directories(BasicRHI PRIVATE
-        "${_basicrhi_reshape_source_root}/Backends/DX12/Layer/Include"
-        "${_basicrhi_reshape_binary_root}/Backends/DX12/Layer/Include"
+    set(_basicrhi_reshape_common_include_dirs
         "${_basicrhi_reshape_source_root}/Features/Descriptor/Backend/Include"
         "${_basicrhi_reshape_binary_root}/Features/Descriptor/Backend/Include"
         "${_basicrhi_reshape_source_root}/Features/ResourceBounds/Backend/Include"
@@ -145,6 +138,20 @@ if(_basicrhi_reshape_available)
         "${_basicrhi_reshape_source_root}/Services/HostResolver/Include"
         "${CMAKE_BINARY_DIR}/External/include"
         "${CMAKE_CURRENT_LIST_DIR}/../GPU-Reshape/ThirdParty/MD5/Include"
+    )
+    set(_basicrhi_reshape_dx12_include_dirs
+        "${_basicrhi_reshape_source_root}/Backends/DX12/Layer/Include"
+        "${_basicrhi_reshape_binary_root}/Backends/DX12/Layer/Include"
+    )
+    get_target_property(_basicrhi_fmt_include_dirs fmt::fmt INTERFACE_INCLUDE_DIRECTORIES)
+
+    if(_basicrhi_fmt_include_dirs)
+        target_include_directories(BasicRHI BEFORE PRIVATE ${_basicrhi_fmt_include_dirs})
+    endif()
+
+    target_include_directories(BasicRHI PRIVATE
+        ${_basicrhi_reshape_common_include_dirs}
+        ${_basicrhi_reshape_dx12_include_dirs}
     )
 
     target_link_libraries(BasicRHI PUBLIC

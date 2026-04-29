@@ -2,7 +2,7 @@
 
 #include <rhi.h>
 #include <resource_states.h>
-#include <d3d12.h>
+#include "rhi_dx12_headers.h"
 #include <cassert>
 
 namespace rhi {
