@@ -2640,5 +2640,6 @@ namespace rhi {
 	}
 
 	rhi::Result CreateD3D12Device(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer = false) noexcept; // implemented in rhi_dx12.cpp
+	rhi::Result CreateVulkanDevice(const DeviceCreateInfo& ci, DevicePtr& outPtr) noexcept; // implemented in rhi_vulkan.cpp
 
 }

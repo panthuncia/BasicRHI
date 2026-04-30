@@ -71,11 +71,13 @@ endif()
 # Build a static library for now.
 add_library(BasicRHI STATIC 
     rhi_dx12.cpp
+    rhi_vulkan.cpp
     rhi_imgui_widgets.cpp
     ImGuiColorTextEdit/TextEditor.cpp
     "rhi_interop.h" 
     "rhi_reshape_shared.h"
     "rhi_dx12.h"  
+    "rhi_vulkan.h"
     "rhi_interop_dx12.h" 
     "resource_states.h" 
     "rhi_helpers.h" 
@@ -167,6 +169,7 @@ set_target_properties(BasicRHI PROPERTIES
 # Set sources
 target_sources(BasicRHI PRIVATE
     rhi_dx12.cpp
+    rhi_vulkan.cpp
     rhi_interop_dx12.cpp
 )
 
