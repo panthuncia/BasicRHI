@@ -18,12 +18,16 @@ namespace rhi {
 	struct VulkanSwapchain;
 	struct VulkanCommandAllocator;
 	struct VulkanCommandList;
+	struct VulkanPipeline;
+	struct VulkanPipelineLayout;
 
 	template<> struct VulkanHandleFor<VulkanDescriptorHeap> { using type = DescriptorHeapHandle; };
 	template<> struct VulkanHandleFor<VulkanResource> { using type = ResourceHandle; };
 	template<> struct VulkanHandleFor<VulkanSwapchain> { using type = SwapChainHandle; };
 	template<> struct VulkanHandleFor<VulkanCommandAllocator> { using type = CommandAllocatorHandle; };
 	template<> struct VulkanHandleFor<VulkanCommandList> { using type = CommandListHandle; };
+	template<> struct VulkanHandleFor<VulkanPipeline> { using type = PipelineHandle; };
+	template<> struct VulkanHandleFor<VulkanPipelineLayout> { using type = PipelineLayoutHandle; };
 
 	template<typename T>
 	struct VulkanSlot {
@@ -194,12 +198,37 @@ namespace rhi {
 		uint32_t familyIndex = 0xFFFFFFFFu;
 	};
 
+	struct VulkanPushConstantRange {
+		PushConstantRangeDesc desc{};
+		uint32_t byteOffset = 0;
+		uint32_t byteSize = 0;
+	};
+
+	struct VulkanPipelineLayout {
+		PipelineLayoutFlags flags = PF_None;
+		std::vector<LayoutBindingRange> ranges;
+		std::vector<PushConstantRangeDesc> pushConstants;
+		std::vector<StaticSamplerDesc> staticSamplers;
+		std::vector<VulkanPushConstantRange> pushConstantRanges;
+		uint32_t totalPushDataBytes = 0;
+	};
+
+	struct VulkanPipeline {
+		VkPipeline pipeline = VK_NULL_HANDLE;
+		VkPipelineLayout layout = VK_NULL_HANDLE;
+		VkPipelineBindPoint bindPoint = VK_PIPELINE_BIND_POINT_MAX_ENUM;
+		PipelineLayoutHandle rhiLayout{};
+		bool isCompute = false;
+	};
+
 	struct VulkanCommandList {
 		VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 		CommandAllocatorHandle allocatorHandle{};
 		QueueKind kind = QueueKind::Graphics;
 		bool isRecording = false;
 		bool passActive = false;
+		PipelineLayoutHandle boundLayout{};
+		PipelineHandle boundPipeline{};
 		DescriptorHeapHandle boundCbvSrvUavHeap{};
 		DescriptorHeapHandle boundSamplerHeap{};
 		std::vector<ResourceHandle> passColorResources;
@@ -229,6 +258,8 @@ namespace rhi {
 		VulkanRegistry<VulkanResource> resources;
 		VulkanRegistry<VulkanSwapchain> swapchains;
 		VulkanRegistry<VulkanCommandAllocator> allocators;
+		VulkanRegistry<VulkanPipeline> pipelines;
+		VulkanRegistry<VulkanPipelineLayout> pipelineLayouts;
 		VulkanRegistry<VulkanCommandList> commandLists;
 		std::array<VulkanQueueState, 3> queues{};
 		QueueHandle gfxHandle{ 0u, 1u };

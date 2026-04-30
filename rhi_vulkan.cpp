@@ -310,6 +310,14 @@ namespace rhi {
 			return impl ? impl->allocators.get(handle) : nullptr;
 		}
 
+		static VulkanPipeline* VkPipelineState(VulkanDevice* impl, PipelineHandle handle) noexcept {
+			return impl ? impl->pipelines.get(handle) : nullptr;
+		}
+
+		static VulkanPipelineLayout* VkPipelineLayoutState(VulkanDevice* impl, PipelineLayoutHandle handle) noexcept {
+			return impl ? impl->pipelineLayouts.get(handle) : nullptr;
+		}
+
 		static VulkanResource* VkResourceState(VulkanDevice* impl, ResourceHandle handle) noexcept {
 			return impl ? impl->resources.get(handle) : nullptr;
 		}
@@ -383,6 +391,33 @@ namespace rhi {
 
 			auto* base = static_cast<std::byte*>(heap->mappedData);
 			return base + static_cast<size_t>(index * heap->descriptorStride);
+		}
+
+		static bool VkIsSpirvBytecode(const ShaderBinary& bytecode) noexcept {
+			static constexpr uint32_t kSpirvMagic = 0x07230203u;
+			if (!bytecode.data || bytecode.size < sizeof(uint32_t) || (bytecode.size % sizeof(uint32_t)) != 0) {
+				return false;
+			}
+
+			uint32_t magic = 0;
+			std::memcpy(&magic, bytecode.data, sizeof(magic));
+			return magic == kSpirvMagic;
+		}
+
+		static void VkDestroyPipeline(VulkanDevice* impl, VulkanPipeline& pipeline) noexcept {
+			if (!impl || impl->device == VK_NULL_HANDLE) {
+				pipeline = {};
+				return;
+			}
+
+			if (pipeline.pipeline != VK_NULL_HANDLE) {
+				vkDestroyPipeline(impl->device, pipeline.pipeline, nullptr);
+			}
+			if (pipeline.layout != VK_NULL_HANDLE) {
+				vkDestroyPipelineLayout(impl->device, pipeline.layout, nullptr);
+			}
+
+			pipeline = {};
 		}
 
 		static void VkDestroyDescriptorHeapBacking(VulkanDevice* impl, VulkanDescriptorHeap& heap) noexcept {
@@ -1619,6 +1654,8 @@ namespace rhi {
 			}
 
 			commandListState->passActive = false;
+			commandListState->boundLayout = {};
+			commandListState->boundPipeline = {};
 			commandListState->boundCbvSrvUavHeap = {};
 			commandListState->boundSamplerHeap = {};
 			commandListState->passColorResources.clear();
@@ -1757,11 +1794,29 @@ namespace rhi {
 		}
 
 		static void cl_bindLayout(CommandList* commandList, PipelineLayoutHandle layout) noexcept {
-			VkIgnoreUnused(commandList, layout);
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!impl || !commandListState) {
+				return;
+			}
+
+			commandListState->boundLayout = VkPipelineLayoutState(impl, layout) ? layout : PipelineLayoutHandle{};
 		}
 
 		static void cl_bindPipeline(CommandList* commandList, PipelineHandle pipeline) noexcept {
-			VkIgnoreUnused(commandList, pipeline);
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!impl || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE) {
+				return;
+			}
+
+			VulkanPipeline* pipelineState = VkPipelineState(impl, pipeline);
+			if (!pipelineState || pipelineState->pipeline == VK_NULL_HANDLE) {
+				return;
+			}
+
+			vkCmdBindPipeline(commandListState->commandBuffer, pipelineState->bindPoint, pipelineState->pipeline);
+			commandListState->boundPipeline = pipeline;
 		}
 
 		static void cl_setVB(CommandList* commandList, uint32_t startSlot, uint32_t numViews, VertexBufferView* views) noexcept {
@@ -1781,7 +1836,18 @@ namespace rhi {
 		}
 
 		static void cl_dispatch(CommandList* commandList, uint32_t x, uint32_t y, uint32_t z) noexcept {
-			VkIgnoreUnused(commandList, x, y, z);
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!impl || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE || commandListState->passActive) {
+				return;
+			}
+
+			VulkanPipeline* pipelineState = VkPipelineState(impl, commandListState->boundPipeline);
+			if (!pipelineState || pipelineState->bindPoint != VK_PIPELINE_BIND_POINT_COMPUTE || pipelineState->pipeline == VK_NULL_HANDLE) {
+				return;
+			}
+
+			vkCmdDispatch(commandListState->commandBuffer, x, y, z);
 		}
 
 		static void cl_clearRTV_slot(CommandList* commandList, DescriptorSlot slot, const ClearValue& clearValue) noexcept {
@@ -1898,7 +1964,42 @@ namespace rhi {
 			uint32_t dstOffset32,
 			uint32_t num32,
 			const void* data) noexcept {
-			VkIgnoreUnused(commandList, stages, set, binding, dstOffset32, num32, data);
+			VkIgnoreUnused(stages);
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!impl || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE || num32 == 0 || !data || !impl->descriptorHeapEnabled) {
+				return;
+			}
+
+			VulkanPipelineLayout* layoutState = VkPipelineLayoutState(impl, commandListState->boundLayout);
+			if (!layoutState) {
+				return;
+			}
+
+			const VulkanPushConstantRange* pushRange = nullptr;
+			for (const VulkanPushConstantRange& candidate : layoutState->pushConstantRanges) {
+				if (candidate.desc.set == set && candidate.desc.binding == binding) {
+					pushRange = &candidate;
+					break;
+				}
+			}
+			if (!pushRange) {
+				return;
+			}
+
+			const uint32_t byteOffset = pushRange->byteOffset + dstOffset32 * 4u;
+			const uint32_t byteSize = num32 * 4u;
+			if (byteOffset + byteSize > pushRange->byteOffset + pushRange->byteSize ||
+				byteOffset + byteSize > layoutState->totalPushDataBytes ||
+				byteOffset + byteSize > impl->descriptorHeapProperties.maxPushDataSize) {
+				return;
+			}
+
+			VkPushDataInfoEXT pushInfo{ VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT };
+			pushInfo.offset = byteOffset;
+			pushInfo.data.address = data;
+			pushInfo.data.size = byteSize;
+			vkCmdPushDataEXT(commandListState->commandBuffer, &pushInfo);
 		}
 
 		static void cl_setPrimitiveTopology(CommandList* commandList, PrimitiveTopology topology) noexcept {
@@ -2010,9 +2111,139 @@ namespace rhi {
 		}
 
 		static Result d_createPipelineFromStream(Device* device, const PipelineStreamItem* items, uint32_t count, PipelinePtr& out) noexcept {
-			VkIgnoreUnused(device, items, count);
 			out.Reset();
-			return Result::Unsupported;
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl || !items || count == 0 || impl->device == VK_NULL_HANDLE) {
+				return Result::InvalidArgument;
+			}
+
+			const SubobjShader* computeShader = nullptr;
+			const VulkanPipelineLayout* layoutState = nullptr;
+			PipelineLayoutHandle layoutHandle{};
+			bool sawGraphicsState = false;
+
+			for (uint32_t index = 0; index < count; ++index) {
+				switch (items[index].type) {
+				case PsoSubobj::Layout: {
+					const auto& layout = *static_cast<const SubobjLayout*>(items[index].data);
+					layoutHandle = layout.layout;
+					layoutState = VkPipelineLayoutState(impl, layout.layout);
+					if (!layoutState) {
+						spdlog::error("Vulkan pipeline creation: invalid pipeline layout handle");
+						return Result::InvalidArgument;
+					}
+					break;
+				}
+				case PsoSubobj::Shader: {
+					const auto& shader = *static_cast<const SubobjShader*>(items[index].data);
+					switch (shader.stage) {
+					case ShaderStage::Compute:
+						if (computeShader) {
+							spdlog::error("Vulkan pipeline creation: multiple compute shader stages are not supported");
+							return Result::InvalidArgument;
+						}
+						computeShader = &shader;
+						break;
+					case ShaderStage::Vertex:
+					case ShaderStage::Pixel:
+					case ShaderStage::Task:
+					case ShaderStage::Mesh:
+						sawGraphicsState = true;
+						break;
+					default:
+						spdlog::error("Vulkan pipeline creation: unsupported shader stage {}", static_cast<uint32_t>(shader.stage));
+						return Result::InvalidArgument;
+					}
+					break;
+				}
+				case PsoSubobj::Rasterizer:
+				case PsoSubobj::Blend:
+				case PsoSubobj::DepthStencil:
+				case PsoSubobj::RTVFormats:
+				case PsoSubobj::DSVFormat:
+				case PsoSubobj::Sample:
+				case PsoSubobj::InputLayout:
+				case PsoSubobj::PrimitiveTopology:
+					sawGraphicsState = true;
+					break;
+				case PsoSubobj::Flags:
+				default:
+					break;
+				}
+			}
+
+			if (!computeShader) {
+				return sawGraphicsState ? Result::Unsupported : Result::InvalidArgument;
+			}
+			if (sawGraphicsState) {
+				spdlog::warn("Vulkan pipeline creation: graphics pipeline creation is not implemented yet");
+				return Result::Unsupported;
+			}
+			if (!layoutState) {
+				spdlog::error("Vulkan pipeline creation: a pipeline layout subobject is required");
+				return Result::InvalidArgument;
+			}
+			if (!layoutState->ranges.empty() || !layoutState->staticSamplers.empty()) {
+				spdlog::warn("Vulkan compute pipeline creation: descriptor mappings are not implemented yet");
+				return Result::Unsupported;
+			}
+			if (!VkIsSpirvBytecode(computeShader->bytecode)) {
+				spdlog::warn("Vulkan compute pipeline creation: shader bytecode was not SPIR-V");
+				return Result::Unsupported;
+			}
+
+			VkShaderModuleCreateInfo shaderModuleInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+			shaderModuleInfo.codeSize = computeShader->bytecode.size;
+			shaderModuleInfo.pCode = static_cast<const uint32_t*>(computeShader->bytecode.data);
+
+			VkShaderModule shaderModule = VK_NULL_HANDLE;
+			VkResult vkResult = vkCreateShaderModule(impl->device, &shaderModuleInfo, nullptr, &shaderModule);
+			if (vkResult != VK_SUCCESS) {
+				spdlog::error("Vulkan compute pipeline creation: vkCreateShaderModule failed with VkResult {}", static_cast<int>(vkResult));
+				return ToRHI(vkResult);
+			}
+
+			VkPipelineLayoutCreateInfo nativeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+			VkPipelineLayout nativeLayout = VK_NULL_HANDLE;
+			vkResult = vkCreatePipelineLayout(impl->device, &nativeLayoutInfo, nullptr, &nativeLayout);
+			if (vkResult != VK_SUCCESS) {
+				vkDestroyShaderModule(impl->device, shaderModule, nullptr);
+				spdlog::error("Vulkan compute pipeline creation: vkCreatePipelineLayout failed with VkResult {}", static_cast<int>(vkResult));
+				return ToRHI(vkResult);
+			}
+
+			const char* entryPoint = computeShader->entryPoint.empty() ? "main" : computeShader->entryPoint.c_str();
+			VkPipelineShaderStageCreateInfo stageInfo{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+			stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+			stageInfo.module = shaderModule;
+			stageInfo.pName = entryPoint;
+
+			VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+			pipelineInfo.stage = stageInfo;
+			pipelineInfo.layout = nativeLayout;
+
+			VkPipeline nativePipeline = VK_NULL_HANDLE;
+			vkResult = vkCreateComputePipelines(impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &nativePipeline);
+			vkDestroyShaderModule(impl->device, shaderModule, nullptr);
+			if (vkResult != VK_SUCCESS) {
+				vkDestroyPipelineLayout(impl->device, nativeLayout, nullptr);
+				spdlog::error("Vulkan compute pipeline creation: vkCreateComputePipelines failed with VkResult {}", static_cast<int>(vkResult));
+				return ToRHI(vkResult);
+			}
+
+			const PipelineHandle handle = impl->pipelines.alloc(VulkanPipeline{
+				.pipeline = nativePipeline,
+				.layout = nativeLayout,
+				.bindPoint = VK_PIPELINE_BIND_POINT_COMPUTE,
+				.rhiLayout = layoutHandle,
+				.isCompute = true,
+			});
+
+			Pipeline pipelineObject(handle);
+			pipelineObject.impl = impl;
+			pipelineObject.vt = &g_vkpsovt;
+			out = MakePipelinePtr(device, pipelineObject, impl->selfWeak.lock());
+			return Result::Ok;
 		}
 
 		static void d_destroyBuffer(DeviceDeletionContext* context, ResourceHandle handle) noexcept {
@@ -2037,7 +2268,15 @@ namespace rhi {
 		}
 
 		static void d_destroyPipeline(DeviceDeletionContext* context, PipelineHandle handle) noexcept {
-			VkIgnoreUnused(context, handle);
+			auto* impl = context ? static_cast<VulkanDevice*>(context->impl) : nullptr;
+			if (!impl) {
+				return;
+			}
+
+			if (VulkanPipeline* pipeline = VkPipelineState(impl, handle)) {
+				VkDestroyPipeline(impl, *pipeline);
+			}
+			impl->pipelines.free(handle);
 		}
 
 		static Result d_createWorkGraph(Device* device, const WorkGraphDesc& desc, WorkGraphPtr& out) noexcept {
@@ -2198,9 +2437,41 @@ namespace rhi {
 		}
 
 		static Result d_createPipelineLayout(Device* device, const PipelineLayoutDesc& desc, PipelineLayoutPtr& out) noexcept {
-			VkIgnoreUnused(device, desc);
-			out.Reset();
-			return Result::Unsupported;
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl || !impl->descriptorHeapEnabled) {
+				out.Reset();
+				return Result::Unsupported;
+			}
+
+			VulkanPipelineLayout layoutState{};
+			layoutState.flags = desc.flags;
+			layoutState.ranges.assign(desc.ranges.data, desc.ranges.data + desc.ranges.size);
+			layoutState.pushConstants.assign(desc.pushConstants.data, desc.pushConstants.data + desc.pushConstants.size);
+			layoutState.staticSamplers.assign(desc.staticSamplers.data, desc.staticSamplers.data + desc.staticSamplers.size);
+
+			uint32_t pushDataOffset = 0;
+			layoutState.pushConstantRanges.reserve(layoutState.pushConstants.size());
+			for (const PushConstantRangeDesc& pushConstant : layoutState.pushConstants) {
+				VulkanPushConstantRange range{};
+				range.desc = pushConstant;
+				range.byteOffset = pushDataOffset;
+				range.byteSize = pushConstant.num32BitValues * 4u;
+				layoutState.pushConstantRanges.push_back(range);
+				pushDataOffset += range.byteSize;
+			}
+			layoutState.totalPushDataBytes = pushDataOffset;
+
+			if (layoutState.totalPushDataBytes > impl->descriptorHeapProperties.maxPushDataSize) {
+				out.Reset();
+				return Result::Unsupported;
+			}
+
+			const PipelineLayoutHandle handle = impl->pipelineLayouts.alloc(layoutState);
+			PipelineLayout layout{ handle };
+			layout.impl = impl;
+			layout.vt = &g_vkplvt;
+			out = MakePipelineLayoutPtr(device, layout, impl->selfWeak.lock());
+			return Result::Ok;
 		}
 
 		static Result d_queryFeatureInfo(const Device* device, FeatureInfoHeader* chain) noexcept {
@@ -2391,7 +2662,11 @@ namespace rhi {
 		}
 
 		static void d_destroyPipelineLayout(DeviceDeletionContext* context, PipelineLayoutHandle handle) noexcept {
-			VkIgnoreUnused(context, handle);
+			auto* impl = context ? static_cast<VulkanDevice*>(context->impl) : nullptr;
+			if (!impl) {
+				return;
+			}
+			impl->pipelineLayouts.free(handle);
 		}
 
 		static Result d_createCommandSignature(Device* device, const CommandSignatureDesc& desc, PipelineLayoutHandle layout, CommandSignaturePtr& out) noexcept {
@@ -3439,6 +3714,24 @@ namespace rhi {
 			slot.alive = false;
 		}
 		resources.clear();
+
+		for (auto& slot : pipelines.slots) {
+			if (!slot.alive) {
+				continue;
+			}
+			VkDestroyPipeline(this, slot.obj);
+			slot.alive = false;
+		}
+		pipelines.clear();
+
+		for (auto& slot : pipelineLayouts.slots) {
+			if (!slot.alive) {
+				continue;
+			}
+			slot.obj = VulkanPipelineLayout{};
+			slot.alive = false;
+		}
+		pipelineLayouts.clear();
 
 		for (auto& slot : commandLists.slots) {
 			if (slot.alive) {
