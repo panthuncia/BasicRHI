@@ -112,8 +112,12 @@ namespace rhi {
 	};
 
 	struct VulkanResource {
+		VkBuffer buffer = VK_NULL_HANDLE;
 		VkImage image = VK_NULL_HANDLE;
 		VkDeviceMemory memory = VK_NULL_HANDLE;
+		void* mappedData = nullptr;
+		VkDeviceAddress deviceAddress = 0;
+		uint64_t bufferSize = 0;
 		VkFormat format = VK_FORMAT_UNDEFINED;
 		ResourceType type = ResourceType::Unknown;
 		ResourceLayout currentLayout = ResourceLayout::Undefined;
@@ -121,23 +125,51 @@ namespace rhi {
 		uint32_t height = 0;
 		uint16_t depthOrLayers = 1;
 		uint16_t mipLevels = 1;
+		bool hostVisible = false;
 		bool isSwapchainImage = false;
+		bool ownsBuffer = false;
 		bool ownsImage = false;
 		bool ownsMemory = false;
 	};
 
 	struct VulkanImageViewSlot {
+		enum class Kind : uint8_t {
+			None,
+			ImageView,
+			BufferView,
+			ConstantBuffer,
+			Sampler,
+		};
+
+		Kind kind = Kind::None;
 		VkImageView view = VK_NULL_HANDLE;
+		VkBufferView bufferView = VK_NULL_HANDLE;
+		VkSampler sampler = VK_NULL_HANDLE;
 		ResourceHandle resource{};
 		VkFormat format = VK_FORMAT_UNDEFINED;
 		VkImageAspectFlags aspectMask = 0;
 		TextureSubresourceRange range{};
+		uint64_t bufferOffset = 0;
+		uint64_t bufferSize = 0;
+		uint32_t bufferStride = 0;
+		BufferViewKind bufferKind = BufferViewKind::Raw;
+		ComponentMapping componentMapping = 0;
+		CbvDesc cbv{};
+		SamplerDesc samplerDesc{};
 	};
 
 	struct VulkanDescriptorHeap {
 		DescriptorHeapType type = DescriptorHeapType::CbvSrvUav;
 		uint32_t capacity = 0;
 		bool shaderVisible = false;
+		VkBuffer buffer = VK_NULL_HANDLE;
+		VkDeviceMemory memory = VK_NULL_HANDLE;
+		void* mappedData = nullptr;
+		VkDeviceAddress deviceAddress = 0;
+		uint64_t descriptorStride = 0;
+		uint64_t descriptorBytes = 0;
+		uint64_t reservedRangeOffset = 0;
+		uint64_t reservedRangeSize = 0;
 		std::vector<VulkanImageViewSlot> imageViewSlots;
 	};
 
@@ -168,6 +200,8 @@ namespace rhi {
 		QueueKind kind = QueueKind::Graphics;
 		bool isRecording = false;
 		bool passActive = false;
+		DescriptorHeapHandle boundCbvSrvUavHeap{};
+		DescriptorHeapHandle boundSamplerHeap{};
 		std::vector<ResourceHandle> passColorResources;
 		ResourceHandle passDepthResource{};
 	};
@@ -183,9 +217,12 @@ namespace rhi {
 		VkPhysicalDeviceProperties physicalDeviceProperties{};
 		VkPhysicalDeviceMemoryProperties memoryProperties{};
 		VkPhysicalDeviceFeatures supportedFeatures{};
+		VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptorHeapProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT };
 		uint32_t loaderApiVersion = VK_API_VERSION_1_0;
 		uint32_t instanceApiVersion = VK_API_VERSION_1_0;
 		bool swapchainExtensionEnabled = false;
+		bool bufferDeviceAddressEnabled = false;
+		bool descriptorHeapEnabled = false;
 		bool dynamicRenderingEnabled = false;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		VulkanRegistry<VulkanDescriptorHeap> descriptorHeaps;

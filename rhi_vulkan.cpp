@@ -335,6 +335,85 @@ namespace rhi {
 			return &heap->imageViewSlots[slot.index];
 		}
 
+		static void VkResetDescriptorSlot(VulkanDevice* impl, VulkanImageViewSlot& slot) noexcept {
+			if (impl && impl->device != VK_NULL_HANDLE) {
+				if (slot.view != VK_NULL_HANDLE) {
+					vkDestroyImageView(impl->device, slot.view, nullptr);
+				}
+				if (slot.bufferView != VK_NULL_HANDLE) {
+					vkDestroyBufferView(impl->device, slot.bufferView, nullptr);
+				}
+				if (slot.sampler != VK_NULL_HANDLE) {
+					vkDestroySampler(impl->device, slot.sampler, nullptr);
+				}
+			}
+			slot = {};
+		}
+
+		static uint64_t VkAlignUp(uint64_t value, uint64_t alignment) noexcept {
+			if (alignment == 0) {
+				return value;
+			}
+			const uint64_t mask = alignment - 1u;
+			return (value + mask) & ~mask;
+		}
+
+		static uint64_t VkDescriptorHeapStride(const VulkanDevice* impl, DescriptorHeapType type) noexcept {
+			if (!impl || !impl->descriptorHeapEnabled) {
+				return 1;
+			}
+
+			switch (type) {
+			case DescriptorHeapType::CbvSrvUav:
+				return (std::max)(static_cast<uint64_t>(impl->descriptorHeapProperties.imageDescriptorSize),
+					static_cast<uint64_t>(impl->descriptorHeapProperties.bufferDescriptorSize));
+			case DescriptorHeapType::Sampler:
+				return static_cast<uint64_t>(impl->descriptorHeapProperties.samplerDescriptorSize);
+			case DescriptorHeapType::RTV:
+			case DescriptorHeapType::DSV:
+			default:
+				return 1;
+			}
+		}
+
+		static void* VkDescriptorHeapSlotAddress(VulkanDescriptorHeap* heap, uint32_t index) noexcept {
+			if (!heap || !heap->mappedData || heap->descriptorStride == 0) {
+				return nullptr;
+			}
+
+			auto* base = static_cast<std::byte*>(heap->mappedData);
+			return base + static_cast<size_t>(index * heap->descriptorStride);
+		}
+
+		static void VkDestroyDescriptorHeapBacking(VulkanDevice* impl, VulkanDescriptorHeap& heap) noexcept {
+			if (!impl || impl->device == VK_NULL_HANDLE) {
+				heap.buffer = VK_NULL_HANDLE;
+				heap.memory = VK_NULL_HANDLE;
+				heap.mappedData = nullptr;
+				heap.deviceAddress = 0;
+				return;
+			}
+
+			if (heap.mappedData && heap.memory != VK_NULL_HANDLE) {
+				vkUnmapMemory(impl->device, heap.memory);
+			}
+			if (heap.buffer != VK_NULL_HANDLE) {
+				vkDestroyBuffer(impl->device, heap.buffer, nullptr);
+			}
+			if (heap.memory != VK_NULL_HANDLE) {
+				vkFreeMemory(impl->device, heap.memory, nullptr);
+			}
+
+			heap.buffer = VK_NULL_HANDLE;
+			heap.memory = VK_NULL_HANDLE;
+			heap.mappedData = nullptr;
+			heap.deviceAddress = 0;
+			heap.descriptorStride = 0;
+			heap.descriptorBytes = 0;
+			heap.reservedRangeOffset = 0;
+			heap.reservedRangeSize = 0;
+		}
+
 		static VulkanCommandList* VkCommandListState(VulkanDevice* impl, CommandListHandle handle) noexcept {
 			return impl ? impl->commandLists.get(handle) : nullptr;
 		}
@@ -405,6 +484,427 @@ namespace rhi {
 			default:
 				return VK_IMAGE_VIEW_TYPE_MAX_ENUM;
 			}
+		}
+
+		static VkImageViewType VkImageViewTypeForSrv(SrvDim dimension) noexcept {
+			switch (dimension) {
+			case SrvDim::Texture1D:
+				return VK_IMAGE_VIEW_TYPE_1D;
+			case SrvDim::Texture1DArray:
+				return VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+			case SrvDim::Texture2D:
+			case SrvDim::Texture2DMS:
+				return VK_IMAGE_VIEW_TYPE_2D;
+			case SrvDim::Texture2DArray:
+			case SrvDim::Texture2DMSArray:
+				return VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+			case SrvDim::Texture3D:
+				return VK_IMAGE_VIEW_TYPE_3D;
+			case SrvDim::TextureCube:
+				return VK_IMAGE_VIEW_TYPE_CUBE;
+			case SrvDim::TextureCubeArray:
+				return VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+			default:
+				return VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+			}
+		}
+
+		static VkImageViewType VkImageViewTypeForUav(UavDim dimension) noexcept {
+			switch (dimension) {
+			case UavDim::Texture1D:
+				return VK_IMAGE_VIEW_TYPE_1D;
+			case UavDim::Texture1DArray:
+				return VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+			case UavDim::Texture2D:
+			case UavDim::Texture2DMS:
+				return VK_IMAGE_VIEW_TYPE_2D;
+			case UavDim::Texture2DArray:
+			case UavDim::Texture2DMSArray:
+				return VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+			case UavDim::Texture3D:
+				return VK_IMAGE_VIEW_TYPE_3D;
+			default:
+				return VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+			}
+		}
+
+		static VkImageSubresourceRange VkMakeImageSubresourceRange(VulkanResource& resource, const TextureSubresourceRange& range, VkImageAspectFlags aspectMask) noexcept;
+
+		static VkImageSubresourceRange VkSrvSubresourceRange(VulkanResource& resource, const SrvDesc& desc, VkImageAspectFlags aspectMask) noexcept {
+			TextureSubresourceRange range{};
+			switch (desc.dimension) {
+			case SrvDim::Texture1D:
+				range.baseMip = desc.tex1D.mostDetailedMip;
+				range.mipCount = desc.tex1D.mipLevels != 0 ? desc.tex1D.mipLevels : static_cast<uint32_t>(resource.mipLevels - desc.tex1D.mostDetailedMip);
+				range.baseLayer = 0;
+				range.layerCount = 1;
+				break;
+			case SrvDim::Texture1DArray:
+				range.baseMip = desc.tex1DArray.mostDetailedMip;
+				range.mipCount = desc.tex1DArray.mipLevels != 0 ? desc.tex1DArray.mipLevels : static_cast<uint32_t>(resource.mipLevels - desc.tex1DArray.mostDetailedMip);
+				range.baseLayer = desc.tex1DArray.firstArraySlice;
+				range.layerCount = desc.tex1DArray.arraySize != 0 ? desc.tex1DArray.arraySize : static_cast<uint32_t>(resource.depthOrLayers - desc.tex1DArray.firstArraySlice);
+				break;
+			case SrvDim::Texture2D:
+			case SrvDim::Texture2DMS:
+				range.baseMip = desc.tex2D.mostDetailedMip;
+				range.mipCount = desc.dimension == SrvDim::Texture2DMS ? 1u : (desc.tex2D.mipLevels != 0 ? desc.tex2D.mipLevels : static_cast<uint32_t>(resource.mipLevels - desc.tex2D.mostDetailedMip));
+				range.baseLayer = 0;
+				range.layerCount = 1;
+				break;
+			case SrvDim::Texture2DArray:
+			case SrvDim::Texture2DMSArray:
+				range.baseMip = desc.tex2DArray.mostDetailedMip;
+				range.mipCount = desc.dimension == SrvDim::Texture2DMSArray ? 1u : (desc.tex2DArray.mipLevels != 0 ? desc.tex2DArray.mipLevels : static_cast<uint32_t>(resource.mipLevels - desc.tex2DArray.mostDetailedMip));
+				range.baseLayer = desc.dimension == SrvDim::Texture2DMSArray ? desc.tex2DMSArray.firstArraySlice : desc.tex2DArray.firstArraySlice;
+				range.layerCount = desc.dimension == SrvDim::Texture2DMSArray
+					? (desc.tex2DMSArray.arraySize != 0 ? desc.tex2DMSArray.arraySize : static_cast<uint32_t>(resource.depthOrLayers - desc.tex2DMSArray.firstArraySlice))
+					: (desc.tex2DArray.arraySize != 0 ? desc.tex2DArray.arraySize : static_cast<uint32_t>(resource.depthOrLayers - desc.tex2DArray.firstArraySlice));
+				break;
+			case SrvDim::Texture3D:
+				range.baseMip = desc.tex3D.mostDetailedMip;
+				range.mipCount = desc.tex3D.mipLevels != 0 ? desc.tex3D.mipLevels : static_cast<uint32_t>(resource.mipLevels - desc.tex3D.mostDetailedMip);
+				range.baseLayer = 0;
+				range.layerCount = 1;
+				break;
+			case SrvDim::TextureCube:
+				range.baseMip = desc.cube.mostDetailedMip;
+				range.mipCount = desc.cube.mipLevels != 0 ? desc.cube.mipLevels : static_cast<uint32_t>(resource.mipLevels - desc.cube.mostDetailedMip);
+				range.baseLayer = 0;
+				range.layerCount = 6;
+				break;
+			case SrvDim::TextureCubeArray:
+				range.baseMip = desc.cubeArray.mostDetailedMip;
+				range.mipCount = desc.cubeArray.mipLevels != 0 ? desc.cubeArray.mipLevels : static_cast<uint32_t>(resource.mipLevels - desc.cubeArray.mostDetailedMip);
+				range.baseLayer = desc.cubeArray.first2DArrayFace;
+				range.layerCount = desc.cubeArray.numCubes != 0 ? desc.cubeArray.numCubes * 6u : static_cast<uint32_t>(resource.depthOrLayers - desc.cubeArray.first2DArrayFace);
+				break;
+			default:
+				break;
+			}
+			return VkMakeImageSubresourceRange(resource, range, aspectMask);
+		}
+
+		static VkImageSubresourceRange VkUavSubresourceRange(VulkanResource& resource, const UavDesc& desc, VkImageAspectFlags aspectMask) noexcept {
+			TextureSubresourceRange range{};
+			switch (desc.dimension) {
+			case UavDim::Texture1D:
+				range.baseMip = desc.texture1D.mipSlice;
+				range.mipCount = 1;
+				range.baseLayer = 0;
+				range.layerCount = 1;
+				break;
+			case UavDim::Texture1DArray:
+				range.baseMip = desc.texture1DArray.mipSlice;
+				range.mipCount = 1;
+				range.baseLayer = desc.texture1DArray.firstArraySlice;
+				range.layerCount = desc.texture1DArray.arraySize != 0 ? desc.texture1DArray.arraySize : static_cast<uint32_t>(resource.depthOrLayers - desc.texture1DArray.firstArraySlice);
+				break;
+			case UavDim::Texture2D:
+			case UavDim::Texture2DMS:
+				range.baseMip = desc.texture2D.mipSlice;
+				range.mipCount = 1;
+				range.baseLayer = 0;
+				range.layerCount = 1;
+				break;
+			case UavDim::Texture2DArray:
+			case UavDim::Texture2DMSArray:
+				range.baseMip = desc.texture2DArray.mipSlice;
+				range.mipCount = 1;
+				range.baseLayer = desc.dimension == UavDim::Texture2DMSArray ? desc.texture2DMSArray.firstArraySlice : desc.texture2DArray.firstArraySlice;
+				range.layerCount = desc.dimension == UavDim::Texture2DMSArray
+					? (desc.texture2DMSArray.arraySize != 0 ? desc.texture2DMSArray.arraySize : static_cast<uint32_t>(resource.depthOrLayers - desc.texture2DMSArray.firstArraySlice))
+					: (desc.texture2DArray.arraySize != 0 ? desc.texture2DArray.arraySize : static_cast<uint32_t>(resource.depthOrLayers - desc.texture2DArray.firstArraySlice));
+				break;
+			case UavDim::Texture3D:
+				range.baseMip = desc.texture3D.mipSlice;
+				range.mipCount = 1;
+				range.baseLayer = 0;
+				range.layerCount = 1;
+				break;
+			default:
+				break;
+			}
+			return VkMakeImageSubresourceRange(resource, range, aspectMask);
+		}
+
+		static VkFilter VkToFilter(Filter filter) noexcept {
+			switch (filter) {
+			case Filter::Nearest:
+				return VK_FILTER_NEAREST;
+			case Filter::Linear:
+			default:
+				return VK_FILTER_LINEAR;
+			}
+		}
+
+		static VkSamplerMipmapMode VkToMipFilter(MipFilter filter) noexcept {
+			switch (filter) {
+			case MipFilter::Nearest:
+				return VK_SAMPLER_MIPMAP_MODE_NEAREST;
+			case MipFilter::Linear:
+			default:
+				return VK_SAMPLER_MIPMAP_MODE_LINEAR;
+			}
+		}
+
+		static VkSamplerAddressMode VkToAddressMode(AddressMode addressMode) noexcept {
+			switch (addressMode) {
+			case AddressMode::Wrap:
+				return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+			case AddressMode::Mirror:
+				return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+			case AddressMode::Clamp:
+				return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+			case AddressMode::Border:
+				return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+			case AddressMode::MirrorOnce:
+				return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+			default:
+				return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+			}
+		}
+
+		static VkCompareOp VkToCompareOp(CompareOp compareOp) noexcept {
+			switch (compareOp) {
+			case CompareOp::Never: return VK_COMPARE_OP_NEVER;
+			case CompareOp::Less: return VK_COMPARE_OP_LESS;
+			case CompareOp::Equal: return VK_COMPARE_OP_EQUAL;
+			case CompareOp::LessEqual: return VK_COMPARE_OP_LESS_OR_EQUAL;
+			case CompareOp::Greater: return VK_COMPARE_OP_GREATER;
+			case CompareOp::NotEqual: return VK_COMPARE_OP_NOT_EQUAL;
+			case CompareOp::GreaterEqual: return VK_COMPARE_OP_GREATER_OR_EQUAL;
+			case CompareOp::Always:
+			default:
+				return VK_COMPARE_OP_ALWAYS;
+			}
+		}
+
+		static VkBorderColor VkToBorderColor(const SamplerDesc& desc) noexcept {
+			switch (desc.borderPreset) {
+			case BorderPreset::TransparentBlack:
+				return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+			case BorderPreset::OpaqueBlack:
+				return VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+			case BorderPreset::OpaqueWhite:
+				return VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+			case BorderPreset::Custom:
+			default:
+				if (desc.borderColor[3] == 0.0f) {
+					return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+				}
+				if (desc.borderColor[0] == 1.0f && desc.borderColor[1] == 1.0f && desc.borderColor[2] == 1.0f && desc.borderColor[3] == 1.0f) {
+					return VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+				}
+				return VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+			}
+		}
+
+		static Result VkCreateBufferDescriptorSlot(VulkanDevice* impl,
+			DescriptorSlot slot,
+			ResourceHandle resourceHandle,
+			VkFormat format,
+			VkDescriptorType descriptorType,
+			BufferViewKind bufferKind,
+			uint64_t offsetBytes,
+			uint64_t sizeBytes,
+			uint32_t strideBytes,
+			const CbvDesc* cbvDesc) noexcept {
+			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
+			VulkanImageViewSlot* descriptorSlot = VkImageViewSlotState(impl, slot, DescriptorHeapType::CbvSrvUav);
+			VulkanResource* resource = VkResourceState(impl, resourceHandle);
+			if (!impl || !heap || !descriptorSlot || !resource || resource->type != ResourceType::Buffer || resource->buffer == VK_NULL_HANDLE) {
+				return Result::InvalidArgument;
+			}
+
+			VkResetDescriptorSlot(impl, *descriptorSlot);
+
+			if (impl->descriptorHeapEnabled && heap->buffer != VK_NULL_HANDLE && resource->deviceAddress != 0) {
+				void* slotAddress = VkDescriptorHeapSlotAddress(heap, slot.index);
+				if (!slotAddress) {
+					return Result::InvalidArgument;
+				}
+
+				std::memset(slotAddress, 0, static_cast<size_t>(heap->descriptorStride));
+
+				VkHostAddressRangeEXT descriptorRange{};
+				descriptorRange.address = slotAddress;
+				descriptorRange.size = static_cast<size_t>(heap->descriptorStride);
+
+				VkResult result = VK_SUCCESS;
+				if (descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+					VkTexelBufferDescriptorInfoEXT texelInfo{ VK_STRUCTURE_TYPE_TEXEL_BUFFER_DESCRIPTOR_INFO_EXT };
+					texelInfo.format = format;
+					texelInfo.addressRange.address = resource->deviceAddress + offsetBytes;
+					texelInfo.addressRange.size = sizeBytes;
+
+					VkResourceDescriptorInfoEXT descriptorInfo{ VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT };
+					descriptorInfo.type = descriptorType;
+					descriptorInfo.data.pTexelBuffer = &texelInfo;
+					result = vkWriteResourceDescriptorsEXT(impl->device, 1, &descriptorInfo, &descriptorRange);
+				}
+				else {
+					VkDeviceAddressRangeEXT addressRange{};
+					addressRange.address = resource->deviceAddress + offsetBytes;
+					addressRange.size = sizeBytes;
+
+					VkResourceDescriptorInfoEXT descriptorInfo{ VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT };
+					descriptorInfo.type = descriptorType;
+					descriptorInfo.data.pAddressRange = &addressRange;
+					result = vkWriteResourceDescriptorsEXT(impl->device, 1, &descriptorInfo, &descriptorRange);
+				}
+
+				if (result != VK_SUCCESS) {
+					return ToRHI(result);
+				}
+			}
+			else if (format != VK_FORMAT_UNDEFINED) {
+				VkBufferViewCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO };
+				createInfo.buffer = resource->buffer;
+				createInfo.format = format;
+				createInfo.offset = offsetBytes;
+				createInfo.range = sizeBytes;
+				const VkResult result = vkCreateBufferView(impl->device, &createInfo, nullptr, &descriptorSlot->bufferView);
+				if (result != VK_SUCCESS) {
+					return ToRHI(result);
+				}
+			}
+
+			descriptorSlot->kind = cbvDesc ? VulkanImageViewSlot::Kind::ConstantBuffer : VulkanImageViewSlot::Kind::BufferView;
+			descriptorSlot->resource = resourceHandle;
+			descriptorSlot->format = format;
+			descriptorSlot->bufferKind = bufferKind;
+			descriptorSlot->bufferOffset = offsetBytes;
+			descriptorSlot->bufferSize = sizeBytes;
+			descriptorSlot->bufferStride = strideBytes;
+			if (cbvDesc) {
+				descriptorSlot->cbv = *cbvDesc;
+			}
+			return Result::Ok;
+		}
+
+		static VkBufferUsageFlags VkBufferUsageForDesc(const ResourceDesc& desc) noexcept {
+			VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+				VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+				VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+				VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+				VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+			return usage;
+		}
+
+		static VkImageType VkImageTypeForResourceType(ResourceType type) noexcept {
+			switch (type) {
+			case ResourceType::Texture1D:
+				return VK_IMAGE_TYPE_1D;
+			case ResourceType::Texture2D:
+				return VK_IMAGE_TYPE_2D;
+			case ResourceType::Texture3D:
+				return VK_IMAGE_TYPE_3D;
+			default:
+				return VK_IMAGE_TYPE_MAX_ENUM;
+			}
+		}
+
+		static VkSampleCountFlagBits VkSampleCountForDesc(uint32_t sampleCount) noexcept {
+			switch (sampleCount) {
+			case 1: return VK_SAMPLE_COUNT_1_BIT;
+			case 2: return VK_SAMPLE_COUNT_2_BIT;
+			case 4: return VK_SAMPLE_COUNT_4_BIT;
+			case 8: return VK_SAMPLE_COUNT_8_BIT;
+			case 16: return VK_SAMPLE_COUNT_16_BIT;
+			case 32: return VK_SAMPLE_COUNT_32_BIT;
+			case 64: return VK_SAMPLE_COUNT_64_BIT;
+			default: return VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM;
+			}
+		}
+
+		static VkImageUsageFlags VkImageUsageForDesc(const ResourceDesc& desc, VkFormat format) noexcept {
+			VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+			const VkImageAspectFlags aspectMask = VkAspectMaskForFormat(format);
+			const uint32_t resourceFlags = static_cast<uint32_t>(desc.resourceFlags);
+			if ((resourceFlags & static_cast<uint32_t>(RF_AllowRenderTarget)) != 0) {
+				usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+			}
+			if ((resourceFlags & static_cast<uint32_t>(RF_AllowDepthStencil)) != 0 || (aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) {
+				usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+			}
+			if ((resourceFlags & static_cast<uint32_t>(RF_AllowUnorderedAccess)) != 0) {
+				usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+			}
+			if ((resourceFlags & static_cast<uint32_t>(RF_DenyShaderResource)) == 0) {
+				usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+			}
+			return usage;
+		}
+
+		static VkMemoryPropertyFlags VkPreferredMemoryPropertyFlags(HeapType heapType) noexcept {
+			switch (heapType) {
+			case HeapType::DeviceLocal:
+				return VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+			case HeapType::Upload:
+				return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+			case HeapType::Readback:
+				return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+			case HeapType::HostCached:
+				return VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+			case HeapType::GPUUpload:
+				return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+			case HeapType::Custom:
+			default:
+				return 0;
+			}
+		}
+
+		static VkMemoryPropertyFlags VkRequiredMemoryPropertyFlags(HeapType heapType) noexcept {
+			switch (heapType) {
+			case HeapType::DeviceLocal:
+				return VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+			case HeapType::Upload:
+				return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+			case HeapType::Readback:
+				return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+			case HeapType::HostCached:
+				return VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+			case HeapType::GPUUpload:
+				return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+			case HeapType::Custom:
+			default:
+				return 0;
+			}
+		}
+
+		static bool VkFindMemoryTypeIndex(const VkPhysicalDeviceMemoryProperties& memoryProperties,
+			uint32_t memoryTypeBits,
+			VkMemoryPropertyFlags preferredFlags,
+			VkMemoryPropertyFlags requiredFlags,
+			uint32_t& memoryTypeIndex) noexcept {
+			for (uint32_t index = 0; index < memoryProperties.memoryTypeCount; ++index) {
+				const uint32_t bit = (1u << index);
+				if ((memoryTypeBits & bit) == 0) {
+					continue;
+				}
+
+				const VkMemoryPropertyFlags flags = memoryProperties.memoryTypes[index].propertyFlags;
+				if ((flags & preferredFlags) == preferredFlags) {
+					memoryTypeIndex = index;
+					return true;
+				}
+			}
+
+			for (uint32_t index = 0; index < memoryProperties.memoryTypeCount; ++index) {
+				const uint32_t bit = (1u << index);
+				if ((memoryTypeBits & bit) == 0) {
+					continue;
+				}
+
+				const VkMemoryPropertyFlags flags = memoryProperties.memoryTypes[index].propertyFlags;
+				if ((flags & requiredFlags) == requiredFlags) {
+					memoryTypeIndex = index;
+					return true;
+				}
+			}
+
+			return false;
 		}
 
 		static VkImageSubresourceRange VkMakeImageSubresourceRange(VulkanResource& resource, const TextureSubresourceRange& range, VkImageAspectFlags aspectMask) noexcept {
@@ -537,10 +1037,7 @@ namespace rhi {
 				return Result::InvalidArgument;
 			}
 
-			if (viewSlot->view != VK_NULL_HANDLE) {
-				vkDestroyImageView(impl->device, viewSlot->view, nullptr);
-				viewSlot->view = VK_NULL_HANDLE;
-			}
+			VkResetDescriptorSlot(impl, *viewSlot);
 
 			VkImageViewCreateInfo createInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
 			createInfo.image = resource->image;
@@ -553,6 +1050,7 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
+			viewSlot->kind = VulkanImageViewSlot::Kind::ImageView;
 			viewSlot->resource = resourceHandle;
 			viewSlot->format = viewFormat;
 			viewSlot->aspectMask = aspectMask;
@@ -575,11 +1073,7 @@ namespace rhi {
 						continue;
 					}
 
-					if (viewSlot.view != VK_NULL_HANDLE) {
-						vkDestroyImageView(impl->device, viewSlot.view, nullptr);
-					}
-
-					viewSlot = {};
+					VkResetDescriptorSlot(impl, viewSlot);
 				}
 			}
 		}
@@ -588,6 +1082,15 @@ namespace rhi {
 			if (!impl || impl->device == VK_NULL_HANDLE) {
 				resource = {};
 				return;
+			}
+
+			if (resource.mappedData != nullptr && resource.memory != VK_NULL_HANDLE) {
+				vkUnmapMemory(impl->device, resource.memory);
+				resource.mappedData = nullptr;
+			}
+
+			if (resource.ownsBuffer && resource.buffer != VK_NULL_HANDLE) {
+				vkDestroyBuffer(impl->device, resource.buffer, nullptr);
 			}
 
 			if (resource.ownsImage && resource.image != VK_NULL_HANDLE) {
@@ -1001,14 +1504,37 @@ namespace rhi {
 		}
 
 		static void buf_map(Resource* resource, void** data, uint64_t offset, uint64_t size) noexcept {
-			VkIgnoreUnused(resource, offset, size);
+			auto* impl = resource ? static_cast<VulkanDevice*>(resource->impl) : nullptr;
+			VulkanResource* resourceState = VkResourceState(impl, resource ? resource->GetHandle() : ResourceHandle{});
 			if (data) {
 				*data = nullptr;
 			}
+			if (!impl || !resourceState || !data || resourceState->memory == VK_NULL_HANDLE || !resourceState->hostVisible || offset > resourceState->bufferSize) {
+				return;
+			}
+
+			if (resourceState->mappedData == nullptr) {
+				const VkDeviceSize mapSize = size == ~0ull ? VK_WHOLE_SIZE : static_cast<VkDeviceSize>(size);
+				void* mappedData = nullptr;
+				if (vkMapMemory(impl->device, resourceState->memory, static_cast<VkDeviceSize>(offset), mapSize, 0, &mappedData) != VK_SUCCESS) {
+					return;
+				}
+				resourceState->mappedData = mappedData;
+			}
+
+			*data = resourceState->mappedData;
 		}
 
 		static void buf_unmap(Resource* resource, uint64_t writeOffset, uint64_t writeSize) noexcept {
-			VkIgnoreUnused(resource, writeOffset, writeSize);
+			VkIgnoreUnused(writeOffset, writeSize);
+			auto* impl = resource ? static_cast<VulkanDevice*>(resource->impl) : nullptr;
+			VulkanResource* resourceState = VkResourceState(impl, resource ? resource->GetHandle() : ResourceHandle{});
+			if (!impl || !resourceState || resourceState->memory == VK_NULL_HANDLE || resourceState->mappedData == nullptr) {
+				return;
+			}
+
+			vkUnmapMemory(impl->device, resourceState->memory);
+			resourceState->mappedData = nullptr;
 		}
 
 		static void buf_setName(Resource* resource, const char* name) noexcept {
@@ -1093,6 +1619,8 @@ namespace rhi {
 			}
 
 			commandListState->passActive = false;
+			commandListState->boundCbvSrvUavHeap = {};
+			commandListState->boundSamplerHeap = {};
 			commandListState->passColorResources.clear();
 			commandListState->passDepthResource = {};
 			commandListState->isRecording = true;
@@ -1275,7 +1803,48 @@ namespace rhi {
 		}
 
 		static void cl_setDescriptorHeaps(CommandList* commandList, DescriptorHeapHandle cbvSrvUav, std::optional<DescriptorHeapHandle> sampler) noexcept {
-			VkIgnoreUnused(commandList, cbvSrvUav, sampler);
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!impl || !commandListState) {
+				return;
+			}
+
+			if (VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, cbvSrvUav);
+				heap && heap->type == DescriptorHeapType::CbvSrvUav && heap->shaderVisible) {
+				commandListState->boundCbvSrvUavHeap = cbvSrvUav;
+				if (impl->descriptorHeapEnabled && heap->buffer != VK_NULL_HANDLE && heap->deviceAddress != 0) {
+					VkBindHeapInfoEXT bindInfo{ VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT };
+					bindInfo.heapRange.address = heap->deviceAddress;
+					bindInfo.heapRange.size = heap->descriptorBytes + heap->reservedRangeSize;
+					bindInfo.reservedRangeOffset = heap->reservedRangeOffset;
+					bindInfo.reservedRangeSize = heap->reservedRangeSize;
+					vkCmdBindResourceHeapEXT(commandListState->commandBuffer, &bindInfo);
+				}
+			}
+			else {
+				commandListState->boundCbvSrvUavHeap = {};
+			}
+
+			if (sampler.has_value()) {
+				if (VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, sampler.value());
+					heap && heap->type == DescriptorHeapType::Sampler && heap->shaderVisible) {
+					commandListState->boundSamplerHeap = sampler.value();
+					if (impl->descriptorHeapEnabled && heap->buffer != VK_NULL_HANDLE && heap->deviceAddress != 0) {
+						VkBindHeapInfoEXT bindInfo{ VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT };
+						bindInfo.heapRange.address = heap->deviceAddress;
+						bindInfo.heapRange.size = heap->descriptorBytes + heap->reservedRangeSize;
+						bindInfo.reservedRangeOffset = heap->reservedRangeOffset;
+						bindInfo.reservedRangeSize = heap->reservedRangeSize;
+						vkCmdBindSamplerHeapEXT(commandListState->commandBuffer, &bindInfo);
+					}
+				}
+				else {
+					commandListState->boundSamplerHeap = {};
+				}
+			}
+			else {
+				commandListState->boundSamplerHeap = {};
+			}
 		}
 
 		static void cl_clearUavUint(CommandList* commandList, const UavClearInfo& clearInfo, const UavClearUint& value) noexcept {
@@ -1848,6 +2417,79 @@ namespace rhi {
 			heap.shaderVisible = desc.shaderVisible;
 			heap.imageViewSlots.resize(desc.capacity);
 
+			if (impl->descriptorHeapEnabled && (desc.type == DescriptorHeapType::CbvSrvUav || desc.type == DescriptorHeapType::Sampler)) {
+				heap.descriptorStride = VkDescriptorHeapStride(impl, desc.type);
+				heap.descriptorBytes = static_cast<uint64_t>(desc.capacity) * heap.descriptorStride;
+				heap.reservedRangeSize = desc.type == DescriptorHeapType::Sampler
+					? static_cast<uint64_t>(impl->descriptorHeapProperties.minSamplerHeapReservedRange)
+					: static_cast<uint64_t>(impl->descriptorHeapProperties.minResourceHeapReservedRange);
+				heap.reservedRangeOffset = heap.descriptorBytes;
+				const uint64_t totalBytes = heap.descriptorBytes + heap.reservedRangeSize;
+
+				VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+				createInfo.size = totalBytes;
+				createInfo.usage = VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+				createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+				const VkResult createResult = vkCreateBuffer(impl->device, &createInfo, nullptr, &heap.buffer);
+				if (createResult != VK_SUCCESS) {
+					out.Reset();
+					return ToRHI(createResult);
+				}
+
+				VkMemoryRequirements memoryRequirements{};
+				vkGetBufferMemoryRequirements(impl->device, heap.buffer, &memoryRequirements);
+
+				uint32_t memoryTypeIndex = 0;
+				if (!VkFindMemoryTypeIndex(
+					impl->memoryProperties,
+					memoryRequirements.memoryTypeBits,
+					VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+					VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+					memoryTypeIndex)) {
+					vkDestroyBuffer(impl->device, heap.buffer, nullptr);
+					out.Reset();
+					return Result::Unsupported;
+				}
+
+				VkMemoryAllocateFlagsInfo allocateFlagsInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+				allocateFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
+				VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+				allocateInfo.pNext = &allocateFlagsInfo;
+				allocateInfo.allocationSize = memoryRequirements.size;
+				allocateInfo.memoryTypeIndex = memoryTypeIndex;
+
+				const VkResult allocateResult = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &heap.memory);
+				if (allocateResult != VK_SUCCESS) {
+					vkDestroyBuffer(impl->device, heap.buffer, nullptr);
+					out.Reset();
+					return ToRHI(allocateResult);
+				}
+
+				const VkResult bindResult = vkBindBufferMemory(impl->device, heap.buffer, heap.memory, 0);
+				if (bindResult != VK_SUCCESS) {
+					vkFreeMemory(impl->device, heap.memory, nullptr);
+					vkDestroyBuffer(impl->device, heap.buffer, nullptr);
+					out.Reset();
+					return ToRHI(bindResult);
+				}
+
+				const VkResult mapResult = vkMapMemory(impl->device, heap.memory, 0, totalBytes, 0, &heap.mappedData);
+				if (mapResult != VK_SUCCESS) {
+					vkFreeMemory(impl->device, heap.memory, nullptr);
+					vkDestroyBuffer(impl->device, heap.buffer, nullptr);
+					out.Reset();
+					return ToRHI(mapResult);
+				}
+
+				std::memset(heap.mappedData, 0, static_cast<size_t>(totalBytes));
+
+				VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+				addressInfo.buffer = heap.buffer;
+				heap.deviceAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
+			}
+
 			const DescriptorHeapHandle handle = impl->descriptorHeaps.alloc(heap);
 			DescriptorHeap descriptorHeap{ handle };
 			descriptorHeap.impl = impl;
@@ -1864,33 +2506,337 @@ namespace rhi {
 			}
 
 			for (VulkanImageViewSlot& slot : heap->imageViewSlots) {
-				if (slot.view != VK_NULL_HANDLE) {
-					vkDestroyImageView(impl->device, slot.view, nullptr);
-					slot.view = VK_NULL_HANDLE;
-				}
+				VkResetDescriptorSlot(impl, slot);
 			}
+			VkDestroyDescriptorHeapBacking(impl, *heap);
 
 			impl->descriptorHeaps.free(handle);
 		}
 
 		static Result d_createShaderResourceView(Device* device, DescriptorSlot slot, const ResourceHandle& resource, const SrvDesc& desc) noexcept {
-			VkIgnoreUnused(device, slot, resource, desc);
-			return Result::Unsupported;
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			VulkanResource* resourceState = VkResourceState(impl, resource);
+			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
+			if (!impl || !resourceState) {
+				return Result::InvalidArgument;
+			}
+
+			if (desc.dimension == SrvDim::Buffer) {
+				VkFormat viewFormat = VK_FORMAT_UNDEFINED;
+				uint32_t strideBytes = 0;
+				VkDescriptorType descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+				switch (desc.buffer.kind) {
+				case BufferViewKind::Raw:
+					viewFormat = VK_FORMAT_R32_UINT;
+					break;
+				case BufferViewKind::Structured:
+					strideBytes = desc.buffer.structureByteStride;
+					break;
+				case BufferViewKind::Typed:
+					viewFormat = ToVkFormat(desc.formatOverride);
+					descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+					break;
+				}
+
+				if (desc.buffer.kind == BufferViewKind::Typed && viewFormat == VK_FORMAT_UNDEFINED) {
+					return Result::Unsupported;
+				}
+
+				const uint64_t elementSize = desc.buffer.kind == BufferViewKind::Structured
+					? strideBytes
+					: (desc.buffer.kind == BufferViewKind::Typed ? static_cast<uint64_t>(FormatByteSize(desc.formatOverride)) : 4ull);
+				if (elementSize == 0) {
+					return Result::InvalidArgument;
+				}
+
+				return VkCreateBufferDescriptorSlot(impl,
+					slot,
+					resource,
+					viewFormat,
+					descriptorType,
+					desc.buffer.kind,
+					desc.buffer.firstElement * elementSize,
+					static_cast<uint64_t>(desc.buffer.numElements) * elementSize,
+					strideBytes,
+					nullptr);
+			}
+
+			const VkImageViewType viewType = VkImageViewTypeForSrv(desc.dimension);
+			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(desc.formatOverride) : resourceState->format;
+			const VkImageAspectFlags aspectMask = VkAspectMaskForFormat(viewFormat);
+			if (viewType == VK_IMAGE_VIEW_TYPE_MAX_ENUM || viewFormat == VK_FORMAT_UNDEFINED) {
+				return Result::Unsupported;
+			}
+			const VkImageSubresourceRange subresourceRange = VkSrvSubresourceRange(*resourceState, desc, aspectMask);
+
+			if (impl->descriptorHeapEnabled && heap && heap->buffer != VK_NULL_HANDLE) {
+				void* slotAddress = VkDescriptorHeapSlotAddress(heap, slot.index);
+				if (!slotAddress) {
+					return Result::InvalidArgument;
+				}
+
+				std::memset(slotAddress, 0, static_cast<size_t>(heap->descriptorStride));
+
+				VkImageViewCreateInfo viewCreateInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+				viewCreateInfo.image = resourceState->image;
+				viewCreateInfo.viewType = viewType;
+				viewCreateInfo.format = viewFormat;
+				viewCreateInfo.components = {
+					VK_COMPONENT_SWIZZLE_IDENTITY,
+					VK_COMPONENT_SWIZZLE_IDENTITY,
+					VK_COMPONENT_SWIZZLE_IDENTITY,
+					VK_COMPONENT_SWIZZLE_IDENTITY,
+				};
+				viewCreateInfo.subresourceRange = subresourceRange;
+
+				const VkImageLayout imageLayout = resourceState->currentLayout != ResourceLayout::Undefined
+					? VkToImageLayout(resourceState->currentLayout, aspectMask)
+					: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+				VkImageDescriptorInfoEXT imageInfo{ VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT };
+				imageInfo.pView = &viewCreateInfo;
+				imageInfo.layout = imageLayout;
+
+				VkResourceDescriptorInfoEXT descriptorInfo{ VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT };
+				descriptorInfo.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+				descriptorInfo.data.pImage = &imageInfo;
+
+				VkHostAddressRangeEXT descriptorRange{};
+				descriptorRange.address = slotAddress;
+				descriptorRange.size = static_cast<size_t>(heap->descriptorStride);
+
+				const VkResult result = vkWriteResourceDescriptorsEXT(impl->device, 1, &descriptorInfo, &descriptorRange);
+				if (result != VK_SUCCESS) {
+					return ToRHI(result);
+				}
+
+				VulkanImageViewSlot* descriptorSlot = VkImageViewSlotState(impl, slot, DescriptorHeapType::CbvSrvUav);
+				if (!descriptorSlot) {
+					return Result::InvalidArgument;
+				}
+				VkResetDescriptorSlot(impl, *descriptorSlot);
+				descriptorSlot->kind = VulkanImageViewSlot::Kind::ImageView;
+				descriptorSlot->resource = resource;
+				descriptorSlot->format = viewFormat;
+				descriptorSlot->aspectMask = aspectMask;
+				descriptorSlot->range = { subresourceRange.baseMipLevel, subresourceRange.levelCount, subresourceRange.baseArrayLayer, subresourceRange.layerCount };
+				return Result::Ok;
+			}
+
+			return VkCreateImageViewSlot(impl,
+				slot,
+				DescriptorHeapType::CbvSrvUav,
+				resource,
+				viewFormat,
+				aspectMask,
+				viewType,
+				{ subresourceRange.baseMipLevel, subresourceRange.levelCount, subresourceRange.baseArrayLayer, subresourceRange.layerCount });
 		}
 
 		static Result d_createUnorderedAccessView(Device* device, DescriptorSlot slot, const ResourceHandle& resource, const UavDesc& desc) noexcept {
-			VkIgnoreUnused(device, slot, resource, desc);
-			return Result::Unsupported;
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			VulkanResource* resourceState = VkResourceState(impl, resource);
+			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
+			if (!impl || !resourceState) {
+				return Result::InvalidArgument;
+			}
+
+			if (desc.dimension == UavDim::Texture2DMS || desc.dimension == UavDim::Texture2DMSArray) {
+				return Result::Unsupported;
+			}
+
+			if (desc.dimension == UavDim::Buffer) {
+				VkFormat viewFormat = VK_FORMAT_UNDEFINED;
+				uint32_t strideBytes = 0;
+				VkDescriptorType descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+				switch (desc.buffer.kind) {
+				case BufferViewKind::Raw:
+					viewFormat = VK_FORMAT_R32_UINT;
+					break;
+				case BufferViewKind::Structured:
+					strideBytes = desc.buffer.structureByteStride;
+					break;
+				case BufferViewKind::Typed:
+					viewFormat = ToVkFormat(desc.formatOverride);
+					descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+					break;
+				}
+
+				if (desc.buffer.kind == BufferViewKind::Typed && viewFormat == VK_FORMAT_UNDEFINED) {
+					return Result::Unsupported;
+				}
+
+				const uint64_t elementSize = desc.buffer.kind == BufferViewKind::Structured
+					? strideBytes
+					: (desc.buffer.kind == BufferViewKind::Typed ? static_cast<uint64_t>(FormatByteSize(desc.formatOverride)) : 4ull);
+				if (elementSize == 0) {
+					return Result::InvalidArgument;
+				}
+
+				return VkCreateBufferDescriptorSlot(impl,
+					slot,
+					resource,
+					viewFormat,
+					descriptorType,
+					desc.buffer.kind,
+					desc.buffer.firstElement * elementSize,
+					static_cast<uint64_t>(desc.buffer.numElements) * elementSize,
+					strideBytes,
+					nullptr);
+			}
+
+			const VkImageViewType viewType = VkImageViewTypeForUav(desc.dimension);
+			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(desc.formatOverride) : resourceState->format;
+			const VkImageAspectFlags aspectMask = VkAspectMaskForFormat(viewFormat);
+			if (viewType == VK_IMAGE_VIEW_TYPE_MAX_ENUM || viewFormat == VK_FORMAT_UNDEFINED) {
+				return Result::Unsupported;
+			}
+
+			const VkImageSubresourceRange subresourceRange = VkUavSubresourceRange(*resourceState, desc, aspectMask);
+			if (impl->descriptorHeapEnabled && heap && heap->buffer != VK_NULL_HANDLE) {
+				void* slotAddress = VkDescriptorHeapSlotAddress(heap, slot.index);
+				if (!slotAddress) {
+					return Result::InvalidArgument;
+				}
+
+				std::memset(slotAddress, 0, static_cast<size_t>(heap->descriptorStride));
+
+				VkImageViewCreateInfo viewCreateInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+				viewCreateInfo.image = resourceState->image;
+				viewCreateInfo.viewType = viewType;
+				viewCreateInfo.format = viewFormat;
+				viewCreateInfo.components = {
+					VK_COMPONENT_SWIZZLE_IDENTITY,
+					VK_COMPONENT_SWIZZLE_IDENTITY,
+					VK_COMPONENT_SWIZZLE_IDENTITY,
+					VK_COMPONENT_SWIZZLE_IDENTITY,
+				};
+				viewCreateInfo.subresourceRange = subresourceRange;
+
+				VkImageDescriptorInfoEXT imageInfo{ VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT };
+				imageInfo.pView = &viewCreateInfo;
+				imageInfo.layout = VK_IMAGE_LAYOUT_GENERAL;
+
+				VkResourceDescriptorInfoEXT descriptorInfo{ VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT };
+				descriptorInfo.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+				descriptorInfo.data.pImage = &imageInfo;
+
+				VkHostAddressRangeEXT descriptorRange{};
+				descriptorRange.address = slotAddress;
+				descriptorRange.size = static_cast<size_t>(heap->descriptorStride);
+
+				const VkResult result = vkWriteResourceDescriptorsEXT(impl->device, 1, &descriptorInfo, &descriptorRange);
+				if (result != VK_SUCCESS) {
+					return ToRHI(result);
+				}
+
+				VulkanImageViewSlot* descriptorSlot = VkImageViewSlotState(impl, slot, DescriptorHeapType::CbvSrvUav);
+				if (!descriptorSlot) {
+					return Result::InvalidArgument;
+				}
+				VkResetDescriptorSlot(impl, *descriptorSlot);
+				descriptorSlot->kind = VulkanImageViewSlot::Kind::ImageView;
+				descriptorSlot->resource = resource;
+				descriptorSlot->format = viewFormat;
+				descriptorSlot->aspectMask = aspectMask;
+				descriptorSlot->range = { subresourceRange.baseMipLevel, subresourceRange.levelCount, subresourceRange.baseArrayLayer, subresourceRange.layerCount };
+				return Result::Ok;
+			}
+
+			return VkCreateImageViewSlot(impl,
+				slot,
+				DescriptorHeapType::CbvSrvUav,
+				resource,
+				viewFormat,
+				aspectMask,
+				viewType,
+				{ subresourceRange.baseMipLevel, subresourceRange.levelCount, subresourceRange.baseArrayLayer, subresourceRange.layerCount });
 		}
 
 		static Result d_createConstantBufferView(Device* device, DescriptorSlot slot, const ResourceHandle& resource, const CbvDesc& desc) noexcept {
-			VkIgnoreUnused(device, slot, resource, desc);
-			return Result::Unsupported;
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			VulkanResource* resourceState = VkResourceState(impl, resource);
+			if (!impl || !resourceState || resourceState->type != ResourceType::Buffer || desc.byteSize == 0) {
+				return Result::InvalidArgument;
+			}
+
+			const uint32_t alignedSize = (desc.byteSize + 255u) & ~255u;
+			return VkCreateBufferDescriptorSlot(impl,
+				slot,
+				resource,
+				VK_FORMAT_UNDEFINED,
+				VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				BufferViewKind::Structured,
+				desc.byteOffset,
+				alignedSize,
+				0,
+				&desc);
 		}
 
 		static Result d_createSampler(Device* device, DescriptorSlot slot, const SamplerDesc& desc) noexcept {
-			VkIgnoreUnused(device, slot, desc);
-			return Result::Unsupported;
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
+			VulkanImageViewSlot* descriptorSlot = VkImageViewSlotState(impl, slot, DescriptorHeapType::Sampler);
+			if (!impl || !descriptorSlot) {
+				return Result::InvalidArgument;
+			}
+
+			if (desc.reduction == ReductionMode::Min || desc.reduction == ReductionMode::Max) {
+				return Result::Unsupported;
+			}
+			if (desc.borderPreset == BorderPreset::Custom) {
+				return Result::Unsupported;
+			}
+
+			VkResetDescriptorSlot(impl, *descriptorSlot);
+
+			VkSamplerCreateInfo createInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+			createInfo.magFilter = VkToFilter(desc.magFilter);
+			createInfo.minFilter = VkToFilter(desc.minFilter);
+			createInfo.mipmapMode = VkToMipFilter(desc.mipFilter);
+			createInfo.addressModeU = VkToAddressMode(desc.addressU);
+			createInfo.addressModeV = VkToAddressMode(desc.addressV);
+			createInfo.addressModeW = VkToAddressMode(desc.addressW);
+			createInfo.mipLodBias = desc.mipLodBias;
+			createInfo.anisotropyEnable = desc.maxAnisotropy > 1;
+			createInfo.maxAnisotropy = static_cast<float>((std::min)(desc.maxAnisotropy, 16u));
+			createInfo.compareEnable = desc.compareEnable ? VK_TRUE : VK_FALSE;
+			createInfo.compareOp = VkToCompareOp(desc.compareOp);
+			createInfo.minLod = desc.minLod;
+			createInfo.maxLod = desc.maxLod;
+			createInfo.borderColor = VkToBorderColor(desc);
+			createInfo.unnormalizedCoordinates = desc.unnormalizedCoordinates ? VK_TRUE : VK_FALSE;
+
+			if (impl->descriptorHeapEnabled && heap && heap->buffer != VK_NULL_HANDLE) {
+				void* slotAddress = VkDescriptorHeapSlotAddress(heap, slot.index);
+				if (!slotAddress) {
+					return Result::InvalidArgument;
+				}
+
+				std::memset(slotAddress, 0, static_cast<size_t>(heap->descriptorStride));
+
+				VkHostAddressRangeEXT descriptorRange{};
+				descriptorRange.address = slotAddress;
+				descriptorRange.size = static_cast<size_t>(heap->descriptorStride);
+
+				const VkResult result = vkWriteSamplerDescriptorsEXT(impl->device, 1, &createInfo, &descriptorRange);
+				if (result != VK_SUCCESS) {
+					return ToRHI(result);
+				}
+
+				descriptorSlot->kind = VulkanImageViewSlot::Kind::Sampler;
+				descriptorSlot->samplerDesc = desc;
+				return Result::Ok;
+			}
+
+			const VkResult result = vkCreateSampler(impl->device, &createInfo, nullptr, &descriptorSlot->sampler);
+			if (result != VK_SUCCESS) {
+				return ToRHI(result);
+			}
+
+			descriptorSlot->kind = VulkanImageViewSlot::Kind::Sampler;
+			descriptorSlot->samplerDesc = desc;
+			return Result::Ok;
 		}
 
 		static Result d_createRenderTargetView(Device* device, DescriptorSlot slot, const ResourceHandle& texture, const RtvDesc& desc) noexcept {
@@ -1992,7 +2938,12 @@ namespace rhi {
 				return result;
 			}
 
-			const CommandListHandle handle = impl->commandLists.alloc(VulkanCommandList{ commandBuffer, allocator.GetHandle(), kind, true });
+			VulkanCommandList commandListState{};
+			commandListState.commandBuffer = commandBuffer;
+			commandListState.allocatorHandle = allocator.GetHandle();
+			commandListState.kind = kind;
+			commandListState.isRecording = true;
+			const CommandListHandle handle = impl->commandLists.alloc(commandListState);
 			CommandList commandList{ handle };
 			commandList.impl = impl;
 			commandList.vt = &g_vkclvt;
@@ -2001,15 +2952,197 @@ namespace rhi {
 		}
 
 		static Result d_createCommittedBuffer(Device* device, const ResourceDesc& desc, ResourcePtr& out) noexcept {
-			VkIgnoreUnused(device, desc);
-			out.Reset();
-			return Result::Unsupported;
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl || impl->device == VK_NULL_HANDLE || desc.type != ResourceType::Buffer || desc.buffer.sizeBytes == 0) {
+				out.Reset();
+				return Result::InvalidArgument;
+			}
+			if (desc.heapType == HeapType::Custom) {
+				out.Reset();
+				return Result::Unsupported;
+			}
+
+			VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			createInfo.size = desc.buffer.sizeBytes;
+			createInfo.usage = VkBufferUsageForDesc(desc);
+			if (impl->bufferDeviceAddressEnabled) {
+				createInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+			}
+			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+			VkBuffer buffer = VK_NULL_HANDLE;
+			VkResult result = vkCreateBuffer(impl->device, &createInfo, nullptr, &buffer);
+			if (result != VK_SUCCESS) {
+				out.Reset();
+				return ToRHI(result);
+			}
+
+			VkMemoryRequirements memoryRequirements{};
+			vkGetBufferMemoryRequirements(impl->device, buffer, &memoryRequirements);
+
+			const VkMemoryPropertyFlags preferredFlags = VkPreferredMemoryPropertyFlags(desc.heapType);
+			const VkMemoryPropertyFlags requiredFlags = VkRequiredMemoryPropertyFlags(desc.heapType);
+			uint32_t memoryTypeIndex = 0;
+			if (!VkFindMemoryTypeIndex(impl->memoryProperties, memoryRequirements.memoryTypeBits, preferredFlags, requiredFlags, memoryTypeIndex)) {
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				out.Reset();
+				return Result::Unsupported;
+			}
+
+			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+			allocateInfo.allocationSize = memoryRequirements.size;
+			allocateInfo.memoryTypeIndex = memoryTypeIndex;
+			VkMemoryAllocateFlagsInfo allocateFlagsInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+			if (impl->bufferDeviceAddressEnabled) {
+				allocateFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+				allocateInfo.pNext = &allocateFlagsInfo;
+			}
+
+			VkDeviceMemory memory = VK_NULL_HANDLE;
+			result = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &memory);
+			if (result != VK_SUCCESS) {
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				out.Reset();
+				return ToRHI(result);
+			}
+
+			result = vkBindBufferMemory(impl->device, buffer, memory, 0);
+			if (result != VK_SUCCESS) {
+				vkFreeMemory(impl->device, memory, nullptr);
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				out.Reset();
+				return ToRHI(result);
+			}
+
+			const VkMemoryPropertyFlags actualFlags = impl->memoryProperties.memoryTypes[memoryTypeIndex].propertyFlags;
+			VulkanResource resourceState{};
+			resourceState.buffer = buffer;
+			resourceState.memory = memory;
+			resourceState.bufferSize = desc.buffer.sizeBytes;
+			resourceState.type = ResourceType::Buffer;
+			resourceState.hostVisible = (actualFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+			resourceState.ownsBuffer = true;
+			resourceState.ownsMemory = true;
+			resourceState.currentLayout = ResourceLayout::Common;
+			if (impl->bufferDeviceAddressEnabled) {
+				VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+				addressInfo.buffer = buffer;
+				resourceState.deviceAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
+			}
+
+			const ResourceHandle handle = impl->resources.alloc(resourceState);
+			Resource resource{ handle, false };
+			resource.impl = impl;
+			resource.vt = &g_vkbuf_rvt;
+			out = MakeBufferPtr(device, resource, impl->selfWeak.lock());
+			return Result::Ok;
 		}
 
 		static Result d_createCommittedTexture(Device* device, const ResourceDesc& desc, ResourcePtr& out) noexcept {
-			VkIgnoreUnused(device, desc);
-			out.Reset();
-			return Result::Unsupported;
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl || impl->device == VK_NULL_HANDLE) {
+				out.Reset();
+				return Result::InvalidArgument;
+			}
+			if (desc.type != ResourceType::Texture1D && desc.type != ResourceType::Texture2D && desc.type != ResourceType::Texture3D) {
+				out.Reset();
+				return Result::InvalidArgument;
+			}
+			if (desc.texture.width == 0 || desc.texture.height == 0 || desc.texture.mipLevels == 0 || desc.texture.format == Format::Unknown) {
+				out.Reset();
+				return Result::InvalidArgument;
+			}
+			if (desc.texture.initialLayout != ResourceLayout::Undefined) {
+				out.Reset();
+				return Result::Unsupported;
+			}
+			if (desc.heapType != HeapType::DeviceLocal) {
+				out.Reset();
+				return Result::Unsupported;
+			}
+
+			const VkFormat format = ToVkFormat(desc.texture.format);
+			const VkImageType imageType = VkImageTypeForResourceType(desc.type);
+			const VkSampleCountFlagBits samples = VkSampleCountForDesc(desc.texture.sampleCount);
+			if (format == VK_FORMAT_UNDEFINED || imageType == VK_IMAGE_TYPE_MAX_ENUM || samples == VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM) {
+				out.Reset();
+				return Result::Unsupported;
+			}
+
+			VkImageCreateInfo createInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+			createInfo.imageType = imageType;
+			createInfo.format = format;
+			createInfo.extent.width = desc.texture.width;
+			createInfo.extent.height = desc.type == ResourceType::Texture1D ? 1u : desc.texture.height;
+			createInfo.extent.depth = desc.type == ResourceType::Texture3D ? desc.texture.depthOrLayers : 1u;
+			createInfo.mipLevels = desc.texture.mipLevels;
+			createInfo.arrayLayers = desc.type == ResourceType::Texture3D ? 1u : desc.texture.depthOrLayers;
+			createInfo.samples = samples;
+			createInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+			createInfo.usage = VkImageUsageForDesc(desc, format);
+			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+			VkImage image = VK_NULL_HANDLE;
+			VkResult result = vkCreateImage(impl->device, &createInfo, nullptr, &image);
+			if (result != VK_SUCCESS) {
+				out.Reset();
+				return ToRHI(result);
+			}
+
+			VkMemoryRequirements memoryRequirements{};
+			vkGetImageMemoryRequirements(impl->device, image, &memoryRequirements);
+
+			uint32_t memoryTypeIndex = 0;
+			if (!VkFindMemoryTypeIndex(impl->memoryProperties,
+				memoryRequirements.memoryTypeBits,
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				memoryTypeIndex)) {
+				vkDestroyImage(impl->device, image, nullptr);
+				out.Reset();
+				return Result::Unsupported;
+			}
+
+			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+			allocateInfo.allocationSize = memoryRequirements.size;
+			allocateInfo.memoryTypeIndex = memoryTypeIndex;
+
+			VkDeviceMemory memory = VK_NULL_HANDLE;
+			result = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &memory);
+			if (result != VK_SUCCESS) {
+				vkDestroyImage(impl->device, image, nullptr);
+				out.Reset();
+				return ToRHI(result);
+			}
+
+			result = vkBindImageMemory(impl->device, image, memory, 0);
+			if (result != VK_SUCCESS) {
+				vkFreeMemory(impl->device, memory, nullptr);
+				vkDestroyImage(impl->device, image, nullptr);
+				out.Reset();
+				return ToRHI(result);
+			}
+
+			VulkanResource resourceState{};
+			resourceState.image = image;
+			resourceState.memory = memory;
+			resourceState.format = format;
+			resourceState.type = desc.type;
+			resourceState.currentLayout = ResourceLayout::Undefined;
+			resourceState.width = desc.texture.width;
+			resourceState.height = desc.type == ResourceType::Texture1D ? 1u : desc.texture.height;
+			resourceState.depthOrLayers = desc.type == ResourceType::Texture3D ? 1u : desc.texture.depthOrLayers;
+			resourceState.mipLevels = desc.texture.mipLevels;
+			resourceState.ownsImage = true;
+			resourceState.ownsMemory = true;
+
+			const ResourceHandle handle = impl->resources.alloc(resourceState);
+			Resource texture{ handle, true };
+			texture.impl = impl;
+			texture.vt = &g_vktex_rvt;
+			out = MakeTexturePtr(device, texture, impl->selfWeak.lock());
+			return Result::Ok;
 		}
 
 		static Result d_createCommittedResource(Device* device, const ResourceDesc& desc, ResourcePtr& out) noexcept {
@@ -2029,8 +3162,8 @@ namespace rhi {
 		}
 
 		static uint32_t d_getDescriptorHandleIncrementSize(Device* device, DescriptorHeapType type) noexcept {
-			VkIgnoreUnused(device, type);
-			return 1;
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			return static_cast<uint32_t>(VkDescriptorHeapStride(impl, type));
 		}
 
 		static Result d_createTimeline(Device* device, uint64_t initialValue, const char* debugName, TimelinePtr& out) noexcept {
@@ -2263,6 +3396,20 @@ namespace rhi {
 		if (device != VK_NULL_HANDLE) {
 			vkDeviceWaitIdle(device);
 		}
+
+		for (auto& slot : descriptorHeaps.slots) {
+			if (!slot.alive) {
+				continue;
+			}
+
+			for (VulkanImageViewSlot& descriptorSlot : slot.obj.imageViewSlots) {
+				VkResetDescriptorSlot(this, descriptorSlot);
+			}
+			VkDestroyDescriptorHeapBacking(this, slot.obj);
+			slot.obj = VulkanDescriptorHeap{};
+			slot.alive = false;
+		}
+		descriptorHeaps.clear();
 
 		for (auto& slot : swapchains.slots) {
 			if (!slot.alive) {
@@ -2603,9 +3750,16 @@ namespace rhi {
 		VkPhysicalDeviceProperties physicalDeviceProperties{};
 		VkPhysicalDeviceMemoryProperties memoryProperties{};
 		VkPhysicalDeviceFeatures supportedFeatures{};
+		VkPhysicalDeviceVulkan12Features supportedVulkan12Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
 		VkPhysicalDeviceVulkan13Features supportedVulkan13Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+		VkPhysicalDeviceDescriptorHeapFeaturesEXT supportedDescriptorHeapFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT };
 		VkPhysicalDeviceFeatures2 supportedFeatures2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
-		supportedFeatures2.pNext = &supportedVulkan13Features;
+		supportedFeatures2.pNext = &supportedVulkan12Features;
+		supportedVulkan12Features.pNext = &supportedVulkan13Features;
+		supportedVulkan13Features.pNext = &supportedDescriptorHeapFeatures;
+		VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptorHeapProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT };
+		VkPhysicalDeviceProperties2 properties2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+		properties2.pNext = &descriptorHeapProperties;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		std::array<uint32_t, 3> selectedQueueFamilies{};
 		if (!VkSelectPhysicalDeviceAndQueues(
@@ -2642,16 +3796,34 @@ namespace rhi {
 			queueCreateInfos.push_back(queueCreateInfo);
 		}
 
+		const bool enableSwapchainExtension = VkHasDeviceExtension(physicalDevice, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+		const bool hasDescriptorHeapExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
 		std::vector<const char*> enabledDeviceExtensions;
-		if (VkHasDeviceExtension(physicalDevice, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
+		if (enableSwapchainExtension) {
 			enabledDeviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 		}
+		if (hasDescriptorHeapExtension) {
+			enabledDeviceExtensions.push_back(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
+		}
 		vkGetPhysicalDeviceFeatures2(physicalDevice, &supportedFeatures2);
+		vkGetPhysicalDeviceProperties2(physicalDevice, &properties2);
 		supportedFeatures = supportedFeatures2.features;
 
+		VkPhysicalDeviceVulkan12Features enabledVulkan12Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
 		VkPhysicalDeviceVulkan13Features enabledVulkan13Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+		VkPhysicalDeviceDescriptorHeapFeaturesEXT enabledDescriptorHeapFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT };
+		enabledVulkan12Features.pNext = &enabledVulkan13Features;
+		enabledVulkan13Features.pNext = &enabledDescriptorHeapFeatures;
+		if (supportedVulkan12Features.bufferDeviceAddress == VK_TRUE) {
+			enabledVulkan12Features.bufferDeviceAddress = VK_TRUE;
+		}
 		if (supportedVulkan13Features.dynamicRendering == VK_TRUE) {
 			enabledVulkan13Features.dynamicRendering = VK_TRUE;
+		}
+		if (hasDescriptorHeapExtension &&
+			supportedDescriptorHeapFeatures.descriptorHeap == VK_TRUE &&
+			enabledVulkan12Features.bufferDeviceAddress == VK_TRUE) {
+			enabledDescriptorHeapFeatures.descriptorHeap = VK_TRUE;
 		}
 
 		VkDeviceCreateInfo deviceCreateInfo{};
@@ -2659,7 +3831,7 @@ namespace rhi {
 		deviceCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
 		deviceCreateInfo.pQueueCreateInfos = queueCreateInfos.data();
 		deviceCreateInfo.pEnabledFeatures = &supportedFeatures;
-		deviceCreateInfo.pNext = enabledVulkan13Features.dynamicRendering == VK_TRUE ? &enabledVulkan13Features : nullptr;
+		deviceCreateInfo.pNext = &enabledVulkan12Features;
 		deviceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(enabledDeviceExtensions.size());
 		deviceCreateInfo.ppEnabledExtensionNames = enabledDeviceExtensions.empty() ? nullptr : enabledDeviceExtensions.data();
 
@@ -2681,10 +3853,13 @@ namespace rhi {
 		impl->physicalDeviceProperties = physicalDeviceProperties;
 		impl->memoryProperties = memoryProperties;
 		impl->supportedFeatures = supportedFeatures;
+		impl->descriptorHeapProperties = descriptorHeapProperties;
+		impl->bufferDeviceAddressEnabled = enabledVulkan12Features.bufferDeviceAddress == VK_TRUE;
+		impl->descriptorHeapEnabled = enabledDescriptorHeapFeatures.descriptorHeap == VK_TRUE;
 		impl->dynamicRenderingEnabled = enabledVulkan13Features.dynamicRendering == VK_TRUE;
 		impl->loaderApiVersion = loaderApiVersion;
 		impl->instanceApiVersion = requestedApiVersion;
-		impl->swapchainExtensionEnabled = !enabledDeviceExtensions.empty();
+		impl->swapchainExtensionEnabled = enableSwapchainExtension;
 		impl->queueFamilyProperties = std::move(queueFamilyProperties);
 		for (uint32_t queueSlot = 0; queueSlot < 3; ++queueSlot) {
 			const uint32_t familyIndex = selectedQueueFamilies[queueSlot];
@@ -2699,14 +3874,17 @@ namespace rhi {
 		impl->self = Device{ impl.get(), &g_vkdevvt };
 
 		spdlog::info(
-			"CreateVulkanDevice: selected device '{}' api {}.{}.{} queueFamilies[gfx={}, compute={}, copy={}]",
+			"CreateVulkanDevice: selected device '{}' api {}.{}.{} queueFamilies[gfx={}, compute={}, copy={}] dynamicRendering={} bufferDeviceAddress={} descriptorHeap={}",
 			impl->physicalDeviceProperties.deviceName,
 			VK_API_VERSION_MAJOR(impl->physicalDeviceProperties.apiVersion),
 			VK_API_VERSION_MINOR(impl->physicalDeviceProperties.apiVersion),
 			VK_API_VERSION_PATCH(impl->physicalDeviceProperties.apiVersion),
 			impl->queues[0].familyIndex,
 			impl->queues[1].familyIndex,
-			impl->queues[2].familyIndex);
+			impl->queues[2].familyIndex,
+			impl->dynamicRenderingEnabled,
+			impl->bufferDeviceAddressEnabled,
+			impl->descriptorHeapEnabled);
 
 		outPtr = MakeDevicePtr(&impl->self, impl);
 		return Result::Ok;
