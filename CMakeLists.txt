@@ -72,6 +72,7 @@ endif()
 add_library(BasicRHI STATIC 
     rhi_dx12.cpp
     rhi_vulkan.cpp
+    ../volk/volk.c
     rhi_imgui_widgets.cpp
     ImGuiColorTextEdit/TextEditor.cpp
     "rhi_interop.h" 
@@ -104,7 +105,18 @@ target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:Clang>:
 >)
 add_library(BasicRHI::BasicRHI ALIAS BasicRHI)
 
+set(_basicrhi_volk_source "${CMAKE_CURRENT_LIST_DIR}/../volk/volk.c")
+set_source_files_properties(${_basicrhi_volk_source} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "/w")
+
 target_link_libraries(BasicRHI PRIVATE imgui::imgui)
+target_include_directories(BasicRHI PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/../volk"
+    "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty"
+)
+
+if(WIN32)
+    target_compile_definitions(BasicRHI PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+endif()
 
 if(_basicrhi_streamline_available)
     if(TARGET Streamline::headers)
@@ -235,3 +247,17 @@ target_compile_definitions(BasicRHI PUBLIC
     BASICRHI_ENABLE_PIX=$<IF:$<BOOL:${_basicrhi_pix_available}>,1,0>
     BASICRHI_ENABLE_RESHAPE=$<IF:$<BOOL:${_basicrhi_reshape_available}>,1,0>
 )
+
+add_executable(BasicRHIVulkanSmoke
+    tests/VulkanSmoke.cpp
+)
+
+set_target_properties(BasicRHIVulkanSmoke PROPERTIES
+    OUTPUT_NAME "BasicRHIVulkanSmoke_v2"
+)
+
+target_link_libraries(BasicRHIVulkanSmoke PRIVATE BasicRHI::BasicRHI)
+
+if(WIN32)
+    target_link_libraries(BasicRHIVulkanSmoke PRIVATE user32)
+endif()
