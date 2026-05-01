@@ -28,6 +28,27 @@ namespace rhi {
 		return static_cast<ResourceAccessType>(static_cast<uint64_t>(a) | static_cast<uint64_t>(b));
 	}
 
+	inline ResourceAccessType CanonicalizeResourceAccessType(ResourceAccessType access)
+	{
+		if (access != ResourceAccessType::None && access != ResourceAccessType::Common) {
+			access = static_cast<ResourceAccessType>(access & ~ResourceAccessType::Common);
+		}
+		return access;
+	}
+
+	inline ResourceAccessType ComposeCompatibleAccessTypes(ResourceAccessType lhs, ResourceAccessType rhs)
+	{
+		lhs = CanonicalizeResourceAccessType(lhs);
+		rhs = CanonicalizeResourceAccessType(rhs);
+
+		if (lhs == ResourceAccessType::None) return rhs;
+		if (rhs == ResourceAccessType::None) return lhs;
+		if (lhs == ResourceAccessType::Common) return rhs;
+		if (rhs == ResourceAccessType::Common) return lhs;
+
+		return static_cast<ResourceAccessType>(lhs | rhs);
+	}
+
 	enum class ResourceLayout {
 		Undefined,
 		Common,
@@ -277,15 +298,15 @@ namespace rhi {
 		}
 		switch (layout) {
 		case ResourceLayout::Common:
-			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument | ResourceAccessType::CopyDest | ResourceAccessType::CopySource)) != 0)
+			if ((access & ~(ResourceAccessType::Common | ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument | ResourceAccessType::CopyDest | ResourceAccessType::CopySource)) != 0)
 				return false;
 			break;
 		case ResourceLayout::DirectCommon:
-			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument | ResourceAccessType::CopyDest | ResourceAccessType::CopySource | ResourceAccessType::UnorderedAccess)) != 0)
+			if ((access & ~(ResourceAccessType::Common | ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument | ResourceAccessType::CopyDest | ResourceAccessType::CopySource | ResourceAccessType::UnorderedAccess)) != 0)
 				return false;
 			break;
 		case ResourceLayout::ComputeCommon:
-			if ((access & ~(ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument | ResourceAccessType::CopyDest | ResourceAccessType::CopySource | ResourceAccessType::UnorderedAccess)) != 0)
+			if ((access & ~(ResourceAccessType::Common | ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument | ResourceAccessType::CopyDest | ResourceAccessType::CopySource | ResourceAccessType::UnorderedAccess)) != 0)
 				return false;
 			break;
 		case ResourceLayout::GenericRead:
