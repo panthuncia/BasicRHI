@@ -6159,7 +6159,7 @@ namespace rhi {
 					p.t.index, p.t.generation,
 					p.value, last->second);
 				BreakIfDebugging();
-				return Result::InvalidArgument; // must be strictly greater
+ 				return Result::InvalidArgument; // must be strictly greater
 			}
 			qs->lastSignaledValue[p.t] = p.value;
 #endif
