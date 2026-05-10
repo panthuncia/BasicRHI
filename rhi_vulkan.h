@@ -20,6 +20,10 @@ namespace rhi {
 	struct VulkanCommandList;
 	struct VulkanPipeline;
 	struct VulkanPipelineLayout;
+	struct VulkanCommandSignature;
+	struct VulkanTimeline;
+	struct VulkanHeap;
+	struct VulkanQueryPool;
 
 	template<> struct VulkanHandleFor<VulkanDescriptorHeap> { using type = DescriptorHeapHandle; };
 	template<> struct VulkanHandleFor<VulkanResource> { using type = ResourceHandle; };
@@ -28,6 +32,10 @@ namespace rhi {
 	template<> struct VulkanHandleFor<VulkanCommandList> { using type = CommandListHandle; };
 	template<> struct VulkanHandleFor<VulkanPipeline> { using type = PipelineHandle; };
 	template<> struct VulkanHandleFor<VulkanPipelineLayout> { using type = PipelineLayoutHandle; };
+	template<> struct VulkanHandleFor<VulkanCommandSignature> { using type = CommandSignatureHandle; };
+	template<> struct VulkanHandleFor<VulkanTimeline> { using type = TimelineHandle; };
+	template<> struct VulkanHandleFor<VulkanHeap> { using type = HeapHandle; };
+	template<> struct VulkanHandleFor<VulkanQueryPool> { using type = QueryPoolHandle; };
 
 	template<typename T>
 	struct VulkanSlot {
@@ -211,6 +219,7 @@ namespace rhi {
 		std::vector<StaticSamplerDesc> staticSamplers;
 		std::vector<VulkanPushConstantRange> pushConstantRanges;
 		uint32_t totalPushDataBytes = 0;
+		bool usesDescriptorHeap = false;
 	};
 
 	struct VulkanPipeline {
@@ -219,6 +228,30 @@ namespace rhi {
 		VkPipelineBindPoint bindPoint = VK_PIPELINE_BIND_POINT_MAX_ENUM;
 		PipelineLayoutHandle rhiLayout{};
 		bool isCompute = false;
+	};
+
+	struct VulkanCommandSignature {
+		std::vector<IndirectArg> args;
+		uint32_t byteStride = 0;
+	};
+
+	struct VulkanTimeline {
+		VkSemaphore semaphore = VK_NULL_HANDLE;
+	};
+
+	struct VulkanHeap {
+		VkDeviceMemory memory = VK_NULL_HANDLE;
+		VkDeviceSize size = 0;
+		uint32_t memoryTypeIndex = 0;
+		HeapType heapType = HeapType::DeviceLocal;
+	};
+
+	struct VulkanQueryPool {
+		VkQueryPool pool = VK_NULL_HANDLE;
+		QueryType type = QueryType::Timestamp;
+		uint32_t count = 0;
+		PipelineStatsMask statsMask = 0;
+		VkQueryPipelineStatisticFlags vkStats = 0;
 	};
 
 	struct VulkanCommandList {
@@ -247,11 +280,16 @@ namespace rhi {
 		VkPhysicalDeviceMemoryProperties memoryProperties{};
 		VkPhysicalDeviceFeatures supportedFeatures{};
 		VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptorHeapProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT };
+		VkPhysicalDeviceMeshShaderPropertiesEXT meshShaderProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT };
 		uint32_t loaderApiVersion = VK_API_VERSION_1_0;
 		uint32_t instanceApiVersion = VK_API_VERSION_1_0;
 		bool swapchainExtensionEnabled = false;
 		bool bufferDeviceAddressEnabled = false;
+		bool timelineSemaphoreEnabled = false;
 		bool descriptorHeapEnabled = false;
+		bool meshShaderEnabled = false;
+		bool taskShaderEnabled = false;
+		bool meshShaderPipelineStatsEnabled = false;
 		bool dynamicRenderingEnabled = false;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		VulkanRegistry<VulkanDescriptorHeap> descriptorHeaps;
@@ -260,6 +298,10 @@ namespace rhi {
 		VulkanRegistry<VulkanCommandAllocator> allocators;
 		VulkanRegistry<VulkanPipeline> pipelines;
 		VulkanRegistry<VulkanPipelineLayout> pipelineLayouts;
+		VulkanRegistry<VulkanCommandSignature> commandSignatures;
+		VulkanRegistry<VulkanTimeline> timelines;
+		VulkanRegistry<VulkanHeap> heaps;
+		VulkanRegistry<VulkanQueryPool> queryPools;
 		VulkanRegistry<VulkanCommandList> commandLists;
 		std::array<VulkanQueueState, 3> queues{};
 		QueueHandle gfxHandle{ 0u, 1u };
