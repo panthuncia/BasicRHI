@@ -22,6 +22,7 @@ namespace rhi {
 		RaytracingAccelerationStructureRead = 1 << 12,
 		RaytracingAccelerationStructureWrite = 1 << 13,
 		DepthStencilClear = 1 << 14,
+		RenderTargetClear = 1 << 15,
 	};
 
 	inline ResourceAccessType operator|(ResourceAccessType a, ResourceAccessType b)
@@ -56,6 +57,7 @@ namespace rhi {
 		Present,
 		GenericRead,
 		RenderTarget,
+		RenderTargetClear,
 		UnorderedAccess,
 		DepthReadWrite,
 		DepthStencilClear,
@@ -172,6 +174,8 @@ namespace rhi {
 			return ResourceLayout::Common;
 		if (access & ResourceAccessType::UnorderedAccess)
 			return ResourceLayout::UnorderedAccess;
+		if (access & ResourceAccessType::RenderTargetClear)
+			return ResourceLayout::RenderTargetClear;
 		if (access & ResourceAccessType::RenderTarget)
 			return ResourceLayout::RenderTarget;
 		if (access & ResourceAccessType::DepthReadWrite)
@@ -236,7 +240,7 @@ namespace rhi {
 			| ResourceAccessType::ShaderResource
 			| ResourceAccessType::UnorderedAccess)) != 0;
 		bool needsIndexInput = (access & ResourceAccessType::IndexBuffer) != 0;
-		bool needsRenderTarget = (access & ResourceAccessType::RenderTarget) != 0;
+		bool needsRenderTarget = (access & (ResourceAccessType::RenderTarget | ResourceAccessType::RenderTargetClear)) != 0;
 		bool needsDepthStencil = (access & (ResourceAccessType::DepthRead
 			| ResourceAccessType::DepthReadWrite
 			| ResourceAccessType::DepthStencilClear)) != 0;
@@ -290,6 +294,7 @@ namespace rhi {
 
 	inline bool AccessTypeIsWriteType(ResourceAccessType access) {
 		if (access & ResourceAccessType::RenderTarget) return true;
+		if (access & ResourceAccessType::RenderTargetClear) return true;
 		if (access & ResourceAccessType::DepthReadWrite) return true;
 		if (access & ResourceAccessType::DepthStencilClear) return true;
 		if (access & ResourceAccessType::CopyDest) return true;
@@ -303,6 +308,9 @@ namespace rhi {
 			return false;
 		}
 		if (access & ResourceAccessType::DepthStencilClear && access & (ResourceAccessType::DepthRead | ResourceAccessType::DepthReadWrite)) {
+			return false;
+		}
+		if (access & ResourceAccessType::RenderTargetClear && access & ResourceAccessType::RenderTarget) {
 			return false;
 		}
 		switch (layout) {
@@ -332,6 +340,10 @@ namespace rhi {
 			break;
 		case ResourceLayout::RenderTarget:
 			if ((access & ~(ResourceAccessType::RenderTarget)) != 0)
+				return false;
+			break;
+		case ResourceLayout::RenderTargetClear:
+			if ((access & ~(ResourceAccessType::RenderTargetClear)) != 0)
 				return false;
 			break;
 		case ResourceLayout::UnorderedAccess:

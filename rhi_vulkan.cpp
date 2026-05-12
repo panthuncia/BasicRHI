@@ -890,6 +890,7 @@ namespace rhi {
 			if ((bits & ResourceAccessType::ConstantBuffer) != 0) flags |= VK_ACCESS_UNIFORM_READ_BIT;
 			if ((bits & ResourceAccessType::IndexBuffer) != 0) flags |= VK_ACCESS_INDEX_READ_BIT;
 			if ((bits & ResourceAccessType::RenderTarget) != 0) flags |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+			if ((bits & ResourceAccessType::RenderTargetClear) != 0) flags |= VK_ACCESS_TRANSFER_WRITE_BIT;
 			if ((bits & ResourceAccessType::UnorderedAccess) != 0) flags |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 			if ((bits & ResourceAccessType::DepthReadWrite) != 0) flags |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 			if ((bits & ResourceAccessType::DepthStencilClear) != 0) flags |= VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2017,6 +2018,8 @@ namespace rhi {
 				return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 			case ResourceLayout::RenderTarget:
 				return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+			case ResourceLayout::RenderTargetClear:
+				return VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 			case ResourceLayout::UnorderedAccess:
 			case ResourceLayout::DirectUnorderedAccess:
 			case ResourceLayout::ComputeUnorderedAccess:
@@ -2899,8 +2902,11 @@ namespace rhi {
 		static void cl_beginPass(CommandList* commandList, const PassBeginInfo& passInfo) noexcept {
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
-			if (!impl || !impl->dynamicRenderingEnabled || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE || commandListState->passActive) {
+			if (!impl || !impl->dynamicRenderingEnabled || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE) {
 				return;
+			}
+			if (commandListState->passActive) {
+				cl_endPass(commandList);
 			}
 
 			std::vector<VkRenderingAttachmentInfo> colorAttachments;
@@ -2915,7 +2921,9 @@ namespace rhi {
 					return;
 				}
 
-				VkTransitionResourceLayout(commandListState->commandBuffer, *resource, viewSlot->aspectMask, ResourceLayout::RenderTarget);
+				if (resource->isSwapchainImage) {
+					VkTransitionResourceLayout(commandListState->commandBuffer, *resource, viewSlot->aspectMask, ResourceLayout::RenderTarget);
+				}
 
 				VkRenderingAttachmentInfo attachmentInfo{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
 				attachmentInfo.imageView = viewSlot->view;
@@ -3030,6 +3038,9 @@ namespace rhi {
 			if (!impl || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE) {
 				return;
 			}
+			if (commandListState->passActive) {
+				cl_endPass(commandList);
+			}
 
 			std::vector<VkImageMemoryBarrier> imageBarriers;
 			std::vector<VkBufferMemoryBarrier> bufferBarriers;
@@ -3053,8 +3064,10 @@ namespace rhi {
 				vkBarrier.image = resource->image;
 				vkBarrier.subresourceRange = VkMakeImageSubresourceRange(*resource, barrier.range, aspect);
 				imageBarriers.push_back(vkBarrier);
-				srcStages |= barrier.discard ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : ((barrier.beforeAccess & ResourceAccessType::DepthStencilClear) != 0 ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.beforeSync));
-				dstStages |= (barrier.afterAccess & ResourceAccessType::DepthStencilClear) != 0 ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.afterSync);
+				const bool beforeTransferClear = (barrier.beforeAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear)) != 0;
+				const bool afterTransferClear = (barrier.afterAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear)) != 0;
+				srcStages |= barrier.discard ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.beforeSync));
+				dstStages |= afterTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.afterSync);
 				resource->currentLayout = barrier.afterLayout;
 			}
 

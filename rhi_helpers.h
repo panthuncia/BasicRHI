@@ -898,6 +898,7 @@ namespace rhi {
             case ResourceLayout::Present:                 return "PRESENT";
             case ResourceLayout::GenericRead:             return "GENERIC_READ";
             case ResourceLayout::RenderTarget:            return "RENDER_TARGET";
+            case ResourceLayout::RenderTargetClear:       return "RENDER_TARGET_CLEAR";
             case ResourceLayout::UnorderedAccess:         return "UNORDERED_ACCESS";
             case ResourceLayout::DepthReadWrite:          return "DEPTH_STENCIL_WRITE";
             case ResourceLayout::DepthStencilClear:       return "DEPTH_STENCIL_CLEAR";
@@ -943,6 +944,7 @@ namespace rhi {
             if (v & static_cast<U>(ResourceAccessType::ConstantBuffer))                      add("CONSTANT_BUFFER");
             if (v & static_cast<U>(ResourceAccessType::IndexBuffer))                         add("INDEX_BUFFER");
             if (v & static_cast<U>(ResourceAccessType::RenderTarget))                        add("RENDER_TARGET");
+            if (v & static_cast<U>(ResourceAccessType::RenderTargetClear))                   add("RENDER_TARGET_CLEAR");
             if (v & static_cast<U>(ResourceAccessType::UnorderedAccess))                     add("UNORDERED_ACCESS");
             if (v & static_cast<U>(ResourceAccessType::DepthReadWrite))                      add("DEPTH_STENCIL_WRITE");
             if (v & static_cast<U>(ResourceAccessType::DepthStencilClear))                   add("DEPTH_STENCIL_CLEAR");
