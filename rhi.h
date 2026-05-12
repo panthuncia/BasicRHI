@@ -1442,6 +1442,7 @@ namespace rhi {
 		ResourceSyncState    afterSync{ ResourceSyncState::None };
 		ResourceAccessType   beforeAccess{ ResourceAccessType::None };
 		ResourceAccessType   afterAccess{ ResourceAccessType::None };
+		bool discard{ false };
 	};
 
 	struct GlobalBarrier {
@@ -2492,6 +2493,7 @@ namespace rhi {
 		Backend backend = Backend::D3D12;
 		uint32_t framesInFlight = 3;
 		bool enableDebug = true;
+		bool validateBarrierTransitions = false;
 		DebugInstrumentationCreateInfo instrumentation{};
 	};
 

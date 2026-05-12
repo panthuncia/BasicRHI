@@ -6596,9 +6596,9 @@ namespace rhi {
 				if (!B || !B->res) continue;
 
 				D3D12_BUFFER_BARRIER bb{};
-				bb.SyncBefore = ToDX(br.beforeSync);
+				bb.SyncBefore = ToDX(br.discard ? ResourceSyncState::None : br.beforeSync);
 				bb.SyncAfter = ToDX(br.afterSync);
-				bb.AccessBefore = ToDX(br.beforeAccess);
+				bb.AccessBefore = ToDX(br.discard ? ResourceAccessType::None : br.beforeAccess);
 				bb.AccessAfter = ToDX(br.afterAccess);
 				bb.pResource = B->res.Get();
 				bb.Offset = br.offset;

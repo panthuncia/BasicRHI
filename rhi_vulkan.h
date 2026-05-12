@@ -132,7 +132,12 @@ namespace rhi {
 		uint64_t bufferSize = 0;
 		VkFormat format = VK_FORMAT_UNDEFINED;
 		ResourceType type = ResourceType::Unknown;
+		ResourceAccessType currentAccess = ResourceAccessType::Common;
 		ResourceLayout currentLayout = ResourceLayout::Undefined;
+		ResourceSyncState currentSync = ResourceSyncState::All;
+		ResourceAccessType submittedAccess = ResourceAccessType::Common;
+		ResourceLayout submittedLayout = ResourceLayout::Undefined;
+		ResourceSyncState submittedSync = ResourceSyncState::All;
 		uint32_t width = 0;
 		uint32_t height = 0;
 		uint16_t depthOrLayers = 1;
@@ -265,6 +270,31 @@ namespace rhi {
 	};
 
 	struct VulkanCommandList {
+		struct RecordedTextureBarrier {
+			ResourceHandle texture{};
+			ResourceAccessType beforeAccess = ResourceAccessType::Common;
+			ResourceAccessType afterAccess = ResourceAccessType::Common;
+			ResourceLayout beforeLayout = ResourceLayout::Common;
+			ResourceLayout afterLayout = ResourceLayout::Common;
+			ResourceSyncState beforeSync = ResourceSyncState::All;
+			ResourceSyncState afterSync = ResourceSyncState::All;
+			bool discard = false;
+		};
+
+		struct RecordedBufferBarrier {
+			ResourceHandle buffer{};
+			ResourceAccessType beforeAccess = ResourceAccessType::Common;
+			ResourceAccessType afterAccess = ResourceAccessType::Common;
+			ResourceSyncState beforeSync = ResourceSyncState::All;
+			ResourceSyncState afterSync = ResourceSyncState::All;
+			bool discard = false;
+		};
+
+		struct RecordedBarrierBatch {
+			std::vector<RecordedTextureBarrier> textures;
+			std::vector<RecordedBufferBarrier> buffers;
+		};
+
 		struct EmulatedRootConstantScratchPage {
 			VkBuffer buffer = VK_NULL_HANDLE;
 			VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -283,6 +313,7 @@ namespace rhi {
 		VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 		CommandAllocatorHandle allocatorHandle{};
 		QueueKind kind = QueueKind::Graphics;
+		Result pendingError = Result::Ok;
 		bool isRecording = false;
 		bool passActive = false;
 		PipelineLayoutHandle boundLayout{};
@@ -292,6 +323,7 @@ namespace rhi {
 		VkRect2D passRenderArea{};
 		std::vector<ResourceHandle> passColorResources;
 		ResourceHandle passDepthResource{};
+		std::vector<RecordedBarrierBatch> recordedBarrierBatches;
 		std::vector<EmulatedRootConstantScratchPage> emulatedRootConstantScratchPages;
 		std::vector<EmulatedRootConstantShadowState> emulatedRootConstantShadowStates;
 	};
@@ -330,6 +362,7 @@ namespace rhi {
 		bool computeDerivativeGroupLinearEnabled = false;
 		bool shaderImageInt64AtomicsEnabled = false;
 		bool shaderSubgroupPartitionedEnabled = false;
+		bool validateBarrierTransitions = false;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		VulkanRegistry<VulkanDescriptorHeap> descriptorHeaps;
 		VulkanRegistry<VulkanResource> resources;
