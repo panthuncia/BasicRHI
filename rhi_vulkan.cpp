@@ -57,30 +57,120 @@ namespace rhi {
 
 		static VkFormat ToVkFormat(Format format) noexcept {
 			switch (format) {
+			case Format::R32G32B32A32_UInt:
+				return VK_FORMAT_R32G32B32A32_UINT;
+			case Format::R32G32B32A32_SInt:
+				return VK_FORMAT_R32G32B32A32_SINT;
 			case Format::R32G32B32A32_Float:
 				return VK_FORMAT_R32G32B32A32_SFLOAT;
+			case Format::R32G32B32_UInt:
+				return VK_FORMAT_R32G32B32_UINT;
+			case Format::R32G32B32_SInt:
+				return VK_FORMAT_R32G32B32_SINT;
 			case Format::R32G32B32_Float:
 				return VK_FORMAT_R32G32B32_SFLOAT;
+			case Format::R32G32_UInt:
+				return VK_FORMAT_R32G32_UINT;
+			case Format::R32G32_SInt:
+				return VK_FORMAT_R32G32_SINT;
 			case Format::R32G32_Float:
 				return VK_FORMAT_R32G32_SFLOAT;
+			case Format::R16G16B16A16_UNorm:
+				return VK_FORMAT_R16G16B16A16_UNORM;
+			case Format::R16G16B16A16_SNorm:
+				return VK_FORMAT_R16G16B16A16_SNORM;
+			case Format::R16G16B16A16_UInt:
+				return VK_FORMAT_R16G16B16A16_UINT;
+			case Format::R16G16B16A16_SInt:
+				return VK_FORMAT_R16G16B16A16_SINT;
 			case Format::R16G16B16A16_Float:
 				return VK_FORMAT_R16G16B16A16_SFLOAT;
+			case Format::R16G16_UNorm:
+				return VK_FORMAT_R16G16_UNORM;
+			case Format::R16G16_SNorm:
+				return VK_FORMAT_R16G16_SNORM;
+			case Format::R16G16_UInt:
+				return VK_FORMAT_R16G16_UINT;
+			case Format::R16G16_SInt:
+				return VK_FORMAT_R16G16_SINT;
 			case Format::R16G16_Float:
 				return VK_FORMAT_R16G16_SFLOAT;
 			case Format::R8G8B8A8_UNorm:
 				return VK_FORMAT_R8G8B8A8_UNORM;
 			case Format::R8G8B8A8_UNorm_sRGB:
 				return VK_FORMAT_R8G8B8A8_SRGB;
+			case Format::R8G8B8A8_UInt:
+				return VK_FORMAT_R8G8B8A8_UINT;
+			case Format::R8G8B8A8_SNorm:
+				return VK_FORMAT_R8G8B8A8_SNORM;
+			case Format::R8G8B8A8_SInt:
+				return VK_FORMAT_R8G8B8A8_SINT;
 			case Format::B8G8R8A8_UNorm:
 				return VK_FORMAT_B8G8R8A8_UNORM;
 			case Format::B8G8R8A8_UNorm_sRGB:
 				return VK_FORMAT_B8G8R8A8_SRGB;
+			case Format::R32_Typeless:
+				return VK_FORMAT_D32_SFLOAT;
 			case Format::R32_Float:
 				return VK_FORMAT_R32_SFLOAT;
 			case Format::R32_UInt:
 				return VK_FORMAT_R32_UINT;
+			case Format::R32_SInt:
+				return VK_FORMAT_R32_SINT;
+			case Format::R16_Float:
+				return VK_FORMAT_R16_SFLOAT;
+			case Format::R16_UNorm:
+				return VK_FORMAT_R16_UNORM;
 			case Format::R16_UInt:
 				return VK_FORMAT_R16_UINT;
+			case Format::R16_SNorm:
+				return VK_FORMAT_R16_SNORM;
+			case Format::R16_SInt:
+				return VK_FORMAT_R16_SINT;
+			case Format::R8G8_UNorm:
+				return VK_FORMAT_R8G8_UNORM;
+			case Format::R8G8_UInt:
+				return VK_FORMAT_R8G8_UINT;
+			case Format::R8G8_SNorm:
+				return VK_FORMAT_R8G8_SNORM;
+			case Format::R8G8_SInt:
+				return VK_FORMAT_R8G8_SINT;
+			case Format::R8_UNorm:
+				return VK_FORMAT_R8_UNORM;
+			case Format::R8_UInt:
+				return VK_FORMAT_R8_UINT;
+			case Format::R8_SNorm:
+				return VK_FORMAT_R8_SNORM;
+			case Format::R8_SInt:
+				return VK_FORMAT_R8_SINT;
+			case Format::BC1_UNorm:
+				return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+			case Format::BC1_UNorm_sRGB:
+				return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+			case Format::BC2_UNorm:
+				return VK_FORMAT_BC2_UNORM_BLOCK;
+			case Format::BC2_UNorm_sRGB:
+				return VK_FORMAT_BC2_SRGB_BLOCK;
+			case Format::BC3_UNorm:
+				return VK_FORMAT_BC3_UNORM_BLOCK;
+			case Format::BC3_UNorm_sRGB:
+				return VK_FORMAT_BC3_SRGB_BLOCK;
+			case Format::BC4_UNorm:
+				return VK_FORMAT_BC4_UNORM_BLOCK;
+			case Format::BC4_SNorm:
+				return VK_FORMAT_BC4_SNORM_BLOCK;
+			case Format::BC5_UNorm:
+				return VK_FORMAT_BC5_UNORM_BLOCK;
+			case Format::BC5_SNorm:
+				return VK_FORMAT_BC5_SNORM_BLOCK;
+			case Format::BC6H_UF16:
+				return VK_FORMAT_BC6H_UFLOAT_BLOCK;
+			case Format::BC6H_SF16:
+				return VK_FORMAT_BC6H_SFLOAT_BLOCK;
+			case Format::BC7_UNorm:
+				return VK_FORMAT_BC7_UNORM_BLOCK;
+			case Format::BC7_UNorm_sRGB:
+				return VK_FORMAT_BC7_SRGB_BLOCK;
 			case Format::D32_Float:
 				return VK_FORMAT_D32_SFLOAT;
 			default:
@@ -90,20 +180,54 @@ namespace rhi {
 
 		static Format FromVkFormat(VkFormat format) noexcept {
 			switch (format) {
+			case VK_FORMAT_R32G32B32A32_UINT:
+				return Format::R32G32B32A32_UInt;
+			case VK_FORMAT_R32G32B32A32_SINT:
+				return Format::R32G32B32A32_SInt;
 			case VK_FORMAT_R32G32B32A32_SFLOAT:
 				return Format::R32G32B32A32_Float;
+			case VK_FORMAT_R32G32B32_UINT:
+				return Format::R32G32B32_UInt;
+			case VK_FORMAT_R32G32B32_SINT:
+				return Format::R32G32B32_SInt;
 			case VK_FORMAT_R32G32B32_SFLOAT:
 				return Format::R32G32B32_Float;
+			case VK_FORMAT_R32G32_UINT:
+				return Format::R32G32_UInt;
+			case VK_FORMAT_R32G32_SINT:
+				return Format::R32G32_SInt;
 			case VK_FORMAT_R32G32_SFLOAT:
 				return Format::R32G32_Float;
+			case VK_FORMAT_R16G16B16A16_UNORM:
+				return Format::R16G16B16A16_UNorm;
+			case VK_FORMAT_R16G16B16A16_SNORM:
+				return Format::R16G16B16A16_SNorm;
+			case VK_FORMAT_R16G16B16A16_UINT:
+				return Format::R16G16B16A16_UInt;
+			case VK_FORMAT_R16G16B16A16_SINT:
+				return Format::R16G16B16A16_SInt;
 			case VK_FORMAT_R16G16B16A16_SFLOAT:
 				return Format::R16G16B16A16_Float;
+			case VK_FORMAT_R16G16_UNORM:
+				return Format::R16G16_UNorm;
+			case VK_FORMAT_R16G16_SNORM:
+				return Format::R16G16_SNorm;
+			case VK_FORMAT_R16G16_UINT:
+				return Format::R16G16_UInt;
+			case VK_FORMAT_R16G16_SINT:
+				return Format::R16G16_SInt;
 			case VK_FORMAT_R16G16_SFLOAT:
 				return Format::R16G16_Float;
 			case VK_FORMAT_R8G8B8A8_UNORM:
 				return Format::R8G8B8A8_UNorm;
 			case VK_FORMAT_R8G8B8A8_SRGB:
 				return Format::R8G8B8A8_UNorm_sRGB;
+			case VK_FORMAT_R8G8B8A8_UINT:
+				return Format::R8G8B8A8_UInt;
+			case VK_FORMAT_R8G8B8A8_SNORM:
+				return Format::R8G8B8A8_SNorm;
+			case VK_FORMAT_R8G8B8A8_SINT:
+				return Format::R8G8B8A8_SInt;
 			case VK_FORMAT_B8G8R8A8_UNORM:
 				return Format::B8G8R8A8_UNorm;
 			case VK_FORMAT_B8G8R8A8_SRGB:
@@ -112,8 +236,62 @@ namespace rhi {
 				return Format::R32_Float;
 			case VK_FORMAT_R32_UINT:
 				return Format::R32_UInt;
+			case VK_FORMAT_R32_SINT:
+				return Format::R32_SInt;
+			case VK_FORMAT_R16_SFLOAT:
+				return Format::R16_Float;
+			case VK_FORMAT_R16_UNORM:
+				return Format::R16_UNorm;
 			case VK_FORMAT_R16_UINT:
 				return Format::R16_UInt;
+			case VK_FORMAT_R16_SNORM:
+				return Format::R16_SNorm;
+			case VK_FORMAT_R16_SINT:
+				return Format::R16_SInt;
+			case VK_FORMAT_R8G8_UNORM:
+				return Format::R8G8_UNorm;
+			case VK_FORMAT_R8G8_UINT:
+				return Format::R8G8_UInt;
+			case VK_FORMAT_R8G8_SNORM:
+				return Format::R8G8_SNorm;
+			case VK_FORMAT_R8G8_SINT:
+				return Format::R8G8_SInt;
+			case VK_FORMAT_R8_UNORM:
+				return Format::R8_UNorm;
+			case VK_FORMAT_R8_UINT:
+				return Format::R8_UInt;
+			case VK_FORMAT_R8_SNORM:
+				return Format::R8_SNorm;
+			case VK_FORMAT_R8_SINT:
+				return Format::R8_SInt;
+			case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+				return Format::BC1_UNorm;
+			case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+				return Format::BC1_UNorm_sRGB;
+			case VK_FORMAT_BC2_UNORM_BLOCK:
+				return Format::BC2_UNorm;
+			case VK_FORMAT_BC2_SRGB_BLOCK:
+				return Format::BC2_UNorm_sRGB;
+			case VK_FORMAT_BC3_UNORM_BLOCK:
+				return Format::BC3_UNorm;
+			case VK_FORMAT_BC3_SRGB_BLOCK:
+				return Format::BC3_UNorm_sRGB;
+			case VK_FORMAT_BC4_UNORM_BLOCK:
+				return Format::BC4_UNorm;
+			case VK_FORMAT_BC4_SNORM_BLOCK:
+				return Format::BC4_SNorm;
+			case VK_FORMAT_BC5_UNORM_BLOCK:
+				return Format::BC5_UNorm;
+			case VK_FORMAT_BC5_SNORM_BLOCK:
+				return Format::BC5_SNorm;
+			case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+				return Format::BC6H_UF16;
+			case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+				return Format::BC6H_SF16;
+			case VK_FORMAT_BC7_UNORM_BLOCK:
+				return Format::BC7_UNorm;
+			case VK_FORMAT_BC7_SRGB_BLOCK:
+				return Format::BC7_UNorm_sRGB;
 			case VK_FORMAT_D32_SFLOAT:
 				return Format::D32_Float;
 			default:

@@ -58,7 +58,7 @@ namespace rhi {
 	struct VulkanQueueInfo { void* queue; uint32_t familyIndex; uint32_t version; };
 	struct VulkanCmdBufInfo { void* commandBuffer; uint32_t version; };
 	struct VulkanSwapchainInfo { void* swapchain; uint32_t version; };
-	struct VulkanResourceInfo { void* resource; uint32_t version; };
+	struct VulkanResourceInfo { void* resource; uint64_t deviceAddress; uint32_t version; };
 	struct VulkanHeapInfo { void* heap; uint32_t version; };
 	struct VulkanQueryPoolInfo { void* queryPool; uint32_t version; };
 	struct VulkanPipelineInfo { void* pipeline; uint32_t version; };
