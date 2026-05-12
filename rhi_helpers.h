@@ -900,6 +900,7 @@ namespace rhi {
             case ResourceLayout::RenderTarget:            return "RENDER_TARGET";
             case ResourceLayout::UnorderedAccess:         return "UNORDERED_ACCESS";
             case ResourceLayout::DepthReadWrite:          return "DEPTH_STENCIL_WRITE";
+            case ResourceLayout::DepthStencilClear:       return "DEPTH_STENCIL_CLEAR";
             case ResourceLayout::DepthRead:               return "DEPTH_STENCIL_READ";
             case ResourceLayout::ShaderResource:          return "SHADER_RESOURCE";
             case ResourceLayout::CopySource:              return "COPY_SOURCE";
@@ -944,6 +945,7 @@ namespace rhi {
             if (v & static_cast<U>(ResourceAccessType::RenderTarget))                        add("RENDER_TARGET");
             if (v & static_cast<U>(ResourceAccessType::UnorderedAccess))                     add("UNORDERED_ACCESS");
             if (v & static_cast<U>(ResourceAccessType::DepthReadWrite))                      add("DEPTH_STENCIL_WRITE");
+            if (v & static_cast<U>(ResourceAccessType::DepthStencilClear))                   add("DEPTH_STENCIL_CLEAR");
             if (v & static_cast<U>(ResourceAccessType::DepthRead))                           add("DEPTH_STENCIL_READ");
             if (v & static_cast<U>(ResourceAccessType::ShaderResource))                      add("SHADER_RESOURCE");
             if (v & static_cast<U>(ResourceAccessType::IndirectArgument))                    add("INDIRECT_ARGUMENT");

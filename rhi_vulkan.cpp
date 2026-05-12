@@ -845,12 +845,37 @@ namespace rhi {
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::DepthStencil)) != 0) stages |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::RenderTarget)) != 0) stages |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::ComputeShading)) != 0) stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+			if ((bits & static_cast<uint32_t>(ResourceSyncState::Raytracing)) != 0) {
+#ifdef VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+				stages |= VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+#else
+				stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+#endif
+			}
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::Copy)) != 0) stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::Resolve)) != 0) stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::ExecuteIndirect)) != 0) stages |= VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::AllShading)) != 0) stages |= VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::NonPixelShading)) != 0) stages |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+			if ((bits & static_cast<uint32_t>(ResourceSyncState::EmitRaytracingAccelerationStructurePostbuildInfo)) != 0) stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::ClearUnorderedAccessView)) != 0) stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+			if ((bits & static_cast<uint32_t>(ResourceSyncState::VideoDecode)) != 0) stages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+			if ((bits & static_cast<uint32_t>(ResourceSyncState::VideoProcess)) != 0) stages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+			if ((bits & static_cast<uint32_t>(ResourceSyncState::VideoEncode)) != 0) stages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+			if ((bits & static_cast<uint32_t>(ResourceSyncState::BuildRaytracingAccelerationStructure)) != 0) {
+#ifdef VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+				stages |= VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+#else
+				stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+#endif
+			}
+			if ((bits & static_cast<uint32_t>(ResourceSyncState::CopyRatracingAccelerationStructure)) != 0) {
+#ifdef VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+				stages |= VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+#else
+				stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+#endif
+			}
 			return stages != 0 ? stages : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 		}
 
@@ -867,6 +892,7 @@ namespace rhi {
 			if ((bits & ResourceAccessType::RenderTarget) != 0) flags |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 			if ((bits & ResourceAccessType::UnorderedAccess) != 0) flags |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 			if ((bits & ResourceAccessType::DepthReadWrite) != 0) flags |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+			if ((bits & ResourceAccessType::DepthStencilClear) != 0) flags |= VK_ACCESS_TRANSFER_WRITE_BIT;
 			if ((bits & ResourceAccessType::DepthRead) != 0) flags |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
 			if ((bits & ResourceAccessType::ShaderResource) != 0) flags |= VK_ACCESS_SHADER_READ_BIT;
 			if ((bits & ResourceAccessType::IndirectArgument) != 0) flags |= VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
@@ -1866,13 +1892,24 @@ namespace rhi {
 			return Result::Ok;
 		}
 
-		static Result VkEnsureGeneratedCommandsPreprocessBuffer(VulkanDevice* impl, VulkanCommandSignature& signature, uint32_t maxSequenceCount) noexcept {
-			if (!impl || impl->device == VK_NULL_HANDLE || !impl->bufferDeviceAddressEnabled || signature.executionSet == VK_NULL_HANDLE || signature.indirectLayout == VK_NULL_HANDLE || !vkGetGeneratedCommandsMemoryRequirementsEXT) {
+		static Result VkEnsureGeneratedCommandsPreprocessBuffer(VulkanDevice* impl, VulkanCommandSignature& signature, VkPipeline pipeline, uint32_t maxSequenceCount) noexcept {
+			if (!impl || impl->device == VK_NULL_HANDLE || !impl->bufferDeviceAddressEnabled || signature.indirectLayout == VK_NULL_HANDLE || !vkGetGeneratedCommandsMemoryRequirementsEXT) {
 				RHI_FAIL(Result::Unsupported);
+			}
+			if (signature.usesExecutionSet && signature.executionSet == VK_NULL_HANDLE) {
+				RHI_FAIL(Result::Unsupported);
+			}
+			if (!signature.usesExecutionSet && pipeline == VK_NULL_HANDLE) {
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			VkGeneratedCommandsMemoryRequirementsInfoEXT requirementsInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT };
-			requirementsInfo.indirectExecutionSet = signature.executionSet;
+			VkGeneratedCommandsPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT };
+			if (!signature.usesExecutionSet) {
+				pipelineInfo.pipeline = pipeline;
+				requirementsInfo.pNext = &pipelineInfo;
+			}
+			requirementsInfo.indirectExecutionSet = signature.usesExecutionSet ? signature.executionSet : VK_NULL_HANDLE;
 			requirementsInfo.indirectCommandsLayout = signature.indirectLayout;
 			requirementsInfo.maxSequenceCount = maxSequenceCount;
 			requirementsInfo.maxDrawCount = maxSequenceCount;
@@ -1968,21 +2005,48 @@ namespace rhi {
 
 		static VkImageLayout VkToImageLayout(ResourceLayout layout, VkImageAspectFlags aspectMask) noexcept {
 			switch (layout) {
+			case ResourceLayout::Common:
+			case ResourceLayout::DirectCommon:
+			case ResourceLayout::ComputeCommon:
+				return VK_IMAGE_LAYOUT_GENERAL;
 			case ResourceLayout::Present:
 				return VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+			case ResourceLayout::GenericRead:
+			case ResourceLayout::DirectGenericRead:
+			case ResourceLayout::ComputeGenericRead:
+				return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 			case ResourceLayout::RenderTarget:
 				return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+			case ResourceLayout::UnorderedAccess:
+			case ResourceLayout::DirectUnorderedAccess:
+			case ResourceLayout::ComputeUnorderedAccess:
+				return VK_IMAGE_LAYOUT_GENERAL;
 			case ResourceLayout::DepthReadWrite:
 				return VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+			case ResourceLayout::DepthStencilClear:
+				return VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 			case ResourceLayout::DepthRead:
 				return VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 			case ResourceLayout::ShaderResource:
-			case ResourceLayout::GenericRead:
+			case ResourceLayout::DirectShaderResource:
+			case ResourceLayout::ComputeShaderResource:
 				return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 			case ResourceLayout::CopyDest:
+			case ResourceLayout::DirectCopyDest:
+			case ResourceLayout::ComputeCopyDest:
+			case ResourceLayout::ResolveDest:
 				return VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 			case ResourceLayout::CopySource:
+			case ResourceLayout::DirectCopySource:
+			case ResourceLayout::ComputeCopySource:
+			case ResourceLayout::ResolveSource:
 				return VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			case ResourceLayout::ShadingRateSource:
+#ifdef VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR
+				return VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+#else
+				return VK_IMAGE_LAYOUT_GENERAL;
+#endif
 			case ResourceLayout::Undefined:
 			default:
 				return VK_IMAGE_LAYOUT_UNDEFINED;
@@ -2011,6 +2075,10 @@ namespace rhi {
 				stageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 				accessMask = VK_ACCESS_SHADER_READ_BIT;
 				break;
+			case VK_IMAGE_LAYOUT_GENERAL:
+				stageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+				accessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+				break;
 			case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
 				stageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
 				accessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2019,6 +2087,12 @@ namespace rhi {
 				stageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
 				accessMask = VK_ACCESS_TRANSFER_READ_BIT;
 				break;
+#ifdef VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR
+			case VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR:
+				stageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+				accessMask = VK_ACCESS_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR;
+				break;
+#endif
 			default:
 				stageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 				accessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -2816,6 +2890,7 @@ namespace rhi {
 				page.cursor = 0;
 			}
 			commandListState->emulatedRootConstantShadowStates.clear();
+			commandListState->passRenderArea = {};
 			commandListState->passColorResources.clear();
 			commandListState->passDepthResource = {};
 			commandListState->isRecording = true;
@@ -2904,6 +2979,7 @@ namespace rhi {
 			VkRenderingInfo renderingInfo{ VK_STRUCTURE_TYPE_RENDERING_INFO };
 			renderingInfo.renderArea.offset = { 0, 0 };
 			renderingInfo.renderArea.extent = { passInfo.width, passInfo.height };
+			commandListState->passRenderArea = renderingInfo.renderArea;
 			renderingInfo.layerCount = 1;
 			renderingInfo.colorAttachmentCount = static_cast<uint32_t>(colorAttachments.size());
 			renderingInfo.pColorAttachments = colorAttachments.empty() ? nullptr : colorAttachments.data();
@@ -2944,6 +3020,7 @@ namespace rhi {
 
 			commandListState->passColorResources.clear();
 			commandListState->passDepthResource = {};
+			commandListState->passRenderArea = {};
 			commandListState->passActive = false;
 		}
 
@@ -2976,8 +3053,8 @@ namespace rhi {
 				vkBarrier.image = resource->image;
 				vkBarrier.subresourceRange = VkMakeImageSubresourceRange(*resource, barrier.range, aspect);
 				imageBarriers.push_back(vkBarrier);
-				srcStages |= barrier.discard ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VkStageMaskForSync(barrier.beforeSync);
-				dstStages |= VkStageMaskForSync(barrier.afterSync);
+				srcStages |= barrier.discard ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : ((barrier.beforeAccess & ResourceAccessType::DepthStencilClear) != 0 ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.beforeSync));
+				dstStages |= (barrier.afterAccess & ResourceAccessType::DepthStencilClear) != 0 ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.afterSync);
 				resource->currentLayout = barrier.afterLayout;
 			}
 
@@ -3112,6 +3189,24 @@ namespace rhi {
 			}
 			VkClearColorValue value{};
 			std::memcpy(value.float32, clearValue.rgba, sizeof(value.float32));
+			if (commandListState->passActive) {
+				for (uint32_t index = 0; index < commandListState->passColorResources.size(); ++index) {
+					if (commandListState->passColorResources[index].index == viewSlot->resource.index &&
+						commandListState->passColorResources[index].generation == viewSlot->resource.generation) {
+						VkClearAttachment attachment{};
+						attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+						attachment.colorAttachment = index;
+						attachment.clearValue.color = value;
+						VkClearRect rect{};
+						rect.rect = commandListState->passRenderArea;
+						rect.baseArrayLayer = 0;
+						rect.layerCount = 1;
+						vkCmdClearAttachments(commandListState->commandBuffer, 1, &attachment, 1, &rect);
+						return;
+					}
+				}
+				cl_endPass(commandList);
+			}
 			VkImageSubresourceRange range = VkMakeImageSubresourceRange(*resource, viewSlot->range, viewSlot->aspectMask);
 			vkCmdClearColorImage(commandListState->commandBuffer, resource->image, VkToImageLayout(resource->currentLayout, viewSlot->aspectMask), &value, 1, &range);
 		}
@@ -3128,6 +3223,24 @@ namespace rhi {
 			VkImageSubresourceRange range = VkMakeImageSubresourceRange(*resource, viewSlot->range, 0);
 			if (clearDepth) range.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
 			if (clearStencil) range.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+			if (commandListState->passActive) {
+				if (commandListState->passDepthResource.index == viewSlot->resource.index &&
+					commandListState->passDepthResource.generation == viewSlot->resource.generation &&
+					range.aspectMask != 0) {
+					VkClearAttachment attachment{};
+					attachment.aspectMask = range.aspectMask & viewSlot->aspectMask;
+					attachment.clearValue.depthStencil = value;
+					if (attachment.aspectMask != 0) {
+						VkClearRect rect{};
+						rect.rect = commandListState->passRenderArea;
+						rect.baseArrayLayer = 0;
+						rect.layerCount = 1;
+						vkCmdClearAttachments(commandListState->commandBuffer, 1, &attachment, 1, &rect);
+					}
+					return;
+				}
+				cl_endPass(commandList);
+			}
 			if (range.aspectMask != 0) {
 				vkCmdClearDepthStencilImage(commandListState->commandBuffer, resource->image, VkToImageLayout(resource->currentLayout, viewSlot->aspectMask), &value, 1, &range);
 			}
@@ -3156,14 +3269,22 @@ namespace rhi {
 					return;
 				}
 
-				if (VkEnsureGeneratedCommandsExecutionSet(impl, *signatureState, pipelineState->pipeline) != Result::Ok ||
-					VkEnsureGeneratedCommandsPreprocessBuffer(impl, *signatureState, maxCommandCount) != Result::Ok) {
+				if (signatureState->usesExecutionSet &&
+					VkEnsureGeneratedCommandsExecutionSet(impl, *signatureState, pipelineState->pipeline) != Result::Ok) {
+					return;
+				}
+				if (VkEnsureGeneratedCommandsPreprocessBuffer(impl, *signatureState, pipelineState->pipeline, maxCommandCount) != Result::Ok) {
 					return;
 				}
 
 				VkGeneratedCommandsInfoEXT generatedInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT };
+				VkGeneratedCommandsPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT };
+				if (!signatureState->usesExecutionSet) {
+					pipelineInfo.pipeline = pipelineState->pipeline;
+					generatedInfo.pNext = &pipelineInfo;
+				}
 				generatedInfo.shaderStages = pipelineState->bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS;
-				generatedInfo.indirectExecutionSet = signatureState->executionSet;
+				generatedInfo.indirectExecutionSet = signatureState->usesExecutionSet ? signatureState->executionSet : VK_NULL_HANDLE;
 				generatedInfo.indirectCommandsLayout = signatureState->indirectLayout;
 				generatedInfo.indirectAddress = argumentResource->deviceAddress + argumentOffset;
 				generatedInfo.indirectAddressSize = static_cast<VkDeviceSize>(stride) * maxCommandCount;
@@ -3274,6 +3395,9 @@ namespace rhi {
 			if (!commandListState || !resource) {
 				return;
 			}
+			if (commandListState->passActive) {
+				cl_endPass(commandList);
+			}
 			if (clearInfo.resource.IsTexture() && resource->image != VK_NULL_HANDLE) {
 				VulkanImageViewSlot* viewSlot = VkImageViewSlotState(impl, clearInfo.cpuVisible, DescriptorHeapType::CbvSrvUav);
 				if (!viewSlot) {
@@ -3297,6 +3421,9 @@ namespace rhi {
 			VulkanResource* resource = VkResourceState(impl, clearInfo.resource.GetHandle());
 			if (!commandListState || !resource) {
 				return;
+			}
+			if (commandListState->passActive) {
+				cl_endPass(commandList);
 			}
 			if (clearInfo.resource.IsTexture() && resource->image != VK_NULL_HANDLE) {
 				VulkanImageViewSlot* viewSlot = VkImageViewSlotState(impl, clearInfo.cpuVisible, DescriptorHeapType::CbvSrvUav);
@@ -3410,6 +3537,9 @@ namespace rhi {
 			VulkanResource* dst = VkResourceState(impl, dstBuffer);
 			if (!commandListState || !queryPoolState || !dst || dst->buffer == VK_NULL_HANDLE || queryCount == 0 || firstQuery + queryCount > queryPoolState->count) {
 				return;
+			}
+			if (commandListState->passActive) {
+				cl_endPass(commandList);
 			}
 			VkDeviceSize stride = sizeof(uint64_t);
 			if (queryPoolState->type == QueryType::PipelineStatistics) {
@@ -3878,7 +4008,7 @@ namespace rhi {
 				VkPipelineColorBlendStateCreateInfo colorBlend{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
 				colorBlend.attachmentCount = static_cast<uint32_t>(blendAttachments.size());
 				colorBlend.pAttachments = blendAttachments.empty() ? nullptr : blendAttachments.data();
-				VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+				VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY };
 				VkPipelineDynamicStateCreateInfo dynamicState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
 				dynamicState.dynamicStateCount = static_cast<uint32_t>(std::size(dynamicStates));
 				dynamicState.pDynamicStates = dynamicStates;
@@ -3893,6 +4023,9 @@ namespace rhi {
 				rendering.depthAttachmentFormat = depthFormat != Format::Unknown ? ToVkFormat(depthFormat) : VK_FORMAT_UNDEFINED;
 				VkPipelineCreateFlags2CreateInfo createFlags{ VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
 				createFlags.flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
+				if (impl->deviceGeneratedCommandsEnabled) {
+					createFlags.flags |= VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
+				}
 				createFlags.pNext = &rendering;
 				VkGraphicsPipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
 				pipelineInfo.pNext = &createFlags;
@@ -3968,6 +4101,9 @@ namespace rhi {
 
 			VkPipelineCreateFlags2CreateInfo createFlags{ VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
 			createFlags.flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
+			if (impl->deviceGeneratedCommandsEnabled) {
+				createFlags.flags |= VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
+			}
 			VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
 			pipelineInfo.pNext = &createFlags;
 			pipelineInfo.stage = stageInfo;
@@ -4585,6 +4721,7 @@ namespace rhi {
 			signature.args.assign(desc.args.data, desc.args.data + desc.args.size);
 			signature.byteStride = desc.byteStride;
 			signature.indirectLayout = indirectLayout;
+			signature.usesExecutionSet = false;
 			const CommandSignatureHandle handle = impl->commandSignatures.alloc(signature);
 			CommandSignature object{ handle };
 			object.impl = impl;
@@ -4619,9 +4756,14 @@ namespace rhi {
 			if (impl->descriptorHeapEnabled && (desc.type == DescriptorHeapType::CbvSrvUav || desc.type == DescriptorHeapType::Sampler)) {
 				heap.descriptorStride = VkDescriptorHeapStride(impl, desc.type);
 				heap.descriptorBytes = static_cast<uint64_t>(desc.capacity) * heap.descriptorStride;
-				heap.reservedRangeSize = desc.type == DescriptorHeapType::Sampler
-					? static_cast<uint64_t>(impl->descriptorHeapProperties.minSamplerHeapReservedRange)
-					: static_cast<uint64_t>(impl->descriptorHeapProperties.minResourceHeapReservedRange);
+				if (desc.type == DescriptorHeapType::Sampler) {
+					heap.reservedRangeSize = (std::max)(
+						static_cast<uint64_t>(impl->descriptorHeapProperties.minSamplerHeapReservedRange),
+						static_cast<uint64_t>(impl->descriptorHeapProperties.minSamplerHeapReservedRangeWithEmbedded));
+				}
+				else {
+					heap.reservedRangeSize = static_cast<uint64_t>(impl->descriptorHeapProperties.minResourceHeapReservedRange);
+				}
 				heap.reservedRangeOffset = heap.descriptorBytes;
 				const uint64_t totalBytes = heap.descriptorBytes + heap.reservedRangeSize;
 

@@ -21,6 +21,7 @@ namespace rhi {
 		CopySource = 1 << 11,
 		RaytracingAccelerationStructureRead = 1 << 12,
 		RaytracingAccelerationStructureWrite = 1 << 13,
+		DepthStencilClear = 1 << 14,
 	};
 
 	inline ResourceAccessType operator|(ResourceAccessType a, ResourceAccessType b)
@@ -57,6 +58,7 @@ namespace rhi {
 		RenderTarget,
 		UnorderedAccess,
 		DepthReadWrite,
+		DepthStencilClear,
 		DepthRead,
 		ShaderResource,
 		CopySource,
@@ -174,6 +176,8 @@ namespace rhi {
 			return ResourceLayout::RenderTarget;
 		if (access & ResourceAccessType::DepthReadWrite)
 			return ResourceLayout::DepthReadWrite;
+		if (access & ResourceAccessType::DepthStencilClear)
+			return ResourceLayout::DepthStencilClear;
 		if (access & ResourceAccessType::CopySource)
 			return ResourceLayout::CopySource;
 		if (access & ResourceAccessType::CopyDest)
@@ -234,7 +238,8 @@ namespace rhi {
 		bool needsIndexInput = (access & ResourceAccessType::IndexBuffer) != 0;
 		bool needsRenderTarget = (access & ResourceAccessType::RenderTarget) != 0;
 		bool needsDepthStencil = (access & (ResourceAccessType::DepthRead
-			| ResourceAccessType::DepthReadWrite)) != 0;
+			| ResourceAccessType::DepthReadWrite
+			| ResourceAccessType::DepthStencilClear)) != 0;
 		bool needsCopy = (access & (ResourceAccessType::CopySource
 			| ResourceAccessType::CopyDest)) != 0;
 		bool needsIndirect = (access & ResourceAccessType::IndirectArgument) != 0;
@@ -286,6 +291,7 @@ namespace rhi {
 	inline bool AccessTypeIsWriteType(ResourceAccessType access) {
 		if (access & ResourceAccessType::RenderTarget) return true;
 		if (access & ResourceAccessType::DepthReadWrite) return true;
+		if (access & ResourceAccessType::DepthStencilClear) return true;
 		if (access & ResourceAccessType::CopyDest) return true;
 		if (access & ResourceAccessType::UnorderedAccess) return true;
 		if (access & ResourceAccessType::RaytracingAccelerationStructureWrite) return true;
@@ -294,6 +300,9 @@ namespace rhi {
 
 	inline bool ValidateResourceLayoutAndAccessType(ResourceLayout layout, ResourceAccessType access) {
 		if (access & ResourceAccessType::DepthRead && access & ResourceAccessType::DepthReadWrite) {
+			return false;
+		}
+		if (access & ResourceAccessType::DepthStencilClear && access & (ResourceAccessType::DepthRead | ResourceAccessType::DepthReadWrite)) {
 			return false;
 		}
 		switch (layout) {
@@ -333,6 +342,10 @@ namespace rhi {
 			break;
 		case ResourceLayout::DepthReadWrite:
 			if ((access & ~(ResourceAccessType::DepthReadWrite | ResourceAccessType::DepthRead)) != 0)
+				return false;
+			break;
+		case ResourceLayout::DepthStencilClear:
+			if ((access & ~(ResourceAccessType::DepthStencilClear)) != 0)
 				return false;
 			break;
 		case ResourceLayout::DepthRead:

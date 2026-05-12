@@ -235,6 +235,7 @@ namespace rhi {
 		std::vector<IndirectArg> args;
 		uint32_t byteStride = 0;
 		VkIndirectCommandsLayoutEXT indirectLayout = VK_NULL_HANDLE;
+		bool usesExecutionSet = false;
 		VkIndirectExecutionSetEXT executionSet = VK_NULL_HANDLE;
 		VkPipeline executionSetPipeline = VK_NULL_HANDLE;
 		VkBuffer preprocessBuffer = VK_NULL_HANDLE;
@@ -288,6 +289,7 @@ namespace rhi {
 		PipelineHandle boundPipeline{};
 		DescriptorHeapHandle boundCbvSrvUavHeap{};
 		DescriptorHeapHandle boundSamplerHeap{};
+		VkRect2D passRenderArea{};
 		std::vector<ResourceHandle> passColorResources;
 		ResourceHandle passDepthResource{};
 		std::vector<EmulatedRootConstantScratchPage> emulatedRootConstantScratchPages;

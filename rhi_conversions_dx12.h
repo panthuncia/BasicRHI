@@ -33,6 +33,9 @@ namespace rhi {
 		if (state & ResourceAccessType::DepthReadWrite) {
 			access |= D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE;
 		}
+		if (state & ResourceAccessType::DepthStencilClear) {
+			access |= D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE;
+		}
 		if (state & ResourceAccessType::DepthRead) {
 			access |= D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ;
 		}
@@ -66,6 +69,7 @@ namespace rhi {
 		case ResourceLayout::RenderTarget: return D3D12_BARRIER_LAYOUT_RENDER_TARGET;
 		case ResourceLayout::UnorderedAccess: return D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS;
 		case ResourceLayout::DepthReadWrite: return D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE;
+		case ResourceLayout::DepthStencilClear: return D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE;
 		case ResourceLayout::DepthRead: return D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ;
 		case ResourceLayout::ShaderResource: return D3D12_BARRIER_LAYOUT_SHADER_RESOURCE;
 		case ResourceLayout::CopySource: return D3D12_BARRIER_LAYOUT_COPY_SOURCE;
