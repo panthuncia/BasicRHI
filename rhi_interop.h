@@ -54,7 +54,7 @@ namespace rhi {
 	struct D3D12TimelineInfo { void* timeline; uint32_t version; };
 	struct D3D12WorkGraphInfo { void* workGraph; uint32_t version; };
 
-	struct VulkanDeviceInfo { void* instance; void* physicalDevice; void* device; uint32_t version; };
+	struct VulkanDeviceInfo { void* instance; void* physicalDevice; void* device; uint32_t version; uint32_t apiVersion; uint32_t deviceApiVersion; };
 	struct VulkanQueueInfo { void* queue; uint32_t familyIndex; uint32_t version; };
 	struct VulkanCmdBufInfo { void* commandBuffer; uint32_t version; };
 	struct VulkanSwapchainInfo { void* swapchain; uint32_t version; };

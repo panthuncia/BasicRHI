@@ -210,6 +210,7 @@ namespace rhi {
 		PushConstantRangeDesc desc{};
 		uint32_t byteOffset = 0;
 		uint32_t byteSize = 0;
+		uint32_t dataByteSize = 0;
 	};
 
 	struct VulkanPipelineLayout {
@@ -233,6 +234,14 @@ namespace rhi {
 	struct VulkanCommandSignature {
 		std::vector<IndirectArg> args;
 		uint32_t byteStride = 0;
+		VkIndirectCommandsLayoutEXT indirectLayout = VK_NULL_HANDLE;
+		VkIndirectExecutionSetEXT executionSet = VK_NULL_HANDLE;
+		VkPipeline executionSetPipeline = VK_NULL_HANDLE;
+		VkBuffer preprocessBuffer = VK_NULL_HANDLE;
+		VkDeviceMemory preprocessMemory = VK_NULL_HANDLE;
+		VkDeviceAddress preprocessAddress = 0;
+		VkDeviceSize preprocessSize = 0;
+		uint32_t preprocessMaxSequenceCount = 0;
 	};
 
 	struct VulkanTimeline {
@@ -255,6 +264,21 @@ namespace rhi {
 	};
 
 	struct VulkanCommandList {
+		struct EmulatedRootConstantScratchPage {
+			VkBuffer buffer = VK_NULL_HANDLE;
+			VkDeviceMemory memory = VK_NULL_HANDLE;
+			void* mappedData = nullptr;
+			VkDeviceAddress deviceAddress = 0;
+			uint32_t capacity = 0;
+			uint32_t cursor = 0;
+		};
+
+		struct EmulatedRootConstantShadowState {
+			uint32_t set = 0;
+			uint32_t binding = 0;
+			std::vector<uint32_t> values;
+		};
+
 		VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 		CommandAllocatorHandle allocatorHandle{};
 		QueueKind kind = QueueKind::Graphics;
@@ -266,6 +290,8 @@ namespace rhi {
 		DescriptorHeapHandle boundSamplerHeap{};
 		std::vector<ResourceHandle> passColorResources;
 		ResourceHandle passDepthResource{};
+		std::vector<EmulatedRootConstantScratchPage> emulatedRootConstantScratchPages;
+		std::vector<EmulatedRootConstantShadowState> emulatedRootConstantShadowStates;
 	};
 
 	struct VulkanDevice {
@@ -281,16 +307,27 @@ namespace rhi {
 		VkPhysicalDeviceFeatures supportedFeatures{};
 		VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptorHeapProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT };
 		VkPhysicalDeviceMeshShaderPropertiesEXT meshShaderProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT };
+		VkPhysicalDeviceComputeShaderDerivativesPropertiesKHR computeShaderDerivativesProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_PROPERTIES_KHR };
 		uint32_t loaderApiVersion = VK_API_VERSION_1_0;
 		uint32_t instanceApiVersion = VK_API_VERSION_1_0;
 		bool swapchainExtensionEnabled = false;
 		bool bufferDeviceAddressEnabled = false;
 		bool timelineSemaphoreEnabled = false;
+		bool descriptorIndexingEnabled = false;
+		bool runtimeDescriptorArrayEnabled = false;
+		bool scalarBlockLayoutEnabled = false;
 		bool descriptorHeapEnabled = false;
 		bool meshShaderEnabled = false;
 		bool taskShaderEnabled = false;
 		bool meshShaderPipelineStatsEnabled = false;
+		bool deviceGeneratedCommandsEnabled = false;
+		bool dynamicGeneratedPipelineLayoutEnabled = false;
 		bool dynamicRenderingEnabled = false;
+		bool shaderDemoteToHelperInvocationEnabled = false;
+		bool computeDerivativeGroupQuadsEnabled = false;
+		bool computeDerivativeGroupLinearEnabled = false;
+		bool shaderImageInt64AtomicsEnabled = false;
+		bool shaderSubgroupPartitionedEnabled = false;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		VulkanRegistry<VulkanDescriptorHeap> descriptorHeaps;
 		VulkanRegistry<VulkanResource> resources;

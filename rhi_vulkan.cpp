@@ -589,6 +589,181 @@ namespace rhi {
 			return (value + mask) & ~mask;
 		}
 
+		static bool VkFindMemoryTypeIndex(const VkPhysicalDeviceMemoryProperties& memoryProperties,
+			uint32_t memoryTypeBits,
+			VkMemoryPropertyFlags preferredFlags,
+			VkMemoryPropertyFlags requiredFlags,
+			uint32_t& outMemoryTypeIndex) noexcept;
+
+		static uint32_t VkPushConstantStorageBytes(const PushConstantRangeDesc& desc) noexcept {
+			if (desc.type == PushConstantRangeType::EmulatedRootConstants) {
+				return static_cast<uint32_t>(sizeof(VkDeviceAddress));
+			}
+			return desc.num32BitValues * 4u;
+		}
+
+		static uint64_t VkEmulatedRootConstantAlignment(const VulkanDevice* impl) noexcept {
+			if (!impl) {
+				return 16u;
+			}
+
+			return (std::max)(16ull, static_cast<uint64_t>(impl->physicalDeviceProperties.limits.minUniformBufferOffsetAlignment));
+		}
+
+		static void VkDestroyEmulatedRootConstantScratchPage(VulkanDevice* impl, VulkanCommandList::EmulatedRootConstantScratchPage& page) noexcept {
+			if (!impl) {
+				page = {};
+				return;
+			}
+
+			if (page.mappedData != nullptr && page.memory != VK_NULL_HANDLE) {
+				vkUnmapMemory(impl->device, page.memory);
+			}
+			if (page.buffer != VK_NULL_HANDLE) {
+				vkDestroyBuffer(impl->device, page.buffer, nullptr);
+			}
+			if (page.memory != VK_NULL_HANDLE) {
+				vkFreeMemory(impl->device, page.memory, nullptr);
+			}
+			page = {};
+		}
+
+		static bool VkEnsureEmulatedRootConstantScratchPage(VulkanDevice* impl, VulkanCommandList& commandListState, uint32_t minSize) noexcept {
+			if (!impl || impl->device == VK_NULL_HANDLE || !impl->bufferDeviceAddressEnabled || minSize == 0) {
+				return false;
+			}
+
+			const uint64_t alignment = VkEmulatedRootConstantAlignment(impl);
+			const uint64_t capacity64 = (std::max<uint64_t>)(VkAlignUp(minSize, alignment), 64ull * 1024ull);
+			if (capacity64 > static_cast<uint64_t>((std::numeric_limits<uint32_t>::max)())) {
+				return false;
+			}
+
+			VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			createInfo.size = capacity64;
+			createInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+			VkBuffer buffer = VK_NULL_HANDLE;
+			if (vkCreateBuffer(impl->device, &createInfo, nullptr, &buffer) != VK_SUCCESS) {
+				return false;
+			}
+
+			VkMemoryRequirements memoryRequirements{};
+			vkGetBufferMemoryRequirements(impl->device, buffer, &memoryRequirements);
+
+			uint32_t memoryTypeIndex = 0;
+			if (!VkFindMemoryTypeIndex(
+				impl->memoryProperties,
+				memoryRequirements.memoryTypeBits,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+				memoryTypeIndex)) {
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				return false;
+			}
+
+			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+			allocateInfo.allocationSize = memoryRequirements.size;
+			allocateInfo.memoryTypeIndex = memoryTypeIndex;
+			VkMemoryAllocateFlagsInfo allocateFlagsInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+			allocateFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+			allocateInfo.pNext = &allocateFlagsInfo;
+
+			VkDeviceMemory memory = VK_NULL_HANDLE;
+			if (vkAllocateMemory(impl->device, &allocateInfo, nullptr, &memory) != VK_SUCCESS) {
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				return false;
+			}
+
+			if (vkBindBufferMemory(impl->device, buffer, memory, 0) != VK_SUCCESS) {
+				vkFreeMemory(impl->device, memory, nullptr);
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				return false;
+			}
+
+			void* mappedData = nullptr;
+			if (vkMapMemory(impl->device, memory, 0, capacity64, 0, &mappedData) != VK_SUCCESS || mappedData == nullptr) {
+				vkFreeMemory(impl->device, memory, nullptr);
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				return false;
+			}
+
+			VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+			addressInfo.buffer = buffer;
+			const VkDeviceAddress deviceAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
+			if (deviceAddress == 0) {
+				vkUnmapMemory(impl->device, memory);
+				vkFreeMemory(impl->device, memory, nullptr);
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				return false;
+			}
+
+			VulkanCommandList::EmulatedRootConstantScratchPage page{};
+			page.buffer = buffer;
+			page.memory = memory;
+			page.mappedData = mappedData;
+			page.deviceAddress = deviceAddress;
+			page.capacity = static_cast<uint32_t>(capacity64);
+			page.cursor = 0;
+			commandListState.emulatedRootConstantScratchPages.push_back(std::move(page));
+			return true;
+		}
+
+		static bool VkAllocateEmulatedRootConstantScratch(
+			VulkanDevice* impl,
+			VulkanCommandList& commandListState,
+			uint32_t size,
+			VkDeviceAddress& outDeviceAddress,
+			void*& outMappedData) noexcept {
+			if (!impl || size == 0) {
+				return false;
+			}
+
+			const uint64_t alignment = VkEmulatedRootConstantAlignment(impl);
+			for (auto& page : commandListState.emulatedRootConstantScratchPages) {
+				const uint64_t alignedCursor = VkAlignUp(page.cursor, alignment);
+				if (alignedCursor + size > page.capacity) {
+					continue;
+				}
+
+				outDeviceAddress = page.deviceAddress + alignedCursor;
+				outMappedData = static_cast<std::byte*>(page.mappedData) + alignedCursor;
+				page.cursor = static_cast<uint32_t>(alignedCursor + size);
+				return true;
+			}
+
+			if (!VkEnsureEmulatedRootConstantScratchPage(impl, commandListState, size)) {
+				return false;
+			}
+
+			auto& page = commandListState.emulatedRootConstantScratchPages.back();
+			outDeviceAddress = page.deviceAddress;
+			outMappedData = page.mappedData;
+			page.cursor = size;
+			return true;
+		}
+
+		static VulkanCommandList::EmulatedRootConstantShadowState* VkGetEmulatedRootConstantShadowState(
+			VulkanCommandList& commandListState,
+			const VulkanPushConstantRange& range) noexcept {
+			for (auto& state : commandListState.emulatedRootConstantShadowStates) {
+				if (state.set == range.desc.set && state.binding == range.desc.binding) {
+					if (state.values.size() != range.desc.num32BitValues) {
+						state.values.assign(range.desc.num32BitValues, 0u);
+					}
+					return &state;
+				}
+			}
+
+			VulkanCommandList::EmulatedRootConstantShadowState state{};
+			state.set = range.desc.set;
+			state.binding = range.desc.binding;
+			state.values.assign(range.desc.num32BitValues, 0u);
+			commandListState.emulatedRootConstantShadowStates.push_back(std::move(state));
+			return &commandListState.emulatedRootConstantShadowStates.back();
+		}
+
 		static uint64_t VkDescriptorHeapStride(const VulkanDevice* impl, DescriptorHeapType type) noexcept {
 			if (!impl || !impl->descriptorHeapEnabled) {
 				return 1;
@@ -781,9 +956,57 @@ namespace rhi {
 			std::vector<VkSamplerCreateInfo>& embeddedSamplers) noexcept {
 			const uint32_t resourceStride = static_cast<uint32_t>(VkDescriptorHeapStride(impl, DescriptorHeapType::CbvSrvUav));
 			const uint32_t samplerStride = static_cast<uint32_t>(VkDescriptorHeapStride(impl, DescriptorHeapType::Sampler));
+			constexpr uint32_t kDescriptorHeapSet = VULKAN_DESCRIPTOR_HEAP_SET;
+			constexpr uint32_t kResourceDescriptorHeapBinding = VULKAN_RESOURCE_DESCRIPTOR_HEAP_BINDING;
+			constexpr uint32_t kSamplerDescriptorHeapBinding = VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING;
+			constexpr uint32_t kCounterDescriptorHeapBinding = VULKAN_COUNTER_DESCRIPTOR_HEAP_BINDING;
+			constexpr VkFlags kResourceDescriptorHeapMask =
+				VK_SPIRV_RESOURCE_TYPE_SAMPLED_IMAGE_BIT_EXT |
+				VK_SPIRV_RESOURCE_TYPE_READ_ONLY_IMAGE_BIT_EXT |
+				VK_SPIRV_RESOURCE_TYPE_READ_WRITE_IMAGE_BIT_EXT |
+				VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT |
+				VK_SPIRV_RESOURCE_TYPE_READ_ONLY_STORAGE_BUFFER_BIT_EXT |
+				VK_SPIRV_RESOURCE_TYPE_READ_WRITE_STORAGE_BUFFER_BIT_EXT |
+				VK_SPIRV_RESOURCE_TYPE_ACCELERATION_STRUCTURE_BIT_EXT;
+			constexpr VkFlags kSamplerDescriptorHeapMask =
+				VK_SPIRV_RESOURCE_TYPE_SAMPLER_BIT_EXT |
+				VK_SPIRV_RESOURCE_TYPE_COMBINED_SAMPLED_IMAGE_BIT_EXT;
 
-			mappings.reserve(layout.ranges.size() + layout.pushConstantRanges.size() + layout.staticSamplers.size());
+			mappings.reserve(layout.ranges.size() + layout.pushConstantRanges.size() + layout.staticSamplers.size() + 3);
 			embeddedSamplers.reserve(layout.staticSamplers.size());
+
+			auto hasMapping = [&](uint32_t set, uint32_t binding, VkFlags resourceMask) noexcept {
+				for (const VkDescriptorSetAndBindingMappingEXT& mapping : mappings) {
+					const uint32_t first = mapping.firstBinding;
+					const uint32_t last = first + (std::max)(1u, mapping.bindingCount);
+					if (mapping.descriptorSet == set && binding >= first && binding < last && (mapping.resourceMask & resourceMask) != 0) {
+						return true;
+					}
+				}
+				return false;
+			};
+
+			auto appendHeapMapping = [&](uint32_t binding, VkFlags resourceMask) noexcept {
+				if (hasMapping(kDescriptorHeapSet, binding, resourceMask)) {
+					return;
+				}
+
+				VkDescriptorSetAndBindingMappingEXT mapping{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT };
+				mapping.descriptorSet = kDescriptorHeapSet;
+				mapping.firstBinding = binding;
+				mapping.bindingCount = 1;
+				mapping.resourceMask = resourceMask;
+				mapping.source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT;
+				mapping.sourceData.constantOffset.heapOffset = 0;
+				mapping.sourceData.constantOffset.heapArrayStride = resourceStride;
+				mapping.sourceData.constantOffset.samplerHeapOffset = 0;
+				mapping.sourceData.constantOffset.samplerHeapArrayStride = samplerStride;
+				mappings.push_back(mapping);
+			};
+
+			appendHeapMapping(kResourceDescriptorHeapBinding, kResourceDescriptorHeapMask);
+			appendHeapMapping(kSamplerDescriptorHeapBinding, kSamplerDescriptorHeapMask);
+			appendHeapMapping(kCounterDescriptorHeapBinding, kResourceDescriptorHeapMask);
 
 			for (const LayoutBindingRange& range : layout.ranges) {
 				VkDescriptorSetAndBindingMappingEXT mapping{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT };
@@ -1020,13 +1243,21 @@ namespace rhi {
 			allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
 			allocateInfo.commandBufferCount = 1;
 
-			return ToRHI(vkAllocateCommandBuffers(device, &allocateInfo, &outCommandBuffer));
+			const VkResult result = vkAllocateCommandBuffers(device, &allocateInfo, &outCommandBuffer);
+			if (result != VK_SUCCESS) {
+				RHI_FAIL(ToRHI(result));
+			}
+			return Result::Ok;
 		}
 
 		static Result VkBeginCommandRecording(VkCommandBuffer commandBuffer) noexcept {
 			VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
 			beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-			return ToRHI(vkBeginCommandBuffer(commandBuffer, &beginInfo));
+			const VkResult result = vkBeginCommandBuffer(commandBuffer, &beginInfo);
+			if (result != VK_SUCCESS) {
+				RHI_FAIL(ToRHI(result));
+			}
+			return Result::Ok;
 		}
 
 		static VkImageAspectFlags VkAspectMaskForFormat(VkFormat format) noexcept {
@@ -1039,6 +1270,22 @@ namespace rhi {
 			default:
 				return VK_IMAGE_ASPECT_COLOR_BIT;
 			}
+		}
+
+		static VkImageAspectFlags VkSampledImageAspectMaskForFormat(VkFormat format) noexcept {
+			switch (format) {
+			case VK_FORMAT_D32_SFLOAT:
+			case VK_FORMAT_D24_UNORM_S8_UINT:
+			case VK_FORMAT_D32_SFLOAT_S8_UINT:
+				return VK_IMAGE_ASPECT_DEPTH_BIT;
+			default:
+				return VK_IMAGE_ASPECT_COLOR_BIT;
+			}
+		}
+
+		static bool VkIsDepthStencilFormat(VkFormat format) noexcept {
+			const VkImageAspectFlags aspectMask = VkAspectMaskForFormat(format);
+			return (aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
 		}
 
 		static VkImageViewType VkImageViewTypeForRtv(RtvDim dimension) noexcept {
@@ -1305,7 +1552,7 @@ namespace rhi {
 			VulkanImageViewSlot* descriptorSlot = VkImageViewSlotState(impl, slot, DescriptorHeapType::CbvSrvUav);
 			VulkanResource* resource = VkResourceState(impl, resourceHandle);
 			if (!impl || !heap || !descriptorSlot || !resource || resource->type != ResourceType::Buffer || resource->buffer == VK_NULL_HANDLE) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			VkResetDescriptorSlot(impl, *descriptorSlot);
@@ -1313,7 +1560,7 @@ namespace rhi {
 			if (impl->descriptorHeapEnabled && heap->buffer != VK_NULL_HANDLE && resource->deviceAddress != 0) {
 				void* slotAddress = VkDescriptorHeapSlotAddress(heap, slot.index);
 				if (!slotAddress) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 
 				std::memset(slotAddress, 0, static_cast<size_t>(heap->descriptorStride));
@@ -1409,6 +1656,21 @@ namespace rhi {
 			}
 		}
 
+		static bool VkImageCreateFlagsForDesc(const ResourceDesc& desc, VkImageCreateFlags& flags) noexcept {
+			flags = 0;
+			const uint32_t resourceFlags = static_cast<uint32_t>(desc.resourceFlags);
+			if ((resourceFlags & static_cast<uint32_t>(RF_TextureCubeCompatible)) != 0) {
+				if (desc.type != ResourceType::Texture2D ||
+					desc.texture.width != desc.texture.height ||
+					desc.texture.depthOrLayers < 6 ||
+					(desc.texture.depthOrLayers % 6) != 0) {
+					return false;
+				}
+				flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+			}
+			return true;
+		}
+
 		static VkImageUsageFlags VkImageUsageForDesc(const ResourceDesc& desc, VkFormat format) noexcept {
 			VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 			const VkImageAspectFlags aspectMask = VkAspectMaskForFormat(format);
@@ -1496,6 +1758,202 @@ namespace rhi {
 			}
 
 			return false;
+		}
+
+		static VkShaderStageFlags VkShaderStageFlagsForRHI(ShaderStage stages) noexcept {
+			VkShaderStageFlags flags = 0;
+			const uint32_t bits = static_cast<uint32_t>(stages);
+			if ((bits & static_cast<uint32_t>(ShaderStage::Vertex)) != 0) flags |= VK_SHADER_STAGE_VERTEX_BIT;
+			if ((bits & static_cast<uint32_t>(ShaderStage::Pixel)) != 0) flags |= VK_SHADER_STAGE_FRAGMENT_BIT;
+			if ((bits & static_cast<uint32_t>(ShaderStage::Compute)) != 0) flags |= VK_SHADER_STAGE_COMPUTE_BIT;
+			if ((bits & static_cast<uint32_t>(ShaderStage::Mesh)) != 0) flags |= VK_SHADER_STAGE_MESH_BIT_EXT;
+			if ((bits & static_cast<uint32_t>(ShaderStage::Task)) != 0) flags |= VK_SHADER_STAGE_TASK_BIT_EXT;
+			return flags != 0 ? flags : VK_SHADER_STAGE_ALL;
+		}
+
+		static uint32_t VkIndirectArgumentByteSize(const IndirectArg& arg) noexcept {
+			switch (arg.kind) {
+			case IndirectArgKind::Constant:
+				return arg.u.rootConstants.num32 * 4u;
+			case IndirectArgKind::Draw:
+				return sizeof(VkDrawIndirectCommand);
+			case IndirectArgKind::DrawIndexed:
+				return sizeof(VkDrawIndexedIndirectCommand);
+			case IndirectArgKind::Dispatch:
+				return sizeof(VkDispatchIndirectCommand);
+			case IndirectArgKind::DispatchMesh:
+				return sizeof(VkDrawMeshTasksIndirectCommandEXT);
+			default:
+				return 0;
+			}
+		}
+
+		static VkIndirectCommandsTokenTypeEXT VkIndirectCommandsTokenTypeForRHI(IndirectArgKind kind) noexcept {
+			switch (kind) {
+			case IndirectArgKind::Draw:
+				return VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_EXT;
+			case IndirectArgKind::DrawIndexed:
+				return VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_INDEXED_EXT;
+			case IndirectArgKind::Dispatch:
+				return VK_INDIRECT_COMMANDS_TOKEN_TYPE_DISPATCH_EXT;
+			case IndirectArgKind::DispatchMesh:
+				return VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_MESH_TASKS_EXT;
+			default:
+				return VK_INDIRECT_COMMANDS_TOKEN_TYPE_MAX_ENUM_EXT;
+			}
+		}
+
+		static VkShaderStageFlags VkIndirectExecutionDomainStages(IndirectArgKind kind) noexcept {
+			switch (kind) {
+			case IndirectArgKind::Dispatch:
+				return VK_SHADER_STAGE_COMPUTE_BIT;
+			case IndirectArgKind::DispatchMesh:
+				return VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
+			case IndirectArgKind::Draw:
+			case IndirectArgKind::DrawIndexed:
+				return VK_SHADER_STAGE_ALL_GRAPHICS;
+			default:
+				return 0;
+			}
+		}
+
+		static void VkDestroyCommandSignature(VulkanDevice* impl, VulkanCommandSignature& signature) noexcept {
+			if (!impl || impl->device == VK_NULL_HANDLE) {
+				signature = {};
+				return;
+			}
+
+			if (signature.preprocessBuffer != VK_NULL_HANDLE) {
+				vkDestroyBuffer(impl->device, signature.preprocessBuffer, nullptr);
+			}
+			if (signature.preprocessMemory != VK_NULL_HANDLE) {
+				vkFreeMemory(impl->device, signature.preprocessMemory, nullptr);
+			}
+			if (signature.executionSet != VK_NULL_HANDLE && vkDestroyIndirectExecutionSetEXT) {
+				vkDestroyIndirectExecutionSetEXT(impl->device, signature.executionSet, nullptr);
+			}
+			if (signature.indirectLayout != VK_NULL_HANDLE && vkDestroyIndirectCommandsLayoutEXT) {
+				vkDestroyIndirectCommandsLayoutEXT(impl->device, signature.indirectLayout, nullptr);
+			}
+
+			signature = {};
+		}
+
+		static Result VkEnsureGeneratedCommandsExecutionSet(VulkanDevice* impl, VulkanCommandSignature& signature, VkPipeline pipeline) noexcept {
+			if (!impl || impl->device == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || !vkCreateIndirectExecutionSetEXT) {
+				RHI_FAIL(Result::Unsupported);
+			}
+			if (signature.executionSet != VK_NULL_HANDLE) {
+				if (signature.executionSetPipeline != pipeline) {
+					RHI_FAIL(Result::Unsupported);
+				}
+				return Result::Ok;
+			}
+
+			VkIndirectExecutionSetPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_PIPELINE_INFO_EXT };
+			pipelineInfo.initialPipeline = pipeline;
+			pipelineInfo.maxPipelineCount = 1;
+
+			VkIndirectExecutionSetCreateInfoEXT createInfo{ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_CREATE_INFO_EXT };
+			createInfo.type = VK_INDIRECT_EXECUTION_SET_INFO_TYPE_PIPELINES_EXT;
+			createInfo.info.pPipelineInfo = &pipelineInfo;
+
+			const VkResult result = vkCreateIndirectExecutionSetEXT(impl->device, &createInfo, nullptr, &signature.executionSet);
+			if (result != VK_SUCCESS) {
+				return ToRHI(result);
+			}
+			signature.executionSetPipeline = pipeline;
+			return Result::Ok;
+		}
+
+		static Result VkEnsureGeneratedCommandsPreprocessBuffer(VulkanDevice* impl, VulkanCommandSignature& signature, uint32_t maxSequenceCount) noexcept {
+			if (!impl || impl->device == VK_NULL_HANDLE || !impl->bufferDeviceAddressEnabled || signature.executionSet == VK_NULL_HANDLE || signature.indirectLayout == VK_NULL_HANDLE || !vkGetGeneratedCommandsMemoryRequirementsEXT) {
+				RHI_FAIL(Result::Unsupported);
+			}
+
+			VkGeneratedCommandsMemoryRequirementsInfoEXT requirementsInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT };
+			requirementsInfo.indirectExecutionSet = signature.executionSet;
+			requirementsInfo.indirectCommandsLayout = signature.indirectLayout;
+			requirementsInfo.maxSequenceCount = maxSequenceCount;
+			requirementsInfo.maxDrawCount = maxSequenceCount;
+
+			VkMemoryRequirements2 requirements{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+			vkGetGeneratedCommandsMemoryRequirementsEXT(impl->device, &requirementsInfo, &requirements);
+			if (requirements.memoryRequirements.size == 0) {
+				RHI_FAIL(Result::Unsupported);
+			}
+
+			if (signature.preprocessBuffer != VK_NULL_HANDLE &&
+				signature.preprocessSize >= requirements.memoryRequirements.size &&
+				signature.preprocessMaxSequenceCount >= maxSequenceCount) {
+				return Result::Ok;
+			}
+
+			if (signature.preprocessBuffer != VK_NULL_HANDLE) {
+				vkDestroyBuffer(impl->device, signature.preprocessBuffer, nullptr);
+				signature.preprocessBuffer = VK_NULL_HANDLE;
+			}
+			if (signature.preprocessMemory != VK_NULL_HANDLE) {
+				vkFreeMemory(impl->device, signature.preprocessMemory, nullptr);
+				signature.preprocessMemory = VK_NULL_HANDLE;
+			}
+			signature.preprocessAddress = 0;
+			signature.preprocessSize = 0;
+			signature.preprocessMaxSequenceCount = 0;
+
+			VkBufferUsageFlags2CreateInfo usage2{ VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO };
+			usage2.usage = VK_BUFFER_USAGE_2_PREPROCESS_BUFFER_BIT_EXT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT;
+			VkBufferCreateInfo bufferInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			bufferInfo.pNext = &usage2;
+			bufferInfo.size = requirements.memoryRequirements.size;
+			bufferInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+			bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+			VkResult result = vkCreateBuffer(impl->device, &bufferInfo, nullptr, &signature.preprocessBuffer);
+			if (result != VK_SUCCESS) {
+				return ToRHI(result);
+			}
+
+			VkMemoryRequirements bufferRequirements{};
+			vkGetBufferMemoryRequirements(impl->device, signature.preprocessBuffer, &bufferRequirements);
+			uint32_t memoryTypeIndex = 0;
+			if (!VkFindMemoryTypeIndex(impl->memoryProperties, bufferRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, memoryTypeIndex)) {
+				vkDestroyBuffer(impl->device, signature.preprocessBuffer, nullptr);
+				signature.preprocessBuffer = VK_NULL_HANDLE;
+				RHI_FAIL(Result::OutOfMemory);
+			}
+
+			VkMemoryAllocateFlagsInfo allocateFlags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+			allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+			allocateInfo.pNext = &allocateFlags;
+			allocateInfo.allocationSize = bufferRequirements.size;
+			allocateInfo.memoryTypeIndex = memoryTypeIndex;
+			result = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &signature.preprocessMemory);
+			if (result != VK_SUCCESS) {
+				vkDestroyBuffer(impl->device, signature.preprocessBuffer, nullptr);
+				signature.preprocessBuffer = VK_NULL_HANDLE;
+				return ToRHI(result);
+			}
+
+			result = vkBindBufferMemory(impl->device, signature.preprocessBuffer, signature.preprocessMemory, 0);
+			if (result != VK_SUCCESS) {
+				vkDestroyBuffer(impl->device, signature.preprocessBuffer, nullptr);
+				vkFreeMemory(impl->device, signature.preprocessMemory, nullptr);
+				signature.preprocessBuffer = VK_NULL_HANDLE;
+				signature.preprocessMemory = VK_NULL_HANDLE;
+				return ToRHI(result);
+			}
+
+			VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+			addressInfo.buffer = signature.preprocessBuffer;
+			signature.preprocessAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
+			signature.preprocessSize = requirements.memoryRequirements.size;
+			signature.preprocessMaxSequenceCount = maxSequenceCount;
+			if (signature.preprocessAddress == 0) {
+				RHI_FAIL(Result::Unsupported);
+			}
+			return Result::Ok;
 		}
 
 		static VkImageSubresourceRange VkMakeImageSubresourceRange(VulkanResource& resource, const TextureSubresourceRange& range, VkImageAspectFlags aspectMask) noexcept {
@@ -1625,7 +2083,7 @@ namespace rhi {
 			VulkanImageViewSlot* viewSlot = VkImageViewSlotState(impl, slot, expectedType);
 			VulkanResource* resource = VkResourceState(impl, resourceHandle);
 			if (!heap || !viewSlot || !resource || resource->image == VK_NULL_HANDLE || viewFormat == VK_FORMAT_UNDEFINED || viewType == VK_IMAGE_VIEW_TYPE_MAX_ENUM) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			VkResetDescriptorSlot(impl, *viewSlot);
@@ -1716,7 +2174,7 @@ namespace rhi {
 
 		static Result VkAcquireNextSwapchainImage(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
 			if (!impl || impl->device == VK_NULL_HANDLE || swapchain.swapchain == VK_NULL_HANDLE || swapchain.acquireFence == VK_NULL_HANDLE) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			VkResult result = vkResetFences(impl->device, 1, &swapchain.acquireFence);
@@ -1831,7 +2289,7 @@ namespace rhi {
 
 		static Result VkCreateOrResizeSwapchain(VulkanDevice* impl, VulkanSwapchain& swapchain, uint32_t width, uint32_t height, Format requestedFormat, uint32_t bufferCount, bool allowTearing) noexcept {
 			if (!impl || impl->device == VK_NULL_HANDLE || impl->physicalDevice == VK_NULL_HANDLE || swapchain.surface == VK_NULL_HANDLE || !impl->swapchainExtensionEnabled) {
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			VkBool32 graphicsPresentSupported = VK_FALSE;
@@ -1840,7 +2298,7 @@ namespace rhi {
 				return ToRHI(result);
 			}
 			if (graphicsPresentSupported != VK_TRUE) {
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			VkSurfaceCapabilitiesKHR capabilities{};
@@ -1875,7 +2333,7 @@ namespace rhi {
 
 			const VkSurfaceFormatKHR surfaceFormat = VkChooseSurfaceFormat(surfaceFormats, requestedFormat);
 			if (surfaceFormat.format == VK_FORMAT_UNDEFINED) {
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			const VkExtent2D extent = VkChooseSwapchainExtent(capabilities, width, height);
@@ -2089,7 +2547,7 @@ namespace rhi {
 			auto* impl = timeline ? static_cast<VulkanDevice*>(timeline->impl) : nullptr;
 			VulkanTimeline* timelineState = VkTimelineState(impl, timeline ? timeline->GetHandle() : TimelineHandle{});
 			if (!impl || !timelineState || timelineState->semaphore == VK_NULL_HANDLE) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			VkSemaphoreWaitInfo waitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
@@ -2121,16 +2579,16 @@ namespace rhi {
 		static Result q_submit(Queue* queue, Span<CommandList> lists, const SubmitDesc& submit) noexcept {
 			auto* impl = queue ? static_cast<VulkanDevice*>(queue->impl) : nullptr;
 			if (!impl || impl->device == VK_NULL_HANDLE) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			if ((submit.waits.size != 0 || submit.signals.size != 0) && !impl->timelineSemaphoreEnabled) {
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			VulkanQueueState* queueState = VkQueueStateForHandle(impl, queue->GetQueueHandle());
 			if (!queueState || queueState->queue == VK_NULL_HANDLE) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			if (lists.size == 0 && submit.waits.size == 0 && submit.signals.size == 0) {
@@ -2142,12 +2600,12 @@ namespace rhi {
 			for (uint32_t index = 0; index < lists.size; ++index) {
 				VulkanCommandList* commandListState = VkCommandListState(impl, lists.data[index].GetHandle());
 				if (!commandListState || commandListState->commandBuffer == VK_NULL_HANDLE) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 
 				if (commandListState->isRecording) {
 					spdlog::error("Vulkan queue submit rejected a command list that is still recording");
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 
 				commandBuffers.push_back(commandListState->commandBuffer);
@@ -2167,7 +2625,7 @@ namespace rhi {
 			for (const TimelinePoint& wait : submit.waits) {
 				VulkanTimeline* timeline = VkTimelineState(impl, wait.t);
 				if (!timeline || timeline->semaphore == VK_NULL_HANDLE) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 				waitSemaphores.push_back(timeline->semaphore);
 				waitValues.push_back(wait.value);
@@ -2175,7 +2633,7 @@ namespace rhi {
 			for (const TimelinePoint& signal : submit.signals) {
 				VulkanTimeline* timeline = VkTimelineState(impl, signal.t);
 				if (!timeline || timeline->semaphore == VK_NULL_HANDLE || signal.value == 0) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 				signalSemaphores.push_back(timeline->semaphore);
 				signalValues.push_back(signal.value);
@@ -2354,6 +2812,10 @@ namespace rhi {
 			commandListState->boundPipeline = {};
 			commandListState->boundCbvSrvUavHeap = {};
 			commandListState->boundSamplerHeap = {};
+			for (auto& page : commandListState->emulatedRootConstantScratchPages) {
+				page.cursor = 0;
+			}
+			commandListState->emulatedRootConstantShadowStates.clear();
 			commandListState->passColorResources.clear();
 			commandListState->passDepthResource = {};
 			commandListState->isRecording = true;
@@ -2688,7 +3150,44 @@ namespace rhi {
 			}
 
 			const uint32_t stride = signatureState->byteStride;
-			switch (signatureState->args.front().kind) {
+			if (signatureState->indirectLayout != VK_NULL_HANDLE) {
+				VulkanPipeline* pipelineState = VkPipelineState(impl, commandListState->boundPipeline);
+				if (!impl || !pipelineState || pipelineState->pipeline == VK_NULL_HANDLE || argumentResource->deviceAddress == 0 || !vkCmdExecuteGeneratedCommandsEXT) {
+					return;
+				}
+
+				if (VkEnsureGeneratedCommandsExecutionSet(impl, *signatureState, pipelineState->pipeline) != Result::Ok ||
+					VkEnsureGeneratedCommandsPreprocessBuffer(impl, *signatureState, maxCommandCount) != Result::Ok) {
+					return;
+				}
+
+				VkGeneratedCommandsInfoEXT generatedInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT };
+				generatedInfo.shaderStages = pipelineState->bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS;
+				generatedInfo.indirectExecutionSet = signatureState->executionSet;
+				generatedInfo.indirectCommandsLayout = signatureState->indirectLayout;
+				generatedInfo.indirectAddress = argumentResource->deviceAddress + argumentOffset;
+				generatedInfo.indirectAddressSize = static_cast<VkDeviceSize>(stride) * maxCommandCount;
+				generatedInfo.preprocessAddress = signatureState->preprocessAddress;
+				generatedInfo.preprocessSize = signatureState->preprocessSize;
+				generatedInfo.maxSequenceCount = maxCommandCount;
+				generatedInfo.sequenceCountAddress = countResource && countResource->deviceAddress != 0 ? countResource->deviceAddress + countOffset : 0;
+				generatedInfo.maxDrawCount = maxCommandCount;
+				vkCmdExecuteGeneratedCommandsEXT(commandListState->commandBuffer, VK_FALSE, &generatedInfo);
+				return;
+			}
+
+			const IndirectArg* executableArg = nullptr;
+			for (const IndirectArg& arg : signatureState->args) {
+				if (arg.kind != IndirectArgKind::Constant) {
+					executableArg = &arg;
+					break;
+				}
+			}
+			if (!executableArg) {
+				return;
+			}
+
+			switch (executableArg->kind) {
 			case IndirectArgKind::Draw:
 				if (countResource && countResource->buffer != VK_NULL_HANDLE && vkCmdDrawIndirectCount) {
 					vkCmdDrawIndirectCount(commandListState->commandBuffer, argumentResource->buffer, argumentOffset, countResource->buffer, countOffset, maxCommandCount, stride);
@@ -2966,18 +3465,51 @@ namespace rhi {
 				return;
 			}
 
-			const uint32_t byteOffset = pushRange->byteOffset + dstOffset32 * 4u;
-			const uint32_t byteSize = num32 * 4u;
-			if (byteOffset + byteSize > pushRange->byteOffset + pushRange->byteSize ||
-				byteOffset + byteSize > layoutState->totalPushDataBytes ||
-				byteOffset + byteSize > impl->descriptorHeapProperties.maxPushDataSize) {
+			const uint32_t dataByteOffset = dstOffset32 * 4u;
+			const uint32_t dataByteSize = num32 * 4u;
+			if (dataByteOffset + dataByteSize > pushRange->dataByteSize) {
+				return;
+			}
+
+			uint32_t pushByteOffset = pushRange->byteOffset;
+			uint32_t pushByteSize = pushRange->byteSize;
+			const void* pushData = data;
+
+			VkDeviceAddress emulatedDeviceAddress = 0;
+			if (pushRange->desc.type == PushConstantRangeType::EmulatedRootConstants) {
+				auto* shadowState = VkGetEmulatedRootConstantShadowState(*commandListState, *pushRange);
+				if (!shadowState || shadowState->values.size() != pushRange->desc.num32BitValues) {
+					return;
+				}
+
+				std::memcpy(
+					shadowState->values.data() + dstOffset32,
+					data,
+					static_cast<size_t>(dataByteSize));
+
+				void* mappedScratch = nullptr;
+				if (!VkAllocateEmulatedRootConstantScratch(
+					impl,
+					*commandListState,
+					pushRange->dataByteSize,
+					emulatedDeviceAddress,
+					mappedScratch) || mappedScratch == nullptr || emulatedDeviceAddress == 0) {
+					return;
+				}
+
+				std::memcpy(mappedScratch, shadowState->values.data(), pushRange->dataByteSize);
+				pushData = &emulatedDeviceAddress;
+			}
+
+			if (pushByteOffset + pushByteSize > layoutState->totalPushDataBytes ||
+				pushByteOffset + pushByteSize > impl->descriptorHeapProperties.maxPushDataSize) {
 				return;
 			}
 
 			VkPushDataInfoEXT pushInfo{ VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT };
-			pushInfo.offset = byteOffset;
-			pushInfo.data.address = data;
-			pushInfo.data.size = byteSize;
+			pushInfo.offset = pushByteOffset;
+			pushInfo.data.address = pushData;
+			pushInfo.data.size = pushByteSize;
 			vkCmdPushDataEXT(commandListState->commandBuffer, &pushInfo);
 		}
 
@@ -3057,7 +3589,7 @@ namespace rhi {
 			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
 			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
 			if (!impl || !swapchainState || swapchainState->swapchain == VK_NULL_HANDLE) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
@@ -3072,7 +3604,7 @@ namespace rhi {
 
 			const Result acquireResult = VkAcquireNextSwapchainImage(impl, *swapchainState);
 			if (presentResult == VK_SUBOPTIMAL_KHR && acquireResult == Result::Ok) {
-				return Result::ModeChanged;
+				RHI_FAIL(Result::ModeChanged);
 			}
 			return acquireResult;
 		}
@@ -3082,7 +3614,7 @@ namespace rhi {
 			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
 			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
 			if (!impl || !swapchainState) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			const Result idleResult = ToRHI(vkDeviceWaitIdle(impl->device));
@@ -3105,7 +3637,7 @@ namespace rhi {
 			out.Reset();
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || !items || count == 0 || impl->device == VK_NULL_HANDLE) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			const SubobjShader* computeShader = nullptr;
@@ -3133,7 +3665,7 @@ namespace rhi {
 					layoutState = VkPipelineLayoutState(impl, layout.layout);
 					if (!layoutState) {
 						spdlog::error("Vulkan pipeline creation: invalid pipeline layout handle");
-						return Result::InvalidArgument;
+						RHI_FAIL(Result::InvalidArgument);
 					}
 					break;
 				}
@@ -3143,7 +3675,7 @@ namespace rhi {
 					case ShaderStage::Compute:
 						if (computeShader) {
 							spdlog::error("Vulkan pipeline creation: multiple compute shader stages are not supported");
-							return Result::InvalidArgument;
+							RHI_FAIL(Result::InvalidArgument);
 						}
 						computeShader = &shader;
 						break;
@@ -3158,7 +3690,7 @@ namespace rhi {
 					case ShaderStage::Task:
 						if (taskShader) {
 							spdlog::error("Vulkan pipeline creation: multiple task shader stages are not supported");
-							return Result::InvalidArgument;
+							RHI_FAIL(Result::InvalidArgument);
 						}
 						taskShader = &shader;
 						sawGraphicsState = true;
@@ -3166,14 +3698,14 @@ namespace rhi {
 					case ShaderStage::Mesh:
 						if (meshShader) {
 							spdlog::error("Vulkan pipeline creation: multiple mesh shader stages are not supported");
-							return Result::InvalidArgument;
+							RHI_FAIL(Result::InvalidArgument);
 						}
 						meshShader = &shader;
 						sawGraphicsState = true;
 						break;
 					default:
 						spdlog::error("Vulkan pipeline creation: unsupported shader stage {}", static_cast<uint32_t>(shader.stage));
-						return Result::InvalidArgument;
+						RHI_FAIL(Result::InvalidArgument);
 					}
 					break;
 				}
@@ -3218,25 +3750,25 @@ namespace rhi {
 			if (sawGraphicsState) {
 				const bool hasMeshShader = meshShader != nullptr;
 				if (computeShader || !layoutState) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 				if (hasMeshShader) {
 					if (!impl->meshShaderEnabled || vertexShader || !VkIsSpirvBytecode(meshShader->bytecode) || (taskShader && (!impl->taskShaderEnabled || !VkIsSpirvBytecode(taskShader->bytecode)))) {
-						return Result::Unsupported;
+						RHI_FAIL(Result::Unsupported);
 					}
 				}
 				else if (!vertexShader || taskShader) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 				if (!impl->dynamicRenderingEnabled) {
-					return Result::Unsupported;
+					RHI_FAIL(Result::Unsupported);
 				}
 				if (!layoutState->usesDescriptorHeap || !impl->descriptorHeapEnabled) {
-					return Result::Unsupported;
+					RHI_FAIL(Result::Unsupported);
 				}
 				if ((!hasMeshShader && !VkIsSpirvBytecode(vertexShader->bytecode)) || (pixelShader && !VkIsSpirvBytecode(pixelShader->bytecode))) {
 					spdlog::warn("Vulkan graphics pipeline creation: shader bytecode was not SPIR-V");
-					return Result::Unsupported;
+					RHI_FAIL(Result::Unsupported);
 				}
 
 				std::vector<VkShaderModule> modules;
@@ -3294,7 +3826,7 @@ namespace rhi {
 					if (format == VK_FORMAT_UNDEFINED) {
 						for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
 						vkDestroyPipelineLayout(impl->device, nativeLayout, nullptr);
-						return Result::Unsupported;
+						RHI_FAIL(Result::Unsupported);
 					}
 					attributes.push_back({ attribute.location, attribute.binding, format, attribute.offset });
 				}
@@ -3393,18 +3925,18 @@ namespace rhi {
 			}
 
 			if (!computeShader) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 			if (!layoutState) {
 				spdlog::error("Vulkan pipeline creation: a pipeline layout subobject is required");
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 			if (!layoutState->usesDescriptorHeap || !impl->descriptorHeapEnabled) {
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 			if (!VkIsSpirvBytecode(computeShader->bytecode)) {
 				spdlog::warn("Vulkan compute pipeline creation: shader bytecode was not SPIR-V");
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			VkShaderModuleCreateInfo shaderModuleInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
@@ -3500,7 +4032,7 @@ namespace rhi {
 		static Result d_createWorkGraph(Device* device, const WorkGraphDesc& desc, WorkGraphPtr& out) noexcept {
 			VkIgnoreUnused(device, desc);
 			out.Reset();
-			return Result::Unsupported;
+			RHI_FAIL(Result::Unsupported);
 		}
 
 		static void d_destroyWorkGraph(DeviceDeletionContext* context, WorkGraphHandle handle) noexcept {
@@ -3526,6 +4058,10 @@ namespace rhi {
 				}
 			}
 
+			for (auto& page : commandListState->emulatedRootConstantScratchPages) {
+				VkDestroyEmulatedRootConstantScratchPage(impl, page);
+			}
+
 			impl->commandLists.free(commandList->GetHandle());
 			commandList->Reset();
 		}
@@ -3545,7 +4081,10 @@ namespace rhi {
 		static Result d_createQueue(Device* device, QueueKind kind, const char* name, Queue& out) noexcept {
 			VkIgnoreUnused(name);
 			out = d_getQueue(device, kind);
-			return out ? Result::Ok : Result::Failed;
+			if (!out) {
+				RHI_FAIL(Result::Failed);
+			}
+			return Result::Ok;
 		}
 
 		static void d_destroyQueue(DeviceDeletionContext* context, QueueHandle handle) noexcept {
@@ -3555,7 +4094,7 @@ namespace rhi {
 		static Result d_waitIdle(Device* device) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || impl->device == VK_NULL_HANDLE) {
-				return Result::Failed;
+				RHI_FAIL(Result::Failed);
 			}
 
 			return ToRHI(vkDeviceWaitIdle(impl->device));
@@ -3569,12 +4108,12 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || impl->instance == VK_NULL_HANDLE || impl->device == VK_NULL_HANDLE || !windowHandle || width == 0 || height == 0) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			if (!impl->swapchainExtensionEnabled) {
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			VulkanSwapchain swapchainState{};
@@ -3590,7 +4129,7 @@ namespace rhi {
 		#else
 			VkIgnoreUnused(windowHandle);
 			out.Reset();
-			return Result::Unsupported;
+			RHI_FAIL(Result::Unsupported);
 		#endif
 
 			const Result createResult = VkCreateOrResizeSwapchain(impl, swapchainState, width, height, format, bufferCount, allowTearing);
@@ -3658,7 +4197,7 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || !impl->descriptorHeapEnabled) {
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			VulkanPipelineLayout layoutState{};
@@ -3674,7 +4213,8 @@ namespace rhi {
 				VulkanPushConstantRange range{};
 				range.desc = pushConstant;
 				range.byteOffset = pushDataOffset;
-				range.byteSize = pushConstant.num32BitValues * 4u;
+				range.dataByteSize = pushConstant.num32BitValues * 4u;
+				range.byteSize = VkPushConstantStorageBytes(pushConstant);
 				layoutState.pushConstantRanges.push_back(range);
 				pushDataOffset += range.byteSize;
 			}
@@ -3682,7 +4222,7 @@ namespace rhi {
 
 			if (layoutState.totalPushDataBytes > impl->descriptorHeapProperties.maxPushDataSize) {
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			const PipelineLayoutHandle handle = impl->pipelineLayouts.alloc(layoutState);
@@ -3695,12 +4235,12 @@ namespace rhi {
 
 		static Result d_queryFeatureInfo(const Device* device, FeatureInfoHeader* chain) noexcept {
 			if (!device || !chain) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			auto* impl = static_cast<const VulkanDevice*>(device->impl);
 			if (!impl || impl->physicalDevice == VK_NULL_HANDLE) {
-				return Result::Failed;
+				RHI_FAIL(Result::Failed);
 			}
 
 			bool hasDeviceLocalHeap = false;
@@ -3735,13 +4275,13 @@ namespace rhi {
 
 			for (FeatureInfoHeader* header = chain; header; header = header->pNext) {
 				if (header->structSize < sizeof(FeatureInfoHeader)) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 
 				switch (header->sType) {
 				case FeatureInfoStructType::AdapterInfo: {
 					if (header->structSize < sizeof(AdapterFeatureInfo)) {
-						return Result::InvalidArgument;
+						RHI_FAIL(Result::InvalidArgument);
 					}
 
 					auto* out = reinterpret_cast<AdapterFeatureInfo*>(header);
@@ -3755,7 +4295,7 @@ namespace rhi {
 
 				case FeatureInfoStructType::Architecture: {
 					if (header->structSize < sizeof(ArchitectureFeatureInfo)) {
-						return Result::InvalidArgument;
+						RHI_FAIL(Result::InvalidArgument);
 					}
 
 					auto* out = reinterpret_cast<ArchitectureFeatureInfo*>(header);
@@ -3767,7 +4307,7 @@ namespace rhi {
 
 				case FeatureInfoStructType::Features: {
 					if (header->structSize < sizeof(ShaderFeatureInfo)) {
-						return Result::InvalidArgument;
+						RHI_FAIL(Result::InvalidArgument);
 					}
 
 					auto* out = reinterpret_cast<ShaderFeatureInfo*>(header);
@@ -3777,26 +4317,30 @@ namespace rhi {
 					out->waveOps = false;
 					out->int64ShaderOps = impl->supportedFeatures.shaderInt64 == VK_TRUE;
 					out->barycentrics = false;
-					out->derivativesInMeshAndTaskShaders = impl->meshShaderEnabled;
+					out->derivativesInMeshAndTaskShaders =
+						impl->computeDerivativeGroupQuadsEnabled &&
+						impl->computeShaderDerivativesProperties.meshAndTaskShaderDerivatives == VK_TRUE;
 					out->atomicInt64OnGroupShared = false;
-					out->atomicInt64OnTypedResource = false;
-					out->atomicInt64OnDescriptorHeapResources = false;
+					out->atomicInt64OnTypedResource = impl->shaderImageInt64AtomicsEnabled;
+					out->atomicInt64OnDescriptorHeapResources = impl->shaderImageInt64AtomicsEnabled && impl->descriptorHeapEnabled;
 				} break;
 
 				case FeatureInfoStructType::MeshShaders: {
 					if (header->structSize < sizeof(MeshShaderFeatureInfo)) {
-						return Result::InvalidArgument;
+						RHI_FAIL(Result::InvalidArgument);
 					}
 
 					auto* out = reinterpret_cast<MeshShaderFeatureInfo*>(header);
 					out->meshShader = impl->meshShaderEnabled;
 					out->taskShader = impl->taskShaderEnabled;
-					out->derivatives = impl->meshShaderEnabled;
+					out->derivatives =
+						impl->computeDerivativeGroupQuadsEnabled &&
+						impl->computeShaderDerivativesProperties.meshAndTaskShaderDerivatives == VK_TRUE;
 				} break;
 
 				case FeatureInfoStructType::RayTracing: {
 					if (header->structSize < sizeof(RayTracingFeatureInfo)) {
-						return Result::InvalidArgument;
+						RHI_FAIL(Result::InvalidArgument);
 					}
 
 					auto* out = reinterpret_cast<RayTracingFeatureInfo*>(header);
@@ -3807,7 +4351,7 @@ namespace rhi {
 
 				case FeatureInfoStructType::ShadingRate: {
 					if (header->structSize < sizeof(ShadingRateFeatureInfo)) {
-						return Result::InvalidArgument;
+						RHI_FAIL(Result::InvalidArgument);
 					}
 
 					auto* out = reinterpret_cast<ShadingRateFeatureInfo*>(header);
@@ -3820,7 +4364,7 @@ namespace rhi {
 
 				case FeatureInfoStructType::EnhancedBarriers: {
 					if (header->structSize < sizeof(EnhancedBarriersFeatureInfo)) {
-						return Result::InvalidArgument;
+						RHI_FAIL(Result::InvalidArgument);
 					}
 
 					auto* out = reinterpret_cast<EnhancedBarriersFeatureInfo*>(header);
@@ -3830,7 +4374,7 @@ namespace rhi {
 
 				case FeatureInfoStructType::ResourceAllocation: {
 					if (header->structSize < sizeof(ResourceAllocationFeatureInfo)) {
-						return Result::InvalidArgument;
+						RHI_FAIL(Result::InvalidArgument);
 					}
 
 					auto* out = reinterpret_cast<ResourceAllocationFeatureInfo*>(header);
@@ -3841,7 +4385,7 @@ namespace rhi {
 
 				case FeatureInfoStructType::WorkGraphs: {
 					if (header->structSize < sizeof(WorkGraphFeatureInfo)) {
-						return Result::InvalidArgument;
+						RHI_FAIL(Result::InvalidArgument);
 					}
 
 					auto* out = reinterpret_cast<WorkGraphFeatureInfo*>(header);
@@ -3862,7 +4406,7 @@ namespace rhi {
 			auto* impl = device ? static_cast<const VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || impl->physicalDevice == VK_NULL_HANDLE) {
 				out = {};
-				return Result::Failed;
+				RHI_FAIL(Result::Failed);
 			}
 
 			out = {};
@@ -3874,7 +4418,7 @@ namespace rhi {
 				out.budgetBytes = VkSumHeapBudget(impl->memoryProperties, false);
 				break;
 			default:
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			return Result::Ok;
@@ -3889,29 +4433,158 @@ namespace rhi {
 		}
 
 		static Result d_createCommandSignature(Device* device, const CommandSignatureDesc& desc, PipelineLayoutHandle layout, CommandSignaturePtr& out) noexcept {
-			VkIgnoreUnused(layout);
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
-			if (!impl || desc.args.size != 1 || desc.byteStride == 0) {
+			if (!impl || desc.args.size == 0 || desc.byteStride == 0) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
+			bool needsGeneratedCommands = false;
+			bool hasExecutableToken = false;
+			uint32_t runningOffset = 0;
 			for (const IndirectArg& arg : desc.args) {
+				const uint32_t argByteSize = VkIndirectArgumentByteSize(arg);
+				if (argByteSize == 0 || runningOffset + argByteSize > desc.byteStride) {
+					out.Reset();
+					RHI_FAIL(Result::Unsupported);
+				}
+
 				switch (arg.kind) {
 				case IndirectArgKind::Draw:
 				case IndirectArgKind::DrawIndexed:
 				case IndirectArgKind::Dispatch:
 				case IndirectArgKind::DispatchMesh:
+					hasExecutableToken = true;
+					break;
+				case IndirectArgKind::Constant:
+					needsGeneratedCommands = true;
 					break;
 				default:
 					out.Reset();
-					return Result::Unsupported;
+					RHI_FAIL(Result::Unsupported);
+				}
+				runningOffset += argByteSize;
+			}
+			if (!hasExecutableToken) {
+				out.Reset();
+				RHI_FAIL(Result::Unsupported);
+			}
+
+			VkIndirectCommandsLayoutEXT indirectLayout = VK_NULL_HANDLE;
+			if (needsGeneratedCommands || desc.args.size != 1) {
+				VulkanPipelineLayout* layoutState = VkPipelineLayoutState(impl, layout);
+				if (!layoutState ||
+					!impl->deviceGeneratedCommandsEnabled ||
+					!impl->dynamicGeneratedPipelineLayoutEnabled ||
+					!impl->bufferDeviceAddressEnabled ||
+					!vkCreateIndirectCommandsLayoutEXT) {
+					out.Reset();
+					RHI_FAIL(Result::Unsupported);
+				}
+
+				std::vector<VkIndirectCommandsLayoutTokenEXT> tokens;
+				std::vector<VkIndirectCommandsPushConstantTokenEXT> pushTokens;
+				tokens.reserve(desc.args.size);
+				pushTokens.reserve(desc.args.size);
+
+				VkShaderStageFlags executionDomainStages = 0;
+				for (const IndirectArg& arg : desc.args) {
+					if (arg.kind == IndirectArgKind::Constant) {
+						continue;
+					}
+
+					const VkShaderStageFlags argStages = VkIndirectExecutionDomainStages(arg.kind);
+					if (argStages == 0) {
+						out.Reset();
+						RHI_FAIL(Result::Unsupported);
+					}
+					if (executionDomainStages != 0 && executionDomainStages != argStages) {
+						out.Reset();
+						RHI_FAIL(Result::Unsupported);
+					}
+					executionDomainStages = argStages;
+				}
+
+				runningOffset = 0;
+				VkShaderStageFlags shaderStages = executionDomainStages;
+				for (const IndirectArg& arg : desc.args) {
+					VkIndirectCommandsLayoutTokenEXT token{ VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT };
+					token.offset = runningOffset;
+
+					if (arg.kind == IndirectArgKind::Constant) {
+						const uint32_t rootIndex = arg.u.rootConstants.rootIndex;
+						if (rootIndex >= layoutState->pushConstantRanges.size()) {
+							out.Reset();
+							RHI_FAIL(Result::InvalidArgument);
+						}
+
+						const VulkanPushConstantRange* pushRange = &layoutState->pushConstantRanges[rootIndex];
+						if (pushRange->desc.type != PushConstantRangeType::RootConstants32) {
+							out.Reset();
+							RHI_FAIL(Result::Unsupported);
+						}
+
+						VkIndirectCommandsPushConstantTokenEXT pushToken{};
+						VkShaderStageFlags pushStages = VkShaderStageFlagsForRHI(pushRange->desc.visibility);
+						if (executionDomainStages != 0) {
+							pushStages &= executionDomainStages;
+						}
+						if (pushStages == 0) {
+							out.Reset();
+							RHI_FAIL(Result::Unsupported);
+						}
+						pushToken.updateRange.stageFlags = pushStages;
+						pushToken.updateRange.offset = pushRange->byteOffset + arg.u.rootConstants.destOffset32 * 4u;
+						pushToken.updateRange.size = arg.u.rootConstants.num32 * 4u;
+						if (pushToken.updateRange.offset + pushToken.updateRange.size > pushRange->byteOffset + pushRange->byteSize) {
+							out.Reset();
+							RHI_FAIL(Result::Unsupported);
+						}
+
+						pushTokens.push_back(pushToken);
+						token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_CONSTANT_EXT;
+						token.data.pPushConstant = &pushTokens.back();
+					}
+					else {
+						token.type = VkIndirectCommandsTokenTypeForRHI(arg.kind);
+						if (token.type == VK_INDIRECT_COMMANDS_TOKEN_TYPE_MAX_ENUM_EXT) {
+							out.Reset();
+							RHI_FAIL(Result::Unsupported);
+						}
+					}
+
+					tokens.push_back(token);
+					runningOffset += VkIndirectArgumentByteSize(arg);
+				}
+
+				const VkShaderStageFlags layoutShaderStages = shaderStages != 0 ? shaderStages : VK_SHADER_STAGE_ALL;
+				VkPushConstantRange pipelineLayoutPushRange{};
+				pipelineLayoutPushRange.stageFlags = layoutShaderStages;
+				pipelineLayoutPushRange.offset = 0;
+				pipelineLayoutPushRange.size = layoutState->totalPushDataBytes;
+				VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+				pipelineLayoutInfo.setLayoutCount = 0;
+				pipelineLayoutInfo.pSetLayouts = nullptr;
+				pipelineLayoutInfo.pushConstantRangeCount = pipelineLayoutPushRange.size != 0 ? 1u : 0u;
+				pipelineLayoutInfo.pPushConstantRanges = pipelineLayoutPushRange.size != 0 ? &pipelineLayoutPushRange : nullptr;
+				VkIndirectCommandsLayoutCreateInfoEXT layoutCreateInfo{ VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_CREATE_INFO_EXT };
+				layoutCreateInfo.pNext = &pipelineLayoutInfo;
+				layoutCreateInfo.shaderStages = layoutShaderStages;
+				layoutCreateInfo.indirectStride = desc.byteStride;
+				layoutCreateInfo.pipelineLayout = VK_NULL_HANDLE;
+				layoutCreateInfo.tokenCount = static_cast<uint32_t>(tokens.size());
+				layoutCreateInfo.pTokens = tokens.data();
+				const VkResult createResult = vkCreateIndirectCommandsLayoutEXT(impl->device, &layoutCreateInfo, nullptr, &indirectLayout);
+				if (createResult != VK_SUCCESS) {
+					out.Reset();
+					return ToRHI(createResult);
 				}
 			}
 
 			VulkanCommandSignature signature{};
 			signature.args.assign(desc.args.data, desc.args.data + desc.args.size);
 			signature.byteStride = desc.byteStride;
+			signature.indirectLayout = indirectLayout;
 			const CommandSignatureHandle handle = impl->commandSignatures.alloc(signature);
 			CommandSignature object{ handle };
 			object.impl = impl;
@@ -3923,6 +4596,9 @@ namespace rhi {
 		static void d_destroyCommandSignature(DeviceDeletionContext* context, CommandSignatureHandle handle) noexcept {
 			auto* impl = context ? static_cast<VulkanDevice*>(context->impl) : nullptr;
 			if (impl) {
+				if (VulkanCommandSignature* signature = VkCommandSignatureState(impl, handle)) {
+					VkDestroyCommandSignature(impl, *signature);
+				}
 				impl->commandSignatures.free(handle);
 			}
 		}
@@ -3931,7 +4607,7 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || impl->device == VK_NULL_HANDLE || desc.capacity == 0) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			VulkanDescriptorHeap heap{};
@@ -3972,7 +4648,7 @@ namespace rhi {
 					memoryTypeIndex)) {
 					vkDestroyBuffer(impl->device, heap.buffer, nullptr);
 					out.Reset();
-					return Result::Unsupported;
+					RHI_FAIL(Result::Unsupported);
 				}
 
 				VkMemoryAllocateFlagsInfo allocateFlagsInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
@@ -4041,7 +4717,7 @@ namespace rhi {
 			VulkanResource* resourceState = VkResourceState(impl, resource);
 			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
 			if (!impl || !resourceState) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			if (desc.dimension == SrvDim::Buffer) {
@@ -4062,14 +4738,14 @@ namespace rhi {
 				}
 
 				if (desc.buffer.kind == BufferViewKind::Typed && viewFormat == VK_FORMAT_UNDEFINED) {
-					return Result::Unsupported;
+					RHI_FAIL(Result::Unsupported);
 				}
 
 				const uint64_t elementSize = desc.buffer.kind == BufferViewKind::Structured
 					? strideBytes
 					: (desc.buffer.kind == BufferViewKind::Typed ? static_cast<uint64_t>(FormatByteSize(desc.formatOverride)) : 4ull);
 				if (elementSize == 0) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 
 				return VkCreateBufferDescriptorSlot(impl,
@@ -4085,17 +4761,19 @@ namespace rhi {
 			}
 
 			const VkImageViewType viewType = VkImageViewTypeForSrv(desc.dimension);
-			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(desc.formatOverride) : resourceState->format;
-			const VkImageAspectFlags aspectMask = VkAspectMaskForFormat(viewFormat);
+			const bool isDepthStencilResource = VkIsDepthStencilFormat(resourceState->format);
+			const VkFormat requestedViewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(desc.formatOverride) : resourceState->format;
+			const VkFormat viewFormat = isDepthStencilResource ? resourceState->format : requestedViewFormat;
+			const VkImageAspectFlags aspectMask = isDepthStencilResource ? VkSampledImageAspectMaskForFormat(resourceState->format) : VkAspectMaskForFormat(viewFormat);
 			if (viewType == VK_IMAGE_VIEW_TYPE_MAX_ENUM || viewFormat == VK_FORMAT_UNDEFINED) {
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 			const VkImageSubresourceRange subresourceRange = VkSrvSubresourceRange(*resourceState, desc, aspectMask);
 
 			if (impl->descriptorHeapEnabled && heap && heap->buffer != VK_NULL_HANDLE) {
 				void* slotAddress = VkDescriptorHeapSlotAddress(heap, slot.index);
 				if (!slotAddress) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 
 				std::memset(slotAddress, 0, static_cast<size_t>(heap->descriptorStride));
@@ -4135,7 +4813,7 @@ namespace rhi {
 
 				VulkanImageViewSlot* descriptorSlot = VkImageViewSlotState(impl, slot, DescriptorHeapType::CbvSrvUav);
 				if (!descriptorSlot) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 				VkResetDescriptorSlot(impl, *descriptorSlot);
 				descriptorSlot->kind = VulkanImageViewSlot::Kind::ImageView;
@@ -4161,11 +4839,11 @@ namespace rhi {
 			VulkanResource* resourceState = VkResourceState(impl, resource);
 			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
 			if (!impl || !resourceState) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			if (desc.dimension == UavDim::Texture2DMS || desc.dimension == UavDim::Texture2DMSArray) {
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			if (desc.dimension == UavDim::Buffer) {
@@ -4186,14 +4864,14 @@ namespace rhi {
 				}
 
 				if (desc.buffer.kind == BufferViewKind::Typed && viewFormat == VK_FORMAT_UNDEFINED) {
-					return Result::Unsupported;
+					RHI_FAIL(Result::Unsupported);
 				}
 
 				const uint64_t elementSize = desc.buffer.kind == BufferViewKind::Structured
 					? strideBytes
 					: (desc.buffer.kind == BufferViewKind::Typed ? static_cast<uint64_t>(FormatByteSize(desc.formatOverride)) : 4ull);
 				if (elementSize == 0) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 
 				return VkCreateBufferDescriptorSlot(impl,
@@ -4212,14 +4890,14 @@ namespace rhi {
 			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(desc.formatOverride) : resourceState->format;
 			const VkImageAspectFlags aspectMask = VkAspectMaskForFormat(viewFormat);
 			if (viewType == VK_IMAGE_VIEW_TYPE_MAX_ENUM || viewFormat == VK_FORMAT_UNDEFINED) {
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			const VkImageSubresourceRange subresourceRange = VkUavSubresourceRange(*resourceState, desc, aspectMask);
 			if (impl->descriptorHeapEnabled && heap && heap->buffer != VK_NULL_HANDLE) {
 				void* slotAddress = VkDescriptorHeapSlotAddress(heap, slot.index);
 				if (!slotAddress) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 
 				std::memset(slotAddress, 0, static_cast<size_t>(heap->descriptorStride));
@@ -4255,7 +4933,7 @@ namespace rhi {
 
 				VulkanImageViewSlot* descriptorSlot = VkImageViewSlotState(impl, slot, DescriptorHeapType::CbvSrvUav);
 				if (!descriptorSlot) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 				VkResetDescriptorSlot(impl, *descriptorSlot);
 				descriptorSlot->kind = VulkanImageViewSlot::Kind::ImageView;
@@ -4280,7 +4958,7 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			VulkanResource* resourceState = VkResourceState(impl, resource);
 			if (!impl || !resourceState || resourceState->type != ResourceType::Buffer || desc.byteSize == 0) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			const uint32_t alignedSize = (desc.byteSize + 255u) & ~255u;
@@ -4301,14 +4979,14 @@ namespace rhi {
 			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
 			VulkanImageViewSlot* descriptorSlot = VkImageViewSlotState(impl, slot, DescriptorHeapType::Sampler);
 			if (!impl || !descriptorSlot) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			if (desc.reduction == ReductionMode::Min || desc.reduction == ReductionMode::Max) {
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 			if (desc.borderPreset == BorderPreset::Custom) {
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			VkResetDescriptorSlot(impl, *descriptorSlot);
@@ -4318,7 +4996,7 @@ namespace rhi {
 			if (impl->descriptorHeapEnabled && heap && heap->buffer != VK_NULL_HANDLE) {
 				void* slotAddress = VkDescriptorHeapSlotAddress(heap, slot.index);
 				if (!slotAddress) {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 
 				std::memset(slotAddress, 0, static_cast<size_t>(heap->descriptorStride));
@@ -4351,7 +5029,7 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			VulkanResource* resource = VkResourceState(impl, texture);
 			if (!impl || !resource) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(desc.formatOverride) : resource->format;
@@ -4363,7 +5041,7 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			VulkanResource* resource = VkResourceState(impl, texture);
 			if (!impl || !resource) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(desc.formatOverride) : resource->format;
@@ -4376,13 +5054,13 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || impl->device == VK_NULL_HANDLE) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			const uint32_t queueSlot = VkPrimaryQueueSlotForKind(kind);
 			if (queueSlot >= impl->queues.size() || impl->queues[queueSlot].familyIndex == kVkInvalidQueueFamily) {
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			VkCommandPoolCreateInfo createInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
@@ -4429,21 +5107,21 @@ namespace rhi {
 			VulkanCommandAllocator* allocatorState = VkAllocatorState(impl, allocator.GetHandle());
 			if (!impl || impl->device == VK_NULL_HANDLE || !allocatorState || allocatorState->pool == VK_NULL_HANDLE) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 			Result result = VkAllocatePrimaryCommandBuffer(impl->device, allocatorState->pool, commandBuffer);
 			if (result != Result::Ok) {
 				out.Reset();
-				return result;
+				RHI_FAIL(result);
 			}
 
 			result = VkBeginCommandRecording(commandBuffer);
 			if (result != Result::Ok) {
 				vkFreeCommandBuffers(impl->device, allocatorState->pool, 1, &commandBuffer);
 				out.Reset();
-				return result;
+				RHI_FAIL(result);
 			}
 
 			VulkanCommandList commandListState{};
@@ -4463,11 +5141,11 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || impl->device == VK_NULL_HANDLE || desc.type != ResourceType::Buffer || desc.buffer.sizeBytes == 0) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 			if (desc.heapType == HeapType::Custom) {
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
@@ -4494,7 +5172,7 @@ namespace rhi {
 			if (!VkFindMemoryTypeIndex(impl->memoryProperties, memoryRequirements.memoryTypeBits, preferredFlags, requiredFlags, memoryTypeIndex)) {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
@@ -4550,23 +5228,23 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || impl->device == VK_NULL_HANDLE) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 			if (desc.type != ResourceType::Texture1D && desc.type != ResourceType::Texture2D && desc.type != ResourceType::Texture3D) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 			if (desc.texture.width == 0 || desc.texture.height == 0 || desc.texture.mipLevels == 0 || desc.texture.format == Format::Unknown) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
-			if (desc.texture.initialLayout != ResourceLayout::Undefined) {
+			if (desc.texture.initialLayout != ResourceLayout::Undefined && desc.texture.initialLayout != ResourceLayout::Common) {
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 			if (desc.heapType != HeapType::DeviceLocal) {
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			const VkFormat format = ToVkFormat(desc.texture.format);
@@ -4574,10 +5252,16 @@ namespace rhi {
 			const VkSampleCountFlagBits samples = VkSampleCountForDesc(desc.texture.sampleCount);
 			if (format == VK_FORMAT_UNDEFINED || imageType == VK_IMAGE_TYPE_MAX_ENUM || samples == VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM) {
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
+			}
+			VkImageCreateFlags imageCreateFlags = 0;
+			if (!VkImageCreateFlagsForDesc(desc, imageCreateFlags)) {
+				out.Reset();
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			VkImageCreateInfo createInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+			createInfo.flags = imageCreateFlags;
 			createInfo.imageType = imageType;
 			createInfo.format = format;
 			createInfo.extent.width = desc.texture.width;
@@ -4609,7 +5293,7 @@ namespace rhi {
 				memoryTypeIndex)) {
 				vkDestroyImage(impl->device, image, nullptr);
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
@@ -4637,7 +5321,7 @@ namespace rhi {
 			resourceState.memory = memory;
 			resourceState.format = format;
 			resourceState.type = desc.type;
-			resourceState.currentLayout = ResourceLayout::Undefined;
+			resourceState.currentLayout = desc.texture.initialLayout;
 			resourceState.width = desc.texture.width;
 			resourceState.height = desc.type == ResourceType::Texture1D ? 1u : desc.texture.height;
 			resourceState.depthOrLayers = desc.type == ResourceType::Texture3D ? 1u : desc.texture.depthOrLayers;
@@ -4665,7 +5349,7 @@ namespace rhi {
 			default:
 				VkIgnoreUnused(device);
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 		}
 
@@ -4678,7 +5362,7 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || !impl->timelineSemaphoreEnabled) {
 				out.Reset();
-				return impl ? Result::Unsupported : Result::InvalidArgument;
+				RHI_FAIL(impl ? Result::Unsupported : Result::InvalidArgument);
 			}
 
 			VkSemaphoreTypeCreateInfo typeInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
@@ -4720,7 +5404,7 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || impl->device == VK_NULL_HANDLE || desc.sizeBytes == 0 || desc.memory == HeapType::Custom) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			VkMemoryPropertyFlags preferredFlags = VkPreferredMemoryPropertyFlags(desc.memory);
@@ -4733,12 +5417,17 @@ namespace rhi {
 			uint32_t memoryTypeIndex = 0;
 			if (!VkFindMemoryTypeIndex(impl->memoryProperties, memoryTypeBits, preferredFlags, requiredFlags, memoryTypeIndex)) {
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
 			allocateInfo.allocationSize = desc.sizeBytes;
 			allocateInfo.memoryTypeIndex = memoryTypeIndex;
+			VkMemoryAllocateFlagsInfo allocateFlagsInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+			if (impl->bufferDeviceAddressEnabled) {
+				allocateFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+				allocateInfo.pNext = &allocateFlagsInfo;
+			}
 			VkDeviceMemory memory = VK_NULL_HANDLE;
 			const VkResult result = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &memory);
 			if (result != VK_SUCCESS) {
@@ -4836,11 +5525,11 @@ namespace rhi {
 				(desc.type != ResourceType::Texture1D && desc.type != ResourceType::Texture2D && desc.type != ResourceType::Texture3D) ||
 				desc.texture.format == Format::Unknown || desc.texture.width == 0 || desc.texture.height == 0 || desc.texture.mipLevels == 0) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
-			if (desc.texture.initialLayout != ResourceLayout::Undefined) {
+			if (desc.texture.initialLayout != ResourceLayout::Undefined && desc.texture.initialLayout != ResourceLayout::Common) {
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			const VkFormat format = ToVkFormat(desc.texture.format);
@@ -4848,10 +5537,16 @@ namespace rhi {
 			const VkSampleCountFlagBits samples = VkSampleCountForDesc(desc.texture.sampleCount);
 			if (format == VK_FORMAT_UNDEFINED || imageType == VK_IMAGE_TYPE_MAX_ENUM || samples == VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM) {
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
+			}
+			VkImageCreateFlags imageCreateFlags = 0;
+			if (!VkImageCreateFlagsForDesc(desc, imageCreateFlags)) {
+				out.Reset();
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			VkImageCreateInfo createInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+			createInfo.flags = imageCreateFlags;
 			createInfo.imageType = imageType;
 			createInfo.format = format;
 			createInfo.extent.width = desc.texture.width;
@@ -4879,7 +5574,7 @@ namespace rhi {
 				offset + requirements.size > heapState->size) {
 				vkDestroyImage(impl->device, image, nullptr);
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			result = vkBindImageMemory(impl->device, image, heapState->memory, offset);
@@ -4894,7 +5589,7 @@ namespace rhi {
 			resourceState.memory = heapState->memory;
 			resourceState.format = format;
 			resourceState.type = desc.type;
-			resourceState.currentLayout = ResourceLayout::Undefined;
+			resourceState.currentLayout = desc.texture.initialLayout;
 			resourceState.width = desc.texture.width;
 			resourceState.height = desc.type == ResourceType::Texture1D ? 1u : desc.texture.height;
 			resourceState.depthOrLayers = desc.type == ResourceType::Texture3D ? 1u : desc.texture.depthOrLayers;
@@ -4915,7 +5610,7 @@ namespace rhi {
 			VulkanHeap* heapState = VkHeapState(impl, heap);
 			if (!impl || !heapState || desc.type != ResourceType::Buffer || desc.buffer.sizeBytes == 0) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
@@ -4940,7 +5635,7 @@ namespace rhi {
 				offset + requirements.size > heapState->size) {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			result = vkBindBufferMemory(impl->device, buffer, heapState->memory, offset);
@@ -4986,7 +5681,7 @@ namespace rhi {
 			default:
 				VkIgnoreUnused(device, heap, offset);
 				out.Reset();
-				return Result::Unsupported;
+				RHI_FAIL(Result::Unsupported);
 			}
 		}
 
@@ -4994,13 +5689,13 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || desc.count == 0) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			const VkQueryType vkType = VkQueryTypeForRHI(desc.type);
 			if (vkType == VK_QUERY_TYPE_MAX_ENUM) {
 				out.Reset();
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			PipelineStatsMask requestedStats = desc.statsMask;
@@ -5012,13 +5707,13 @@ namespace rhi {
 				const PipelineStatsMask unsupported = requestedStats & ~VkSupportedPipelineStatsMask(impl);
 				if (unsupported != 0 && desc.requireAllStats) {
 					out.Reset();
-					return Result::Unsupported;
+					RHI_FAIL(Result::Unsupported);
 				}
 				requestedStats &= VkSupportedPipelineStatsMask(impl);
 				vkStats = VkPipelineStatsToVk(requestedStats);
 				if (vkStats == 0) {
 					out.Reset();
-					return Result::Unsupported;
+					RHI_FAIL(Result::Unsupported);
 				}
 			}
 
@@ -5111,7 +5806,7 @@ namespace rhi {
 		static Result d_getResourceAllocationInfo(const Device* device, const ResourceDesc* resources, uint32_t resourceCount, ResourceAllocationInfo* outInfos) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || !resources || resourceCount == 0 || !outInfos) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			uint64_t runningOffset = 0;
@@ -5136,9 +5831,14 @@ namespace rhi {
 					const VkImageType imageType = VkImageTypeForResourceType(desc.type);
 					const VkSampleCountFlagBits samples = VkSampleCountForDesc(desc.texture.sampleCount);
 					if (format == VK_FORMAT_UNDEFINED || imageType == VK_IMAGE_TYPE_MAX_ENUM || samples == VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM) {
-						return Result::Unsupported;
+						RHI_FAIL(Result::Unsupported);
+					}
+					VkImageCreateFlags imageCreateFlags = 0;
+					if (!VkImageCreateFlagsForDesc(desc, imageCreateFlags)) {
+						RHI_FAIL(Result::InvalidArgument);
 					}
 					VkImageCreateInfo createInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+					createInfo.flags = imageCreateFlags;
 					createInfo.imageType = imageType;
 					createInfo.format = format;
 					createInfo.extent.width = desc.texture.width;
@@ -5160,7 +5860,7 @@ namespace rhi {
 					vkDestroyImage(impl->device, image, nullptr);
 				}
 				else {
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 
 				runningOffset = VkAlignUp(runningOffset, requirements.alignment);
@@ -5174,27 +5874,27 @@ namespace rhi {
 			VkIgnoreUnused(priority);
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl) {
-				return Result::InvalidArgument;
+				RHI_FAIL(Result::InvalidArgument);
 			}
 			for (const PageableRef& object : objects) {
 				switch (object.kind) {
 				case PageableKind::Resource:
-					if (!VkResourceState(impl, object.resource)) return Result::InvalidArgument;
+					if (!VkResourceState(impl, object.resource)) RHI_FAIL(Result::InvalidArgument);
 					break;
 				case PageableKind::Heap:
-					if (!VkHeapState(impl, object.heap)) return Result::InvalidArgument;
+					if (!VkHeapState(impl, object.heap)) RHI_FAIL(Result::InvalidArgument);
 					break;
 				case PageableKind::DescriptorHeap:
-					if (!VkDescriptorHeapState(impl, object.descHeap)) return Result::InvalidArgument;
+					if (!VkDescriptorHeapState(impl, object.descHeap)) RHI_FAIL(Result::InvalidArgument);
 					break;
 				case PageableKind::QueryPool:
-					if (!VkQueryPoolState(impl, object.queryPool)) return Result::InvalidArgument;
+					if (!VkQueryPoolState(impl, object.queryPool)) RHI_FAIL(Result::InvalidArgument);
 					break;
 				case PageableKind::Pipeline:
-					if (!VkPipelineState(impl, object.pipeline)) return Result::InvalidArgument;
+					if (!VkPipelineState(impl, object.pipeline)) RHI_FAIL(Result::InvalidArgument);
 					break;
 				default:
-					return Result::InvalidArgument;
+					RHI_FAIL(Result::InvalidArgument);
 				}
 			}
 			return Result::Ok;
@@ -5283,22 +5983,22 @@ namespace rhi {
 
 		static Result d_setDebugGlobalInstrumentationMask(Device* device, uint64_t featureMask) noexcept {
 			VkIgnoreUnused(device, featureMask);
-			return Result::Unsupported;
+			RHI_FAIL(Result::Unsupported);
 		}
 
 		static Result d_setDebugPipelineInstrumentationMask(Device* device, uint64_t pipelineUid, uint64_t featureMask) noexcept {
 			VkIgnoreUnused(device, pipelineUid, featureMask);
-			return Result::Unsupported;
+			RHI_FAIL(Result::Unsupported);
 		}
 
 		static Result d_setDebugSynchronousRecording(Device* device, bool enabled) noexcept {
 			VkIgnoreUnused(device, enabled);
-			return Result::Unsupported;
+			RHI_FAIL(Result::Unsupported);
 		}
 
 		static Result d_setDebugTexelAddressing(Device* device, bool enabled) noexcept {
 			VkIgnoreUnused(device, enabled);
-			return Result::Unsupported;
+			RHI_FAIL(Result::Unsupported);
 		}
 	} // namespace
 
@@ -5367,6 +6067,15 @@ namespace rhi {
 			slot.alive = false;
 		}
 		pipelineLayouts.clear();
+
+		for (auto& slot : commandSignatures.slots) {
+			if (!slot.alive) {
+				continue;
+			}
+			VkDestroyCommandSignature(this, slot.obj);
+			slot.alive = false;
+		}
+		commandSignatures.clear();
 
 		for (auto& slot : commandLists.slots) {
 			if (slot.alive) {
@@ -5614,13 +6323,13 @@ namespace rhi {
 	rhi::Result CreateVulkanDevice(const DeviceCreateInfo& ci, DevicePtr& outPtr) noexcept {
 		outPtr = {};
 		if (ci.backend != Backend::Vulkan) {
-			return Result::InvalidArgument;
+			RHI_FAIL(Result::InvalidArgument);
 		}
 
 		const VkResult volkInit = volkInitialize();
 		if (volkInit != VK_SUCCESS) {
 			spdlog::error("CreateVulkanDevice: volkInitialize failed with VkResult {}", static_cast<int>(volkInit));
-			return Result::SdkComponentMissing;
+			RHI_FAIL(Result::SdkComponentMissing);
 		}
 
 		const uint32_t loaderApiVersion = (std::max)(volkGetInstanceVersion(), VK_API_VERSION_1_0);
@@ -5680,20 +6389,28 @@ namespace rhi {
 		VkPhysicalDeviceFeatures supportedFeatures{};
 		VkPhysicalDeviceVulkan12Features supportedVulkan12Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
 		VkPhysicalDeviceVulkan13Features supportedVulkan13Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
-		VkPhysicalDeviceTimelineSemaphoreFeatures supportedTimelineFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES };
 		VkPhysicalDeviceDescriptorHeapFeaturesEXT supportedDescriptorHeapFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT };
 		VkPhysicalDeviceMeshShaderFeaturesEXT supportedMeshShaderFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT };
+		VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT supportedDeviceGeneratedCommandsFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT };
+		VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR supportedComputeShaderDerivativesFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR };
+		VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT supportedShaderImageAtomicInt64Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT };
+		VkPhysicalDeviceShaderSubgroupPartitionedFeaturesEXT supportedShaderSubgroupPartitionedFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT };
 		VkPhysicalDeviceFeatures2 supportedFeatures2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
 		supportedFeatures2.pNext = &supportedVulkan12Features;
 		supportedVulkan12Features.pNext = &supportedVulkan13Features;
-		supportedVulkan13Features.pNext = &supportedTimelineFeatures;
-		supportedTimelineFeatures.pNext = &supportedDescriptorHeapFeatures;
+		supportedVulkan13Features.pNext = &supportedDescriptorHeapFeatures;
 		supportedDescriptorHeapFeatures.pNext = &supportedMeshShaderFeatures;
+		supportedMeshShaderFeatures.pNext = &supportedDeviceGeneratedCommandsFeatures;
+		supportedDeviceGeneratedCommandsFeatures.pNext = &supportedComputeShaderDerivativesFeatures;
+		supportedComputeShaderDerivativesFeatures.pNext = &supportedShaderImageAtomicInt64Features;
+		supportedShaderImageAtomicInt64Features.pNext = &supportedShaderSubgroupPartitionedFeatures;
 		VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptorHeapProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT };
 		VkPhysicalDeviceMeshShaderPropertiesEXT meshShaderProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT };
+		VkPhysicalDeviceComputeShaderDerivativesPropertiesKHR computeShaderDerivativesProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_PROPERTIES_KHR };
 		VkPhysicalDeviceProperties2 properties2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
 		properties2.pNext = &descriptorHeapProperties;
 		descriptorHeapProperties.pNext = &meshShaderProperties;
+		meshShaderProperties.pNext = &computeShaderDerivativesProperties;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		std::array<uint32_t, 3> selectedQueueFamilies{};
 		if (!VkSelectPhysicalDeviceAndQueues(
@@ -5705,7 +6422,7 @@ namespace rhi {
 			queueFamilyProperties,
 			selectedQueueFamilies)) {
 			vkDestroyInstance(instance, nullptr);
-			return Result::NotFound;
+			RHI_FAIL(Result::NotFound);
 		}
 
 		std::vector<uint32_t> uniqueQueueFamilies;
@@ -5731,17 +6448,33 @@ namespace rhi {
 		}
 
 		const bool enableSwapchainExtension = VkHasDeviceExtension(physicalDevice, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+		const bool hasMaintenance5Extension = VkHasDeviceExtension(physicalDevice, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 		const bool hasDescriptorHeapExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
 		const bool hasMeshShaderExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_MESH_SHADER_EXTENSION_NAME);
+		const bool hasDeviceGeneratedCommandsExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_DEVICE_GENERATED_COMMANDS_EXTENSION_NAME);
+		const bool hasComputeShaderDerivativesExtension = VkHasDeviceExtension(physicalDevice, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+		const bool hasNvComputeShaderDerivativesExtension = !hasComputeShaderDerivativesExtension && VkHasDeviceExtension(physicalDevice, VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+		const bool hasShaderImageAtomicInt64Extension = VkHasDeviceExtension(physicalDevice, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
+		const bool hasShaderSubgroupPartitionedExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
+		const bool hasNvShaderSubgroupPartitionedExtension = !hasShaderSubgroupPartitionedExtension && VkHasDeviceExtension(physicalDevice, VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
 		std::vector<const char*> enabledDeviceExtensions;
 		if (enableSwapchainExtension) {
 			enabledDeviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 		}
-		if (hasDescriptorHeapExtension) {
+		if (hasMaintenance5Extension && (hasDescriptorHeapExtension || hasDeviceGeneratedCommandsExtension)) {
+			enabledDeviceExtensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+		}
+		if (hasDescriptorHeapExtension && hasMaintenance5Extension) {
 			enabledDeviceExtensions.push_back(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
 		}
 		if (hasMeshShaderExtension) {
 			enabledDeviceExtensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+		}
+		if (hasComputeShaderDerivativesExtension) {
+			enabledDeviceExtensions.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+		}
+		else if (hasNvComputeShaderDerivativesExtension) {
+			enabledDeviceExtensions.push_back(VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
 		}
 		vkGetPhysicalDeviceFeatures2(physicalDevice, &supportedFeatures2);
 		vkGetPhysicalDeviceProperties2(physicalDevice, &properties2);
@@ -5749,34 +6482,88 @@ namespace rhi {
 
 		VkPhysicalDeviceVulkan12Features enabledVulkan12Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
 		VkPhysicalDeviceVulkan13Features enabledVulkan13Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
-		VkPhysicalDeviceTimelineSemaphoreFeatures enabledTimelineFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES };
 		VkPhysicalDeviceDescriptorHeapFeaturesEXT enabledDescriptorHeapFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT };
 		VkPhysicalDeviceMeshShaderFeaturesEXT enabledMeshShaderFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT };
+		VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT enabledDeviceGeneratedCommandsFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT };
+		VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR enabledComputeShaderDerivativesFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR };
+		VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT enabledShaderImageAtomicInt64Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT };
+		VkPhysicalDeviceShaderSubgroupPartitionedFeaturesEXT enabledShaderSubgroupPartitionedFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT };
 		enabledVulkan12Features.pNext = &enabledVulkan13Features;
-		enabledVulkan13Features.pNext = &enabledTimelineFeatures;
-		enabledTimelineFeatures.pNext = &enabledDescriptorHeapFeatures;
+		enabledVulkan13Features.pNext = &enabledDescriptorHeapFeatures;
 		enabledDescriptorHeapFeatures.pNext = &enabledMeshShaderFeatures;
+		enabledMeshShaderFeatures.pNext = &enabledDeviceGeneratedCommandsFeatures;
+		enabledDeviceGeneratedCommandsFeatures.pNext = &enabledComputeShaderDerivativesFeatures;
+		enabledComputeShaderDerivativesFeatures.pNext = &enabledShaderImageAtomicInt64Features;
+		enabledShaderImageAtomicInt64Features.pNext = &enabledShaderSubgroupPartitionedFeatures;
 		if (supportedVulkan12Features.bufferDeviceAddress == VK_TRUE) {
 			enabledVulkan12Features.bufferDeviceAddress = VK_TRUE;
 		}
 		if (supportedVulkan13Features.dynamicRendering == VK_TRUE) {
 			enabledVulkan13Features.dynamicRendering = VK_TRUE;
 		}
-		if (supportedTimelineFeatures.timelineSemaphore == VK_TRUE || supportedVulkan12Features.timelineSemaphore == VK_TRUE) {
+		if (supportedVulkan13Features.shaderDemoteToHelperInvocation == VK_TRUE) {
+			enabledVulkan13Features.shaderDemoteToHelperInvocation = VK_TRUE;
+		}
+		if (supportedVulkan12Features.timelineSemaphore == VK_TRUE) {
 			enabledVulkan12Features.timelineSemaphore = VK_TRUE;
-			enabledTimelineFeatures.timelineSemaphore = VK_TRUE;
+		}
+		if (supportedVulkan12Features.descriptorIndexing == VK_TRUE) {
+			enabledVulkan12Features.descriptorIndexing = VK_TRUE;
+		}
+		if (supportedVulkan12Features.shaderUniformBufferArrayNonUniformIndexing == VK_TRUE) {
+			enabledVulkan12Features.shaderUniformBufferArrayNonUniformIndexing = VK_TRUE;
+		}
+		if (supportedVulkan12Features.shaderSampledImageArrayNonUniformIndexing == VK_TRUE) {
+			enabledVulkan12Features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+		}
+		if (supportedVulkan12Features.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE) {
+			enabledVulkan12Features.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+		}
+		if (supportedVulkan12Features.shaderStorageImageArrayNonUniformIndexing == VK_TRUE) {
+			enabledVulkan12Features.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
+		}
+		if (supportedVulkan12Features.descriptorBindingPartiallyBound == VK_TRUE) {
+			enabledVulkan12Features.descriptorBindingPartiallyBound = VK_TRUE;
+		}
+		if (supportedVulkan12Features.runtimeDescriptorArray == VK_TRUE) {
+			enabledVulkan12Features.runtimeDescriptorArray = VK_TRUE;
+		}
+		if (supportedVulkan12Features.scalarBlockLayout == VK_TRUE) {
+			enabledVulkan12Features.scalarBlockLayout = VK_TRUE;
 		}
 		if (hasDescriptorHeapExtension &&
+			hasMaintenance5Extension &&
 			supportedDescriptorHeapFeatures.descriptorHeap == VK_TRUE &&
-			enabledVulkan12Features.bufferDeviceAddress == VK_TRUE) {
+			enabledVulkan12Features.bufferDeviceAddress == VK_TRUE &&
+			enabledVulkan12Features.runtimeDescriptorArray == VK_TRUE &&
+			enabledVulkan12Features.scalarBlockLayout == VK_TRUE) {
 			enabledDescriptorHeapFeatures.descriptorHeap = VK_TRUE;
 		}
 		if (hasMeshShaderExtension && supportedMeshShaderFeatures.meshShader == VK_TRUE) {
 			enabledMeshShaderFeatures.meshShader = VK_TRUE;
 			enabledMeshShaderFeatures.taskShader = supportedMeshShaderFeatures.taskShader;
-			enabledMeshShaderFeatures.multiviewMeshShader = supportedMeshShaderFeatures.multiviewMeshShader;
-			enabledMeshShaderFeatures.primitiveFragmentShadingRateMeshShader = supportedMeshShaderFeatures.primitiveFragmentShadingRateMeshShader;
 			enabledMeshShaderFeatures.meshShaderQueries = supportedMeshShaderFeatures.meshShaderQueries;
+		}
+		if (hasDeviceGeneratedCommandsExtension && hasMaintenance5Extension && supportedDeviceGeneratedCommandsFeatures.deviceGeneratedCommands == VK_TRUE) {
+			enabledDeviceExtensions.push_back(VK_EXT_DEVICE_GENERATED_COMMANDS_EXTENSION_NAME);
+			enabledDeviceGeneratedCommandsFeatures.deviceGeneratedCommands = VK_TRUE;
+			enabledDeviceGeneratedCommandsFeatures.dynamicGeneratedPipelineLayout = supportedDeviceGeneratedCommandsFeatures.dynamicGeneratedPipelineLayout;
+		}
+		if ((hasComputeShaderDerivativesExtension || hasNvComputeShaderDerivativesExtension) &&
+			supportedComputeShaderDerivativesFeatures.computeDerivativeGroupQuads == VK_TRUE) {
+			enabledComputeShaderDerivativesFeatures.computeDerivativeGroupQuads = VK_TRUE;
+			enabledComputeShaderDerivativesFeatures.computeDerivativeGroupLinear = supportedComputeShaderDerivativesFeatures.computeDerivativeGroupLinear;
+		}
+		if (hasShaderImageAtomicInt64Extension && supportedShaderImageAtomicInt64Features.shaderImageInt64Atomics == VK_TRUE) {
+			enabledDeviceExtensions.push_back(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
+			enabledShaderImageAtomicInt64Features.shaderImageInt64Atomics = VK_TRUE;
+		}
+		if (hasShaderSubgroupPartitionedExtension && supportedShaderSubgroupPartitionedFeatures.shaderSubgroupPartitioned == VK_TRUE) {
+			enabledDeviceExtensions.push_back(VK_EXT_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
+			enabledShaderSubgroupPartitionedFeatures.shaderSubgroupPartitioned = VK_TRUE;
+		}
+		else if (hasNvShaderSubgroupPartitionedExtension) {
+			enabledDeviceExtensions.push_back(VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
 		}
 
 		VkDeviceCreateInfo deviceCreateInfo{};
@@ -5808,13 +6595,24 @@ namespace rhi {
 		impl->supportedFeatures = supportedFeatures;
 		impl->descriptorHeapProperties = descriptorHeapProperties;
 		impl->meshShaderProperties = meshShaderProperties;
+		impl->computeShaderDerivativesProperties = computeShaderDerivativesProperties;
 		impl->bufferDeviceAddressEnabled = enabledVulkan12Features.bufferDeviceAddress == VK_TRUE;
-		impl->timelineSemaphoreEnabled = enabledVulkan12Features.timelineSemaphore == VK_TRUE || enabledTimelineFeatures.timelineSemaphore == VK_TRUE;
+		impl->timelineSemaphoreEnabled = enabledVulkan12Features.timelineSemaphore == VK_TRUE;
+		impl->descriptorIndexingEnabled = enabledVulkan12Features.descriptorIndexing == VK_TRUE;
+		impl->runtimeDescriptorArrayEnabled = enabledVulkan12Features.runtimeDescriptorArray == VK_TRUE;
+		impl->scalarBlockLayoutEnabled = enabledVulkan12Features.scalarBlockLayout == VK_TRUE;
 		impl->descriptorHeapEnabled = enabledDescriptorHeapFeatures.descriptorHeap == VK_TRUE;
 		impl->meshShaderEnabled = enabledMeshShaderFeatures.meshShader == VK_TRUE;
 		impl->taskShaderEnabled = enabledMeshShaderFeatures.taskShader == VK_TRUE;
 		impl->meshShaderPipelineStatsEnabled = enabledMeshShaderFeatures.meshShaderQueries == VK_TRUE;
+		impl->deviceGeneratedCommandsEnabled = enabledDeviceGeneratedCommandsFeatures.deviceGeneratedCommands == VK_TRUE;
+		impl->dynamicGeneratedPipelineLayoutEnabled = enabledDeviceGeneratedCommandsFeatures.dynamicGeneratedPipelineLayout == VK_TRUE;
 		impl->dynamicRenderingEnabled = enabledVulkan13Features.dynamicRendering == VK_TRUE;
+		impl->shaderDemoteToHelperInvocationEnabled = enabledVulkan13Features.shaderDemoteToHelperInvocation == VK_TRUE;
+		impl->computeDerivativeGroupQuadsEnabled = enabledComputeShaderDerivativesFeatures.computeDerivativeGroupQuads == VK_TRUE;
+		impl->computeDerivativeGroupLinearEnabled = enabledComputeShaderDerivativesFeatures.computeDerivativeGroupLinear == VK_TRUE;
+		impl->shaderImageInt64AtomicsEnabled = enabledShaderImageAtomicInt64Features.shaderImageInt64Atomics == VK_TRUE;
+		impl->shaderSubgroupPartitionedEnabled = enabledShaderSubgroupPartitionedFeatures.shaderSubgroupPartitioned == VK_TRUE || hasNvShaderSubgroupPartitionedExtension;
 		impl->loaderApiVersion = loaderApiVersion;
 		impl->instanceApiVersion = requestedApiVersion;
 		impl->swapchainExtensionEnabled = enableSwapchainExtension;
@@ -5832,7 +6630,7 @@ namespace rhi {
 		impl->self = Device{ impl.get(), &g_vkdevvt };
 
 		spdlog::info(
-			"CreateVulkanDevice: selected device '{}' api {}.{}.{} queueFamilies[gfx={}, compute={}, copy={}] dynamicRendering={} bufferDeviceAddress={} descriptorHeap={} meshShader={} taskShader={}",
+			"CreateVulkanDevice: selected device '{}' api {}.{}.{} queueFamilies[gfx={}, compute={}, copy={}] dynamicRendering={} bufferDeviceAddress={} descriptorIndexing={} runtimeDescriptorArray={} descriptorHeap={} meshShader={} taskShader={} deviceGeneratedCommands={} dynamicGeneratedPipelineLayout={} computeDerivativeGroupQuads={} computeDerivativeGroupLinear={}",
 			impl->physicalDeviceProperties.deviceName,
 			VK_API_VERSION_MAJOR(impl->physicalDeviceProperties.apiVersion),
 			VK_API_VERSION_MINOR(impl->physicalDeviceProperties.apiVersion),
@@ -5842,9 +6640,15 @@ namespace rhi {
 			impl->queues[2].familyIndex,
 			impl->dynamicRenderingEnabled,
 			impl->bufferDeviceAddressEnabled,
+			impl->descriptorIndexingEnabled,
+			impl->runtimeDescriptorArrayEnabled,
 			impl->descriptorHeapEnabled,
 			impl->meshShaderEnabled,
-			impl->taskShaderEnabled);
+			impl->taskShaderEnabled,
+			impl->deviceGeneratedCommandsEnabled,
+			impl->dynamicGeneratedPipelineLayoutEnabled,
+			impl->computeDerivativeGroupQuadsEnabled,
+			impl->computeDerivativeGroupLinearEnabled);
 
 		outPtr = MakeDevicePtr(&impl->self, impl);
 		return Result::Ok;

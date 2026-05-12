@@ -40,6 +40,18 @@ namespace rhi::vulkan {
 		return from_native_void<VkDevice>(info.device);
     }
 
+    inline uint32_t get_api_version(rhi::Device device) {
+        VulkanDeviceInfo info{};
+        if (!QueryNativeDevice(device, RHI_IID_VK_DEVICE, &info, sizeof(info))) return VK_API_VERSION_1_0;
+        return info.apiVersion ? info.apiVersion : VK_API_VERSION_1_0;
+    }
+
+    inline uint32_t get_device_api_version(rhi::Device device) {
+        VulkanDeviceInfo info{};
+        if (!QueryNativeDevice(device, RHI_IID_VK_DEVICE, &info, sizeof(info))) return VK_API_VERSION_1_0;
+        return info.deviceApiVersion ? info.deviceApiVersion : VK_API_VERSION_1_0;
+    }
+
     inline VkQueue get_queue(rhi::Queue queue) {
         VulkanQueueInfo info{};
         if (!QueryNativeQueue(queue, RHI_IID_VK_QUEUE, &info, sizeof(info))) return VK_NULL_HANDLE;

@@ -45,6 +45,10 @@ namespace rhi {
 	inline constexpr uint32_t RHI_SAMPLER_ABI_MIN = 1;
 	inline constexpr uint32_t RHI_DESCRIPTORHEAP_ABI_MIN = 1;
 	inline constexpr uint32_t RHI_TIMELINE_ABI_MIN = 1;
+	inline constexpr uint32_t VULKAN_DESCRIPTOR_HEAP_SET = 0;
+	inline constexpr uint32_t VULKAN_RESOURCE_DESCRIPTOR_HEAP_BINDING = 1000000;
+	inline constexpr uint32_t VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING = 1000001;
+	inline constexpr uint32_t VULKAN_COUNTER_DESCRIPTOR_HEAP_BINDING = 1000002;
 
 	class Device;
 
@@ -1275,7 +1279,8 @@ namespace rhi {
 		RF_VideoDecodeReferenceOnly = 1 << 6,
 		RF_VideoEncodeReferenceOnly = 1 << 7,
 		RF_RaytracingAccelerationStructure = 1 << 8,
-		RF_UseTightAlignment = 1 << 9
+		RF_UseTightAlignment = 1 << 9,
+		RF_TextureCubeCompatible = 1 << 10
 	};
 	// Define |= for ResourceFlags
 	inline ResourceFlags operator|(ResourceFlags a, ResourceFlags b) {

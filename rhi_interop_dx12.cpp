@@ -44,6 +44,8 @@ namespace rhi {
             out->physicalDevice = NativeHandleToVoid(impl->physicalDevice);
             out->device = NativeHandleToVoid(impl->device);
             out->version = 1;
+            out->apiVersion = impl->instanceApiVersion;
+            out->deviceApiVersion = impl->physicalDeviceProperties.apiVersion;
             return true;
         }
 
