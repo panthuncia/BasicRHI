@@ -955,6 +955,7 @@ namespace rhi {
             if (v & static_cast<U>(ResourceAccessType::CopySource))                          add("COPY_SOURCE");
             if (v & static_cast<U>(ResourceAccessType::RaytracingAccelerationStructureRead)) add("RT_AS_READ");
             if (v & static_cast<U>(ResourceAccessType::RaytracingAccelerationStructureWrite))add("RT_AS_WRITE");
+            if (v & static_cast<U>(ResourceAccessType::Present))                            add("PRESENT");
 
             // Any unknown bits?
             if (out.empty()) out = "UNKNOWN";

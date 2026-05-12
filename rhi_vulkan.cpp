@@ -3089,10 +3089,6 @@ namespace rhi {
 					return;
 				}
 
-				if (resource->isSwapchainImage) {
-					VkTransitionResourceLayout(commandListState->commandBuffer, *resource, viewSlot->aspectMask, ResourceLayout::RenderTarget);
-				}
-
 				VkRenderingAttachmentInfo attachmentInfo{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
 				attachmentInfo.imageView = viewSlot->view;
 				attachmentInfo.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -3129,9 +3125,6 @@ namespace rhi {
 					spdlog::error("Vulkan BeginPass: invalid DSV slot {}", passInfo.depth->dsv.index);
 					return;
 				}
-
-				const ResourceLayout depthLayout = passInfo.depth->readOnly ? ResourceLayout::DepthRead : ResourceLayout::DepthReadWrite;
-				VkTransitionResourceLayout(commandListState->commandBuffer, *resource, viewSlot->aspectMask, depthLayout);
 
 				depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
 				depthAttachment.imageView = viewSlot->view;
@@ -3187,13 +3180,6 @@ namespace rhi {
 
 			vkCmdEndRendering(commandListState->commandBuffer);
 
-			for (ResourceHandle handle : commandListState->passColorResources) {
-				VulkanResource* resource = VkResourceState(impl, handle);
-				if (resource && resource->isSwapchainImage) {
-					VkTransitionResourceLayout(commandListState->commandBuffer, *resource, VK_IMAGE_ASPECT_COLOR_BIT, ResourceLayout::Present);
-				}
-			}
-
 			commandListState->passColorResources.clear();
 			commandListState->passDepthResource = {};
 			commandListState->passRenderArea = {};
@@ -3242,8 +3228,10 @@ namespace rhi {
 				const VkImageAspectFlags aspect = VkAspectMaskForFormat(resource->format);
 				const bool firstUseFromUndefined = !barrier.discard && resource->submittedLayout == ResourceLayout::Undefined;
 				VkImageMemoryBarrier vkBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-				vkBarrier.srcAccessMask = (barrier.discard || firstUseFromUndefined) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
-				vkBarrier.dstAccessMask = VkAccessMaskForAccess(barrier.afterAccess);
+				const bool beforePresent = barrier.beforeLayout == ResourceLayout::Present;
+				const bool afterPresent = barrier.afterLayout == ResourceLayout::Present;
+				vkBarrier.srcAccessMask = (barrier.discard || firstUseFromUndefined || beforePresent) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
+				vkBarrier.dstAccessMask = afterPresent ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
 				vkBarrier.oldLayout = (barrier.discard || firstUseFromUndefined) ? VK_IMAGE_LAYOUT_UNDEFINED : VkToImageLayout(barrier.beforeLayout, aspect);
 				vkBarrier.newLayout = VkToImageLayout(barrier.afterLayout, aspect);
 				vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -3253,8 +3241,8 @@ namespace rhi {
 				imageBarriers.push_back(vkBarrier);
 				const bool beforeTransferClear = (barrier.beforeAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear)) != 0;
 				const bool afterTransferClear = (barrier.afterAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear)) != 0;
-				srcStages |= (barrier.discard || firstUseFromUndefined) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.beforeSync));
-				dstStages |= afterTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.afterSync);
+				srcStages |= (barrier.discard || firstUseFromUndefined || beforePresent) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.beforeSync));
+				dstStages |= afterPresent ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : (afterTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.afterSync));
 				if (impl->validateBarrierTransitions) {
 					recordedBatch.textures.push_back(VulkanCommandList::RecordedTextureBarrier{
 						barrier.texture,

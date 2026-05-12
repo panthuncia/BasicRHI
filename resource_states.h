@@ -23,6 +23,7 @@ namespace rhi {
 		RaytracingAccelerationStructureWrite = 1 << 13,
 		DepthStencilClear = 1 << 14,
 		RenderTargetClear = 1 << 15,
+		Present = 1 << 16,
 	};
 
 	inline ResourceAccessType operator|(ResourceAccessType a, ResourceAccessType b)
@@ -172,6 +173,8 @@ namespace rhi {
 		// most-specific first:
 		if (access & ResourceAccessType::Common)
 			return ResourceLayout::Common;
+		if (access & ResourceAccessType::Present)
+			return ResourceLayout::Present;
 		if (access & ResourceAccessType::UnorderedAccess)
 			return ResourceLayout::UnorderedAccess;
 		if (access & ResourceAccessType::RenderTargetClear)
@@ -249,6 +252,7 @@ namespace rhi {
 		bool needsIndirect = (access & ResourceAccessType::IndirectArgument) != 0;
 		bool needsRayTracing = (access & ResourceAccessType::RaytracingAccelerationStructureRead) != 0;
 		bool needsBuildAS = (access & ResourceAccessType::RaytracingAccelerationStructureWrite) != 0;
+		bool needsPresent = (access & ResourceAccessType::Present) != 0;
 
 		// count how many distinct categories are requested
 		int categoryCount =
@@ -260,7 +264,8 @@ namespace rhi {
 			+ (int)needsCopy
 			+ (int)needsIndirect
 			+ (int)needsRayTracing
-			+ (int)needsBuildAS;
+			+ (int)needsBuildAS
+			+ (int)needsPresent;
 
 		// zero categories = no sync
 		if (categoryCount == 0)
@@ -287,6 +292,7 @@ namespace rhi {
 		if (needsIndirect)      return ResourceSyncState::ExecuteIndirect;
 		if (needsBuildAS)       return ResourceSyncState::BuildRaytracingAccelerationStructure;
 		if (needsRayTracing)    return ResourceSyncState::Raytracing;
+		if (needsPresent)       return ResourceSyncState::All;
 
 		// (should never get here)
 		return ResourceSyncState::All;
@@ -316,6 +322,10 @@ namespace rhi {
 		switch (layout) {
 		case ResourceLayout::Common:
 			if ((access & ~(ResourceAccessType::Common | ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument | ResourceAccessType::CopyDest | ResourceAccessType::CopySource)) != 0)
+				return false;
+			break;
+		case ResourceLayout::Present:
+			if ((access & ~(ResourceAccessType::Present)) != 0)
 				return false;
 			break;
 		case ResourceLayout::DirectCommon:

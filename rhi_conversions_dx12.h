@@ -15,6 +15,9 @@ namespace rhi {
 		if (state & ResourceAccessType::Common) {
 			access |= D3D12_BARRIER_ACCESS_COMMON;
 		}
+		if (state & ResourceAccessType::Present) {
+			access |= D3D12_BARRIER_ACCESS_COMMON;
+		}
 		if (state & ResourceAccessType::IndexBuffer) {
 			access |= D3D12_BARRIER_ACCESS_INDEX_BUFFER;
 		}
