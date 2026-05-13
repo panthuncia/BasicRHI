@@ -3539,8 +3539,8 @@ namespace rhi {
 				imageBarriers.push_back(vkBarrier);
 				const bool beforeTransferClear = (barrier.beforeAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
 				const bool afterTransferClear = (barrier.afterAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
-				srcStages |= (barrier.discard || firstUseFromUndefined || beforePresent) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.beforeSync));
-				dstStages |= afterPresent ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : (afterTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.afterSync));
+				srcStages |= (barrier.discard || firstUseFromUndefined || beforePresent) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (VkStageMaskForSync(barrier.beforeSync) | (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
+				dstStages |= afterPresent ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : (VkStageMaskForSync(barrier.afterSync) | (afterTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
 				if (impl->validateBarrierTransitions) {
 					recordedBatch.textures.push_back(VulkanCommandList::RecordedTextureBarrier{
 						barrier.texture,
@@ -6742,6 +6742,27 @@ namespace rhi {
 		if (device != VK_NULL_HANDLE) {
 			vkDeviceWaitIdle(device);
 		}
+
+		for (auto& slot : commandLists.slots) {
+			if (!slot.alive) {
+				continue;
+			}
+
+			if (slot.obj.commandBuffer != VK_NULL_HANDLE) {
+				if (VulkanCommandAllocator* allocatorState = VkAllocatorState(this, slot.obj.allocatorHandle);
+					allocatorState && allocatorState->pool != VK_NULL_HANDLE && device != VK_NULL_HANDLE) {
+					vkFreeCommandBuffers(device, allocatorState->pool, 1, &slot.obj.commandBuffer);
+				}
+			}
+
+			for (auto& page : slot.obj.emulatedRootConstantScratchPages) {
+				VkDestroyEmulatedRootConstantScratchPage(this, page);
+			}
+			slot.obj = VulkanCommandList{};
+			slot.alive = false;
+		}
+		commandLists.clear();
+
 		for (auto& slot : descriptorHeaps.slots) {
 			if (!slot.alive) {
 				continue;
@@ -6786,6 +6807,15 @@ namespace rhi {
 		}
 		resources.clear();
 
+		for (auto& slot : commandSignatures.slots) {
+			if (!slot.alive) {
+				continue;
+			}
+			VkDestroyCommandSignature(this, slot.obj);
+			slot.alive = false;
+		}
+		commandSignatures.clear();
+
 		for (auto& slot : pipelines.slots) {
 			if (!slot.alive) {
 				continue;
@@ -6804,60 +6834,33 @@ namespace rhi {
 		}
 		pipelineLayouts.clear();
 
-		for (auto& slot : commandSignatures.slots) {
-			if (!slot.alive) {
-				continue;
-			}
-			VkDestroyCommandSignature(this, slot.obj);
-			slot.alive = false;
-		}
-		commandSignatures.clear();
-
-		for (auto& slot : commandLists.slots) {
-			if (slot.alive) {
-				for (auto& page : slot.obj.emulatedRootConstantScratchPages) {
-					VkDestroyEmulatedRootConstantScratchPage(this, page);
+		if (device != VK_NULL_HANDLE) {
+			for (auto& slot : timelines.slots) {
+				if (slot.alive && slot.obj.semaphore != VK_NULL_HANDLE) {
+					vkDestroySemaphore(device, slot.obj.semaphore, nullptr);
+					slot.obj.semaphore = VK_NULL_HANDLE;
 				}
-				slot.obj = VulkanCommandList{};
+				slot.alive = false;
+			}
+
+			for (auto& slot : heaps.slots) {
+				if (slot.alive && slot.obj.memory != VK_NULL_HANDLE) {
+					vkFreeMemory(device, slot.obj.memory, nullptr);
+					slot.obj.memory = VK_NULL_HANDLE;
+				}
+				slot.alive = false;
+			}
+
+			for (auto& slot : queryPools.slots) {
+				if (slot.alive && slot.obj.pool != VK_NULL_HANDLE) {
+					vkDestroyQueryPool(device, slot.obj.pool, nullptr);
+					slot.obj.pool = VK_NULL_HANDLE;
+				}
 				slot.alive = false;
 			}
 		}
-		commandLists.clear();
-
-		for (auto& slot : timelines.slots) {
-			if (!slot.alive) {
-				continue;
-			}
-			if (device != VK_NULL_HANDLE && slot.obj.semaphore != VK_NULL_HANDLE) {
-				vkDestroySemaphore(device, slot.obj.semaphore, nullptr);
-			}
-			slot.obj = VulkanTimeline{};
-			slot.alive = false;
-		}
 		timelines.clear();
-
-		for (auto& slot : heaps.slots) {
-			if (!slot.alive) {
-				continue;
-			}
-			if (device != VK_NULL_HANDLE && slot.obj.memory != VK_NULL_HANDLE) {
-				vkFreeMemory(device, slot.obj.memory, nullptr);
-			}
-			slot.obj = VulkanHeap{};
-			slot.alive = false;
-		}
 		heaps.clear();
-
-		for (auto& slot : queryPools.slots) {
-			if (!slot.alive) {
-				continue;
-			}
-			if (device != VK_NULL_HANDLE && slot.obj.pool != VK_NULL_HANDLE) {
-				vkDestroyQueryPool(device, slot.obj.pool, nullptr);
-			}
-			slot.obj = VulkanQueryPool{};
-			slot.alive = false;
-		}
 		queryPools.clear();
 
 		if (device != VK_NULL_HANDLE) {
@@ -7177,6 +7180,14 @@ namespace rhi {
 				names.push_back(name);
 			}
 		};
+		auto removeName = [](std::vector<const char*>& names, const char* name) {
+			if (!name) {
+				return;
+			}
+			names.erase(std::remove_if(names.begin(), names.end(), [name](const char* existing) {
+				return existing && std::strcmp(existing, name) == 0;
+			}), names.end());
+		};
 
 		if (streamlineInitialized && g_vkSlDlssRequirementsValid) {
 			for (uint32_t index = 0; index < g_vkSlDlssRequirements.vkNumInstanceExtensions; ++index) {
@@ -7440,6 +7451,9 @@ namespace rhi {
 		if (streamlineInitialized && g_vkSlDlssRequirementsValid) {
 			for (uint32_t index = 0; index < g_vkSlDlssRequirements.vkNumDeviceExtensions; ++index) {
 				const char* extensionName = g_vkSlDlssRequirements.vkDeviceExtensions[index];
+				if (extensionName && std::strcmp(extensionName, VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) == 0) {
+					extensionName = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
+				}
 				if (extensionName && VkHasDeviceExtension(physicalDevice, extensionName)) {
 					appendUniqueName(enabledDeviceExtensions, extensionName);
 				}
@@ -7452,6 +7466,7 @@ namespace rhi {
 				}
 			}
 		}
+		removeName(enabledDeviceExtensions, VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
 #endif
 
 		VkPhysicalDeviceVulkan12Features enabledVulkan12Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
