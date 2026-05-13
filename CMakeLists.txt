@@ -266,6 +266,32 @@ set_target_properties(BasicRHIVulkanSmoke PROPERTIES
 
 target_link_libraries(BasicRHIVulkanSmoke PRIVATE BasicRHI::BasicRHI)
 
+if(_basicrhi_streamline_available AND WIN32)
+    target_link_libraries(BasicRHIVulkanSmoke PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/sl.interposer.lib"
+    )
+endif()
+
+target_include_directories(BasicRHIVulkanSmoke PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/../volk"
+    "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/include"
+    "${CMAKE_CURRENT_LIST_DIR}/../FidelityFX-SDK/sdk/include"
+)
+
+if(WIN32)
+    add_custom_command(TARGET BasicRHIVulkanSmoke POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/sl.interposer.dll"
+            "$<TARGET_FILE_DIR:BasicRHIVulkanSmoke>/sl.interposer.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/FFX/amd_fidelityfx_vk.dll"
+            "$<TARGET_FILE_DIR:BasicRHIVulkanSmoke>/amd_fidelityfx_vk.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/FFX/ffx_backend_vk_x64drel.dll"
+            "$<TARGET_FILE_DIR:BasicRHIVulkanSmoke>/ffx_backend_vk_x64drel.dll"
+    )
+endif()
+
 if(WIN32)
     target_link_libraries(BasicRHIVulkanSmoke PRIVATE user32)
 endif()

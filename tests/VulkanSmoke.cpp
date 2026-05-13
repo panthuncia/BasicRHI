@@ -1,13 +1,219 @@
 #include "rhi.h"
 #include "rhi_helpers.h"
+#include "rhi_interop_vulkan.h"
 
+#include "ThirdParty/FFX/ffx_api_loader.h"
+#include "ThirdParty/FFX/ffx_upscale.h"
+#include "ThirdParty/FFX/host/backends/vk/ffx_vk.h"
+#include "ThirdParty/FFX/vk/ffx_api_vk.h"
+
+#include <FidelityFX/host/ffx_fsr3upscaler.h>
+
+#include <cstdlib>
 #include <cstdio>
+#include <cstring>
 
 #ifdef _WIN32
 #include <Windows.h>
 #endif
 
 namespace {
+	template<typename Function>
+	bool LoadFfxBackendFunction(HMODULE module, Function& target, const char* name) {
+		target = reinterpret_cast<Function>(GetProcAddress(module, name));
+		if (target == nullptr) {
+			std::fprintf(stderr, "FidelityFX Vulkan backend module is missing export %s\n", name);
+			return false;
+		}
+		return true;
+	}
+
+	bool ValidateFidelityFXVulkanBackend(
+		HMODULE ffxApiModule,
+		VkDevice vkDevice,
+		VkPhysicalDevice vkPhysicalDevice,
+		PFN_vkGetDeviceProcAddr vkDeviceProcAddr) {
+		using PfnGetScratchMemorySizeVK = decltype(&ffxGetScratchMemorySizeVK);
+		using PfnGetDeviceVK = decltype(&ffxGetDeviceVK);
+		using PfnGetInterfaceVK = decltype(&ffxGetInterfaceVK);
+		using PfnFsr3UpscalerContextCreate = decltype(&ffxFsr3UpscalerContextCreate);
+		using PfnFsr3UpscalerContextDestroy = decltype(&ffxFsr3UpscalerContextDestroy);
+		using PfnFsr3UpscalerGetSharedResourceDescriptions = decltype(&ffxFsr3UpscalerGetSharedResourceDescriptions);
+
+		HMODULE ffxBackendModule = LoadLibraryW(L"ffx_backend_vk_x64drel.dll");
+		if (ffxBackendModule == nullptr) {
+			std::fprintf(stderr, "LoadLibraryW(ffx_backend_vk_x64drel.dll) failed with error %lu\n", GetLastError());
+			return false;
+		}
+
+		PfnGetScratchMemorySizeVK getScratchMemorySizeVK = nullptr;
+		PfnGetDeviceVK getDeviceVK = nullptr;
+		PfnGetInterfaceVK getInterfaceVK = nullptr;
+		if (!LoadFfxBackendFunction(ffxBackendModule, getScratchMemorySizeVK, "ffxGetScratchMemorySizeVK") ||
+			!LoadFfxBackendFunction(ffxBackendModule, getDeviceVK, "ffxGetDeviceVK") ||
+			!LoadFfxBackendFunction(ffxBackendModule, getInterfaceVK, "ffxGetInterfaceVK")) {
+			FreeLibrary(ffxBackendModule);
+			return false;
+		}
+
+		VkDeviceContext deviceContext{};
+		deviceContext.vkDevice = vkDevice;
+		deviceContext.vkPhysicalDevice = vkPhysicalDevice;
+		deviceContext.vkDeviceProcAddr = vkDeviceProcAddr;
+
+		std::fprintf(stderr, "FFX Vulkan smoke: calling ffxGetDeviceVK\n");
+		std::fflush(stderr);
+		const FfxDevice ffxDevice = getDeviceVK(&deviceContext);
+
+		std::fprintf(stderr, "FFX Vulkan smoke: calling ffxGetScratchMemorySizeVK\n");
+		std::fflush(stderr);
+		const size_t scratchMemorySize = getScratchMemorySizeVK(vkPhysicalDevice, 1);
+		std::fprintf(stderr, "FFX Vulkan smoke: scratchMemorySize=%zu\n", scratchMemorySize);
+		std::fflush(stderr);
+		if (scratchMemorySize == 0) {
+			FreeLibrary(ffxBackendModule);
+			return false;
+		}
+
+		void* scratchMemory = std::malloc(scratchMemorySize);
+		if (scratchMemory == nullptr) {
+			std::fprintf(stderr, "FFX Vulkan smoke: malloc(%zu) failed\n", scratchMemorySize);
+			FreeLibrary(ffxBackendModule);
+			return false;
+		}
+		std::memset(scratchMemory, 0, scratchMemorySize);
+
+		FfxInterface backendInterface{};
+		std::fprintf(stderr, "FFX Vulkan smoke: calling ffxGetInterfaceVK\n");
+		std::fflush(stderr);
+		const FfxErrorCode interfaceResult = getInterfaceVK(&backendInterface, ffxDevice, scratchMemory, scratchMemorySize, 1);
+		std::fprintf(stderr, "FFX Vulkan smoke: ffxGetInterfaceVK returned %d\n", static_cast<int>(interfaceResult));
+		std::fflush(stderr);
+		if (interfaceResult != FFX_OK) {
+			std::free(scratchMemory);
+			FreeLibrary(ffxBackendModule);
+			return false;
+		}
+
+		PfnFsr3UpscalerContextCreate fsr3Create = nullptr;
+		PfnFsr3UpscalerContextDestroy fsr3Destroy = nullptr;
+		PfnFsr3UpscalerGetSharedResourceDescriptions fsr3GetSharedResourceDescriptions = nullptr;
+		if (LoadFfxBackendFunction(ffxApiModule, fsr3Create, "ffxFsr3UpscalerContextCreate") &&
+			LoadFfxBackendFunction(ffxApiModule, fsr3Destroy, "ffxFsr3UpscalerContextDestroy") &&
+			LoadFfxBackendFunction(ffxApiModule, fsr3GetSharedResourceDescriptions, "ffxFsr3UpscalerGetSharedResourceDescriptions")) {
+			FfxFsr3UpscalerContextDescription fsr3Desc{};
+			fsr3Desc.flags = FFX_FSR3UPSCALER_ENABLE_AUTO_EXPOSURE | FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE | FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED;
+			fsr3Desc.maxRenderSize = { 320u, 240u };
+			fsr3Desc.maxUpscaleSize = { 320u, 240u };
+			fsr3Desc.backendInterface = backendInterface;
+
+			FfxFsr3UpscalerContext fsr3Context{};
+			std::fprintf(stderr, "FFX Vulkan smoke: calling ffxFsr3UpscalerContextCreate directly\n");
+			std::fflush(stderr);
+			const FfxErrorCode fsr3CreateResult = fsr3Create(&fsr3Context, &fsr3Desc);
+			std::fprintf(stderr, "FFX Vulkan smoke: ffxFsr3UpscalerContextCreate returned %d\n", static_cast<int>(fsr3CreateResult));
+			std::fflush(stderr);
+
+			if (fsr3CreateResult == FFX_OK) {
+				FfxFsr3UpscalerSharedResourceDescriptions sharedDescriptions{};
+				std::fprintf(stderr, "FFX Vulkan smoke: calling ffxFsr3UpscalerGetSharedResourceDescriptions directly\n");
+				std::fflush(stderr);
+				const FfxErrorCode sharedDescriptionsResult = fsr3GetSharedResourceDescriptions(&fsr3Context, &sharedDescriptions);
+				std::fprintf(stderr, "FFX Vulkan smoke: ffxFsr3UpscalerGetSharedResourceDescriptions returned %d\n", static_cast<int>(sharedDescriptionsResult));
+				std::fflush(stderr);
+
+				std::fprintf(stderr, "FFX Vulkan smoke: calling ffxFsr3UpscalerContextDestroy directly\n");
+				std::fflush(stderr);
+				const FfxErrorCode fsr3DestroyResult = fsr3Destroy(&fsr3Context);
+				std::fprintf(stderr, "FFX Vulkan smoke: ffxFsr3UpscalerContextDestroy returned %d\n", static_cast<int>(fsr3DestroyResult));
+				std::fflush(stderr);
+			}
+		}
+
+		std::free(scratchMemory);
+		FreeLibrary(ffxBackendModule);
+		return true;
+	}
+
+	bool ValidateFidelityFXVulkanContext(rhi::Device& device) {
+		HMODULE ffxApiModule = LoadLibraryW(L"amd_fidelityfx_vk.dll");
+		if (ffxApiModule == nullptr) {
+			std::fprintf(stderr, "LoadLibraryW(amd_fidelityfx_vk.dll) failed with error %lu\n", GetLastError());
+			return false;
+		}
+
+		ffxFunctions ffxApi{};
+		ffxLoadFunctions(&ffxApi, ffxApiModule);
+		if (ffxApi.CreateContext == nullptr || ffxApi.DestroyContext == nullptr) {
+			std::fprintf(stderr, "FidelityFX Vulkan API module is missing context exports\n");
+			FreeLibrary(ffxApiModule);
+			return false;
+		}
+
+		const VkDevice vkDevice = rhi::vulkan::get_device(device);
+		const VkPhysicalDevice vkPhysicalDevice = rhi::vulkan::get_physical_device(device);
+		const PFN_vkGetDeviceProcAddr vkDeviceProcAddr = rhi::vulkan::get_device_proc_addr();
+		const PFN_vkVoidFunction createDescriptorPoolProc = vkDeviceProcAddr && vkDevice != VK_NULL_HANDLE
+			? vkDeviceProcAddr(vkDevice, "vkCreateDescriptorPool")
+			: nullptr;
+
+		std::fprintf(
+			stderr,
+			"FFX Vulkan smoke handles: device=%p physicalDevice=%p vkGetDeviceProcAddr=%p vkCreateDescriptorPool=%p\n",
+			reinterpret_cast<void*>(vkDevice),
+			reinterpret_cast<void*>(vkPhysicalDevice),
+			reinterpret_cast<void*>(vkDeviceProcAddr),
+			reinterpret_cast<void*>(createDescriptorPoolProc));
+
+		if (vkDevice == VK_NULL_HANDLE || vkPhysicalDevice == VK_NULL_HANDLE || vkDeviceProcAddr == nullptr || createDescriptorPoolProc == nullptr) {
+			std::fprintf(stderr, "FidelityFX Vulkan smoke skipped because Vulkan native handles or proc loader are invalid\n");
+			FreeLibrary(ffxApiModule);
+			return false;
+		}
+
+		if (!ValidateFidelityFXVulkanBackend(ffxApiModule, vkDevice, vkPhysicalDevice, vkDeviceProcAddr)) {
+			std::fprintf(stderr, "FidelityFX Vulkan backend probe failed before API CreateContext\n");
+			FreeLibrary(ffxApiModule);
+			return false;
+		}
+
+		ffxCreateBackendVKDesc backendDesc{};
+		backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+		backendDesc.vkDevice = vkDevice;
+		backendDesc.vkPhysicalDevice = vkPhysicalDevice;
+		backendDesc.vkDeviceProcAddr = vkDeviceProcAddr;
+
+		ffxCreateContextDescUpscale createUpscale{};
+		createUpscale.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+		createUpscale.header.pNext = &backendDesc.header;
+		createUpscale.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
+		createUpscale.maxRenderSize = { 320u, 240u };
+		createUpscale.maxUpscaleSize = { 320u, 240u };
+
+		ffxContext context = nullptr;
+		std::fprintf(stderr, "FFX Vulkan smoke: calling ffxCreateContext\n");
+		std::fflush(stderr);
+		const ffxReturnCode_t createResult = ffxApi.CreateContext(&context, &createUpscale.header, nullptr);
+		if (createResult != FFX_API_RETURN_OK) {
+			std::fprintf(stderr, "ffxCreateContext Vulkan upscale failed with code %u\n", static_cast<unsigned>(createResult));
+			FreeLibrary(ffxApiModule);
+			return false;
+		}
+		std::fprintf(stderr, "FFX Vulkan smoke: ffxCreateContext returned OK\n");
+		std::fflush(stderr);
+
+		const ffxReturnCode_t destroyResult = ffxApi.DestroyContext(&context, nullptr);
+		FreeLibrary(ffxApiModule);
+		if (destroyResult != FFX_API_RETURN_OK) {
+			std::fprintf(stderr, "ffxDestroyContext Vulkan upscale failed with code %u\n", static_cast<unsigned>(destroyResult));
+			return false;
+		}
+		std::fprintf(stderr, "FFX Vulkan smoke: ffxDestroyContext returned OK\n");
+		std::fflush(stderr);
+
+		return true;
+	}
+
 	rhi::Result Check(rhi::Result result, const char* what) {
 		if (result != rhi::Result::Ok) {
 			std::fprintf(stderr, "%s failed with result %u\n", what, static_cast<unsigned>(result));
@@ -48,6 +254,34 @@ namespace {
 		color.clear.rgba[2] = 0.35f;
 		color.clear.rgba[3] = 1.00f;
 
+		rhi::TextureBarrier beginBarriers[2]{};
+		uint32_t beginBarrierCount = 0;
+		beginBarriers[beginBarrierCount++] = rhi::TextureBarrier{
+			.texture = imageHandle,
+			.range = {},
+			.beforeSync = rhi::ResourceSyncState::None,
+			.afterSync = rhi::ResourceSyncState::RenderTarget,
+			.beforeAccess = rhi::ResourceAccessType::None,
+			.afterAccess = rhi::ResourceAccessType::RenderTarget,
+			.beforeLayout = rhi::ResourceLayout::Undefined,
+			.afterLayout = rhi::ResourceLayout::RenderTarget,
+			.discard = true,
+		};
+		if (depthAttachment != nullptr && depthAttachment->resource.valid()) {
+			beginBarriers[beginBarrierCount++] = rhi::TextureBarrier{
+				.texture = depthAttachment->resource,
+				.range = {},
+				.beforeSync = rhi::ResourceSyncState::None,
+				.afterSync = rhi::ResourceSyncState::DepthStencil,
+				.beforeAccess = rhi::ResourceAccessType::None,
+				.afterAccess = rhi::ResourceAccessType::DepthReadWrite,
+				.beforeLayout = rhi::ResourceLayout::Undefined,
+				.afterLayout = rhi::ResourceLayout::DepthReadWrite,
+				.discard = true,
+			};
+		}
+		commandList.Barriers(rhi::BarrierBatch{ .textures = { beginBarriers, beginBarrierCount } });
+
 		const rhi::PassBeginInfo passInfo{
 			.colors = { &color, 1 },
 			.depth = depthAttachment,
@@ -58,6 +292,19 @@ namespace {
 
 		commandList.BeginPass(passInfo);
 		commandList.EndPass();
+
+		rhi::TextureBarrier presentBarrier{
+			.texture = imageHandle,
+			.range = {},
+			.beforeSync = rhi::ResourceSyncState::RenderTarget,
+			.afterSync = rhi::ResourceSyncState::All,
+			.beforeAccess = rhi::ResourceAccessType::RenderTarget,
+			.afterAccess = rhi::ResourceAccessType::Present,
+			.beforeLayout = rhi::ResourceLayout::RenderTarget,
+			.afterLayout = rhi::ResourceLayout::Present,
+			.discard = false,
+		};
+		commandList.Barriers(rhi::BarrierBatch{ .textures = { &presentBarrier, 1 } });
 		commandList.End();
 
 		const rhi::CommandList submitLists[] = { commandList };
@@ -82,10 +329,12 @@ namespace {
 		return rhi::Result::Ok;
 	}
 
-	rhi::Result ValidateDescriptors(rhi::Device& device, rhi::CommandList& commandList) {
-		rhi::DescriptorHeapPtr shaderVisibleHeap;
+	rhi::Result ValidateDescriptors(
+		rhi::Device& device,
+		rhi::CommandList& commandList,
+		rhi::DescriptorHeapPtr& shaderVisibleHeap,
+		rhi::DescriptorHeapPtr& samplerHeap) {
 		rhi::DescriptorHeapPtr cpuVisibleHeap;
-		rhi::DescriptorHeapPtr samplerHeap;
 
 		rhi::DescriptorHeapDesc shaderHeapDesc{};
 		shaderHeapDesc.type = rhi::DescriptorHeapType::CbvSrvUav;
@@ -183,7 +432,11 @@ namespace {
 		return rhi::Result::Ok;
 	}
 
-	rhi::Result ValidatePipelineLayoutPushData(rhi::Device& device, rhi::CommandList& commandList) {
+	rhi::Result ValidatePipelineLayoutPushData(
+		rhi::Device& device,
+		rhi::CommandList& commandList,
+		rhi::PipelineLayoutPtr& pipelineLayout,
+		rhi::PipelinePtr& pipeline) {
 		static constexpr uint32_t kEmptyComputeSpirv[] = {
 			0x07230203,0x00010000,0x000d000a,0x0000000a,
 			0x00000000,0x00020011,0x00000001,0x0006000b,
@@ -215,7 +468,6 @@ namespace {
 		pushConstantRange.set = 0;
 		pushConstantRange.binding = 7;
 
-		rhi::PipelineLayoutPtr pipelineLayout;
 		if (Check(device.CreatePipelineLayout(
 			rhi::PipelineLayoutDesc{
 				.ranges = {},
@@ -238,7 +490,6 @@ namespace {
 			rhi::Make(subobjCompute),
 		};
 
-		rhi::PipelinePtr pipeline;
 		if (Check(device.CreatePipeline(items, static_cast<uint32_t>(std::size(items)), pipeline), "CreatePipeline compute") != rhi::Result::Ok) {
 			return rhi::Result::InvalidArgument;
 		}
@@ -298,6 +549,10 @@ int main() {
 		return 1;
 	}
 
+	if (!ValidateFidelityFXVulkanContext(device.Get())) {
+		return 1;
+	}
+
 	auto graphicsQueue = device->GetQueue(rhi::QueueKind::Graphics);
 	if (!graphicsQueue) {
 		std::fprintf(stderr, "Graphics queue acquisition failed\n");
@@ -318,11 +573,15 @@ int main() {
 		return 1;
 	}
 
-	if (ValidateDescriptors(device.Get(), commandList.Get()) != rhi::Result::Ok) {
+	rhi::DescriptorHeapPtr shaderVisibleHeap;
+	rhi::DescriptorHeapPtr samplerHeap;
+	if (ValidateDescriptors(device.Get(), commandList.Get(), shaderVisibleHeap, samplerHeap) != rhi::Result::Ok) {
 		return 1;
 	}
 
-	if (ValidatePipelineLayoutPushData(device.Get(), commandList.Get()) != rhi::Result::Ok) {
+	rhi::PipelineLayoutPtr pipelineLayout;
+	rhi::PipelinePtr pipeline;
+	if (ValidatePipelineLayoutPushData(device.Get(), commandList.Get(), pipelineLayout, pipeline) != rhi::Result::Ok) {
 		return 1;
 	}
 

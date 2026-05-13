@@ -209,6 +209,7 @@ namespace rhi {
 			pref.numFeaturesToLoad = _countof(features);
 			pref.renderAPI = sl::RenderAPI::eVulkan;
 			pref.flags |= sl::PreferenceFlags::eUseManualHooking;
+			pref.flags |= sl::PreferenceFlags::eUseFrameBasedResourceTagging;
 			VkResolveStreamlineCommonHooks(pluginPath);
 
 			if (SL_FAILED(result, slInitFn(pref, sl::kSDKVersion))) {
@@ -7715,6 +7716,9 @@ namespace rhi {
 		}
 		if (supportedVulkan12Features.scalarBlockLayout == VK_TRUE) {
 			enabledVulkan12Features.scalarBlockLayout = VK_TRUE;
+		}
+		if (supportedVulkan12Features.shaderFloat16 == VK_TRUE) {
+			enabledVulkan12Features.shaderFloat16 = VK_TRUE;
 		}
 		if (hasDescriptorHeapExtension &&
 			hasMaintenance5Extension &&
