@@ -87,6 +87,17 @@ namespace rhi {
 		static PFN_vkDeviceWaitIdle g_vkSlDeviceWaitIdle = nullptr;
 		static PFN_vkCreateWin32SurfaceKHR g_vkSlCreateWin32SurfaceKHR = nullptr;
 		static PFN_vkDestroySurfaceKHR g_vkSlDestroySurfaceKHR = nullptr;
+		static PFN_vkBeginCommandBuffer g_vkSlBeginCommandBuffer = nullptr;
+		static PFN_vkCmdBindPipeline g_vkSlCmdBindPipeline = nullptr;
+		static PFN_vkCmdBindDescriptorSets g_vkSlCmdBindDescriptorSets = nullptr;
+		using PFun_slGetPluginFunction = void* (const char* name);
+		using PFun_slHookVkBeginCommandBuffer = void(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* beginInfo);
+		using PFun_slHookVkCmdBindPipeline = void(VkCommandBuffer commandBuffer, VkPipelineBindPoint bindPoint, VkPipeline pipeline);
+		using PFun_slHookVkCmdBindDescriptorSets = void(VkCommandBuffer commandBuffer, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, uint32_t firstSet, uint32_t descriptorSetCount, const VkDescriptorSet* descriptorSets, uint32_t dynamicOffsetCount, const uint32_t* dynamicOffsets);
+		static HMODULE g_vkSlCommonModule = nullptr;
+		static PFun_slHookVkBeginCommandBuffer* g_vkSlCommonBeginCommandBuffer = nullptr;
+		static PFun_slHookVkCmdBindPipeline* g_vkSlCommonCmdBindPipeline = nullptr;
+		static PFun_slHookVkCmdBindDescriptorSets* g_vkSlCommonCmdBindDescriptorSets = nullptr;
 		static sl::FeatureRequirements g_vkSlDlssRequirements{};
 		static bool g_vkSlDlssRequirementsValid = false;
 
@@ -100,6 +111,12 @@ namespace rhi {
 			g_vkSlDeviceWaitIdle = nullptr;
 			g_vkSlCreateWin32SurfaceKHR = nullptr;
 			g_vkSlDestroySurfaceKHR = nullptr;
+			g_vkSlBeginCommandBuffer = nullptr;
+			g_vkSlCmdBindPipeline = nullptr;
+			g_vkSlCmdBindDescriptorSets = nullptr;
+			g_vkSlCommonBeginCommandBuffer = nullptr;
+			g_vkSlCommonCmdBindPipeline = nullptr;
+			g_vkSlCommonCmdBindDescriptorSets = nullptr;
 		}
 
 		static void VkShutdownStreamline() noexcept {
@@ -110,6 +127,10 @@ namespace rhi {
 			if (g_vkSlInterposerModule) {
 				FreeLibrary(g_vkSlInterposerModule);
 				g_vkSlInterposerModule = nullptr;
+			}
+			if (g_vkSlCommonModule) {
+				FreeLibrary(g_vkSlCommonModule);
+				g_vkSlCommonModule = nullptr;
 			}
 			g_vkSlShutdown = nullptr;
 			g_vkSlGetFeatureRequirements = nullptr;
@@ -125,6 +146,28 @@ namespace rhi {
 			std::wstring path(buffer);
 			const std::wstring::size_type pos = path.find_last_of(L"\\/");
 			return pos == std::wstring::npos ? std::wstring{} : path.substr(0, pos);
+		}
+
+		static void VkResolveStreamlineCommonHooks(const std::wstring& pluginPath) noexcept {
+			const std::wstring commonPath = pluginPath + L"\\sl.common.dll";
+			g_vkSlCommonModule = LoadLibraryW(commonPath.c_str());
+			if (!g_vkSlCommonModule) {
+				spdlog::warn("CreateVulkanDevice: unable to load sl.common.dll for direct Vulkan command hook fallback.");
+				return;
+			}
+
+			auto* getPluginFunction = reinterpret_cast<PFun_slGetPluginFunction*>(GetProcAddress(g_vkSlCommonModule, "slGetPluginFunction"));
+			if (!getPluginFunction) {
+				spdlog::warn("CreateVulkanDevice: sl.common.dll does not export slGetPluginFunction for direct Vulkan command hook fallback.");
+				return;
+			}
+
+			g_vkSlCommonBeginCommandBuffer = reinterpret_cast<PFun_slHookVkBeginCommandBuffer*>(getPluginFunction("slHookVkBeginCommandBuffer"));
+			g_vkSlCommonCmdBindPipeline = reinterpret_cast<PFun_slHookVkCmdBindPipeline*>(getPluginFunction("slHookVkCmdBindPipeline"));
+			g_vkSlCommonCmdBindDescriptorSets = reinterpret_cast<PFun_slHookVkCmdBindDescriptorSets*>(getPluginFunction("slHookVkCmdBindDescriptorSets"));
+			if (!g_vkSlCommonBeginCommandBuffer || !g_vkSlCommonCmdBindPipeline || !g_vkSlCommonCmdBindDescriptorSets) {
+				spdlog::warn("CreateVulkanDevice: sl.common.dll is missing one or more direct Vulkan command hook fallbacks.");
+			}
 		}
 
 		static bool VkInitStreamline() noexcept {
@@ -166,6 +209,7 @@ namespace rhi {
 			pref.numFeaturesToLoad = _countof(features);
 			pref.renderAPI = sl::RenderAPI::eVulkan;
 			pref.flags |= sl::PreferenceFlags::eUseManualHooking;
+			VkResolveStreamlineCommonHooks(pluginPath);
 
 			if (SL_FAILED(result, slInitFn(pref, sl::kSDKVersion))) {
 				spdlog::error("CreateVulkanDevice: slInit for Vulkan failed with result {}.", static_cast<int>(result));
@@ -207,6 +251,12 @@ namespace rhi {
 		static constexpr PFN_vkDeviceWaitIdle g_vkSlDeviceWaitIdle = nullptr;
 		static constexpr PFN_vkCreateWin32SurfaceKHR g_vkSlCreateWin32SurfaceKHR = nullptr;
 		static constexpr PFN_vkDestroySurfaceKHR g_vkSlDestroySurfaceKHR = nullptr;
+		static constexpr PFN_vkBeginCommandBuffer g_vkSlBeginCommandBuffer = nullptr;
+		static constexpr PFN_vkCmdBindPipeline g_vkSlCmdBindPipeline = nullptr;
+		static constexpr PFN_vkCmdBindDescriptorSets g_vkSlCmdBindDescriptorSets = nullptr;
+		static constexpr auto g_vkSlCommonBeginCommandBuffer = nullptr;
+		static constexpr auto g_vkSlCommonCmdBindPipeline = nullptr;
+		static constexpr auto g_vkSlCommonCmdBindDescriptorSets = nullptr;
 		static bool VkInitStreamline() noexcept { return false; }
 		static void VkShutdownStreamline() noexcept {}
 #endif
@@ -224,6 +274,9 @@ namespace rhi {
 		static bool VkResolveStreamlineInstanceProxies(VkInstance instance) noexcept {
 			g_vkSlGetDeviceProcAddr = VkGetStreamlineInstanceProc<PFN_vkGetDeviceProcAddr>(instance, "vkGetDeviceProcAddr");
 			g_vkSlDestroySurfaceKHR = VkGetStreamlineInstanceProc<PFN_vkDestroySurfaceKHR>(instance, "vkDestroySurfaceKHR");
+			g_vkSlBeginCommandBuffer = VkGetStreamlineInstanceProc<PFN_vkBeginCommandBuffer>(instance, "vkBeginCommandBuffer");
+			g_vkSlCmdBindPipeline = VkGetStreamlineInstanceProc<PFN_vkCmdBindPipeline>(instance, "vkCmdBindPipeline");
+			g_vkSlCmdBindDescriptorSets = VkGetStreamlineInstanceProc<PFN_vkCmdBindDescriptorSets>(instance, "vkCmdBindDescriptorSets");
 #ifdef _WIN32
 			g_vkSlCreateWin32SurfaceKHR = VkGetStreamlineInstanceProc<PFN_vkCreateWin32SurfaceKHR>(instance, "vkCreateWin32SurfaceKHR");
 			return g_vkSlGetDeviceProcAddr && g_vkSlCreateWin32SurfaceKHR && g_vkSlDestroySurfaceKHR;
@@ -280,6 +333,31 @@ namespace rhi {
 		static void VkDestroySurfaceKHRHooked(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks* allocator) noexcept {
 			const PFN_vkDestroySurfaceKHR fn = g_vkSlDestroySurfaceKHR ? g_vkSlDestroySurfaceKHR : vkDestroySurfaceKHR;
 			fn(instance, surface, allocator);
+		}
+
+		static VkResult VkBeginCommandBufferHooked(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* beginInfo) noexcept {
+			const PFN_vkBeginCommandBuffer fn = g_vkSlBeginCommandBuffer ? g_vkSlBeginCommandBuffer : vkBeginCommandBuffer;
+			const VkResult result = fn(commandBuffer, beginInfo);
+			if (result == VK_SUCCESS && g_vkSlCommonBeginCommandBuffer) {
+				g_vkSlCommonBeginCommandBuffer(commandBuffer, beginInfo);
+			}
+			return result;
+		}
+
+		static void VkCmdBindPipelineHooked(VkCommandBuffer commandBuffer, VkPipelineBindPoint bindPoint, VkPipeline pipeline) noexcept {
+			const PFN_vkCmdBindPipeline fn = g_vkSlCmdBindPipeline ? g_vkSlCmdBindPipeline : vkCmdBindPipeline;
+			fn(commandBuffer, bindPoint, pipeline);
+			if (g_vkSlCommonCmdBindPipeline) {
+				g_vkSlCommonCmdBindPipeline(commandBuffer, bindPoint, pipeline);
+			}
+		}
+
+		static void VkCmdBindDescriptorSetsHooked(VkCommandBuffer commandBuffer, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, uint32_t firstSet, uint32_t descriptorSetCount, const VkDescriptorSet* descriptorSets, uint32_t dynamicOffsetCount, const uint32_t* dynamicOffsets) noexcept {
+			const PFN_vkCmdBindDescriptorSets fn = g_vkSlCmdBindDescriptorSets ? g_vkSlCmdBindDescriptorSets : vkCmdBindDescriptorSets;
+			fn(commandBuffer, bindPoint, layout, firstSet, descriptorSetCount, descriptorSets, dynamicOffsetCount, dynamicOffsets);
+			if (g_vkSlCommonCmdBindDescriptorSets) {
+				g_vkSlCommonCmdBindDescriptorSets(commandBuffer, bindPoint, layout, firstSet, descriptorSetCount, descriptorSets, dynamicOffsetCount, dynamicOffsets);
+			}
 		}
 
 		static void VkMarkCommandListError(VulkanCommandList* commandListState, Result result) noexcept {
@@ -1598,7 +1676,7 @@ namespace rhi {
 		static Result VkBeginCommandRecording(VkCommandBuffer commandBuffer) noexcept {
 			VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
 			beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-			const VkResult result = vkBeginCommandBuffer(commandBuffer, &beginInfo);
+			const VkResult result = VkBeginCommandBufferHooked(commandBuffer, &beginInfo);
 			if (result != VK_SUCCESS) {
 				RHI_FAIL(ToRHI(result));
 			}
@@ -3745,7 +3823,7 @@ namespace rhi {
 				return;
 			}
 
-			vkCmdBindPipeline(commandListState->commandBuffer, pipelineState->bindPoint, pipelineState->pipeline);
+			VkCmdBindPipelineHooked(commandListState->commandBuffer, pipelineState->bindPoint, pipelineState->pipeline);
 			commandListState->boundPipeline = pipeline;
 		}
 
