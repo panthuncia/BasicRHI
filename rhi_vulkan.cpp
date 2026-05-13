@@ -3234,7 +3234,8 @@ namespace rhi {
 
 			VkViewport viewport{};
 			viewport.width = static_cast<float>(passInfo.width);
-			viewport.height = static_cast<float>(passInfo.height);
+			viewport.y = static_cast<float>(passInfo.height);
+			viewport.height = -static_cast<float>(passInfo.height);
 			viewport.minDepth = 0.0f;
 			viewport.maxDepth = 1.0f;
 			vkCmdSetViewport(commandListState->commandBuffer, 0, 1, &viewport);

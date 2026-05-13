@@ -71,7 +71,7 @@ namespace rhi {
 
 	static inline D3D12_BARRIER_LAYOUT ToDX(const ResourceLayout l) {
 		switch (l) {
-		case ResourceLayout::Undefined: return D3D12_BARRIER_LAYOUT_UNDEFINED;
+		case ResourceLayout::Undefined: return D3D12_BARRIER_LAYOUT_COMMON;
 		case ResourceLayout::Common: return D3D12_BARRIER_LAYOUT_COMMON;
 		case ResourceLayout::Present: return D3D12_BARRIER_LAYOUT_PRESENT;
 		case ResourceLayout::GenericRead: return D3D12_BARRIER_LAYOUT_GENERIC_READ;

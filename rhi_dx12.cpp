@@ -6578,14 +6578,15 @@ namespace rhi {
 				if (!T || !T->res) continue;
 
 				D3D12_TEXTURE_BARRIER tb{};
-				tb.SyncBefore = ToDX(t.beforeSync);
+				tb.SyncBefore = ToDX(t.discard ? ResourceSyncState::None : t.beforeSync);
 				tb.SyncAfter = ToDX(t.afterSync);
-				tb.AccessBefore = ToDX(t.beforeAccess);
+				tb.AccessBefore = ToDX(t.discard ? ResourceAccessType::None : t.beforeAccess);
 				tb.AccessAfter = ToDX(t.afterAccess);
 				tb.LayoutBefore = ToDX(t.beforeLayout);
 				tb.LayoutAfter = ToDX(t.afterLayout);
 				tb.pResource = T->res.Get();
 				tb.Subresources = ToDX(t.range);
+				tb.Flags = t.discard ? D3D12_TEXTURE_BARRIER_FLAG_DISCARD : D3D12_TEXTURE_BARRIER_FLAG_NONE;
 				tex.push_back(tb);
 			}
 
