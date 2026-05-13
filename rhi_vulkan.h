@@ -362,11 +362,13 @@ namespace rhi {
 		uint32_t instanceApiVersion = VK_API_VERSION_1_0;
 		bool swapchainExtensionEnabled = false;
 		bool bufferDeviceAddressEnabled = false;
+		bool bufferDeviceAddressCaptureReplayEnabled = false;
 		bool timelineSemaphoreEnabled = false;
 		bool descriptorIndexingEnabled = false;
 		bool runtimeDescriptorArrayEnabled = false;
 		bool scalarBlockLayoutEnabled = false;
 		bool descriptorHeapEnabled = false;
+		bool descriptorHeapCaptureReplayEnabled = false;
 		bool meshShaderEnabled = false;
 		bool taskShaderEnabled = false;
 		bool meshShaderPipelineStatsEnabled = false;

@@ -617,6 +617,10 @@ namespace rhi {
 			return (std::max)(16ull, static_cast<uint64_t>(impl->physicalDeviceProperties.limits.minUniformBufferOffsetAlignment));
 		}
 
+		static VkBufferCreateFlags VkBufferDeviceAddressCreateFlags(const VulkanDevice* impl) noexcept;
+		static VkMemoryAllocateFlags VkMemoryDeviceAddressAllocateFlags(const VulkanDevice* impl) noexcept;
+		static VkImageCreateFlags VkDescriptorHeapCaptureReplayImageFlags(const VulkanDevice* impl) noexcept;
+
 		static void VkDestroyEmulatedRootConstantScratchPage(VulkanDevice* impl, VulkanCommandList::EmulatedRootConstantScratchPage& page) noexcept {
 			if (!impl) {
 				page = {};
@@ -647,6 +651,7 @@ namespace rhi {
 			}
 
 			VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			createInfo.flags = VkBufferDeviceAddressCreateFlags(impl);
 			createInfo.size = capacity64;
 			createInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -674,7 +679,7 @@ namespace rhi {
 			allocateInfo.allocationSize = memoryRequirements.size;
 			allocateInfo.memoryTypeIndex = memoryTypeIndex;
 			VkMemoryAllocateFlagsInfo allocateFlagsInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
-			allocateFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+			allocateFlagsInfo.flags = VkMemoryDeviceAddressAllocateFlags(impl);
 			allocateInfo.pNext = &allocateFlagsInfo;
 
 			VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -787,6 +792,26 @@ namespace rhi {
 			default:
 				return 1;
 			}
+		}
+
+		static VkBufferCreateFlags VkBufferDeviceAddressCreateFlags(const VulkanDevice* impl) noexcept {
+			return impl && impl->bufferDeviceAddressCaptureReplayEnabled
+				? VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT
+				: 0;
+		}
+
+		static VkMemoryAllocateFlags VkMemoryDeviceAddressAllocateFlags(const VulkanDevice* impl) noexcept {
+			VkMemoryAllocateFlags flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+			if (impl && impl->bufferDeviceAddressCaptureReplayEnabled) {
+				flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+			}
+			return flags;
+		}
+
+		static VkImageCreateFlags VkDescriptorHeapCaptureReplayImageFlags(const VulkanDevice* impl) noexcept {
+			return impl && impl->descriptorHeapCaptureReplayEnabled
+				? VK_IMAGE_CREATE_DESCRIPTOR_HEAP_CAPTURE_REPLAY_BIT_EXT
+				: 0;
 		}
 
 		static void* VkDescriptorHeapSlotAddress(VulkanDescriptorHeap* heap, uint32_t index) noexcept {
@@ -1172,11 +1197,23 @@ namespace rhi {
 				return false;
 			}
 
+			const Format format = FromVkFormat(texture.format);
+			const BlockInfo blockInfo = GetBlockInfo(format);
+			if (blockInfo.bytesPerBlock == 0) {
+				return false;
+			}
+
+			uint32_t bufferRowLength = 0;
+			if (footprint.footprint.rowPitch != 0) {
+				const uint32_t blocksPerRow = footprint.footprint.rowPitch / blockInfo.bytesPerBlock;
+				bufferRowLength = blockInfo.isCompressed
+					? blocksPerRow * blockInfo.blockWidth
+					: blocksPerRow;
+			}
+
 			out = {};
 			out.bufferOffset = footprint.footprint.offset;
-			out.bufferRowLength = footprint.footprint.rowPitch && FormatByteSize(FromVkFormat(texture.format))
-				? footprint.footprint.rowPitch / FormatByteSize(FromVkFormat(texture.format))
-				: 0;
+			out.bufferRowLength = bufferRowLength;
 			out.bufferImageHeight = 0;
 			out.imageSubresource.aspectMask = VkAspectMaskForFormat(texture.format);
 			out.imageSubresource.mipLevel = footprint.mip;
@@ -1964,6 +2001,7 @@ namespace rhi {
 			usage2.usage = VK_BUFFER_USAGE_2_PREPROCESS_BUFFER_BIT_EXT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT;
 			VkBufferCreateInfo bufferInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
 			bufferInfo.pNext = &usage2;
+			bufferInfo.flags = VkBufferDeviceAddressCreateFlags(impl);
 			bufferInfo.size = requirements.memoryRequirements.size;
 			bufferInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 			bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -1983,7 +2021,7 @@ namespace rhi {
 			}
 
 			VkMemoryAllocateFlagsInfo allocateFlags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
-			allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+			allocateFlags.flags = VkMemoryDeviceAddressAllocateFlags(impl);
 			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
 			allocateInfo.pNext = &allocateFlags;
 			allocateInfo.allocationSize = bufferRequirements.size;
@@ -5150,6 +5188,7 @@ namespace rhi {
 				const uint64_t totalBytes = heap.descriptorBytes + heap.reservedRangeSize;
 
 				VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+				createInfo.flags = VkBufferDeviceAddressCreateFlags(impl);
 				createInfo.size = totalBytes;
 				createInfo.usage = VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 				createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -5176,7 +5215,7 @@ namespace rhi {
 				}
 
 				VkMemoryAllocateFlagsInfo allocateFlagsInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
-				allocateFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+				allocateFlagsInfo.flags = VkMemoryDeviceAddressAllocateFlags(impl);
 
 				VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
 				allocateInfo.pNext = &allocateFlagsInfo;
@@ -5669,6 +5708,7 @@ namespace rhi {
 			}
 
 			VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			createInfo.flags = VkBufferDeviceAddressCreateFlags(impl);
 			createInfo.size = desc.buffer.sizeBytes;
 			createInfo.usage = VkBufferUsageForDesc(desc);
 			if (impl->bufferDeviceAddressEnabled) {
@@ -5700,7 +5740,7 @@ namespace rhi {
 			allocateInfo.memoryTypeIndex = memoryTypeIndex;
 			VkMemoryAllocateFlagsInfo allocateFlagsInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
 			if (impl->bufferDeviceAddressEnabled) {
-				allocateFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+				allocateFlagsInfo.flags = VkMemoryDeviceAddressAllocateFlags(impl);
 				allocateInfo.pNext = &allocateFlagsInfo;
 			}
 
@@ -5775,7 +5815,7 @@ namespace rhi {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
 			}
-			VkImageCreateFlags imageCreateFlags = 0;
+			VkImageCreateFlags imageCreateFlags = VkDescriptorHeapCaptureReplayImageFlags(impl);
 			if (!VkImageCreateFlagsForDesc(desc, imageCreateFlags)) {
 				out.Reset();
 				RHI_FAIL(Result::InvalidArgument);
@@ -5946,7 +5986,7 @@ namespace rhi {
 			allocateInfo.memoryTypeIndex = memoryTypeIndex;
 			VkMemoryAllocateFlagsInfo allocateFlagsInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
 			if (impl->bufferDeviceAddressEnabled) {
-				allocateFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+				allocateFlagsInfo.flags = VkMemoryDeviceAddressAllocateFlags(impl);
 				allocateInfo.pNext = &allocateFlagsInfo;
 			}
 			VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -6060,7 +6100,7 @@ namespace rhi {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
 			}
-			VkImageCreateFlags imageCreateFlags = 0;
+			VkImageCreateFlags imageCreateFlags = VkDescriptorHeapCaptureReplayImageFlags(impl);
 			if (!VkImageCreateFlagsForDesc(desc, imageCreateFlags)) {
 				out.Reset();
 				RHI_FAIL(Result::InvalidArgument);
@@ -6135,6 +6175,7 @@ namespace rhi {
 			}
 
 			VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			createInfo.flags = VkBufferDeviceAddressCreateFlags(impl);
 			createInfo.size = desc.buffer.sizeBytes;
 			createInfo.usage = VkBufferUsageForDesc(desc);
 			if (impl->bufferDeviceAddressEnabled) {
@@ -6302,8 +6343,9 @@ namespace rhi {
 				return {};
 			}
 
-			const uint32_t bytesPerPixel = FormatByteSize(FromVkFormat(texture->format));
-			if (bytesPerPixel == 0) {
+			const Format format = FromVkFormat(texture->format);
+			const BlockInfo blockInfo = GetBlockInfo(format);
+			if (blockInfo.bytesPerBlock == 0) {
 				return {};
 			}
 
@@ -6315,10 +6357,16 @@ namespace rhi {
 					const uint32_t width = VkMipDim(texture->width, actualMip);
 					const uint32_t height = VkMipDim(texture->height, actualMip);
 					const uint32_t depth = texture->type == ResourceType::Texture3D ? VkMipDim(texture->depthOrLayers, actualMip) : 1u;
-					const uint32_t rowPitch = static_cast<uint32_t>(VkAlignUp(static_cast<uint64_t>(width) * bytesPerPixel, 256));
+					const uint32_t blocksWide = (width + blockInfo.blockWidth - 1u) / blockInfo.blockWidth;
+					const uint32_t rows = (height + blockInfo.blockHeight - 1u) / blockInfo.blockHeight;
+					const uint32_t rowSize = blockInfo.isCompressed
+						? blocksWide * blockInfo.bytesPerBlock
+						: width * blockInfo.bytesPerBlock;
+					uint32_t rowPitch = static_cast<uint32_t>(VkAlignUp(static_cast<uint64_t>(rowSize), 256));
+					rowPitch = static_cast<uint32_t>(VkAlignUp(static_cast<uint64_t>(rowPitch), blockInfo.bytesPerBlock));
 					offset = VkAlignUp(offset, 512);
 					out[written++] = { offset, rowPitch, width, height, depth };
-					offset += static_cast<uint64_t>(rowPitch) * height * depth;
+					offset += static_cast<uint64_t>(rowPitch) * rows * depth;
 				}
 			}
 
@@ -6337,6 +6385,7 @@ namespace rhi {
 				VkMemoryRequirements requirements{};
 				if (desc.type == ResourceType::Buffer) {
 					VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+					createInfo.flags = VkBufferDeviceAddressCreateFlags(impl);
 					createInfo.size = desc.buffer.sizeBytes;
 					createInfo.usage = VkBufferUsageForDesc(desc);
 					createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -6355,7 +6404,7 @@ namespace rhi {
 					if (format == VK_FORMAT_UNDEFINED || imageType == VK_IMAGE_TYPE_MAX_ENUM || samples == VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM) {
 						RHI_FAIL(Result::Unsupported);
 					}
-					VkImageCreateFlags imageCreateFlags = 0;
+					VkImageCreateFlags imageCreateFlags = VkDescriptorHeapCaptureReplayImageFlags(impl);
 					if (!VkImageCreateFlagsForDesc(desc, imageCreateFlags)) {
 						RHI_FAIL(Result::InvalidArgument);
 					}
@@ -7061,6 +7110,11 @@ namespace rhi {
 			enabledVulkan12Features.runtimeDescriptorArray == VK_TRUE &&
 			enabledVulkan12Features.scalarBlockLayout == VK_TRUE) {
 			enabledDescriptorHeapFeatures.descriptorHeap = VK_TRUE;
+				if (supportedDescriptorHeapFeatures.descriptorHeapCaptureReplay == VK_TRUE &&
+					supportedVulkan12Features.bufferDeviceAddressCaptureReplay == VK_TRUE) {
+					enabledVulkan12Features.bufferDeviceAddressCaptureReplay = VK_TRUE;
+					enabledDescriptorHeapFeatures.descriptorHeapCaptureReplay = VK_TRUE;
+				}
 		}
 		if (hasMeshShaderExtension && supportedMeshShaderFeatures.meshShader == VK_TRUE) {
 			enabledMeshShaderFeatures.meshShader = VK_TRUE;
@@ -7120,11 +7174,13 @@ namespace rhi {
 		impl->meshShaderProperties = meshShaderProperties;
 		impl->computeShaderDerivativesProperties = computeShaderDerivativesProperties;
 		impl->bufferDeviceAddressEnabled = enabledVulkan12Features.bufferDeviceAddress == VK_TRUE;
+		impl->bufferDeviceAddressCaptureReplayEnabled = enabledVulkan12Features.bufferDeviceAddressCaptureReplay == VK_TRUE;
 		impl->timelineSemaphoreEnabled = enabledVulkan12Features.timelineSemaphore == VK_TRUE;
 		impl->descriptorIndexingEnabled = enabledVulkan12Features.descriptorIndexing == VK_TRUE;
 		impl->runtimeDescriptorArrayEnabled = enabledVulkan12Features.runtimeDescriptorArray == VK_TRUE;
 		impl->scalarBlockLayoutEnabled = enabledVulkan12Features.scalarBlockLayout == VK_TRUE;
 		impl->descriptorHeapEnabled = enabledDescriptorHeapFeatures.descriptorHeap == VK_TRUE;
+		impl->descriptorHeapCaptureReplayEnabled = enabledDescriptorHeapFeatures.descriptorHeapCaptureReplay == VK_TRUE;
 		impl->meshShaderEnabled = enabledMeshShaderFeatures.meshShader == VK_TRUE;
 		impl->taskShaderEnabled = enabledMeshShaderFeatures.taskShader == VK_TRUE;
 		impl->meshShaderPipelineStatsEnabled = enabledMeshShaderFeatures.meshShaderQueries == VK_TRUE;
@@ -7154,7 +7210,7 @@ namespace rhi {
 		impl->self = Device{ impl.get(), &g_vkdevvt };
 
 		spdlog::info(
-			"CreateVulkanDevice: selected device '{}' api {}.{}.{} queueFamilies[gfx={}, compute={}, copy={}] dynamicRendering={} bufferDeviceAddress={} descriptorIndexing={} runtimeDescriptorArray={} descriptorHeap={} meshShader={} taskShader={} deviceGeneratedCommands={} dynamicGeneratedPipelineLayout={} computeDerivativeGroupQuads={} computeDerivativeGroupLinear={} validateBarrierTransitions={}",
+			"CreateVulkanDevice: selected device '{}' api {}.{}.{} queueFamilies[gfx={}, compute={}, copy={}] dynamicRendering={} bufferDeviceAddress={} bufferDeviceAddressCaptureReplay={} descriptorIndexing={} runtimeDescriptorArray={} descriptorHeap={} descriptorHeapCaptureReplay={} meshShader={} taskShader={} deviceGeneratedCommands={} dynamicGeneratedPipelineLayout={} computeDerivativeGroupQuads={} computeDerivativeGroupLinear={} validateBarrierTransitions={}",
 			impl->physicalDeviceProperties.deviceName,
 			VK_API_VERSION_MAJOR(impl->physicalDeviceProperties.apiVersion),
 			VK_API_VERSION_MINOR(impl->physicalDeviceProperties.apiVersion),
@@ -7164,9 +7220,11 @@ namespace rhi {
 			impl->queues[2].familyIndex,
 			impl->dynamicRenderingEnabled,
 			impl->bufferDeviceAddressEnabled,
+			impl->bufferDeviceAddressCaptureReplayEnabled,
 			impl->descriptorIndexingEnabled,
 			impl->runtimeDescriptorArrayEnabled,
 			impl->descriptorHeapEnabled,
+			impl->descriptorHeapCaptureReplayEnabled,
 			impl->meshShaderEnabled,
 			impl->taskShaderEnabled,
 			impl->deviceGeneratedCommandsEnabled,
@@ -7174,6 +7232,20 @@ namespace rhi {
 			impl->computeDerivativeGroupQuadsEnabled,
 			impl->computeDerivativeGroupLinearEnabled,
 			impl->validateBarrierTransitions);
+		if (impl->descriptorHeapEnabled) {
+			spdlog::info(
+				"CreateVulkanDevice: descriptorHeap sizes sampler={} image={} buffer={} alignments sampler={} image={} buffer={} reserved sampler={} samplerEmbedded={} resource={} imageCaptureReplayOpaqueDataSize={}",
+				static_cast<uint64_t>(impl->descriptorHeapProperties.samplerDescriptorSize),
+				static_cast<uint64_t>(impl->descriptorHeapProperties.imageDescriptorSize),
+				static_cast<uint64_t>(impl->descriptorHeapProperties.bufferDescriptorSize),
+				static_cast<uint64_t>(impl->descriptorHeapProperties.samplerDescriptorAlignment),
+				static_cast<uint64_t>(impl->descriptorHeapProperties.imageDescriptorAlignment),
+				static_cast<uint64_t>(impl->descriptorHeapProperties.bufferDescriptorAlignment),
+				static_cast<uint64_t>(impl->descriptorHeapProperties.minSamplerHeapReservedRange),
+				static_cast<uint64_t>(impl->descriptorHeapProperties.minSamplerHeapReservedRangeWithEmbedded),
+				static_cast<uint64_t>(impl->descriptorHeapProperties.minResourceHeapReservedRange),
+				static_cast<uint64_t>(impl->descriptorHeapProperties.imageCaptureReplayOpaqueDataSize));
+		}
 
 		outPtr = MakeDevicePtr(&impl->self, impl);
 		return Result::Ok;
