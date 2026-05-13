@@ -946,6 +946,7 @@ namespace rhi {
             if (v & static_cast<U>(ResourceAccessType::RenderTarget))                        add("RENDER_TARGET");
             if (v & static_cast<U>(ResourceAccessType::RenderTargetClear))                   add("RENDER_TARGET_CLEAR");
             if (v & static_cast<U>(ResourceAccessType::UnorderedAccess))                     add("UNORDERED_ACCESS");
+            if (v & static_cast<U>(ResourceAccessType::UnorderedAccessClear))                add("UNORDERED_ACCESS_CLEAR");
             if (v & static_cast<U>(ResourceAccessType::DepthReadWrite))                      add("DEPTH_STENCIL_WRITE");
             if (v & static_cast<U>(ResourceAccessType::DepthStencilClear))                   add("DEPTH_STENCIL_CLEAR");
             if (v & static_cast<U>(ResourceAccessType::DepthRead))                           add("DEPTH_STENCIL_READ");

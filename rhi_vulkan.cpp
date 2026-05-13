@@ -899,6 +899,7 @@ namespace rhi {
 			if ((bits & ResourceAccessType::RenderTarget) != 0) flags |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 			if ((bits & ResourceAccessType::RenderTargetClear) != 0) flags |= VK_ACCESS_TRANSFER_WRITE_BIT;
 			if ((bits & ResourceAccessType::UnorderedAccess) != 0) flags |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+			if ((bits & ResourceAccessType::UnorderedAccessClear) != 0) flags |= VK_ACCESS_TRANSFER_WRITE_BIT;
 			if ((bits & ResourceAccessType::DepthReadWrite) != 0) flags |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 			if ((bits & ResourceAccessType::DepthStencilClear) != 0) flags |= VK_ACCESS_TRANSFER_WRITE_BIT;
 			if ((bits & ResourceAccessType::DepthRead) != 0) flags |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
@@ -909,6 +910,19 @@ namespace rhi {
 			if ((bits & ResourceAccessType::RaytracingAccelerationStructureRead) != 0) flags |= VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
 			if ((bits & ResourceAccessType::RaytracingAccelerationStructureWrite) != 0) flags |= VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
 			return flags;
+		}
+
+		static VkAttachmentStoreOp VkStoreOpForAttachment(StoreOp storeOp, bool readOnly = false) noexcept {
+			if (readOnly) {
+#if defined(VK_VERSION_1_3)
+				return VK_ATTACHMENT_STORE_OP_NONE;
+#elif defined(VK_KHR_dynamic_rendering)
+				return VK_ATTACHMENT_STORE_OP_NONE_KHR;
+#else
+				return VK_ATTACHMENT_STORE_OP_DONT_CARE;
+#endif
+			}
+			return storeOp == StoreOp::DontCare ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
 		}
 
 		static VkIndexType VkIndexTypeForFormat(Format format) noexcept {
@@ -2256,6 +2270,41 @@ namespace rhi {
 			swapchain.images.clear();
 		}
 
+		static void VkReleaseSwapchainPresentSemaphores(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			if (!impl || impl->device == VK_NULL_HANDLE) {
+				swapchain.presentWaitSemaphores.clear();
+				return;
+			}
+
+			for (VkSemaphore semaphore : swapchain.presentWaitSemaphores) {
+				if (semaphore != VK_NULL_HANDLE) {
+					vkDestroySemaphore(impl->device, semaphore, nullptr);
+				}
+			}
+			swapchain.presentWaitSemaphores.clear();
+		}
+
+		static Result VkCreateSwapchainPresentSemaphores(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			if (!impl || impl->device == VK_NULL_HANDLE || swapchain.imageCount == 0) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			swapchain.presentWaitSemaphores.assign(swapchain.imageCount, VK_NULL_HANDLE);
+			VkSemaphoreCreateInfo semaphoreInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+			for (uint32_t imageIndex = 0; imageIndex < swapchain.imageCount; ++imageIndex) {
+				VkSemaphore semaphore = VK_NULL_HANDLE;
+				const VkResult result = vkCreateSemaphore(impl->device, &semaphoreInfo, nullptr, &semaphore);
+				if (result != VK_SUCCESS) {
+					VkReleaseSwapchainPresentSemaphores(impl, swapchain);
+					return ToRHI(result);
+				}
+				swapchain.presentWaitSemaphores[imageIndex] = semaphore;
+				VkSetObjectName(impl, reinterpret_cast<uint64_t>(semaphore), VK_OBJECT_TYPE_SEMAPHORE, std::format("Swapchain Present Wait Semaphore {}", imageIndex).c_str());
+			}
+
+			return Result::Ok;
+		}
+
 		static Result VkAcquireNextSwapchainImage(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
 			if (!impl || impl->device == VK_NULL_HANDLE || swapchain.swapchain == VK_NULL_HANDLE || swapchain.acquireFence == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
@@ -2426,6 +2475,7 @@ namespace rhi {
 
 			std::vector<ResourceHandle> oldImageHandles = std::move(swapchain.imageHandles);
 			std::vector<VkImage> oldImages = std::move(swapchain.images);
+			std::vector<VkSemaphore> oldPresentWaitSemaphores = std::move(swapchain.presentWaitSemaphores);
 			VkSwapchainKHR oldSwapchain = swapchain.swapchain;
 
 			VkSwapchainCreateInfoKHR createInfo{ VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
@@ -2448,6 +2498,7 @@ namespace rhi {
 			if (result != VK_SUCCESS) {
 				swapchain.imageHandles = std::move(oldImageHandles);
 				swapchain.images = std::move(oldImages);
+				swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
 				swapchain.swapchain = oldSwapchain;
 				return ToRHI(result);
 			}
@@ -2467,6 +2518,7 @@ namespace rhi {
 					swapchain.swapchain = oldSwapchain;
 					swapchain.imageHandles = std::move(oldImageHandles);
 					swapchain.images = std::move(oldImages);
+					swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
 					return ToRHI(result);
 				}
 			}
@@ -2474,11 +2526,25 @@ namespace rhi {
 			const Result populateResult = VkPopulateSwapchainImages(impl, swapchain);
 			if (populateResult != Result::Ok) {
 				VkReleaseSwapchainImageHandles(impl, swapchain);
+				VkReleaseSwapchainPresentSemaphores(impl, swapchain);
 				vkDestroySwapchainKHR(impl->device, newSwapchain, nullptr);
 				swapchain.swapchain = oldSwapchain;
 				swapchain.imageHandles = std::move(oldImageHandles);
 				swapchain.images = std::move(oldImages);
+				swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
 				return populateResult;
+			}
+
+			const Result semaphoreResult = VkCreateSwapchainPresentSemaphores(impl, swapchain);
+			if (semaphoreResult != Result::Ok) {
+				VkReleaseSwapchainImageHandles(impl, swapchain);
+				VkReleaseSwapchainPresentSemaphores(impl, swapchain);
+				vkDestroySwapchainKHR(impl->device, newSwapchain, nullptr);
+				swapchain.swapchain = oldSwapchain;
+				swapchain.imageHandles = std::move(oldImageHandles);
+				swapchain.images = std::move(oldImages);
+				swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
+				return semaphoreResult;
 			}
 
 			for (const ResourceHandle handle : oldImageHandles) {
@@ -2486,6 +2552,11 @@ namespace rhi {
 					VkDestroyResource(impl, *resource);
 				}
 				impl->resources.free(handle);
+			}
+			for (VkSemaphore semaphore : oldPresentWaitSemaphores) {
+				if (semaphore != VK_NULL_HANDLE) {
+					vkDestroySemaphore(impl->device, semaphore, nullptr);
+				}
 			}
 
 			if (oldSwapchain != VK_NULL_HANDLE) {
@@ -2885,6 +2956,8 @@ namespace rhi {
 				for (uint32_t index = 0; index < lists.size; ++index) {
 					if (VulkanCommandList* commandListState = VkCommandListState(impl, lists.data[index].GetHandle())) {
 						commandListState->recordedBarrierBatches.clear();
+						commandListState->recordingTextureStates.clear();
+						commandListState->recordingBufferStates.clear();
 					}
 				}
 			}
@@ -3057,6 +3130,8 @@ namespace rhi {
 			commandListState->boundSamplerHeap = {};
 			commandListState->pendingError = Result::Ok;
 			commandListState->recordedBarrierBatches.clear();
+			commandListState->recordingTextureStates.clear();
+			commandListState->recordingBufferStates.clear();
 			for (auto& page : commandListState->emulatedRootConstantScratchPages) {
 				page.cursor = 0;
 			}
@@ -3092,7 +3167,7 @@ namespace rhi {
 				VkRenderingAttachmentInfo attachmentInfo{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
 				attachmentInfo.imageView = viewSlot->view;
 				attachmentInfo.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-				attachmentInfo.storeOp = color.storeOp == StoreOp::DontCare ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+				attachmentInfo.storeOp = VkStoreOpForAttachment(color.storeOp);
 				switch (color.loadOp) {
 				case LoadOp::Clear:
 					attachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -3130,7 +3205,7 @@ namespace rhi {
 				depthAttachment.imageView = viewSlot->view;
 				depthAttachment.imageLayout = passInfo.depth->readOnly ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 				depthAttachment.loadOp = passInfo.depth->depthLoad == LoadOp::Clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : (passInfo.depth->depthLoad == LoadOp::DontCare ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD);
-				depthAttachment.storeOp = passInfo.depth->depthStore == StoreOp::DontCare ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+				depthAttachment.storeOp = VkStoreOpForAttachment(passInfo.depth->depthStore, passInfo.depth->readOnly);
 				depthAttachment.clearValue.depthStencil.depth = passInfo.depth->clear.depthStencil.depth;
 				depthAttachment.clearValue.depthStencil.stencil = passInfo.depth->clear.depthStencil.stencil;
 				depthAttachmentPtr = (viewSlot->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 ? &depthAttachment : nullptr;
@@ -3138,7 +3213,7 @@ namespace rhi {
 				if ((viewSlot->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) {
 					stencilAttachment = depthAttachment;
 					stencilAttachment.loadOp = passInfo.depth->stencilLoad == LoadOp::Clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : (passInfo.depth->stencilLoad == LoadOp::DontCare ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD);
-					stencilAttachment.storeOp = passInfo.depth->stencilStore == StoreOp::DontCare ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+					stencilAttachment.storeOp = VkStoreOpForAttachment(passInfo.depth->stencilStore, passInfo.depth->readOnly);
 					stencilAttachmentPtr = &stencilAttachment;
 				}
 
@@ -3200,12 +3275,14 @@ namespace rhi {
 			std::vector<VkBufferMemoryBarrier> bufferBarriers;
 			std::vector<VkMemoryBarrier> memoryBarriers;
 			struct TextureStateUpdate {
+				ResourceHandle handle{};
 				VulkanResource* resource = nullptr;
 				ResourceAccessType access = ResourceAccessType::Common;
 				ResourceLayout layout = ResourceLayout::Common;
 				ResourceSyncState sync = ResourceSyncState::All;
 			};
 			struct BufferStateUpdate {
+				ResourceHandle handle{};
 				VulkanResource* resource = nullptr;
 				ResourceAccessType access = ResourceAccessType::Common;
 				ResourceSyncState sync = ResourceSyncState::All;
@@ -3220,13 +3297,44 @@ namespace rhi {
 			VkPipelineStageFlags srcStages = 0;
 			VkPipelineStageFlags dstStages = 0;
 
+			auto getRecordingTextureState = [&](ResourceHandle texture, const VulkanResource& resource) -> VulkanCommandList::RecordingTextureState {
+				for (const auto& state : commandListState->recordingTextureStates) {
+					if (state.texture.index == texture.index && state.texture.generation == texture.generation) {
+						return state;
+					}
+				}
+				return VulkanCommandList::RecordingTextureState{ texture, resource.submittedAccess, resource.submittedLayout, resource.submittedSync };
+			};
+			auto upsertRecordingTextureState = [&](ResourceHandle texture, ResourceAccessType access, ResourceLayout layout, ResourceSyncState sync) {
+				for (auto& state : commandListState->recordingTextureStates) {
+					if (state.texture.index == texture.index && state.texture.generation == texture.generation) {
+						state.access = access;
+						state.layout = layout;
+						state.sync = sync;
+						return;
+					}
+				}
+				commandListState->recordingTextureStates.push_back(VulkanCommandList::RecordingTextureState{ texture, access, layout, sync });
+			};
+			auto upsertRecordingBufferState = [&](ResourceHandle buffer, ResourceAccessType access, ResourceSyncState sync) {
+				for (auto& state : commandListState->recordingBufferStates) {
+					if (state.buffer.index == buffer.index && state.buffer.generation == buffer.generation) {
+						state.access = access;
+						state.sync = sync;
+						return;
+					}
+				}
+				commandListState->recordingBufferStates.push_back(VulkanCommandList::RecordingBufferState{ buffer, access, sync });
+			};
+
 			for (const TextureBarrier& barrier : barriers.textures) {
 				VulkanResource* resource = VkResourceState(impl, barrier.texture);
 				if (!resource || resource->image == VK_NULL_HANDLE) {
 					continue;
 				}
 				const VkImageAspectFlags aspect = VkAspectMaskForFormat(resource->format);
-				const bool firstUseFromUndefined = !barrier.discard && resource->submittedLayout == ResourceLayout::Undefined;
+				const auto recordingState = getRecordingTextureState(barrier.texture, *resource);
+				const bool firstUseFromUndefined = !barrier.discard && recordingState.layout == ResourceLayout::Undefined && barrier.beforeLayout == ResourceLayout::Undefined;
 				VkImageMemoryBarrier vkBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
 				const bool beforePresent = barrier.beforeLayout == ResourceLayout::Present;
 				const bool afterPresent = barrier.afterLayout == ResourceLayout::Present;
@@ -3239,8 +3347,8 @@ namespace rhi {
 				vkBarrier.image = resource->image;
 				vkBarrier.subresourceRange = VkMakeImageSubresourceRange(*resource, barrier.range, aspect);
 				imageBarriers.push_back(vkBarrier);
-				const bool beforeTransferClear = (barrier.beforeAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear)) != 0;
-				const bool afterTransferClear = (barrier.afterAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear)) != 0;
+				const bool beforeTransferClear = (barrier.beforeAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
+				const bool afterTransferClear = (barrier.afterAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
 				srcStages |= (barrier.discard || firstUseFromUndefined || beforePresent) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.beforeSync));
 				dstStages |= afterPresent ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : (afterTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VkStageMaskForSync(barrier.afterSync));
 				if (impl->validateBarrierTransitions) {
@@ -3254,7 +3362,7 @@ namespace rhi {
 						barrier.afterSync,
 						barrier.discard });
 				}
-				textureUpdates.push_back(TextureStateUpdate{ resource, barrier.afterAccess, barrier.afterLayout, barrier.afterSync });
+				textureUpdates.push_back(TextureStateUpdate{ barrier.texture, resource, barrier.afterAccess, barrier.afterLayout, barrier.afterSync });
 			}
 
 			for (const BufferBarrier& barrier : barriers.buffers) {
@@ -3282,7 +3390,7 @@ namespace rhi {
 						barrier.afterSync,
 						barrier.discard });
 				}
-				bufferUpdates.push_back(BufferStateUpdate{ resource, barrier.afterAccess, barrier.afterSync });
+				bufferUpdates.push_back(BufferStateUpdate{ barrier.buffer, resource, barrier.afterAccess, barrier.afterSync });
 			}
 
 			for (const GlobalBarrier& barrier : barriers.globals) {
@@ -3305,13 +3413,10 @@ namespace rhi {
 			}
 
 			for (const TextureStateUpdate& update : textureUpdates) {
-				update.resource->currentAccess = update.access;
-				update.resource->currentLayout = update.layout;
-				update.resource->currentSync = update.sync;
+				upsertRecordingTextureState(update.handle, update.access, update.layout, update.sync);
 			}
 			for (const BufferStateUpdate& update : bufferUpdates) {
-				update.resource->currentAccess = update.access;
-				update.resource->currentSync = update.sync;
+				upsertRecordingBufferState(update.handle, update.access, update.sync);
 			}
 			if (impl->validateBarrierTransitions && (!recordedBatch.textures.empty() || !recordedBatch.buffers.empty())) {
 				commandListState->recordedBarrierBatches.push_back(std::move(recordedBatch));
@@ -3939,15 +4044,59 @@ namespace rhi {
 			return {};
 		}
 
-		static Result sc_present(Swapchain* swapchain, bool vsync) noexcept {
+		static Result sc_present(Swapchain* swapchain, bool vsync, const PresentSyncDesc* sync) noexcept {
 			VkIgnoreUnused(vsync);
 			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
 			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
 			if (!impl || !swapchainState || swapchainState->swapchain == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
+			if (swapchainState->currentImageIndex >= swapchainState->presentWaitSemaphores.size()) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			VkSemaphore presentWaitSemaphore = swapchainState->presentWaitSemaphores[swapchainState->currentImageIndex];
+			if (presentWaitSemaphore == VK_NULL_HANDLE) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			VulkanQueueState* signalQueueState = nullptr;
+			VulkanTimeline* waitTimeline = nullptr;
+			if (sync && sync->queue && sync->wait.value != 0) {
+				signalQueueState = VkQueueStateForHandle(impl, sync->queue.GetQueueHandle());
+				waitTimeline = VkTimelineState(impl, sync->wait.t);
+				if (!signalQueueState || signalQueueState->queue == VK_NULL_HANDLE || !waitTimeline || waitTimeline->semaphore == VK_NULL_HANDLE) {
+					RHI_FAIL(Result::InvalidArgument);
+				}
+			} else {
+				signalQueueState = &impl->queues[0];
+			}
+
+			VkTimelineSemaphoreSubmitInfo timelineInfo{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+			VkSemaphore waitSemaphore = VK_NULL_HANDLE;
+			uint64_t waitValue = 0;
+			VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+			VkSubmitInfo signalPresentInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+			if (waitTimeline) {
+				waitSemaphore = waitTimeline->semaphore;
+				waitValue = sync->wait.value;
+				timelineInfo.waitSemaphoreValueCount = 1;
+				timelineInfo.pWaitSemaphoreValues = &waitValue;
+				signalPresentInfo.pNext = &timelineInfo;
+				signalPresentInfo.waitSemaphoreCount = 1;
+				signalPresentInfo.pWaitSemaphores = &waitSemaphore;
+				signalPresentInfo.pWaitDstStageMask = &waitStage;
+			}
+			signalPresentInfo.signalSemaphoreCount = 1;
+			signalPresentInfo.pSignalSemaphores = &presentWaitSemaphore;
+			VkResult signalResult = vkQueueSubmit(signalQueueState->queue, 1, &signalPresentInfo, VK_NULL_HANDLE);
+			if (signalResult != VK_SUCCESS) {
+				return ToRHI(signalResult);
+			}
 
 			VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+			presentInfo.waitSemaphoreCount = 1;
+			presentInfo.pWaitSemaphores = &presentWaitSemaphore;
 			presentInfo.swapchainCount = 1;
 			presentInfo.pSwapchains = &swapchainState->swapchain;
 			presentInfo.pImageIndices = &swapchainState->currentImageIndex;
@@ -4500,6 +4649,7 @@ namespace rhi {
 
 			const Result createResult = VkCreateOrResizeSwapchain(impl, swapchainState, width, height, format, bufferCount, allowTearing);
 			if (createResult != Result::Ok) {
+				VkReleaseSwapchainPresentSemaphores(impl, swapchainState);
 				if (swapchainState.acquireFence != VK_NULL_HANDLE) {
 					vkDestroyFence(impl->device, swapchainState.acquireFence, nullptr);
 				}
@@ -4533,6 +4683,7 @@ namespace rhi {
 			if (impl->device != VK_NULL_HANDLE) {
 				vkDeviceWaitIdle(impl->device);
 				VkReleaseSwapchainImageHandles(impl, *swapchainState);
+				VkReleaseSwapchainPresentSemaphores(impl, *swapchainState);
 				if (swapchainState->acquireFence != VK_NULL_HANDLE) {
 					vkDestroyFence(impl->device, swapchainState->acquireFence, nullptr);
 					swapchainState->acquireFence = VK_NULL_HANDLE;
@@ -6397,6 +6548,7 @@ namespace rhi {
 			}
 
 			VkReleaseSwapchainImageHandles(this, slot.obj);
+			VkReleaseSwapchainPresentSemaphores(this, slot.obj);
 			if (device != VK_NULL_HANDLE && slot.obj.acquireFence != VK_NULL_HANDLE) {
 				vkDestroyFence(device, slot.obj.acquireFence, nullptr);
 			}

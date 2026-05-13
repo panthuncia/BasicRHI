@@ -54,6 +54,9 @@ namespace rhi {
 		if (state & ResourceAccessType::UnorderedAccess) {
 			access |= D3D12_BARRIER_ACCESS_UNORDERED_ACCESS;
 		}
+		if (state & ResourceAccessType::UnorderedAccessClear) {
+			access |= D3D12_BARRIER_ACCESS_UNORDERED_ACCESS;
+		}
 		if (state & ResourceAccessType::IndirectArgument) {
 			access |= D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT;
 		}

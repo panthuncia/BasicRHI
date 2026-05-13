@@ -1874,6 +1874,11 @@ namespace rhi {
 		QueueHandle queueHandle;
 	};
 
+	struct PresentSyncDesc {
+		Queue queue;
+		TimelinePoint wait{};
+	};
+
 	struct ResourceVTable {
 		void (*map)(Resource*, void** data, uint64_t offset, uint64_t size) noexcept;
 		void (*unmap)(Resource*, uint64_t writeOffset, uint64_t writeSize) noexcept;
@@ -2070,7 +2075,7 @@ namespace rhi {
 		uint32_t(*currentImageIndex)(Swapchain*) noexcept;
 		//ViewHandle(*rtv)(Swapchain*, uint32_t img) noexcept; // RTV per image
 		ResourceHandle(*image)(Swapchain*, uint32_t img) noexcept; // texture handle per image
-		Result(*present)(Swapchain*, bool vsync) noexcept; // Present
+		Result(*present)(Swapchain*, bool vsync, const PresentSyncDesc* sync) noexcept; // Present
 		Result(*resizeBuffers)(Swapchain*, uint32_t bufferCount, uint32_t w, uint32_t h, Format newFormat, uint32_t flags) noexcept;
 		void (*setName)(Swapchain*, const char*) noexcept;
 		uint32_t abi_version = 1;
@@ -2094,6 +2099,7 @@ namespace rhi {
 		//inline ViewHandle RTV(uint32_t i) noexcept;
 		inline ResourceHandle Image(uint32_t i) noexcept;
 		inline Result Present(bool vsync) noexcept;
+		inline Result Present(bool vsync, const PresentSyncDesc& sync) noexcept;
 		inline Result ResizeBuffers(uint32_t bufferCount, uint32_t w, uint32_t h, Format newFmt, uint32_t flags) noexcept {
 			return vt->resizeBuffers ? vt->resizeBuffers(this, bufferCount, w, h, newFmt, flags) : Result::Unsupported;
 		}
@@ -2427,7 +2433,8 @@ namespace rhi {
 	inline uint32_t Swapchain::CurrentImageIndex() noexcept { return vt->currentImageIndex(this); }
 	//inline ViewHandle Swapchain::RTV(uint32_t i) noexcept { return vt->rtv(this, i); }
 	inline ResourceHandle Swapchain::Image(uint32_t i) noexcept { return vt->image(this, i); }
-	inline Result Swapchain::Present(bool vsync) noexcept { return vt->present(this, vsync); }
+	inline Result Swapchain::Present(bool vsync) noexcept { return vt->present(this, vsync, nullptr); }
+	inline Result Swapchain::Present(bool vsync, const PresentSyncDesc& sync) noexcept { return vt->present(this, vsync, &sync); }
 
 	inline void CommandList::End() noexcept { vt->end(this); }
 	inline void CommandList::Recycle(const CommandAllocator& alloc) noexcept { vt->recycle(this, alloc); }

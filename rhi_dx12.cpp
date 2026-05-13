@@ -7178,10 +7178,11 @@ namespace rhi {
 		static uint32_t sc_curr(Swapchain* sc) noexcept { return dx12_detail::SC(sc)->pSlProxySC->GetCurrentBackBufferIndex(); }
 		//static ViewHandle sc_rtv(Swapchain* sc, uint32_t i) noexcept { return dx12_detail::SC(sc)->rtvHandles[i]; }
 		static ResourceHandle sc_img(Swapchain* sc, uint32_t i) noexcept { return dx12_detail::SC(sc)->imageHandles[i]; }
-		static Result sc_present(Swapchain* sc, bool vsync) noexcept {
+		static Result sc_present(Swapchain* sc, bool vsync, const PresentSyncDesc* presentSync) noexcept {
+			(void)presentSync;
 			auto* s = dx12_detail::SC(sc);
-			UINT sync = vsync ? 1 : 0; UINT flags = 0;
-			return s->pSlProxySC->Present(sync, flags) == S_OK ? Result::Ok : Result::Failed;
+			UINT syncInterval = vsync ? 1 : 0; UINT flags = 0;
+			return s->pSlProxySC->Present(syncInterval, flags) == S_OK ? Result::Ok : Result::Failed;
 		}
 
 		static Result sc_resizeBuffers(

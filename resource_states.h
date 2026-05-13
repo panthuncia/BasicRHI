@@ -24,6 +24,7 @@ namespace rhi {
 		DepthStencilClear = 1 << 14,
 		RenderTargetClear = 1 << 15,
 		Present = 1 << 16,
+		UnorderedAccessClear = 1 << 17,
 	};
 
 	inline ResourceAccessType operator|(ResourceAccessType a, ResourceAccessType b)
@@ -175,6 +176,8 @@ namespace rhi {
 			return ResourceLayout::Common;
 		if (access & ResourceAccessType::Present)
 			return ResourceLayout::Present;
+		if (access & ResourceAccessType::UnorderedAccessClear)
+			return ResourceLayout::UnorderedAccess;
 		if (access & ResourceAccessType::UnorderedAccess)
 			return ResourceLayout::UnorderedAccess;
 		if (access & ResourceAccessType::RenderTargetClear)
@@ -226,9 +229,13 @@ namespace rhi {
 
 	inline ResourceSyncState ComputeSyncFromAccess(ResourceAccessType access) {
 		bool needsIndirect = (access & ResourceAccessType::IndirectArgument) != 0;
+		bool needsUavClear = (access & ResourceAccessType::UnorderedAccessClear) != 0;
 
 		if (needsIndirect) {
 			return ResourceSyncState::ExecuteIndirect;
+		}
+		if (needsUavClear) {
+			return ResourceSyncState::ClearUnorderedAccessView;
 		}
 
 		return ResourceSyncState::ComputeShading;
@@ -242,6 +249,7 @@ namespace rhi {
 			| ResourceAccessType::ConstantBuffer
 			| ResourceAccessType::ShaderResource
 			| ResourceAccessType::UnorderedAccess)) != 0;
+		bool needsUavClear = (access & ResourceAccessType::UnorderedAccessClear) != 0;
 		bool needsIndexInput = (access & ResourceAccessType::IndexBuffer) != 0;
 		bool needsRenderTarget = (access & (ResourceAccessType::RenderTarget | ResourceAccessType::RenderTargetClear)) != 0;
 		bool needsDepthStencil = (access & (ResourceAccessType::DepthRead
@@ -258,6 +266,7 @@ namespace rhi {
 		int categoryCount =
 			(int)needsCommon
 			+ (int)needsShading
+			+ (int)needsUavClear
 			+ (int)needsIndexInput
 			+ (int)needsRenderTarget
 			+ (int)needsDepthStencil
@@ -273,6 +282,7 @@ namespace rhi {
 		// Mixed graphics-pipeline categories can use the DRAW aggregate scope.
 		if (categoryCount > 1
 			&& !needsCommon
+			&& !needsUavClear
 			&& !needsCopy
 			&& !needsIndirect
 			&& !needsRayTracing
@@ -284,6 +294,7 @@ namespace rhi {
 
 		// exactly one category = pick it
 		if (needsCommon)        return ResourceSyncState::All;
+		if (needsUavClear)      return ResourceSyncState::ClearUnorderedAccessView;
 		if (needsShading)       return ResourceSyncState::AllShading;
 		if (needsIndexInput)    return ResourceSyncState::IndexInput;
 		if (needsRenderTarget)  return ResourceSyncState::RenderTarget;
@@ -304,6 +315,7 @@ namespace rhi {
 		if (access & ResourceAccessType::DepthReadWrite) return true;
 		if (access & ResourceAccessType::DepthStencilClear) return true;
 		if (access & ResourceAccessType::CopyDest) return true;
+		if (access & ResourceAccessType::UnorderedAccessClear) return true;
 		if (access & ResourceAccessType::UnorderedAccess) return true;
 		if (access & ResourceAccessType::RaytracingAccelerationStructureWrite) return true;
 		return false;
@@ -359,7 +371,7 @@ namespace rhi {
 		case ResourceLayout::UnorderedAccess:
 		case ResourceLayout::DirectUnorderedAccess:
 		case ResourceLayout::ComputeUnorderedAccess:
-			if ((access & ~(ResourceAccessType::UnorderedAccess)) != 0)
+			if ((access & ~(ResourceAccessType::UnorderedAccess | ResourceAccessType::UnorderedAccessClear)) != 0)
 				return false;
 			break;
 		case ResourceLayout::DepthReadWrite:

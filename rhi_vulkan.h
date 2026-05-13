@@ -202,6 +202,7 @@ namespace rhi {
 		bool allowTearing = false;
 		std::vector<VkImage> images;
 		std::vector<ResourceHandle> imageHandles;
+		std::vector<VkSemaphore> presentWaitSemaphores;
 		VkFence acquireFence = VK_NULL_HANDLE;
 	};
 
@@ -295,6 +296,19 @@ namespace rhi {
 			std::vector<RecordedBufferBarrier> buffers;
 		};
 
+		struct RecordingTextureState {
+			ResourceHandle texture{};
+			ResourceAccessType access = ResourceAccessType::Common;
+			ResourceLayout layout = ResourceLayout::Undefined;
+			ResourceSyncState sync = ResourceSyncState::All;
+		};
+
+		struct RecordingBufferState {
+			ResourceHandle buffer{};
+			ResourceAccessType access = ResourceAccessType::Common;
+			ResourceSyncState sync = ResourceSyncState::All;
+		};
+
 		struct EmulatedRootConstantScratchPage {
 			VkBuffer buffer = VK_NULL_HANDLE;
 			VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -324,6 +338,8 @@ namespace rhi {
 		std::vector<ResourceHandle> passColorResources;
 		ResourceHandle passDepthResource{};
 		std::vector<RecordedBarrierBatch> recordedBarrierBatches;
+		std::vector<RecordingTextureState> recordingTextureStates;
+		std::vector<RecordingBufferState> recordingBufferStates;
 		std::vector<EmulatedRootConstantScratchPage> emulatedRootConstantScratchPages;
 		std::vector<EmulatedRootConstantShadowState> emulatedRootConstantShadowStates;
 	};
