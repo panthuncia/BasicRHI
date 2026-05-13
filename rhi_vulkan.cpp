@@ -78,13 +78,43 @@ namespace rhi {
 		static PFun_slGetFeatureRequirements* g_vkSlGetFeatureRequirements = nullptr;
 		static PFun_slSetVulkanInfo* g_vkSlSetVulkanInfo = nullptr;
 		static PFN_vkGetInstanceProcAddr g_vkSlGetInstanceProcAddr = nullptr;
+		static PFN_vkGetDeviceProcAddr g_vkSlGetDeviceProcAddr = nullptr;
+		static PFN_vkCreateSwapchainKHR g_vkSlCreateSwapchainKHR = nullptr;
+		static PFN_vkDestroySwapchainKHR g_vkSlDestroySwapchainKHR = nullptr;
+		static PFN_vkGetSwapchainImagesKHR g_vkSlGetSwapchainImagesKHR = nullptr;
+		static PFN_vkAcquireNextImageKHR g_vkSlAcquireNextImageKHR = nullptr;
+		static PFN_vkQueuePresentKHR g_vkSlQueuePresentKHR = nullptr;
+		static PFN_vkDeviceWaitIdle g_vkSlDeviceWaitIdle = nullptr;
+		static PFN_vkCreateWin32SurfaceKHR g_vkSlCreateWin32SurfaceKHR = nullptr;
+		static PFN_vkDestroySurfaceKHR g_vkSlDestroySurfaceKHR = nullptr;
 		static sl::FeatureRequirements g_vkSlDlssRequirements{};
 		static bool g_vkSlDlssRequirementsValid = false;
+
+		static void VkClearStreamlineVulkanProxies() noexcept {
+			g_vkSlGetDeviceProcAddr = nullptr;
+			g_vkSlCreateSwapchainKHR = nullptr;
+			g_vkSlDestroySwapchainKHR = nullptr;
+			g_vkSlGetSwapchainImagesKHR = nullptr;
+			g_vkSlAcquireNextImageKHR = nullptr;
+			g_vkSlQueuePresentKHR = nullptr;
+			g_vkSlDeviceWaitIdle = nullptr;
+			g_vkSlCreateWin32SurfaceKHR = nullptr;
+			g_vkSlDestroySurfaceKHR = nullptr;
+		}
 
 		static void VkShutdownStreamline() noexcept {
 			if (g_vkSlShutdown) {
 				g_vkSlShutdown();
 			}
+			VkClearStreamlineVulkanProxies();
+			if (g_vkSlInterposerModule) {
+				FreeLibrary(g_vkSlInterposerModule);
+				g_vkSlInterposerModule = nullptr;
+			}
+			g_vkSlShutdown = nullptr;
+			g_vkSlGetFeatureRequirements = nullptr;
+			g_vkSlSetVulkanInfo = nullptr;
+			g_vkSlGetInstanceProcAddr = nullptr;
 			g_vkSlDlssRequirements = {};
 			g_vkSlDlssRequirementsValid = false;
 		}
@@ -168,9 +198,89 @@ namespace rhi {
 		}
 #else
 		static constexpr PFN_vkGetInstanceProcAddr g_vkSlGetInstanceProcAddr = nullptr;
+		static constexpr PFN_vkGetDeviceProcAddr g_vkSlGetDeviceProcAddr = nullptr;
+		static constexpr PFN_vkCreateSwapchainKHR g_vkSlCreateSwapchainKHR = nullptr;
+		static constexpr PFN_vkDestroySwapchainKHR g_vkSlDestroySwapchainKHR = nullptr;
+		static constexpr PFN_vkGetSwapchainImagesKHR g_vkSlGetSwapchainImagesKHR = nullptr;
+		static constexpr PFN_vkAcquireNextImageKHR g_vkSlAcquireNextImageKHR = nullptr;
+		static constexpr PFN_vkQueuePresentKHR g_vkSlQueuePresentKHR = nullptr;
+		static constexpr PFN_vkDeviceWaitIdle g_vkSlDeviceWaitIdle = nullptr;
+		static constexpr PFN_vkCreateWin32SurfaceKHR g_vkSlCreateWin32SurfaceKHR = nullptr;
+		static constexpr PFN_vkDestroySurfaceKHR g_vkSlDestroySurfaceKHR = nullptr;
 		static bool VkInitStreamline() noexcept { return false; }
 		static void VkShutdownStreamline() noexcept {}
 #endif
+
+		template <typename TFunc>
+		static TFunc VkGetStreamlineInstanceProc(VkInstance instance, const char* name) noexcept {
+			return g_vkSlGetInstanceProcAddr ? reinterpret_cast<TFunc>(g_vkSlGetInstanceProcAddr(instance, name)) : nullptr;
+		}
+
+		template <typename TFunc>
+		static TFunc VkGetStreamlineDeviceProc(VkDevice device, const char* name) noexcept {
+			return g_vkSlGetDeviceProcAddr ? reinterpret_cast<TFunc>(g_vkSlGetDeviceProcAddr(device, name)) : nullptr;
+		}
+
+		static bool VkResolveStreamlineInstanceProxies(VkInstance instance) noexcept {
+			g_vkSlGetDeviceProcAddr = VkGetStreamlineInstanceProc<PFN_vkGetDeviceProcAddr>(instance, "vkGetDeviceProcAddr");
+			g_vkSlDestroySurfaceKHR = VkGetStreamlineInstanceProc<PFN_vkDestroySurfaceKHR>(instance, "vkDestroySurfaceKHR");
+#ifdef _WIN32
+			g_vkSlCreateWin32SurfaceKHR = VkGetStreamlineInstanceProc<PFN_vkCreateWin32SurfaceKHR>(instance, "vkCreateWin32SurfaceKHR");
+			return g_vkSlGetDeviceProcAddr && g_vkSlCreateWin32SurfaceKHR && g_vkSlDestroySurfaceKHR;
+#else
+			return g_vkSlGetDeviceProcAddr && g_vkSlDestroySurfaceKHR;
+#endif
+		}
+
+		static bool VkResolveStreamlineDeviceProxies(VkDevice device) noexcept {
+			g_vkSlCreateSwapchainKHR = VkGetStreamlineDeviceProc<PFN_vkCreateSwapchainKHR>(device, "vkCreateSwapchainKHR");
+			g_vkSlDestroySwapchainKHR = VkGetStreamlineDeviceProc<PFN_vkDestroySwapchainKHR>(device, "vkDestroySwapchainKHR");
+			g_vkSlGetSwapchainImagesKHR = VkGetStreamlineDeviceProc<PFN_vkGetSwapchainImagesKHR>(device, "vkGetSwapchainImagesKHR");
+			g_vkSlAcquireNextImageKHR = VkGetStreamlineDeviceProc<PFN_vkAcquireNextImageKHR>(device, "vkAcquireNextImageKHR");
+			g_vkSlQueuePresentKHR = VkGetStreamlineDeviceProc<PFN_vkQueuePresentKHR>(device, "vkQueuePresentKHR");
+			g_vkSlDeviceWaitIdle = VkGetStreamlineDeviceProc<PFN_vkDeviceWaitIdle>(device, "vkDeviceWaitIdle");
+			return g_vkSlCreateSwapchainKHR && g_vkSlDestroySwapchainKHR && g_vkSlGetSwapchainImagesKHR && g_vkSlAcquireNextImageKHR && g_vkSlQueuePresentKHR && g_vkSlDeviceWaitIdle;
+		}
+
+		static VkResult VkCreateSwapchainKHRHooked(VkDevice device, const VkSwapchainCreateInfoKHR* createInfo, const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain) noexcept {
+			const PFN_vkCreateSwapchainKHR fn = g_vkSlCreateSwapchainKHR ? g_vkSlCreateSwapchainKHR : vkCreateSwapchainKHR;
+			return fn(device, createInfo, allocator, swapchain);
+		}
+
+		static void VkDestroySwapchainKHRHooked(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* allocator) noexcept {
+			const PFN_vkDestroySwapchainKHR fn = g_vkSlDestroySwapchainKHR ? g_vkSlDestroySwapchainKHR : vkDestroySwapchainKHR;
+			fn(device, swapchain, allocator);
+		}
+
+		static VkResult VkGetSwapchainImagesKHRHooked(VkDevice device, VkSwapchainKHR swapchain, uint32_t* imageCount, VkImage* images) noexcept {
+			const PFN_vkGetSwapchainImagesKHR fn = g_vkSlGetSwapchainImagesKHR ? g_vkSlGetSwapchainImagesKHR : vkGetSwapchainImagesKHR;
+			return fn(device, swapchain, imageCount, images);
+		}
+
+		static VkResult VkAcquireNextImageKHRHooked(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t* imageIndex) noexcept {
+			const PFN_vkAcquireNextImageKHR fn = g_vkSlAcquireNextImageKHR ? g_vkSlAcquireNextImageKHR : vkAcquireNextImageKHR;
+			return fn(device, swapchain, timeout, semaphore, fence, imageIndex);
+		}
+
+		static VkResult VkQueuePresentKHRHooked(VkQueue queue, const VkPresentInfoKHR* presentInfo) noexcept {
+			const PFN_vkQueuePresentKHR fn = g_vkSlQueuePresentKHR ? g_vkSlQueuePresentKHR : vkQueuePresentKHR;
+			return fn(queue, presentInfo);
+		}
+
+		static VkResult VkDeviceWaitIdleHooked(VkDevice device) noexcept {
+			const PFN_vkDeviceWaitIdle fn = g_vkSlDeviceWaitIdle ? g_vkSlDeviceWaitIdle : vkDeviceWaitIdle;
+			return fn(device);
+		}
+
+		static VkResult VkCreateWin32SurfaceKHRHooked(VkInstance instance, const VkWin32SurfaceCreateInfoKHR* createInfo, const VkAllocationCallbacks* allocator, VkSurfaceKHR* surface) noexcept {
+			const PFN_vkCreateWin32SurfaceKHR fn = g_vkSlCreateWin32SurfaceKHR ? g_vkSlCreateWin32SurfaceKHR : vkCreateWin32SurfaceKHR;
+			return fn(instance, createInfo, allocator, surface);
+		}
+
+		static void VkDestroySurfaceKHRHooked(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks* allocator) noexcept {
+			const PFN_vkDestroySurfaceKHR fn = g_vkSlDestroySurfaceKHR ? g_vkSlDestroySurfaceKHR : vkDestroySurfaceKHR;
+			fn(instance, surface, allocator);
+		}
 
 		static void VkMarkCommandListError(VulkanCommandList* commandListState, Result result) noexcept {
 			if (commandListState && commandListState->pendingError == Result::Ok) {
@@ -2504,7 +2614,7 @@ namespace rhi {
 			}
 
 			uint32_t imageIndex = 0;
-			result = vkAcquireNextImageKHR(impl->device, swapchain.swapchain, UINT64_MAX, VK_NULL_HANDLE, swapchain.acquireFence, &imageIndex);
+			result = VkAcquireNextImageKHRHooked(impl->device, swapchain.swapchain, UINT64_MAX, VK_NULL_HANDLE, swapchain.acquireFence, &imageIndex);
 			if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
 				return ToRHI(result);
 			}
@@ -2576,13 +2686,13 @@ namespace rhi {
 
 		static Result VkPopulateSwapchainImages(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
 			uint32_t imageCount = 0;
-			VkResult result = vkGetSwapchainImagesKHR(impl->device, swapchain.swapchain, &imageCount, nullptr);
+			VkResult result = VkGetSwapchainImagesKHRHooked(impl->device, swapchain.swapchain, &imageCount, nullptr);
 			if (result != VK_SUCCESS || imageCount == 0) {
 				return ToRHI(result);
 			}
 
 			swapchain.images.resize(imageCount);
-			result = vkGetSwapchainImagesKHR(impl->device, swapchain.swapchain, &imageCount, swapchain.images.data());
+			result = VkGetSwapchainImagesKHRHooked(impl->device, swapchain.swapchain, &imageCount, swapchain.images.data());
 			if (result != VK_SUCCESS) {
 				swapchain.images.clear();
 				return ToRHI(result);
@@ -2683,7 +2793,7 @@ namespace rhi {
 			createInfo.oldSwapchain = oldSwapchain;
 
 			VkSwapchainKHR newSwapchain = VK_NULL_HANDLE;
-			result = vkCreateSwapchainKHR(impl->device, &createInfo, nullptr, &newSwapchain);
+			result = VkCreateSwapchainKHRHooked(impl->device, &createInfo, nullptr, &newSwapchain);
 			if (result != VK_SUCCESS) {
 				swapchain.imageHandles = std::move(oldImageHandles);
 				swapchain.images = std::move(oldImages);
@@ -2703,7 +2813,7 @@ namespace rhi {
 				VkFenceCreateInfo fenceCreateInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
 				result = vkCreateFence(impl->device, &fenceCreateInfo, nullptr, &swapchain.acquireFence);
 				if (result != VK_SUCCESS) {
-					vkDestroySwapchainKHR(impl->device, newSwapchain, nullptr);
+					VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
 					swapchain.swapchain = oldSwapchain;
 					swapchain.imageHandles = std::move(oldImageHandles);
 					swapchain.images = std::move(oldImages);
@@ -2716,7 +2826,7 @@ namespace rhi {
 			if (populateResult != Result::Ok) {
 				VkReleaseSwapchainImageHandles(impl, swapchain);
 				VkReleaseSwapchainPresentSemaphores(impl, swapchain);
-				vkDestroySwapchainKHR(impl->device, newSwapchain, nullptr);
+				VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
 				swapchain.swapchain = oldSwapchain;
 				swapchain.imageHandles = std::move(oldImageHandles);
 				swapchain.images = std::move(oldImages);
@@ -2728,7 +2838,7 @@ namespace rhi {
 			if (semaphoreResult != Result::Ok) {
 				VkReleaseSwapchainImageHandles(impl, swapchain);
 				VkReleaseSwapchainPresentSemaphores(impl, swapchain);
-				vkDestroySwapchainKHR(impl->device, newSwapchain, nullptr);
+				VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
 				swapchain.swapchain = oldSwapchain;
 				swapchain.imageHandles = std::move(oldImageHandles);
 				swapchain.images = std::move(oldImages);
@@ -2749,7 +2859,7 @@ namespace rhi {
 			}
 
 			if (oldSwapchain != VK_NULL_HANDLE) {
-				vkDestroySwapchainKHR(impl->device, oldSwapchain, nullptr);
+				VkDestroySwapchainKHRHooked(impl->device, oldSwapchain, nullptr);
 			}
 
 			return VkAcquireNextSwapchainImage(impl, swapchain);
@@ -4291,7 +4401,7 @@ namespace rhi {
 			presentInfo.pSwapchains = &swapchainState->swapchain;
 			presentInfo.pImageIndices = &swapchainState->currentImageIndex;
 
-			const VkResult presentResult = vkQueuePresentKHR(impl->queues[0].queue, &presentInfo);
+			const VkResult presentResult = VkQueuePresentKHRHooked(impl->queues[0].queue, &presentInfo);
 			if (presentResult != VK_SUCCESS && presentResult != VK_SUBOPTIMAL_KHR) {
 				return ToRHI(presentResult);
 			}
@@ -4311,7 +4421,7 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			const Result idleResult = ToRHI(vkDeviceWaitIdle(impl->device));
+			const Result idleResult = ToRHI(VkDeviceWaitIdleHooked(impl->device));
 			if (idleResult != Result::Ok) {
 				return idleResult;
 			}
@@ -4802,7 +4912,7 @@ namespace rhi {
 				RHI_FAIL(Result::Failed);
 			}
 
-			return ToRHI(vkDeviceWaitIdle(impl->device));
+			return ToRHI(VkDeviceWaitIdleHooked(impl->device));
 		}
 
 		static void d_flushDeletionQueue(Device* device) noexcept {
@@ -4826,7 +4936,7 @@ namespace rhi {
 			VkWin32SurfaceCreateInfoKHR surfaceCreateInfo{ VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR };
 			surfaceCreateInfo.hwnd = static_cast<HWND>(windowHandle);
 			surfaceCreateInfo.hinstance = GetModuleHandleW(nullptr);
-			const VkResult surfaceResult = vkCreateWin32SurfaceKHR(impl->instance, &surfaceCreateInfo, nullptr, &swapchainState.surface);
+			const VkResult surfaceResult = VkCreateWin32SurfaceKHRHooked(impl->instance, &surfaceCreateInfo, nullptr, &swapchainState.surface);
 			if (surfaceResult != VK_SUCCESS) {
 				out.Reset();
 				return ToRHI(surfaceResult);
@@ -4844,7 +4954,7 @@ namespace rhi {
 					vkDestroyFence(impl->device, swapchainState.acquireFence, nullptr);
 				}
 				if (swapchainState.surface != VK_NULL_HANDLE) {
-					vkDestroySurfaceKHR(impl->instance, swapchainState.surface, nullptr);
+					VkDestroySurfaceKHRHooked(impl->instance, swapchainState.surface, nullptr);
 				}
 				out.Reset();
 				return createResult;
@@ -4871,7 +4981,7 @@ namespace rhi {
 			}
 
 			if (impl->device != VK_NULL_HANDLE) {
-				vkDeviceWaitIdle(impl->device);
+				VkDeviceWaitIdleHooked(impl->device);
 				VkReleaseSwapchainImageHandles(impl, *swapchainState);
 				VkReleaseSwapchainPresentSemaphores(impl, *swapchainState);
 				if (swapchainState->acquireFence != VK_NULL_HANDLE) {
@@ -4879,13 +4989,13 @@ namespace rhi {
 					swapchainState->acquireFence = VK_NULL_HANDLE;
 				}
 				if (swapchainState->swapchain != VK_NULL_HANDLE) {
-					vkDestroySwapchainKHR(impl->device, swapchainState->swapchain, nullptr);
+					VkDestroySwapchainKHRHooked(impl->device, swapchainState->swapchain, nullptr);
 					swapchainState->swapchain = VK_NULL_HANDLE;
 				}
 			}
 
 			if (impl->instance != VK_NULL_HANDLE && swapchainState->surface != VK_NULL_HANDLE) {
-				vkDestroySurfaceKHR(impl->instance, swapchainState->surface, nullptr);
+				VkDestroySurfaceKHRHooked(impl->instance, swapchainState->surface, nullptr);
 				swapchainState->surface = VK_NULL_HANDLE;
 			}
 
@@ -6740,8 +6850,15 @@ namespace rhi {
 
 	void VulkanDevice::Shutdown() noexcept {
 		if (device != VK_NULL_HANDLE) {
-			vkDeviceWaitIdle(device);
+			VkDeviceWaitIdleHooked(device);
 		}
+
+#if BASICRHI_ENABLE_STREAMLINE
+		if (streamlineInitialized) {
+			VkShutdownStreamline();
+			streamlineInitialized = false;
+		}
+#endif
 
 		for (auto& slot : commandLists.slots) {
 			if (!slot.alive) {
@@ -6788,10 +6905,10 @@ namespace rhi {
 				vkDestroyFence(device, slot.obj.acquireFence, nullptr);
 			}
 			if (device != VK_NULL_HANDLE && slot.obj.swapchain != VK_NULL_HANDLE) {
-				vkDestroySwapchainKHR(device, slot.obj.swapchain, nullptr);
+				VkDestroySwapchainKHRHooked(device, slot.obj.swapchain, nullptr);
 			}
 			if (instance != VK_NULL_HANDLE && slot.obj.surface != VK_NULL_HANDLE) {
-				vkDestroySurfaceKHR(instance, slot.obj.surface, nullptr);
+				VkDestroySurfaceKHRHooked(instance, slot.obj.surface, nullptr);
 			}
 			slot.obj = VulkanSwapchain{};
 			slot.alive = false;
@@ -6883,14 +7000,6 @@ namespace rhi {
 			vkDestroyInstance(instance, nullptr);
 			instance = VK_NULL_HANDLE;
 		}
-
-#if BASICRHI_ENABLE_STREAMLINE
-		if (streamlineInitialized) {
-			VkShutdownStreamline();
-			streamlineInitialized = false;
-		}
-#endif
-
 		physicalDevice = VK_NULL_HANDLE;
 		physicalDeviceProperties = {};
 		memoryProperties = {};
@@ -7271,6 +7380,15 @@ namespace rhi {
 
 		volkLoadInstance(instance);
 
+#if BASICRHI_ENABLE_STREAMLINE
+		if (streamlineInitialized && !VkResolveStreamlineInstanceProxies(instance)) {
+			spdlog::warn("CreateVulkanDevice: disabling Streamline because required Vulkan instance proxy hooks could not be resolved.");
+			VkShutdownStreamline();
+			streamlineInitialized = false;
+			enableStreamline = false;
+		}
+#endif
+
 		VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 		VkPhysicalDeviceProperties physicalDeviceProperties{};
 		VkPhysicalDeviceMemoryProperties memoryProperties{};
@@ -7617,6 +7735,11 @@ namespace rhi {
 			vulkanInfo.opticalFlowQueueIndex = streamlineOpticalFlowQueueIndex;
 			if (SL_FAILED(result, g_vkSlSetVulkanInfo(vulkanInfo))) {
 				spdlog::error("CreateVulkanDevice: slSetVulkanInfo failed with result {}; disabling Streamline.", static_cast<int>(result));
+				streamlineInitialized = false;
+				enableStreamline = false;
+				VkShutdownStreamline();
+			} else if (!VkResolveStreamlineDeviceProxies(device)) {
+				spdlog::warn("CreateVulkanDevice: disabling Streamline because required Vulkan device proxy hooks could not be resolved.");
 				streamlineInitialized = false;
 				enableStreamline = false;
 				VkShutdownStreamline();
