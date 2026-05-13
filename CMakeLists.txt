@@ -29,7 +29,7 @@ set(_basicrhi_streamline_manual_include "")
 set(_basicrhi_pix_manual_include "")
 
 if(BASICRHI_ENABLE_RESHAPE)
-    if(TARGET GRS.Backends.DX12.Layer)
+    if(TARGET GRS.Backends.DX12.Layer OR TARGET GRS.Backends.Vulkan.Layer)
         set(_basicrhi_reshape_available ON)
         message(STATUS "BasicRHI: GPU-Reshape runtime resolved from in-tree GPU-Reshape targets")
     else()
@@ -160,6 +160,10 @@ if(_basicrhi_reshape_available)
         "${_basicrhi_reshape_source_root}/Backends/DX12/Layer/Include"
         "${_basicrhi_reshape_binary_root}/Backends/DX12/Layer/Include"
     )
+    set(_basicrhi_reshape_vulkan_include_dirs
+        "${_basicrhi_reshape_source_root}/Backends/Vulkan/Layer/Include"
+        "${_basicrhi_reshape_binary_root}/Backends/Vulkan/Layer/Include"
+    )
     get_target_property(_basicrhi_fmt_include_dirs fmt::fmt INTERFACE_INCLUDE_DIRECTORIES)
 
     if(_basicrhi_fmt_include_dirs)
@@ -169,6 +173,7 @@ if(_basicrhi_reshape_available)
     target_include_directories(BasicRHI PRIVATE
         ${_basicrhi_reshape_common_include_dirs}
         ${_basicrhi_reshape_dx12_include_dirs}
+        ${_basicrhi_reshape_vulkan_include_dirs}
     )
 
     target_link_libraries(BasicRHI PUBLIC

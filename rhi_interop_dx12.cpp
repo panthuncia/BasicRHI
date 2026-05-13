@@ -172,7 +172,14 @@ namespace rhi {
             auto* out = reinterpret_cast<VulkanResourceInfo*>(outStruct);
             out->resource = rec->image != VK_NULL_HANDLE ? NativeHandleToVoid(rec->image) : NativeHandleToVoid(rec->buffer);
             out->deviceAddress = rec->deviceAddress;
-            out->version = 2;
+            out->version = 3;
+            out->nativeFormat = static_cast<uint32_t>(rec->format);
+            out->width = rec->width;
+            out->height = rec->height;
+            out->mipLevels = rec->mipLevels;
+            out->arrayLayers = rec->depthOrLayers;
+            out->flags = rec->imageCreateFlags;
+            out->usage = rec->imageUsage;
             return true;
         }
         if (!IsDx12Resource(h)) return false;
@@ -337,6 +344,30 @@ namespace rhi {
         out->version = 1;
         return true;
 	}
+
+    bool QueryNativeDescriptorSlot(Device device, DescriptorSlot slot, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
+        if (!device.IsValid() || !outStruct) return false;
+        if (!IsVulkanDevice(device)) return false;
+        if (iid != RHI_IID_VK_DESCRIPTOR_SLOT || outSize < sizeof(VulkanDescriptorSlotInfo)) return false;
+        auto* impl = static_cast<VulkanDevice*>(device.impl);
+        if (!impl) return false;
+        VulkanDescriptorHeap* heap = impl->descriptorHeaps.get(slot.heap);
+        if (!heap || slot.index >= heap->imageViewSlots.size()) return false;
+        const VulkanImageViewSlot& rec = heap->imageViewSlots[slot.index];
+        if (rec.kind != VulkanImageViewSlot::Kind::ImageView && rec.kind != VulkanImageViewSlot::Kind::BufferView) return false;
+
+        auto* out = reinterpret_cast<VulkanDescriptorSlotInfo*>(outStruct);
+        out->imageView = NativeHandleToVoid(rec.view);
+        out->bufferView = NativeHandleToVoid(rec.bufferView);
+        out->version = 1;
+        out->nativeFormat = static_cast<uint32_t>(rec.format);
+        out->aspectMask = rec.aspectMask;
+        out->baseMipLevel = rec.range.baseMip;
+        out->levelCount = rec.range.mipCount;
+        out->baseArrayLayer = rec.range.baseLayer;
+        out->layerCount = rec.range.layerCount;
+        return true;
+    }
 
     namespace dx12 {
 

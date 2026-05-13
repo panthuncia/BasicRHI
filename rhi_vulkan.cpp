@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <cstddef>
 
@@ -15,12 +16,161 @@
 
 #include <spdlog/spdlog.h>
 
+#if BASICRHI_ENABLE_STREAMLINE
+#include <sl.h>
+#include <sl_core_api.h>
+#include <sl_helpers_vk.h>
+#endif
+
+#if BASICRHI_ENABLE_RESHAPE
+#include <Backend/Environment.h>
+#include <Backend/EnvironmentInfo.h>
+#include <Backends/Vulkan/Layer.h>
+#endif
+
 namespace rhi {
 	namespace {
 		static constexpr uint32_t kVkInvalidQueueFamily = 0xFFFFFFFFu;
 
 		template <typename... TArgs>
 		constexpr void VkIgnoreUnused(TArgs&&...) noexcept {}
+
+#if BASICRHI_ENABLE_RESHAPE
+		static std::wstring VkGetExecutableDirectoryForReShape() {
+			WCHAR buffer[MAX_PATH] = { 0 };
+			GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+			std::wstring path(buffer);
+			const std::wstring::size_type pos = path.find_last_of(L"\\/");
+			return pos == std::wstring::npos ? std::wstring{} : path.substr(0, pos);
+		}
+
+		static void VkAppendReShapeLayerPath() noexcept {
+			const std::wstring executableDirectory = VkGetExecutableDirectoryForReShape();
+			if (executableDirectory.empty()) {
+				return;
+			}
+
+			DWORD existingLength = GetEnvironmentVariableW(L"VK_LAYER_PATH", nullptr, 0);
+			std::wstring layerPath = executableDirectory;
+			if (existingLength > 1) {
+				std::wstring existing(existingLength, L'\0');
+				GetEnvironmentVariableW(L"VK_LAYER_PATH", existing.data(), existingLength);
+				if (!existing.empty() && existing.back() == L'\0') {
+					existing.pop_back();
+				}
+				if (existing.find(executableDirectory) == std::wstring::npos) {
+					layerPath += L";";
+					layerPath += existing;
+				}
+				else {
+					layerPath = existing;
+				}
+			}
+
+			SetEnvironmentVariableW(L"VK_LAYER_PATH", layerPath.c_str());
+		}
+#endif
+
+#if BASICRHI_ENABLE_STREAMLINE
+		static void VkSlLogMessageCallback(sl::LogType, const char*) {}
+		static HMODULE g_vkSlInterposerModule = nullptr;
+		static PFun_slShutdown* g_vkSlShutdown = nullptr;
+		static PFun_slGetFeatureRequirements* g_vkSlGetFeatureRequirements = nullptr;
+		static PFun_slSetVulkanInfo* g_vkSlSetVulkanInfo = nullptr;
+		static PFN_vkGetInstanceProcAddr g_vkSlGetInstanceProcAddr = nullptr;
+		static sl::FeatureRequirements g_vkSlDlssRequirements{};
+		static bool g_vkSlDlssRequirementsValid = false;
+
+		static void VkShutdownStreamline() noexcept {
+			if (g_vkSlShutdown) {
+				g_vkSlShutdown();
+			}
+			g_vkSlDlssRequirements = {};
+			g_vkSlDlssRequirementsValid = false;
+		}
+
+		static std::wstring VkGetExecutableDirectory() {
+			WCHAR buffer[MAX_PATH] = { 0 };
+			GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+			std::wstring path(buffer);
+			const std::wstring::size_type pos = path.find_last_of(L"\\/");
+			return pos == std::wstring::npos ? std::wstring{} : path.substr(0, pos);
+		}
+
+		static bool VkInitStreamline() noexcept {
+			HMODULE module = LoadLibraryW(L"sl.interposer.dll");
+			if (!module) {
+				spdlog::error("CreateVulkanDevice: failed to load sl.interposer.dll.");
+				return false;
+			}
+			g_vkSlInterposerModule = module;
+			auto* slInitFn = reinterpret_cast<PFun_slInit*>(GetProcAddress(module, "slInit"));
+			g_vkSlShutdown = reinterpret_cast<PFun_slShutdown*>(GetProcAddress(module, "slShutdown"));
+			g_vkSlGetFeatureRequirements = reinterpret_cast<PFun_slGetFeatureRequirements*>(GetProcAddress(module, "slGetFeatureRequirements"));
+			g_vkSlSetVulkanInfo = reinterpret_cast<PFun_slSetVulkanInfo*>(GetProcAddress(module, "slSetVulkanInfo"));
+			g_vkSlGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(module, "vkGetInstanceProcAddr"));
+			if (!slInitFn || !g_vkSlShutdown || !g_vkSlGetFeatureRequirements || !g_vkSlSetVulkanInfo || !g_vkSlGetInstanceProcAddr) {
+				spdlog::error("CreateVulkanDevice: failed to resolve Streamline Vulkan entry points from sl.interposer.dll.");
+				FreeLibrary(module);
+				g_vkSlInterposerModule = nullptr;
+				g_vkSlShutdown = nullptr;
+				g_vkSlGetFeatureRequirements = nullptr;
+				g_vkSlSetVulkanInfo = nullptr;
+				g_vkSlGetInstanceProcAddr = nullptr;
+				return false;
+			}
+
+			sl::Preferences pref{};
+			pref.showConsole = true;
+			pref.logLevel = sl::LogLevel::eDefault;
+			const std::wstring pluginPath = VkGetExecutableDirectory() + L"\\NVSL";
+			const wchar_t* pluginPathRaw = pluginPath.c_str();
+			pref.pathsToPlugins = { &pluginPathRaw };
+			pref.numPathsToPlugins = 1;
+			pref.logMessageCallback = VkSlLogMessageCallback;
+			pref.engine = sl::EngineType::eCustom;
+			pref.engineVersion = "0.0.1";
+			pref.projectId = "72a89ee2-1139-4cc5-8daa-d27189bed781";
+			sl::Feature features[] = { sl::kFeatureDLSS };
+			pref.featuresToLoad = features;
+			pref.numFeaturesToLoad = _countof(features);
+			pref.renderAPI = sl::RenderAPI::eVulkan;
+			pref.flags |= sl::PreferenceFlags::eUseManualHooking;
+
+			if (SL_FAILED(result, slInitFn(pref, sl::kSDKVersion))) {
+				spdlog::error("CreateVulkanDevice: slInit for Vulkan failed with result {}.", static_cast<int>(result));
+				FreeLibrary(module);
+				g_vkSlInterposerModule = nullptr;
+				g_vkSlShutdown = nullptr;
+				g_vkSlGetFeatureRequirements = nullptr;
+				g_vkSlSetVulkanInfo = nullptr;
+				g_vkSlGetInstanceProcAddr = nullptr;
+				return false;
+			}
+
+			g_vkSlDlssRequirements = {};
+			if (SL_FAILED(result, g_vkSlGetFeatureRequirements(sl::kFeatureDLSS, g_vkSlDlssRequirements))) {
+				spdlog::error("CreateVulkanDevice: slGetFeatureRequirements for Vulkan DLSS failed with result {}.", static_cast<int>(result));
+				VkShutdownStreamline();
+				return false;
+			}
+
+			const uint32_t requirementFlags = static_cast<uint32_t>(g_vkSlDlssRequirements.flags);
+			if ((requirementFlags & static_cast<uint32_t>(sl::FeatureRequirementFlags::eVulkanSupported)) == 0) {
+				spdlog::warn("CreateVulkanDevice: disabling Streamline because the loaded DLSS plugin does not advertise Vulkan support.");
+				VkShutdownStreamline();
+				return false;
+			}
+
+			g_vkSlDlssRequirementsValid = true;
+
+			return true;
+		}
+#else
+		static constexpr PFN_vkGetInstanceProcAddr g_vkSlGetInstanceProcAddr = nullptr;
+		static bool VkInitStreamline() noexcept { return false; }
+		static void VkShutdownStreamline() noexcept {}
+#endif
 
 		static void VkMarkCommandListError(VulkanCommandList* commandListState, Result result) noexcept {
 			if (commandListState && commandListState->pendingError == Result::Ok) {
@@ -2449,6 +2599,7 @@ namespace rhi {
 				resource.height = swapchain.height;
 				resource.depthOrLayers = 1;
 				resource.mipLevels = 1;
+				resource.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 				resource.currentLayout = ResourceLayout::Undefined;
 				resource.isSwapchainImage = true;
 				swapchain.imageHandles.push_back(impl->resources.alloc(resource));
@@ -5375,6 +5526,10 @@ namespace rhi {
 					RHI_FAIL(Result::InvalidArgument);
 				}
 				VkResetDescriptorSlot(impl, *descriptorSlot);
+				const VkResult viewResult = vkCreateImageView(impl->device, &viewCreateInfo, nullptr, &descriptorSlot->view);
+				if (viewResult != VK_SUCCESS) {
+					return ToRHI(viewResult);
+				}
 				descriptorSlot->kind = VulkanImageViewSlot::Kind::ImageView;
 				descriptorSlot->resource = resource;
 				descriptorSlot->format = viewFormat;
@@ -5495,6 +5650,10 @@ namespace rhi {
 					RHI_FAIL(Result::InvalidArgument);
 				}
 				VkResetDescriptorSlot(impl, *descriptorSlot);
+				const VkResult viewResult = vkCreateImageView(impl->device, &viewCreateInfo, nullptr, &descriptorSlot->view);
+				if (viewResult != VK_SUCCESS) {
+					return ToRHI(viewResult);
+				}
 				descriptorSlot->kind = VulkanImageViewSlot::Kind::ImageView;
 				descriptorSlot->resource = resource;
 				descriptorSlot->format = viewFormat;
@@ -5887,6 +6046,8 @@ namespace rhi {
 			resourceState.height = desc.type == ResourceType::Texture1D ? 1u : desc.texture.height;
 			resourceState.depthOrLayers = desc.type == ResourceType::Texture3D ? 1u : desc.texture.depthOrLayers;
 			resourceState.mipLevels = desc.texture.mipLevels;
+			resourceState.imageCreateFlags = createInfo.flags;
+			resourceState.imageUsage = createInfo.usage;
 			resourceState.ownsImage = true;
 			resourceState.ownsMemory = true;
 
@@ -6155,6 +6316,8 @@ namespace rhi {
 			resourceState.height = desc.type == ResourceType::Texture1D ? 1u : desc.texture.height;
 			resourceState.depthOrLayers = desc.type == ResourceType::Texture3D ? 1u : desc.texture.depthOrLayers;
 			resourceState.mipLevels = desc.texture.mipLevels;
+			resourceState.imageCreateFlags = createInfo.flags;
+			resourceState.imageUsage = createInfo.usage;
 			resourceState.ownsImage = true;
 			resourceState.ownsMemory = false;
 
@@ -6573,11 +6736,12 @@ namespace rhi {
 		}
 	} // namespace
 
+	VulkanDevice::~VulkanDevice() = default;
+
 	void VulkanDevice::Shutdown() noexcept {
 		if (device != VK_NULL_HANDLE) {
 			vkDeviceWaitIdle(device);
 		}
-
 		for (auto& slot : descriptorHeaps.slots) {
 			if (!slot.alive) {
 				continue;
@@ -6651,11 +6815,50 @@ namespace rhi {
 
 		for (auto& slot : commandLists.slots) {
 			if (slot.alive) {
+				for (auto& page : slot.obj.emulatedRootConstantScratchPages) {
+					VkDestroyEmulatedRootConstantScratchPage(this, page);
+				}
 				slot.obj = VulkanCommandList{};
 				slot.alive = false;
 			}
 		}
 		commandLists.clear();
+
+		for (auto& slot : timelines.slots) {
+			if (!slot.alive) {
+				continue;
+			}
+			if (device != VK_NULL_HANDLE && slot.obj.semaphore != VK_NULL_HANDLE) {
+				vkDestroySemaphore(device, slot.obj.semaphore, nullptr);
+			}
+			slot.obj = VulkanTimeline{};
+			slot.alive = false;
+		}
+		timelines.clear();
+
+		for (auto& slot : heaps.slots) {
+			if (!slot.alive) {
+				continue;
+			}
+			if (device != VK_NULL_HANDLE && slot.obj.memory != VK_NULL_HANDLE) {
+				vkFreeMemory(device, slot.obj.memory, nullptr);
+			}
+			slot.obj = VulkanHeap{};
+			slot.alive = false;
+		}
+		heaps.clear();
+
+		for (auto& slot : queryPools.slots) {
+			if (!slot.alive) {
+				continue;
+			}
+			if (device != VK_NULL_HANDLE && slot.obj.pool != VK_NULL_HANDLE) {
+				vkDestroyQueryPool(device, slot.obj.pool, nullptr);
+			}
+			slot.obj = VulkanQueryPool{};
+			slot.alive = false;
+		}
+		queryPools.clear();
 
 		if (device != VK_NULL_HANDLE) {
 			for (auto& slot : allocators.slots) {
@@ -6677,6 +6880,13 @@ namespace rhi {
 			vkDestroyInstance(instance, nullptr);
 			instance = VK_NULL_HANDLE;
 		}
+
+#if BASICRHI_ENABLE_STREAMLINE
+		if (streamlineInitialized) {
+			VkShutdownStreamline();
+			streamlineInitialized = false;
+		}
+#endif
 
 		physicalDevice = VK_NULL_HANDLE;
 		physicalDeviceProperties = {};
@@ -6892,15 +7102,36 @@ namespace rhi {
 		1u
 	};
 
-	rhi::Result CreateVulkanDevice(const DeviceCreateInfo& ci, DevicePtr& outPtr) noexcept {
+	rhi::Result CreateVulkanDevice(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer) noexcept {
 		outPtr = {};
+		bool streamlineInitialized = false;
+		bool enableStreamline = enableStreamlineInterposer;
+		if (enableStreamline && ci.instrumentation.enableRuntimeInstrumentation) {
+			spdlog::warn("CreateVulkanDevice: disabling Streamline because GPU-Reshape instrumentation is enabled for this device.");
+			enableStreamline = false;
+		}
 		if (ci.backend != Backend::Vulkan) {
 			RHI_FAIL(Result::InvalidArgument);
+		}
+		if (enableStreamline) {
+			streamlineInitialized = VkInitStreamline();
+			enableStreamline = streamlineInitialized;
 		}
 
 		const VkResult volkInit = volkInitialize();
 		if (volkInit != VK_SUCCESS) {
 			spdlog::error("CreateVulkanDevice: volkInitialize failed with VkResult {}", static_cast<int>(volkInit));
+			if (streamlineInitialized) {
+				VkShutdownStreamline();
+			}
+			RHI_FAIL(Result::SdkComponentMissing);
+		}
+
+		if (volkGetInstanceVersion() == 0) {
+			spdlog::error("CreateVulkanDevice: Vulkan loader initialization failed.");
+			if (streamlineInitialized) {
+				VkShutdownStreamline();
+			}
 			RHI_FAIL(Result::SdkComponentMissing);
 		}
 
@@ -6909,6 +7140,10 @@ namespace rhi {
 
 		std::vector<const char*> enabledLayers;
 		std::vector<const char*> enabledExtensions;
+#if BASICRHI_ENABLE_RESHAPE
+		std::unique_ptr<::Backend::Environment> reshapeEnvironment;
+		VkGPUOpenGPUReshapeCreateInfo reshapeCreateInfo{};
+#endif
 		if (VkHasInstanceExtension(VK_KHR_SURFACE_EXTENSION_NAME)) {
 			enabledExtensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
 		}
@@ -6930,6 +7165,67 @@ namespace rhi {
 			}
 		}
 
+#if BASICRHI_ENABLE_STREAMLINE
+		auto appendUniqueName = [](std::vector<const char*>& names, const char* name) {
+			if (!name) {
+				return;
+			}
+			const auto iter = std::find_if(names.begin(), names.end(), [name](const char* existing) {
+				return existing && std::strcmp(existing, name) == 0;
+			});
+			if (iter == names.end()) {
+				names.push_back(name);
+			}
+		};
+
+		if (streamlineInitialized && g_vkSlDlssRequirementsValid) {
+			for (uint32_t index = 0; index < g_vkSlDlssRequirements.vkNumInstanceExtensions; ++index) {
+				const char* extensionName = g_vkSlDlssRequirements.vkInstanceExtensions[index];
+				if (extensionName && VkHasInstanceExtension(extensionName)) {
+					appendUniqueName(enabledExtensions, extensionName);
+				}
+				else {
+					spdlog::warn("CreateVulkanDevice: disabling Streamline because required Vulkan instance extension {} is not available.", extensionName ? extensionName : "<null>");
+					VkShutdownStreamline();
+					streamlineInitialized = false;
+					enableStreamline = false;
+					break;
+				}
+			}
+		}
+#endif
+
+#if BASICRHI_ENABLE_RESHAPE
+		if (ci.instrumentation.enableRuntimeInstrumentation) {
+			VkAppendReShapeLayerPath();
+			if (VkHasInstanceLayer(VK_GPUOPEN_GPURESHAPE_LAYER_NAME)) {
+				reshapeEnvironment = std::make_unique<::Backend::Environment>();
+				::Backend::EnvironmentInfo environmentInfo{};
+				environmentInfo.device.applicationName = "BasicRenderer";
+				environmentInfo.device.apiName = "Vulkan";
+				environmentInfo.memoryBridge = true;
+				environmentInfo.loadPlugins = true;
+				if (reshapeEnvironment->Install(environmentInfo)) {
+					enabledLayers.push_back(VK_GPUOPEN_GPURESHAPE_LAYER_NAME);
+					reshapeCreateInfo.sType = VK_STRUCTURE_TYPE_GPUOPEN_GPURESHAPE_CREATE_INFO;
+					reshapeCreateInfo.registry = reshapeEnvironment->GetRegistry();
+					spdlog::info("CreateVulkanDevice: enabling GPU-Reshape Vulkan layer {}.", VK_GPUOPEN_GPURESHAPE_LAYER_NAME);
+				}
+				else {
+					spdlog::error("CreateVulkanDevice: GPU-Reshape Vulkan environment initialization failed. Continuing without Vulkan runtime instrumentation.");
+					reshapeEnvironment.reset();
+				}
+			}
+			else {
+				spdlog::error("CreateVulkanDevice: GPU-Reshape Vulkan layer {} was requested but is not discoverable by the Vulkan loader.", VK_GPUOPEN_GPURESHAPE_LAYER_NAME);
+			}
+		}
+#else
+		if (ci.instrumentation.enableRuntimeInstrumentation) {
+			spdlog::warn("CreateVulkanDevice: GPU-Reshape Vulkan instrumentation was requested, but BasicRHI was built without ReShape support.");
+		}
+#endif
+
 		VkApplicationInfo applicationInfo{};
 		applicationInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
 		applicationInfo.pApplicationName = "BasicRenderer";
@@ -6945,11 +7241,20 @@ namespace rhi {
 		instanceCreateInfo.ppEnabledLayerNames = enabledLayers.empty() ? nullptr : enabledLayers.data();
 		instanceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size());
 		instanceCreateInfo.ppEnabledExtensionNames = enabledExtensions.empty() ? nullptr : enabledExtensions.data();
+#if BASICRHI_ENABLE_RESHAPE
+		if (reshapeEnvironment) {
+			reshapeCreateInfo.pNext = instanceCreateInfo.pNext;
+			instanceCreateInfo.pNext = &reshapeCreateInfo;
+		}
+#endif
 
 		VkInstance instance = VK_NULL_HANDLE;
 		VkResult result = vkCreateInstance(&instanceCreateInfo, nullptr, &instance);
 		if (result != VK_SUCCESS) {
 			spdlog::error("CreateVulkanDevice: vkCreateInstance failed with VkResult {}", static_cast<int>(result));
+			if (streamlineInitialized) {
+				VkShutdownStreamline();
+			}
 			return ToRHI(result);
 		}
 
@@ -6979,10 +7284,12 @@ namespace rhi {
 		VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptorHeapProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT };
 		VkPhysicalDeviceMeshShaderPropertiesEXT meshShaderProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT };
 		VkPhysicalDeviceComputeShaderDerivativesPropertiesKHR computeShaderDerivativesProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_PROPERTIES_KHR };
+		VkPhysicalDevicePushDescriptorPropertiesKHR pushDescriptorProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR };
 		VkPhysicalDeviceProperties2 properties2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
 		properties2.pNext = &descriptorHeapProperties;
 		descriptorHeapProperties.pNext = &meshShaderProperties;
 		meshShaderProperties.pNext = &computeShaderDerivativesProperties;
+		computeShaderDerivativesProperties.pNext = &pushDescriptorProperties;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		std::array<uint32_t, 3> selectedQueueFamilies{};
 		if (!VkSelectPhysicalDeviceAndQueues(
@@ -7007,15 +7314,71 @@ namespace rhi {
 			}
 		}
 
-		const float queuePriority = 1.0f;
 		std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
 		queueCreateInfos.reserve(uniqueQueueFamilies.size());
+		std::vector<std::vector<float>> queuePriorities;
+		queuePriorities.reserve(uniqueQueueFamilies.size());
+		uint32_t streamlineGraphicsQueueFamily = kVkInvalidQueueFamily;
+		uint32_t streamlineGraphicsQueueIndex = 0;
+		uint32_t streamlineComputeQueueFamily = kVkInvalidQueueFamily;
+		uint32_t streamlineComputeQueueIndex = 0;
+		uint32_t streamlineOpticalFlowQueueFamily = kVkInvalidQueueFamily;
+		uint32_t streamlineOpticalFlowQueueIndex = 0;
 		for (uint32_t familyIndex : uniqueQueueFamilies) {
+			uint32_t queueCount = 1;
+#if BASICRHI_ENABLE_STREAMLINE
+			if (streamlineInitialized && g_vkSlDlssRequirementsValid) {
+				uint32_t nextStreamlineQueueIndex = 1;
+				if (familyIndex == selectedQueueFamilies[0]) {
+					if (g_vkSlDlssRequirements.vkNumGraphicsQueuesRequired > 0) {
+						streamlineGraphicsQueueFamily = familyIndex;
+						streamlineGraphicsQueueIndex = nextStreamlineQueueIndex;
+						nextStreamlineQueueIndex += g_vkSlDlssRequirements.vkNumGraphicsQueuesRequired;
+					}
+				}
+				if (familyIndex == selectedQueueFamilies[1]) {
+					if (g_vkSlDlssRequirements.vkNumComputeQueuesRequired > 0) {
+						streamlineComputeQueueFamily = familyIndex;
+						streamlineComputeQueueIndex = nextStreamlineQueueIndex;
+						nextStreamlineQueueIndex += g_vkSlDlssRequirements.vkNumComputeQueuesRequired;
+					}
+					if (g_vkSlDlssRequirements.vkNumOpticalFlowQueuesRequired > 0) {
+						streamlineOpticalFlowQueueFamily = familyIndex;
+						streamlineOpticalFlowQueueIndex = nextStreamlineQueueIndex;
+						nextStreamlineQueueIndex += g_vkSlDlssRequirements.vkNumOpticalFlowQueuesRequired;
+					}
+				}
+				const uint32_t streamlineQueueCount = nextStreamlineQueueIndex - 1;
+
+				const uint32_t availableQueueCount = familyIndex < queueFamilyProperties.size() ? queueFamilyProperties[familyIndex].queueCount : 0;
+				if (streamlineQueueCount > 0 && availableQueueCount >= 1 + streamlineQueueCount) {
+					queueCount += streamlineQueueCount;
+				}
+				else if (streamlineQueueCount > 0) {
+					spdlog::warn(
+						"CreateVulkanDevice: disabling Streamline because queue family {} exposes {} queues but DLSS requires {} additional queues.",
+						familyIndex,
+						availableQueueCount,
+						streamlineQueueCount);
+					VkShutdownStreamline();
+					streamlineInitialized = false;
+					enableStreamline = false;
+					streamlineGraphicsQueueFamily = kVkInvalidQueueFamily;
+					streamlineGraphicsQueueIndex = 0;
+					streamlineComputeQueueFamily = kVkInvalidQueueFamily;
+					streamlineComputeQueueIndex = 0;
+					streamlineOpticalFlowQueueFamily = kVkInvalidQueueFamily;
+					streamlineOpticalFlowQueueIndex = 0;
+				}
+			}
+#endif
+
+			queuePriorities.emplace_back(queueCount, 1.0f);
 			VkDeviceQueueCreateInfo queueCreateInfo{};
 			queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
 			queueCreateInfo.queueFamilyIndex = familyIndex;
-			queueCreateInfo.queueCount = 1;
-			queueCreateInfo.pQueuePriorities = &queuePriority;
+			queueCreateInfo.queueCount = queueCount;
+			queueCreateInfo.pQueuePriorities = queuePriorities.back().data();
 			queueCreateInfos.push_back(queueCreateInfo);
 		}
 
@@ -7029,6 +7392,7 @@ namespace rhi {
 		const bool hasShaderImageAtomicInt64Extension = VkHasDeviceExtension(physicalDevice, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 		const bool hasShaderSubgroupPartitionedExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
 		const bool hasNvShaderSubgroupPartitionedExtension = !hasShaderSubgroupPartitionedExtension && VkHasDeviceExtension(physicalDevice, VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
+		const bool hasPushDescriptorExtension = VkHasDeviceExtension(physicalDevice, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
 		std::vector<const char*> enabledDeviceExtensions;
 		if (enableSwapchainExtension) {
 			enabledDeviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
@@ -7051,6 +7415,44 @@ namespace rhi {
 		vkGetPhysicalDeviceFeatures2(physicalDevice, &supportedFeatures2);
 		vkGetPhysicalDeviceProperties2(physicalDevice, &properties2);
 		supportedFeatures = supportedFeatures2.features;
+		if (enableStreamline) {
+			if (hasPushDescriptorExtension && pushDescriptorProperties.maxPushDescriptors > 0) {
+				appendUniqueName(enabledDeviceExtensions, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+			}
+			else {
+				if (!hasPushDescriptorExtension) {
+					spdlog::warn("CreateVulkanDevice: disabling Streamline because the selected Vulkan device does not support {}.", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+				}
+				else {
+					spdlog::warn("CreateVulkanDevice: disabling Streamline because the selected Vulkan device reports maxPushDescriptors={}.", pushDescriptorProperties.maxPushDescriptors);
+				}
+#if BASICRHI_ENABLE_STREAMLINE
+				if (streamlineInitialized) {
+					VkShutdownStreamline();
+				}
+#endif
+				streamlineInitialized = false;
+				enableStreamline = false;
+			}
+		}
+
+#if BASICRHI_ENABLE_STREAMLINE
+		if (streamlineInitialized && g_vkSlDlssRequirementsValid) {
+			for (uint32_t index = 0; index < g_vkSlDlssRequirements.vkNumDeviceExtensions; ++index) {
+				const char* extensionName = g_vkSlDlssRequirements.vkDeviceExtensions[index];
+				if (extensionName && VkHasDeviceExtension(physicalDevice, extensionName)) {
+					appendUniqueName(enabledDeviceExtensions, extensionName);
+				}
+				else {
+					spdlog::warn("CreateVulkanDevice: disabling Streamline because required Vulkan device extension {} is not available.", extensionName ? extensionName : "<null>");
+					VkShutdownStreamline();
+					streamlineInitialized = false;
+					enableStreamline = false;
+					break;
+				}
+			}
+		}
+#endif
 
 		VkPhysicalDeviceVulkan12Features enabledVulkan12Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
 		VkPhysicalDeviceVulkan13Features enabledVulkan13Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
@@ -7143,6 +7545,25 @@ namespace rhi {
 			enabledDeviceExtensions.push_back(VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
 		}
 
+#if BASICRHI_ENABLE_STREAMLINE
+		if (streamlineInitialized && g_vkSlDlssRequirementsValid) {
+			VkPhysicalDeviceVulkan12Features streamlineVulkan12Features = sl::getVkPhysicalDeviceVulkan12Features(
+				g_vkSlDlssRequirements.vkNumFeatures12,
+				g_vkSlDlssRequirements.vkFeatures12);
+			VkPhysicalDeviceVulkan13Features streamlineVulkan13Features = sl::getVkPhysicalDeviceVulkan13Features(
+				g_vkSlDlssRequirements.vkNumFeatures13,
+				g_vkSlDlssRequirements.vkFeatures13);
+			sl::getMergedSupportedVkPhysicalDeviceVulkanFeatures(
+				reinterpret_cast<VkBaseOutStructure*>(&enabledVulkan12Features),
+				reinterpret_cast<const VkBaseOutStructure*>(&streamlineVulkan12Features),
+				reinterpret_cast<const VkBaseOutStructure*>(&supportedVulkan12Features));
+			sl::getMergedSupportedVkPhysicalDeviceVulkanFeatures(
+				reinterpret_cast<VkBaseOutStructure*>(&enabledVulkan13Features),
+				reinterpret_cast<const VkBaseOutStructure*>(&streamlineVulkan13Features),
+				reinterpret_cast<const VkBaseOutStructure*>(&supportedVulkan13Features));
+		}
+#endif
+
 		VkDeviceCreateInfo deviceCreateInfo{};
 		deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		deviceCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
@@ -7157,10 +7578,36 @@ namespace rhi {
 		if (result != VK_SUCCESS) {
 			spdlog::error("CreateVulkanDevice: vkCreateDevice failed with VkResult {}", static_cast<int>(result));
 			vkDestroyInstance(instance, nullptr);
+#if BASICRHI_ENABLE_STREAMLINE
+			if (streamlineInitialized) {
+				VkShutdownStreamline();
+			}
+#endif
 			return ToRHI(result);
 		}
 
 		volkLoadDevice(device);
+
+#if BASICRHI_ENABLE_STREAMLINE
+		if (streamlineInitialized) {
+			sl::VulkanInfo vulkanInfo{};
+			vulkanInfo.instance = instance;
+			vulkanInfo.physicalDevice = physicalDevice;
+			vulkanInfo.device = device;
+			vulkanInfo.graphicsQueueFamily = streamlineGraphicsQueueFamily != kVkInvalidQueueFamily ? streamlineGraphicsQueueFamily : selectedQueueFamilies[0];
+			vulkanInfo.graphicsQueueIndex = streamlineGraphicsQueueIndex;
+			vulkanInfo.computeQueueFamily = streamlineComputeQueueFamily != kVkInvalidQueueFamily ? streamlineComputeQueueFamily : selectedQueueFamilies[1];
+			vulkanInfo.computeQueueIndex = streamlineComputeQueueIndex;
+			vulkanInfo.opticalFlowQueueFamily = streamlineOpticalFlowQueueFamily != kVkInvalidQueueFamily ? streamlineOpticalFlowQueueFamily : vulkanInfo.computeQueueFamily;
+			vulkanInfo.opticalFlowQueueIndex = streamlineOpticalFlowQueueIndex;
+			if (SL_FAILED(result, g_vkSlSetVulkanInfo(vulkanInfo))) {
+				spdlog::error("CreateVulkanDevice: slSetVulkanInfo failed with result {}; disabling Streamline.", static_cast<int>(result));
+				streamlineInitialized = false;
+				enableStreamline = false;
+				VkShutdownStreamline();
+			}
+		}
+#endif
 
 		auto impl = std::make_shared<VulkanDevice>();
 		impl->selfWeak = impl;
@@ -7193,10 +7640,14 @@ namespace rhi {
 		impl->shaderImageInt64AtomicsEnabled = enabledShaderImageAtomicInt64Features.shaderImageInt64Atomics == VK_TRUE;
 		impl->shaderSubgroupPartitionedEnabled = enabledShaderSubgroupPartitionedFeatures.shaderSubgroupPartitioned == VK_TRUE || hasNvShaderSubgroupPartitionedExtension;
 		impl->validateBarrierTransitions = ci.validateBarrierTransitions;
+		impl->streamlineInitialized = streamlineInitialized;
 		impl->loaderApiVersion = loaderApiVersion;
 		impl->instanceApiVersion = requestedApiVersion;
 		impl->swapchainExtensionEnabled = enableSwapchainExtension;
 		impl->queueFamilyProperties = std::move(queueFamilyProperties);
+#if BASICRHI_ENABLE_RESHAPE
+		impl->reshapeEnvironment = std::move(reshapeEnvironment);
+#endif
 		for (uint32_t queueSlot = 0; queueSlot < 3; ++queueSlot) {
 			const uint32_t familyIndex = selectedQueueFamilies[queueSlot];
 			if (familyIndex == kVkInvalidQueueFamily) {

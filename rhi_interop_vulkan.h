@@ -82,6 +82,22 @@ namespace rhi::vulkan {
         return from_native_void<VkImage>(info.resource);
     }
 
+    inline bool get_resource_info(rhi::Resource resource, VulkanResourceInfo& info) {
+        info = {};
+        return QueryNativeResource(resource, RHI_IID_VK_RESOURCE, &info, sizeof(info));
+    }
+
+    inline bool get_descriptor_slot_info(rhi::Device device, rhi::DescriptorSlot slot, VulkanDescriptorSlotInfo& info) {
+        info = {};
+        return QueryNativeDescriptorSlot(device, slot, RHI_IID_VK_DESCRIPTOR_SLOT, &info, sizeof(info));
+    }
+
+    inline VkImageView get_image_view(rhi::Device device, rhi::DescriptorSlot slot) {
+        VulkanDescriptorSlotInfo info{};
+        if (!get_descriptor_slot_info(device, slot, info)) return VK_NULL_HANDLE;
+        return from_native_void<VkImageView>(info.imageView);
+    }
+
     inline uint64_t get_buffer_device_address(rhi::Resource resource) {
         VulkanResourceInfo info{};
         if (!QueryNativeResource(resource, RHI_IID_VK_RESOURCE, &info, sizeof(info))) return 0u;

@@ -10,6 +10,10 @@
 
 #include <vector>
 
+#if BASICRHI_ENABLE_RESHAPE
+namespace Backend { class Environment; }
+#endif
+
 namespace rhi {
 	template<class Obj> struct VulkanHandleFor;
 
@@ -142,6 +146,8 @@ namespace rhi {
 		uint32_t height = 0;
 		uint16_t depthOrLayers = 1;
 		uint16_t mipLevels = 1;
+		VkImageCreateFlags imageCreateFlags = 0;
+		VkImageUsageFlags imageUsage = 0;
 		bool hostVisible = false;
 		bool isSwapchainImage = false;
 		bool ownsBuffer = false;
@@ -345,7 +351,7 @@ namespace rhi {
 	};
 
 	struct VulkanDevice {
-		~VulkanDevice() = default;
+		~VulkanDevice();
 		void Shutdown() noexcept;
 
 		Device self{};
@@ -381,6 +387,7 @@ namespace rhi {
 		bool shaderImageInt64AtomicsEnabled = false;
 		bool shaderSubgroupPartitionedEnabled = false;
 		bool validateBarrierTransitions = false;
+		bool streamlineInitialized = false;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		VulkanRegistry<VulkanDescriptorHeap> descriptorHeaps;
 		VulkanRegistry<VulkanResource> resources;
@@ -394,6 +401,9 @@ namespace rhi {
 		VulkanRegistry<VulkanQueryPool> queryPools;
 		VulkanRegistry<VulkanCommandList> commandLists;
 		std::array<VulkanQueueState, 3> queues{};
+#if BASICRHI_ENABLE_RESHAPE
+		std::unique_ptr<::Backend::Environment> reshapeEnvironment;
+#endif
 		QueueHandle gfxHandle{ 0u, 1u };
 		QueueHandle compHandle{ 1u, 1u };
 		QueueHandle copyHandle{ 2u, 1u };

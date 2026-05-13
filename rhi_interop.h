@@ -38,6 +38,7 @@ namespace rhi {
 	constexpr uint32_t RHI_IID_VK_DESCRIPTOR_HEAP = 0x200B;
 	constexpr uint32_t RHI_IID_VK_TIMELINE = 0x200C;
 	constexpr uint32_t RHI_IID_VK_WORK_GRAPH = 0x200D;
+	constexpr uint32_t RHI_IID_VK_DESCRIPTOR_SLOT = 0x200E;
 
 	// --- Narrow, typed query surface (no native types)
 	struct D3D12DeviceInfo { void* device; void* factory; void* adapter; uint32_t version; };
@@ -58,7 +59,29 @@ namespace rhi {
 	struct VulkanQueueInfo { void* queue; uint32_t familyIndex; uint32_t version; };
 	struct VulkanCmdBufInfo { void* commandBuffer; uint32_t version; };
 	struct VulkanSwapchainInfo { void* swapchain; uint32_t version; };
-	struct VulkanResourceInfo { void* resource; uint64_t deviceAddress; uint32_t version; };
+	struct VulkanResourceInfo {
+		void* resource;
+		uint64_t deviceAddress;
+		uint32_t version;
+		uint32_t nativeFormat;
+		uint32_t width;
+		uint32_t height;
+		uint32_t mipLevels;
+		uint32_t arrayLayers;
+		uint32_t flags;
+		uint32_t usage;
+	};
+	struct VulkanDescriptorSlotInfo {
+		void* imageView;
+		void* bufferView;
+		uint32_t version;
+		uint32_t nativeFormat;
+		uint32_t aspectMask;
+		uint32_t baseMipLevel;
+		uint32_t levelCount;
+		uint32_t baseArrayLayer;
+		uint32_t layerCount;
+	};
 	struct VulkanHeapInfo { void* heap; uint32_t version; };
 	struct VulkanQueryPoolInfo { void* queryPool; uint32_t version; };
 	struct VulkanPipelineInfo { void* pipeline; uint32_t version; };
@@ -82,4 +105,5 @@ namespace rhi {
 	bool QueryNativeDescriptorHeap(DescriptorHeap, uint32_t iid, void* outStruct, uint32_t outSize) noexcept;
 	bool QueryNativeTimeline(Timeline, uint32_t iid, void* outStruct, uint32_t outSize) noexcept;
 	bool QueryNativeWorkGraph(WorkGraph, uint32_t iid, void* outStruct, uint32_t outSize) noexcept;
+	bool QueryNativeDescriptorSlot(Device, DescriptorSlot, uint32_t iid, void* outStruct, uint32_t outSize) noexcept;
 } // namespace rhi
