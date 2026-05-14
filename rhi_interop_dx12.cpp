@@ -81,13 +81,11 @@ namespace rhi {
             if (iid != RHI_IID_VK_QUEUE || outSize < sizeof(VulkanQueueInfo)) return false;
             auto* impl = static_cast<VulkanDevice*>(q.impl);
             if (!impl) return false;
-            const uint32_t queueSlot = q.GetQueueHandle().index;
-            if (queueSlot >= impl->queues.size()) return false;
-            const VulkanQueueState& queueState = impl->queues[queueSlot];
-            if (queueState.queue == VK_NULL_HANDLE) return false;
+            const VulkanQueueState* queueState = impl->queues.get(q.GetQueueHandle());
+            if (!queueState || queueState->queue == VK_NULL_HANDLE) return false;
             auto* out = reinterpret_cast<VulkanQueueInfo*>(outStruct);
-            out->queue = NativeHandleToVoid(queueState.queue);
-            out->familyIndex = queueState.familyIndex;
+            out->queue = NativeHandleToVoid(queueState->queue);
+            out->familyIndex = queueState->familyIndex;
             out->version = 1;
             return true;
         }

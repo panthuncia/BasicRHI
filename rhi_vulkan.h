@@ -28,6 +28,7 @@ namespace rhi {
 	struct VulkanTimeline;
 	struct VulkanHeap;
 	struct VulkanQueryPool;
+	struct VulkanQueueState;
 
 	template<> struct VulkanHandleFor<VulkanDescriptorHeap> { using type = DescriptorHeapHandle; };
 	template<> struct VulkanHandleFor<VulkanResource> { using type = ResourceHandle; };
@@ -40,6 +41,7 @@ namespace rhi {
 	template<> struct VulkanHandleFor<VulkanTimeline> { using type = TimelineHandle; };
 	template<> struct VulkanHandleFor<VulkanHeap> { using type = HeapHandle; };
 	template<> struct VulkanHandleFor<VulkanQueryPool> { using type = QueryPoolHandle; };
+	template<> struct VulkanHandleFor<VulkanQueueState> { using type = QueueHandle; };
 
 	template<typename T>
 	struct VulkanSlot {
@@ -400,13 +402,15 @@ namespace rhi {
 		VulkanRegistry<VulkanHeap> heaps;
 		VulkanRegistry<VulkanQueryPool> queryPools;
 		VulkanRegistry<VulkanCommandList> commandLists;
-		std::array<VulkanQueueState, 3> queues{};
+		VulkanRegistry<VulkanQueueState> queues;
+		std::vector<uint32_t> queueFamilyNextQueueIndex;
+		std::vector<std::vector<uint32_t>> queueFamilyFreeQueueIndices;
 #if BASICRHI_ENABLE_RESHAPE
 		std::unique_ptr<::Backend::Environment> reshapeEnvironment;
 #endif
-		QueueHandle gfxHandle{ 0u, 1u };
-		QueueHandle compHandle{ 1u, 1u };
-		QueueHandle copyHandle{ 2u, 1u };
+		QueueHandle gfxHandle{};
+		QueueHandle compHandle{};
+		QueueHandle copyHandle{};
 		std::weak_ptr<VulkanDevice> selfWeak;
 	};
 

@@ -838,25 +838,16 @@ namespace rhi {
 			}
 		}
 
-		static uint32_t VkPrimaryQueueSlotForKind(QueueKind kind) noexcept {
-			switch (kind) {
-			case QueueKind::Graphics:
-				return 0;
-			case QueueKind::Compute:
-				return 1;
-			case QueueKind::Copy:
-				return 2;
-			default:
-				return 0;
-			}
+		static VulkanQueueState* VkQueueStateForHandle(VulkanDevice* impl, QueueHandle handle) noexcept {
+			return impl ? impl->queues.get(handle) : nullptr;
 		}
 
-		static VulkanQueueState* VkQueueStateForHandle(VulkanDevice* impl, QueueHandle handle) noexcept {
-			if (!impl || handle.generation != 1u || handle.index >= impl->queues.size()) {
-				return nullptr;
-			}
+		static const VulkanQueueState* VkQueueStateForHandle(const VulkanDevice* impl, QueueHandle handle) noexcept {
+			return impl ? impl->queues.get(handle) : nullptr;
+		}
 
-			return &impl->queues[handle.index];
+		static VulkanQueueState* VkPrimaryQueueStateForKind(VulkanDevice* impl, QueueKind kind) noexcept {
+			return VkQueueStateForHandle(impl, VkPrimaryQueueHandleForKind(impl, kind));
 		}
 
 		static VulkanCommandAllocator* VkAllocatorState(VulkanDevice* impl, CommandAllocatorHandle handle) noexcept {
@@ -2804,7 +2795,11 @@ namespace rhi {
 			}
 
 			VkBool32 graphicsPresentSupported = VK_FALSE;
-			VkResult result = vkGetPhysicalDeviceSurfaceSupportKHR(impl->physicalDevice, impl->queues[0].familyIndex, swapchain.surface, &graphicsPresentSupported);
+			const VulkanQueueState* graphicsQueueState = VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
+			if (!graphicsQueueState) {
+				RHI_FAIL(Result::Failed);
+			}
+			VkResult result = vkGetPhysicalDeviceSurfaceSupportKHR(impl->physicalDevice, graphicsQueueState->familyIndex, swapchain.surface, &graphicsPresentSupported);
 			if (result != VK_SUCCESS) {
 				return ToRHI(result);
 			}
@@ -3298,7 +3293,13 @@ namespace rhi {
 
 			for (const TimelinePoint& wait : submit.waits) {
 				VulkanTimeline* timeline = VkTimelineState(impl, wait.t);
-				if (!timeline || timeline->semaphore == VK_NULL_HANDLE) {
+				if (!timeline || timeline->semaphore == VK_NULL_HANDLE || wait.value == UINT64_MAX) {
+					if (wait.value == UINT64_MAX) {
+						spdlog::error(
+							"Vulkan queue submit rejected timeline wait on terminal value UINT64_MAX (timeline idx={}, gen={})",
+							wait.t.index,
+							wait.t.generation);
+					}
 					RHI_FAIL(Result::InvalidArgument);
 				}
 				waitSemaphores.push_back(timeline->semaphore);
@@ -3306,7 +3307,13 @@ namespace rhi {
 			}
 			for (const TimelinePoint& signal : submit.signals) {
 				VulkanTimeline* timeline = VkTimelineState(impl, signal.t);
-				if (!timeline || timeline->semaphore == VK_NULL_HANDLE || signal.value == 0) {
+				if (!timeline || timeline->semaphore == VK_NULL_HANDLE || signal.value == 0 || signal.value == UINT64_MAX) {
+					if (signal.value == UINT64_MAX) {
+						spdlog::error(
+							"Vulkan queue submit rejected timeline signal to terminal value UINT64_MAX (timeline idx={}, gen={})",
+							signal.t.index,
+							signal.t.generation);
+					}
 					RHI_FAIL(Result::InvalidArgument);
 				}
 				signalSemaphores.push_back(timeline->semaphore);
@@ -4448,7 +4455,7 @@ namespace rhi {
 					RHI_FAIL(Result::InvalidArgument);
 				}
 			} else {
-				signalQueueState = &impl->queues[0];
+				signalQueueState = VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
 			}
 
 			VkTimelineSemaphoreSubmitInfo timelineInfo{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
@@ -4480,7 +4487,11 @@ namespace rhi {
 			presentInfo.pSwapchains = &swapchainState->swapchain;
 			presentInfo.pImageIndices = &swapchainState->currentImageIndex;
 
-			const VkResult presentResult = VkQueuePresentKHRHooked(impl->queues[0].queue, &presentInfo);
+			const VulkanQueueState* graphicsQueueState = VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
+			if (!graphicsQueueState || graphicsQueueState->queue == VK_NULL_HANDLE) {
+				RHI_FAIL(Result::Failed);
+			}
+			const VkResult presentResult = VkQueuePresentKHRHooked(graphicsQueueState->queue, &presentInfo);
 			if (presentResult != VK_SUCCESS && presentResult != VK_SUBOPTIMAL_KHR) {
 				return ToRHI(presentResult);
 			}
@@ -4895,7 +4906,6 @@ namespace rhi {
 			if (!impl) {
 				return;
 			}
-
 			VkReleaseViewsForResource(impl, handle);
 			if (VulkanResource* resource = VkResourceState(impl, handle)) {
 				VkDestroyResource(impl, *resource);
@@ -4973,16 +4983,76 @@ namespace rhi {
 		}
 
 		static Result d_createQueue(Device* device, QueueKind kind, const char* name, Queue& out) noexcept {
-			VkIgnoreUnused(name);
-			out = d_getQueue(device, kind);
-			if (!out) {
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl || impl->device == VK_NULL_HANDLE) {
+				out = Queue(kind);
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			const VulkanQueueState* primaryQueueState = VkPrimaryQueueStateForKind(impl, kind);
+			if (!primaryQueueState || primaryQueueState->familyIndex == kVkInvalidQueueFamily) {
+				out = Queue(kind);
+				RHI_FAIL(Result::Unsupported);
+			}
+
+			const uint32_t familyIndex = primaryQueueState->familyIndex;
+			if (familyIndex >= impl->queueFamilyNextQueueIndex.size() || familyIndex >= impl->queueFamilyProperties.size()) {
+				out = Queue(kind);
+				RHI_FAIL(Result::Unsupported);
+			}
+
+			const uint32_t queueCount = impl->queueFamilyProperties[familyIndex].queueCount;
+			uint32_t queueIndex = UINT32_MAX;
+			if (familyIndex < impl->queueFamilyFreeQueueIndices.size() && !impl->queueFamilyFreeQueueIndices[familyIndex].empty()) {
+				queueIndex = impl->queueFamilyFreeQueueIndices[familyIndex].back();
+				impl->queueFamilyFreeQueueIndices[familyIndex].pop_back();
+			}
+			else {
+				queueIndex = impl->queueFamilyNextQueueIndex[familyIndex];
+			}
+			if (queueIndex >= queueCount) {
+				spdlog::warn(
+					"Vulkan CreateQueue('{}') for kind {} could not allocate a distinct queue from family {}: requested index {} but only {} queue(s) were created.",
+					name ? name : "UserQueue",
+					static_cast<int>(kind),
+					familyIndex,
+					queueIndex,
+					queueCount);
+				out = Queue(kind);
+				RHI_FAIL(Result::Unsupported);
+			}
+
+			VkQueue vkQueue = VK_NULL_HANDLE;
+			vkGetDeviceQueue(impl->device, familyIndex, queueIndex, &vkQueue);
+			if (vkQueue == VK_NULL_HANDLE) {
+				out = Queue(kind);
 				RHI_FAIL(Result::Failed);
+			}
+
+			const QueueHandle handle = impl->queues.alloc(VulkanQueueState{ vkQueue, familyIndex, queueIndex });
+			if (queueIndex == impl->queueFamilyNextQueueIndex[familyIndex]) {
+				++impl->queueFamilyNextQueueIndex[familyIndex];
+			}
+			out = Queue{ kind, handle };
+			out.vt = &g_vkqvt;
+			out.impl = impl;
+			if (name) {
+				q_setName(&out, name);
 			}
 			return Result::Ok;
 		}
 
 		static void d_destroyQueue(DeviceDeletionContext* context, QueueHandle handle) noexcept {
-			VkIgnoreUnused(context, handle);
+			auto* impl = context ? static_cast<VulkanDevice*>(context->impl) : nullptr;
+			if (!impl) {
+				return;
+			}
+
+			const VulkanQueueState* queueState = impl->queues.get(handle);
+			if (queueState && queueState->familyIndex < impl->queueFamilyFreeQueueIndices.size()) {
+				impl->queueFamilyFreeQueueIndices[queueState->familyIndex].push_back(queueState->queueIndex);
+			}
+			impl->queues.free(handle);
 		}
 
 		static Result d_waitIdle(Device* device) noexcept {
@@ -5964,15 +6034,15 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			const uint32_t queueSlot = VkPrimaryQueueSlotForKind(kind);
-			if (queueSlot >= impl->queues.size() || impl->queues[queueSlot].familyIndex == kVkInvalidQueueFamily) {
+			const VulkanQueueState* queueState = VkPrimaryQueueStateForKind(impl, kind);
+			if (!queueState || queueState->familyIndex == kVkInvalidQueueFamily) {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
 			}
 
 			VkCommandPoolCreateInfo createInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
 			createInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-			createInfo.queueFamilyIndex = impl->queues[queueSlot].familyIndex;
+			createInfo.queueFamilyIndex = queueState->familyIndex;
 
 			VkCommandPool pool = VK_NULL_HANDLE;
 			const VkResult result = vkCreateCommandPool(impl->device, &createInfo, nullptr, &pool);
@@ -7085,6 +7155,8 @@ namespace rhi {
 		supportedFeatures = {};
 		queueFamilyProperties.clear();
 		queues = {};
+		queueFamilyNextQueueIndex.clear();
+		queueFamilyFreeQueueIndices.clear();
 		self = {};
 	}
 
@@ -7522,25 +7594,44 @@ namespace rhi {
 			}
 		}
 
+		std::vector<uint32_t> rhiPrimaryQueueCounts(queueFamilyProperties.size(), 0u);
+		for (uint32_t familyIndex : selectedQueueFamilies) {
+			if (familyIndex == kVkInvalidQueueFamily || familyIndex >= queueFamilyProperties.size()) {
+				continue;
+			}
+			const uint32_t availableQueueCount = queueFamilyProperties[familyIndex].queueCount;
+			if (rhiPrimaryQueueCounts[familyIndex] < availableQueueCount) {
+				++rhiPrimaryQueueCounts[familyIndex];
+			}
+		}
+
 		std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
 		queueCreateInfos.reserve(uniqueQueueFamilies.size());
 		std::vector<std::vector<float>> queuePriorities;
 		queuePriorities.reserve(uniqueQueueFamilies.size());
+		std::vector<uint32_t> requestedQueueCounts(queueFamilyProperties.size(), 0u);
 		uint32_t streamlineGraphicsQueueFamily = kVkInvalidQueueFamily;
 		uint32_t streamlineGraphicsQueueIndex = 0;
+		uint32_t streamlineGraphicsQueueCount = 0;
 		uint32_t streamlineComputeQueueFamily = kVkInvalidQueueFamily;
 		uint32_t streamlineComputeQueueIndex = 0;
+		uint32_t streamlineComputeQueueCount = 0;
 		uint32_t streamlineOpticalFlowQueueFamily = kVkInvalidQueueFamily;
 		uint32_t streamlineOpticalFlowQueueIndex = 0;
+		uint32_t streamlineOpticalFlowQueueCount = 0;
 		for (uint32_t familyIndex : uniqueQueueFamilies) {
-			uint32_t queueCount = 1;
+			const uint32_t availableQueueCount = familyIndex < queueFamilyProperties.size() ? queueFamilyProperties[familyIndex].queueCount : 0u;
+			uint32_t queueCount = availableQueueCount;
 #if BASICRHI_ENABLE_STREAMLINE
 			if (streamlineInitialized && g_vkSlDlssRequirementsValid) {
-				uint32_t nextStreamlineQueueIndex = 1;
+				uint32_t nextStreamlineQueueIndex = familyIndex < rhiPrimaryQueueCounts.size()
+					? (std::max)(1u, rhiPrimaryQueueCounts[familyIndex])
+					: 1u;
 				if (familyIndex == selectedQueueFamilies[0]) {
 					if (g_vkSlDlssRequirements.vkNumGraphicsQueuesRequired > 0) {
 						streamlineGraphicsQueueFamily = familyIndex;
 						streamlineGraphicsQueueIndex = nextStreamlineQueueIndex;
+						streamlineGraphicsQueueCount = g_vkSlDlssRequirements.vkNumGraphicsQueuesRequired;
 						nextStreamlineQueueIndex += g_vkSlDlssRequirements.vkNumGraphicsQueuesRequired;
 					}
 				}
@@ -7548,38 +7639,48 @@ namespace rhi {
 					if (g_vkSlDlssRequirements.vkNumComputeQueuesRequired > 0) {
 						streamlineComputeQueueFamily = familyIndex;
 						streamlineComputeQueueIndex = nextStreamlineQueueIndex;
+						streamlineComputeQueueCount = g_vkSlDlssRequirements.vkNumComputeQueuesRequired;
 						nextStreamlineQueueIndex += g_vkSlDlssRequirements.vkNumComputeQueuesRequired;
 					}
 					if (g_vkSlDlssRequirements.vkNumOpticalFlowQueuesRequired > 0) {
 						streamlineOpticalFlowQueueFamily = familyIndex;
 						streamlineOpticalFlowQueueIndex = nextStreamlineQueueIndex;
+						streamlineOpticalFlowQueueCount = g_vkSlDlssRequirements.vkNumOpticalFlowQueuesRequired;
 						nextStreamlineQueueIndex += g_vkSlDlssRequirements.vkNumOpticalFlowQueuesRequired;
 					}
 				}
-				const uint32_t streamlineQueueCount = nextStreamlineQueueIndex - 1;
+				const uint32_t streamlineQueueCount = nextStreamlineQueueIndex - ((std::max)(1u, rhiPrimaryQueueCounts[familyIndex]));
 
-				const uint32_t availableQueueCount = familyIndex < queueFamilyProperties.size() ? queueFamilyProperties[familyIndex].queueCount : 0;
-				if (streamlineQueueCount > 0 && availableQueueCount >= 1 + streamlineQueueCount) {
-					queueCount += streamlineQueueCount;
+				if (streamlineQueueCount > 0 && availableQueueCount >= nextStreamlineQueueIndex) {
+					queueCount = availableQueueCount;
 				}
 				else if (streamlineQueueCount > 0) {
 					spdlog::warn(
-						"CreateVulkanDevice: disabling Streamline because queue family {} exposes {} queues but DLSS requires {} additional queues.",
+						"CreateVulkanDevice: disabling Streamline because queue family {} exposes {} queues but RHI primary queues and DLSS require {} queues.",
 						familyIndex,
 						availableQueueCount,
-						streamlineQueueCount);
+						nextStreamlineQueueIndex);
 					VkShutdownStreamline();
 					streamlineInitialized = false;
 					enableStreamline = false;
 					streamlineGraphicsQueueFamily = kVkInvalidQueueFamily;
 					streamlineGraphicsQueueIndex = 0;
+					streamlineGraphicsQueueCount = 0;
 					streamlineComputeQueueFamily = kVkInvalidQueueFamily;
 					streamlineComputeQueueIndex = 0;
+					streamlineComputeQueueCount = 0;
 					streamlineOpticalFlowQueueFamily = kVkInvalidQueueFamily;
 					streamlineOpticalFlowQueueIndex = 0;
+					streamlineOpticalFlowQueueCount = 0;
 				}
 			}
 #endif
+			if (queueCount == 0) {
+				queueCount = 1;
+			}
+			if (familyIndex < requestedQueueCounts.size()) {
+				requestedQueueCounts[familyIndex] = queueCount;
+			}
 
 			queuePriorities.emplace_back(queueCount, 1.0f);
 			VkDeviceQueueCreateInfo queueCreateInfo{};
@@ -7829,6 +7930,18 @@ namespace rhi {
 		}
 #endif
 
+		if (!streamlineInitialized) {
+			streamlineGraphicsQueueFamily = kVkInvalidQueueFamily;
+			streamlineGraphicsQueueIndex = 0;
+			streamlineGraphicsQueueCount = 0;
+			streamlineComputeQueueFamily = kVkInvalidQueueFamily;
+			streamlineComputeQueueIndex = 0;
+			streamlineComputeQueueCount = 0;
+			streamlineOpticalFlowQueueFamily = kVkInvalidQueueFamily;
+			streamlineOpticalFlowQueueIndex = 0;
+			streamlineOpticalFlowQueueCount = 0;
+		}
+
 		auto impl = std::make_shared<VulkanDevice>();
 		impl->selfWeak = impl;
 		impl->instance = instance;
@@ -7868,15 +7981,49 @@ namespace rhi {
 #if BASICRHI_ENABLE_RESHAPE
 		impl->reshapeEnvironment = std::move(reshapeEnvironment);
 #endif
+		impl->queueFamilyNextQueueIndex.assign(impl->queueFamilyProperties.size(), 0u);
+		impl->queueFamilyFreeQueueIndices.assign(impl->queueFamilyProperties.size(), {});
+		std::vector<uint32_t> nextPrimaryQueueIndex(impl->queueFamilyProperties.size(), 0u);
 		for (uint32_t queueSlot = 0; queueSlot < 3; ++queueSlot) {
 			const uint32_t familyIndex = selectedQueueFamilies[queueSlot];
-			if (familyIndex == kVkInvalidQueueFamily) {
+			if (familyIndex == kVkInvalidQueueFamily || familyIndex >= impl->queueFamilyProperties.size()) {
 				continue;
 			}
 
-			vkGetDeviceQueue(device, familyIndex, 0, &impl->queues[queueSlot].queue);
-			impl->queues[queueSlot].familyIndex = familyIndex;
-			impl->queues[queueSlot].queueIndex = 0;
+			const uint32_t reservedPrimaryCount = familyIndex < rhiPrimaryQueueCounts.size() ? rhiPrimaryQueueCounts[familyIndex] : 1u;
+			const uint32_t queueIndex = nextPrimaryQueueIndex[familyIndex] < reservedPrimaryCount ? nextPrimaryQueueIndex[familyIndex]++ : 0u;
+			VkQueue vkQueue = VK_NULL_HANDLE;
+			vkGetDeviceQueue(device, familyIndex, queueIndex, &vkQueue);
+			const QueueHandle queueHandle = impl->queues.alloc(VulkanQueueState{ vkQueue, familyIndex, queueIndex });
+			switch (static_cast<QueueKind>(queueSlot)) {
+			case QueueKind::Graphics:
+				impl->gfxHandle = queueHandle;
+				break;
+			case QueueKind::Compute:
+				impl->compHandle = queueHandle;
+				break;
+			case QueueKind::Copy:
+				impl->copyHandle = queueHandle;
+				break;
+			default:
+				break;
+			}
+			impl->queueFamilyNextQueueIndex[familyIndex] = (std::max)(impl->queueFamilyNextQueueIndex[familyIndex], queueIndex + 1u);
+		}
+		auto reserveExternalQueueRange = [&](uint32_t familyIndex, uint32_t queueIndex, uint32_t queueCount) {
+			if (familyIndex == kVkInvalidQueueFamily || familyIndex >= impl->queueFamilyNextQueueIndex.size() || queueCount == 0) {
+				return;
+			}
+			impl->queueFamilyNextQueueIndex[familyIndex] = (std::max)(impl->queueFamilyNextQueueIndex[familyIndex], queueIndex + queueCount);
+		};
+		reserveExternalQueueRange(streamlineGraphicsQueueFamily, streamlineGraphicsQueueIndex, streamlineGraphicsQueueCount);
+		reserveExternalQueueRange(streamlineComputeQueueFamily, streamlineComputeQueueIndex, streamlineComputeQueueCount);
+		reserveExternalQueueRange(streamlineOpticalFlowQueueFamily, streamlineOpticalFlowQueueIndex, streamlineOpticalFlowQueueCount);
+		for (uint32_t familyIndex = 0; familyIndex < impl->queueFamilyNextQueueIndex.size(); ++familyIndex) {
+			const uint32_t requestedQueueCount = familyIndex < requestedQueueCounts.size() ? requestedQueueCounts[familyIndex] : 0u;
+			if (requestedQueueCount > 0 && impl->queueFamilyNextQueueIndex[familyIndex] > requestedQueueCount) {
+				impl->queueFamilyNextQueueIndex[familyIndex] = requestedQueueCount;
+			}
 		}
 		impl->self = Device{ impl.get(), &g_vkdevvt };
 
@@ -7886,9 +8033,9 @@ namespace rhi {
 			VK_API_VERSION_MAJOR(impl->physicalDeviceProperties.apiVersion),
 			VK_API_VERSION_MINOR(impl->physicalDeviceProperties.apiVersion),
 			VK_API_VERSION_PATCH(impl->physicalDeviceProperties.apiVersion),
-			impl->queues[0].familyIndex,
-			impl->queues[1].familyIndex,
-			impl->queues[2].familyIndex,
+			VkPrimaryQueueStateForKind(impl.get(), QueueKind::Graphics) ? VkPrimaryQueueStateForKind(impl.get(), QueueKind::Graphics)->familyIndex : kVkInvalidQueueFamily,
+			VkPrimaryQueueStateForKind(impl.get(), QueueKind::Compute) ? VkPrimaryQueueStateForKind(impl.get(), QueueKind::Compute)->familyIndex : kVkInvalidQueueFamily,
+			VkPrimaryQueueStateForKind(impl.get(), QueueKind::Copy) ? VkPrimaryQueueStateForKind(impl.get(), QueueKind::Copy)->familyIndex : kVkInvalidQueueFamily,
 			impl->dynamicRenderingEnabled,
 			impl->bufferDeviceAddressEnabled,
 			impl->bufferDeviceAddressCaptureReplayEnabled,
