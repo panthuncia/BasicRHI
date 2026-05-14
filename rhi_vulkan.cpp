@@ -3068,7 +3068,19 @@ namespace rhi {
 			}
 
 			uint64_t value = 0;
-			return vkGetSemaphoreCounterValue(impl->device, timelineState->semaphore, &value) == VK_SUCCESS ? value : 0;
+			if (vkGetSemaphoreCounterValue(impl->device, timelineState->semaphore, &value) != VK_SUCCESS) {
+				return 0;
+			}
+			if (value == UINT64_MAX && timelineState->lastSubmittedSignalValue != UINT64_MAX) {
+				const TimelineHandle handle = timeline->GetHandle();
+				spdlog::critical(
+					"Vulkan timeline(idx={}, gen={}) reports completed UINT64_MAX, but BasicRHI highest submitted signal is {}. Raw semaphore={}, suggesting an external signal path or semaphore object corruption.",
+					handle.index,
+					handle.generation,
+					timelineState->lastSubmittedSignalValue,
+					reinterpret_cast<uint64_t>(timelineState->semaphore));
+			}
+			return value;
 		}
 
 		static Result tl_timelineHostWait(Timeline* timeline, const uint64_t value, uint32_t timeoutMs) noexcept {
@@ -3338,6 +3350,11 @@ namespace rhi {
 
 			const Result submitResult = ToRHI(vkQueueSubmit(queueState->queue, 1, &submitInfo, VK_NULL_HANDLE));
 			if (submitResult == Result::Ok) {
+				for (const TimelinePoint& signal : submit.signals) {
+					if (VulkanTimeline* timeline = VkTimelineState(impl, signal.t)) {
+						timeline->lastSubmittedSignalValue = (std::max)(timeline->lastSubmittedSignalValue, signal.value);
+					}
+				}
 				for (uint32_t index = 0; index < lists.size; ++index) {
 					if (VulkanCommandList* commandListState = VkCommandListState(impl, lists.data[index].GetHandle())) {
 						commandListState->recordedBarrierBatches.clear();
@@ -6358,7 +6375,7 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
-			const TimelineHandle handle = impl->timelines.alloc(VulkanTimeline{ semaphore });
+			const TimelineHandle handle = impl->timelines.alloc(VulkanTimeline{ semaphore, initialValue });
 			Timeline timeline{ handle };
 			timeline.impl = impl;
 			timeline.vt = &g_vktlvt;

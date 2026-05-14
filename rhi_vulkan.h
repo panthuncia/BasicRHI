@@ -261,6 +261,7 @@ namespace rhi {
 
 	struct VulkanTimeline {
 		VkSemaphore semaphore = VK_NULL_HANDLE;
+		uint64_t lastSubmittedSignalValue = 0;
 	};
 
 	struct VulkanHeap {
