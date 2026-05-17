@@ -176,6 +176,17 @@ if(_basicrhi_reshape_available)
         ${_basicrhi_reshape_vulkan_include_dirs}
     )
 
+    set(_basicrhi_reshape_schema_targets)
+    if(TARGET GRS.Features.Descriptor.Backend)
+        list(APPEND _basicrhi_reshape_schema_targets GRS.Features.Descriptor.Backend)
+    endif()
+    if(TARGET GRS.Features.ResourceBounds.Backend)
+        list(APPEND _basicrhi_reshape_schema_targets GRS.Features.ResourceBounds.Backend)
+    endif()
+    if(_basicrhi_reshape_schema_targets)
+        add_dependencies(BasicRHI ${_basicrhi_reshape_schema_targets})
+    endif()
+
     target_link_libraries(BasicRHI PUBLIC
         $<BUILD_INTERFACE:GRS.Libraries.Backend>
     )

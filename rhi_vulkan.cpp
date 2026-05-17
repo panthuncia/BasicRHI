@@ -25,7 +25,14 @@
 #if BASICRHI_ENABLE_RESHAPE
 #include <Backend/Environment.h>
 #include <Backend/EnvironmentInfo.h>
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4005)
+#endif
 #include <Backends/Vulkan/Layer.h>
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 #endif
 
 namespace rhi {
