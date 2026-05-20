@@ -87,8 +87,15 @@ namespace rhi {
 	struct Dx12Pipeline {
 		Dx12Pipeline() {}
 		explicit Dx12Pipeline(Microsoft::WRL::ComPtr<ID3D12PipelineState> p, bool isComp, Dx12Device* device) : pso(p), isCompute(isComp), dev(device) {}
+		Dx12Pipeline(Microsoft::WRL::ComPtr<ID3D12StateObject> so, Microsoft::WRL::ComPtr<ID3D12StateObjectProperties> props, std::vector<std::wstring> groups, Dx12Device* device, bool isLibraryObject = false)
+			: stateObject(std::move(so)), stateObjectProperties(std::move(props)), rayTracingGroupExportNames(std::move(groups)), isRayTracing(true), isRayTracingLibrary(isLibraryObject), dev(device) {}
 		Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
-		bool isCompute;
+		Microsoft::WRL::ComPtr<ID3D12StateObject> stateObject;
+		Microsoft::WRL::ComPtr<ID3D12StateObjectProperties> stateObjectProperties;
+		std::vector<std::wstring> rayTracingGroupExportNames;
+		bool isCompute = false;
+		bool isRayTracing = false;
+		bool isRayTracingLibrary = false;
 		Dx12Device* dev = nullptr;
 	};
 
@@ -307,6 +314,17 @@ namespace rhi {
 		Dx12Device* dev = nullptr;
 	};
 
+	struct Dx12AccelerationStructure {
+		Dx12AccelerationStructure() {}
+		Dx12AccelerationStructure(RayTracingAccelerationStructureType t, ResourceHandle s, uint64_t o, uint64_t bytes, Dx12Device* d)
+			: type(t), storage(s), storageOffset(o), sizeBytes(bytes), dev(d) {}
+		RayTracingAccelerationStructureType type = RayTracingAccelerationStructureType::BottomLevel;
+		ResourceHandle storage{};
+		uint64_t storageOffset = 0;
+		uint64_t sizeBytes = 0;
+		Dx12Device* dev = nullptr;
+	};
+
 	using Dx12PendingInstrumentationPipelineIssue = ReShapePendingInstrumentationPipelineIssue;
 	using Dx12PendingInstrumentationShaderIssue = ReShapePendingInstrumentationShaderIssue;
 	using Dx12InstrumentationExecutionKind = ReShapeInstrumentationExecutionKind;
@@ -393,6 +411,7 @@ namespace rhi {
 	template<> struct HandleFor<Dx12CommandList> { using type = CommandListHandle; };
 	template<> struct HandleFor<Dx12Heap> { using type = HeapHandle; };
 	template<> struct HandleFor<Dx12QueryPool> { using type = QueryPoolHandle; };
+	template<> struct HandleFor<Dx12AccelerationStructure> { using type = AccelerationStructureHandle; };
 	template<> struct HandleFor<Dx12Swapchain> { using type = SwapChainHandle; };
 	template<> struct HandleFor<Dx12QueueState> { using type = QueueHandle; };
 
@@ -465,7 +484,9 @@ namespace rhi {
 		Registry<Dx12Timeline> timelines;
 		Registry<Dx12Heap> heaps;
 		Registry<Dx12QueryPool> queryPools;
+		Registry<Dx12AccelerationStructure> accelerationStructures;
 		Registry<Dx12Swapchain> swapchains; // For uniformity, not really part of device
+		ComPtr<ID3D12CommandSignature> dispatchRaysIndirectSignature;
 
 		Registry<Dx12QueueState> queues;
 		QueueHandle gfxHandle, compHandle, copyHandle;
@@ -485,6 +506,7 @@ namespace rhi {
 	extern const CommandAllocatorVTable g_calvt;
 	extern const ResourceVTable g_buf_rvt;
 	extern const ResourceVTable g_tex_rvt;
+	extern const AccelerationStructureVTable g_asvt;
 	extern const QueryPoolVTable g_qpvt;
 	extern const PipelineVTable g_psovt;
 	extern const WorkGraphVTable g_wgvt;

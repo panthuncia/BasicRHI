@@ -7,6 +7,7 @@
 #include <array>
 #include <deque>
 #include <memory>
+#include <string>
 
 #include <vector>
 
@@ -28,6 +29,7 @@ namespace rhi {
 	struct VulkanTimeline;
 	struct VulkanHeap;
 	struct VulkanQueryPool;
+	struct VulkanAccelerationStructure;
 	struct VulkanQueueState;
 
 	template<> struct VulkanHandleFor<VulkanDescriptorHeap> { using type = DescriptorHeapHandle; };
@@ -41,6 +43,7 @@ namespace rhi {
 	template<> struct VulkanHandleFor<VulkanTimeline> { using type = TimelineHandle; };
 	template<> struct VulkanHandleFor<VulkanHeap> { using type = HeapHandle; };
 	template<> struct VulkanHandleFor<VulkanQueryPool> { using type = QueryPoolHandle; };
+	template<> struct VulkanHandleFor<VulkanAccelerationStructure> { using type = AccelerationStructureHandle; };
 	template<> struct VulkanHandleFor<VulkanQueueState> { using type = QueueHandle; };
 
 	template<typename T>
@@ -164,6 +167,7 @@ namespace rhi {
 			BufferView,
 			ConstantBuffer,
 			Sampler,
+			AccelerationStructure,
 		};
 
 		Kind kind = Kind::None;
@@ -181,6 +185,7 @@ namespace rhi {
 		ComponentMapping componentMapping = 0;
 		CbvDesc cbv{};
 		SamplerDesc samplerDesc{};
+		AccelerationStructureHandle accelerationStructure{};
 	};
 
 	struct VulkanDescriptorHeap {
@@ -243,6 +248,19 @@ namespace rhi {
 		VkPipelineBindPoint bindPoint = VK_PIPELINE_BIND_POINT_MAX_ENUM;
 		PipelineLayoutHandle rhiLayout{};
 		bool isCompute = false;
+		bool isRayTracing = false;
+		bool isRayTracingLibrary = false;
+		uint32_t shaderGroupCount = 0;
+		uint32_t rayTracingStackSize = 0;
+	};
+
+	struct VulkanAccelerationStructure {
+		VkAccelerationStructureKHR accelerationStructure = VK_NULL_HANDLE;
+		ResourceHandle storage{};
+		uint64_t storageOffset = 0;
+		uint64_t sizeBytes = 0;
+		RayTracingAccelerationStructureType type = RayTracingAccelerationStructureType::BottomLevel;
+		VkDeviceAddress deviceAddress = 0;
 	};
 
 	struct VulkanCommandSignature {
@@ -351,6 +369,7 @@ namespace rhi {
 		std::vector<RecordingBufferState> recordingBufferStates;
 		std::vector<EmulatedRootConstantScratchPage> emulatedRootConstantScratchPages;
 		std::vector<EmulatedRootConstantShadowState> emulatedRootConstantShadowStates;
+		std::vector<VkQueryPool> transientQueryPools;
 	};
 
 	struct VulkanDevice {
@@ -367,6 +386,11 @@ namespace rhi {
 		VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptorHeapProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT };
 		VkPhysicalDeviceMeshShaderPropertiesEXT meshShaderProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT };
 		VkPhysicalDeviceComputeShaderDerivativesPropertiesKHR computeShaderDerivativesProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_PROPERTIES_KHR };
+		VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
+		VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
+		VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
+		VkPhysicalDeviceAccelerationStructurePropertiesKHR accelerationStructureProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR };
+		VkPhysicalDeviceRayTracingPipelinePropertiesKHR rayTracingPipelineProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR };
 		uint32_t loaderApiVersion = VK_API_VERSION_1_0;
 		uint32_t instanceApiVersion = VK_API_VERSION_1_0;
 		bool swapchainExtensionEnabled = false;
@@ -389,6 +413,11 @@ namespace rhi {
 		bool computeDerivativeGroupLinearEnabled = false;
 		bool shaderImageInt64AtomicsEnabled = false;
 		bool shaderSubgroupPartitionedEnabled = false;
+		bool deferredHostOperationsEnabled = false;
+		bool accelerationStructureEnabled = false;
+		bool rayTracingPipelineEnabled = false;
+		bool rayQueryEnabled = false;
+		bool rayTracingPipelineLibraryEnabled = false;
 		bool validateBarrierTransitions = false;
 		bool streamlineInitialized = false;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
@@ -402,6 +431,7 @@ namespace rhi {
 		VulkanRegistry<VulkanTimeline> timelines;
 		VulkanRegistry<VulkanHeap> heaps;
 		VulkanRegistry<VulkanQueryPool> queryPools;
+		VulkanRegistry<VulkanAccelerationStructure> accelerationStructures;
 		VulkanRegistry<VulkanCommandList> commandLists;
 		VulkanRegistry<VulkanQueueState> queues;
 		std::vector<uint32_t> queueFamilyNextQueueIndex;
@@ -423,6 +453,7 @@ namespace rhi {
 	extern const ResourceVTable g_vkbuf_rvt;
 	extern const ResourceVTable g_vktex_rvt;
 	extern const QueryPoolVTable g_vkqpvt;
+	extern const AccelerationStructureVTable g_vkasvt;
 	extern const PipelineVTable g_vkpsovt;
 	extern const WorkGraphVTable g_vkwgvt;
 	extern const PipelineLayoutVTable g_vkplvt;

@@ -117,6 +117,7 @@ namespace rhi {
 		VideoEncode = 0x400000,
 		BuildRaytracingAccelerationStructure = 0x800000,
 		CopyRatracingAccelerationStructure = 0x1000000,
+		CopyRaytracingAccelerationStructure = CopyRatracingAccelerationStructure,
 		SyncSplit = 0x80000000u,
 	};
 

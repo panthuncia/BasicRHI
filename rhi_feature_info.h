@@ -30,6 +30,7 @@ enum class ShaderModel : uint16_t {
 // "quality level" enums that are RHI-defined (NOT necessarily DX tiers).
 enum class MeshShaderLevel : uint8_t { None, Mesh, MeshPlusTask };
 enum class RayTracingLevel : uint8_t { None, Pipeline, PipelinePlusQuery };
+enum class RayTracingBackendTier : uint8_t { None, DXR_1_0, DXR_1_1, VulkanKHR };
 enum class ShadingRateLevel : uint8_t { None, PerDraw, Attachment };
 enum class WorkGraphLevel : uint8_t { None, ComputeNodes, MeshNodes };
 
@@ -90,11 +91,48 @@ struct MeshShaderFeatureInfo {
 };
 
 struct RayTracingFeatureInfo {
-    FeatureInfoHeader header{ FeatureInfoStructType::RayTracing, nullptr, sizeof(RayTracingFeatureInfo), 1 };
+    FeatureInfoHeader header{ FeatureInfoStructType::RayTracing, nullptr, sizeof(RayTracingFeatureInfo), 2 };
 
     bool pipeline = false;   // RT pipeline + shader tables (DXR pipeline / VK ray_tracing_pipeline)
     bool rayQuery = false;   // inline ray queries (DXR 1.1-ish / VK ray_query)
     bool indirect = false;   // indirect trace support
+
+    // Core acceleration structure support.
+    bool accelerationStructure = false;
+    bool accelerationStructureUpdate = false;
+    bool accelerationStructureCompaction = false;
+    bool accelerationStructureCopy = false;
+    bool accelerationStructureSerialization = false;
+    bool hostAccelerationStructureBuild = false;
+    bool indirectAccelerationStructureBuild = false;
+
+    // Pipeline and shader table support.
+    bool pipelineLibrary = false;
+    bool deferredHostOperations = false;
+    bool shaderGroupHandleCaptureReplay = false;
+
+    // Optional/newer features. These are false unless the backend can expose a real native path.
+    bool opacityMicromap = false;
+    bool shaderExecutionReordering = false;
+    bool clusterAccelerationStructure = false;
+    bool partitionedAccelerationStructure = false;
+
+    RayTracingBackendTier backendTier = RayTracingBackendTier::None;
+
+    uint32_t shaderGroupHandleSize = 0;
+    uint32_t shaderGroupHandleAlignment = 0;
+    uint32_t shaderGroupBaseAlignment = 0;
+    uint32_t shaderTableStrideAlignment = 0;
+    uint32_t shaderTableMaxStride = 0;
+    uint32_t maxRayRecursionDepth = 0;
+    uint32_t maxRayDispatchWidth = 0;
+    uint32_t maxRayDispatchHeight = 0;
+    uint32_t maxRayDispatchDepth = 0;
+    uint32_t maxGeometryCount = 0;
+    uint32_t maxInstanceCount = 0;
+    uint32_t maxPrimitiveCount = 0;
+    uint64_t scratchAlignment = 0;
+    uint64_t resultAlignment = 0;
 
     [[nodiscard]] constexpr RayTracingLevel Level() const noexcept {
         if (!pipeline) return RayTracingLevel::None;

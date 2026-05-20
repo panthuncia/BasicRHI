@@ -95,6 +95,12 @@ namespace rhi::dx12_detail
 		return (dev && qp) ? dev->queryPools.get(qp->GetHandle()) : nullptr;
 	}
 
+	[[nodiscard]] inline Dx12AccelerationStructure* AS(const AccelerationStructure* as) noexcept
+	{
+		Dx12Device* dev = Dev(as);
+		return (dev && as) ? dev->accelerationStructures.get(as->GetHandle()) : nullptr;
+	}
+
 	[[nodiscard]] inline Dx12Swapchain* SC(const Swapchain* sc) noexcept
 	{
 		Dx12Device* dev = Dev(sc);

@@ -674,12 +674,209 @@ namespace rhi {
 			}
 		}
 
+		static bool Dx12IsRayTracingShaderStage(ShaderStage stage) noexcept {
+			switch (stage) {
+			case ShaderStage::RayGen:
+			case ShaderStage::Miss:
+			case ShaderStage::ClosestHit:
+			case ShaderStage::AnyHit:
+			case ShaderStage::Intersection:
+			case ShaderStage::Callable:
+				return true;
+			default:
+				return false;
+			}
+		}
+
+		static D3D12_HIT_GROUP_TYPE Dx12HitGroupType(RayTracingShaderGroupType type) noexcept {
+			switch (type) {
+			case RayTracingShaderGroupType::ProceduralHitGroup: return D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
+			case RayTracingShaderGroupType::TrianglesHitGroup:
+			default: return D3D12_HIT_GROUP_TYPE_TRIANGLES;
+			}
+		}
+
+		static D3D12_RAYTRACING_PIPELINE_FLAGS Dx12RtPipelineFlags(RayTracingPipelineFlags flags) noexcept {
+			const uint32_t bits = static_cast<uint32_t>(flags);
+			D3D12_RAYTRACING_PIPELINE_FLAGS out = D3D12_RAYTRACING_PIPELINE_FLAG_NONE;
+			if ((bits & RTPipeline_SkipTriangles) != 0) out |= D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_TRIANGLES;
+			if ((bits & RTPipeline_SkipProceduralPrimitives) != 0) out |= D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_PROCEDURAL_PRIMITIVES;
+			return out;
+		}
+
+		static Result Dx12CreateRayTracingPipeline(Device* d, const SubobjRayTracingPipeline& rt, PipelinePtr& out) noexcept {
+			auto* dimpl = static_cast<Dx12Device*>(d ? d->impl : nullptr);
+			if (!dimpl || !dimpl->pNativeDevice || rt.shaders.size == 0 || rt.shaderGroups.size == 0) {
+				out.Reset();
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
+			const HRESULT featureHr = dimpl->pNativeDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5));
+			if (FAILED(featureHr) || options5.RaytracingTier == D3D12_RAYTRACING_TIER_NOT_SUPPORTED) {
+				out.Reset();
+				RHI_FAIL(Result::Unsupported);
+			}
+
+			struct StringStore {
+				std::deque<std::wstring> ws;
+				LPCWSTR W(const char* s) {
+					ws.emplace_back(s2ws(std::string(s ? s : "")));
+					return ws.back().c_str();
+				}
+			};
+			StringStore strings;
+
+			CD3DX12_STATE_OBJECT_DESC soDesc(rt.library ? D3D12_STATE_OBJECT_TYPE_COLLECTION : D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
+
+			for (PipelineHandle libraryHandle : rt.libraries) {
+				Dx12Pipeline* library = dimpl->pipelines.get(libraryHandle);
+				if (!library || !library->isRayTracingLibrary || !library->stateObject) {
+					out.Reset();
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				auto* existing = soDesc.CreateSubobject<CD3DX12_EXISTING_COLLECTION_SUBOBJECT>();
+				existing->SetExistingCollection(library->stateObject.Get());
+			}
+
+			for (const SubobjShader& shader : rt.shaders) {
+				if (!Dx12IsRayTracingShaderStage(shader.stage) || !shader.bytecode.data || shader.bytecode.size == 0 || shader.entryPoint.empty()) {
+					out.Reset();
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				Dx12TrackLocalShaderEntryPoint(dimpl, shader);
+
+				auto* lib = soDesc.CreateSubobject<CD3DX12_DXIL_LIBRARY_SUBOBJECT>();
+				D3D12_SHADER_BYTECODE bytecode{ shader.bytecode.data, shader.bytecode.size };
+				lib->SetDXILLibrary(&bytecode);
+				lib->DefineExport(strings.W(shader.entryPoint.c_str()));
+			}
+
+			if (rt.globalLayout.valid()) {
+				const auto* layout = dimpl->pipelineLayouts.get(rt.globalLayout);
+				if (!layout || !layout->root) {
+					out.Reset();
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				auto* grs = soDesc.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
+				grs->SetRootSignature(layout->root.Get());
+			}
+
+			for (const LocalRootAssociation& assoc : rt.localRootAssociations) {
+				const auto* layout = dimpl->pipelineLayouts.get(assoc.localRootSignature);
+				if (!layout || !layout->root || assoc.exports.size == 0) {
+					out.Reset();
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				auto* lrs = soDesc.CreateSubobject<CD3DX12_LOCAL_ROOT_SIGNATURE_SUBOBJECT>();
+				lrs->SetRootSignature(layout->root.Get());
+
+				auto* association = soDesc.CreateSubobject<CD3DX12_SUBOBJECT_TO_EXPORTS_ASSOCIATION_SUBOBJECT>();
+				association->SetSubobjectToAssociate(*lrs);
+				for (const char* exportName : assoc.exports) {
+					if (exportName && exportName[0] != '\0') association->AddExport(strings.W(exportName));
+				}
+			}
+
+			std::vector<std::wstring> groupExportNames;
+			groupExportNames.reserve(rt.shaderGroups.size);
+			for (const RayTracingShaderGroupDesc& group : rt.shaderGroups) {
+				if (group.type == RayTracingShaderGroupType::General) {
+					const char* shaderExport = group.generalShader ? group.generalShader : group.name;
+					if (!shaderExport || shaderExport[0] == '\0') {
+						out.Reset();
+						RHI_FAIL(Result::InvalidArgument);
+					}
+					groupExportNames.emplace_back(s2ws(shaderExport));
+					continue;
+				}
+
+				if (!group.name || group.name[0] == '\0') {
+					out.Reset();
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				auto* hitGroup = soDesc.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+				hitGroup->SetHitGroupExport(strings.W(group.name));
+				hitGroup->SetHitGroupType(Dx12HitGroupType(group.type));
+				if (group.closestHitShader && group.closestHitShader[0] != '\0') hitGroup->SetClosestHitShaderImport(strings.W(group.closestHitShader));
+				if (group.anyHitShader && group.anyHitShader[0] != '\0') hitGroup->SetAnyHitShaderImport(strings.W(group.anyHitShader));
+				if (group.intersectionShader && group.intersectionShader[0] != '\0') hitGroup->SetIntersectionShaderImport(strings.W(group.intersectionShader));
+				groupExportNames.emplace_back(s2ws(group.name));
+			}
+
+			auto* shaderConfig = soDesc.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
+			shaderConfig->Config(rt.shaderConfig.maxPayloadSizeInBytes, rt.shaderConfig.maxAttributeSizeInBytes);
+			if (!groupExportNames.empty()) {
+				auto* association = soDesc.CreateSubobject<CD3DX12_SUBOBJECT_TO_EXPORTS_ASSOCIATION_SUBOBJECT>();
+				association->SetSubobjectToAssociate(*shaderConfig);
+				for (const std::wstring& exportName : groupExportNames) {
+					association->AddExport(exportName.c_str());
+				}
+			}
+
+			if (!rt.library) {
+				const D3D12_RAYTRACING_PIPELINE_FLAGS nativeFlags = Dx12RtPipelineFlags(rt.flags);
+				if (nativeFlags != D3D12_RAYTRACING_PIPELINE_FLAG_NONE) {
+					if (options5.RaytracingTier < D3D12_RAYTRACING_TIER_1_1) {
+						out.Reset();
+						RHI_FAIL(Result::Unsupported);
+					}
+					auto* pipelineConfig = soDesc.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT>();
+					pipelineConfig->Config(rt.pipelineConfig.maxTraceRecursionDepth, nativeFlags);
+				}
+				else {
+					auto* pipelineConfig = soDesc.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
+					pipelineConfig->Config(rt.pipelineConfig.maxTraceRecursionDepth);
+				}
+			}
+
+			UINT64 infoQueueStart = 0;
+			ComPtr<ID3D12InfoQueue> infoQueue;
+			if (SUCCEEDED(dimpl->pNativeDevice->QueryInterface(IID_PPV_ARGS(&infoQueue))) && infoQueue) {
+				infoQueueStart = infoQueue->GetNumStoredMessagesAllowedByRetrievalFilter();
+			}
+			ComPtr<ID3D12StateObject> stateObject;
+			if (const HRESULT hr = dimpl->pNativeDevice->CreateStateObject(soDesc, IID_PPV_ARGS(&stateObject)); FAILED(hr)) {
+				Dx12LogInfoQueueMessagesSince(dimpl->pNativeDevice.Get(), infoQueueStart);
+				out.Reset();
+				RHI_FAIL(ToRHI(hr));
+			}
+
+			ComPtr<ID3D12StateObjectProperties> properties;
+			if (const HRESULT hr = stateObject.As(&properties); FAILED(hr) || !properties) {
+				out.Reset();
+				RHI_FAIL(Result::Failed);
+			}
+
+			const auto handle = dimpl->pipelines.alloc(Dx12Pipeline(stateObject, properties, std::move(groupExportNames), dimpl, rt.library));
+			Pipeline ret(handle);
+			ret.vt = &g_psovt;
+			ret.impl = dimpl;
+			out = MakePipelinePtr(d, ret, dimpl->selfWeak.lock());
+			return Result::Ok;
+		}
+
 		static Result d_createPipelineFromStream(Device* d,
 			const PipelineStreamItem* items,
 			uint32_t count,
 			PipelinePtr& out) noexcept
 		{
 			auto* dimpl = static_cast<Dx12Device*>(d->impl);
+			const SubobjRayTracingPipeline* rtPipeline = nullptr;
+			for (uint32_t i = 0; i < count; ++i) {
+				if (items[i].type == PsoSubobj::RayTracingPipeline) {
+					if (rtPipeline || !items[i].data || items[i].size != sizeof(SubobjRayTracingPipeline)) {
+						RHI_FAIL(Result::InvalidArgument);
+					}
+					rtPipeline = static_cast<const SubobjRayTracingPipeline*>(items[i].data);
+				}
+			}
+			if (rtPipeline) {
+				if (count != 1) {
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				return Dx12CreateRayTracingPipeline(d, *rtPipeline, out);
+			}
 
 			// Collect RHI subobjects
 			ID3D12RootSignature* root = nullptr;
@@ -720,6 +917,16 @@ namespace rhi {
 					case ShaderStage::Pixel: ps = bc; hasGfx = true; break;
 					case ShaderStage::Task: as = bc; hasGfx = true; break;
 					case ShaderStage::Mesh: ms = bc; hasGfx = true; break;
+					case ShaderStage::RayGen:
+					case ShaderStage::Miss:
+					case ShaderStage::ClosestHit:
+					case ShaderStage::AnyHit:
+					case ShaderStage::Intersection:
+					case ShaderStage::Callable:
+					case ShaderStage::AllRayTracing:
+						spdlog::error("DX12 pipeline creation: ray tracing shader stages require an RT pipeline subobject");
+						RHI_FAIL(Result::Unsupported);
+						break;
 					case ShaderStage::AllGraphics:
 						spdlog::error("DX12 pipeline creation: invalid shader stage 'AllGraphics'");
 						RHI_FAIL(Result::InvalidArgument);
@@ -796,6 +1003,9 @@ namespace rhi {
 				case PsoSubobj::Flags: {
 					break;
 				}
+				case PsoSubobj::RayTracingPipeline: {
+					RHI_FAIL(Result::InvalidArgument);
+				} break;
 				}
 			}
 
@@ -1969,6 +2179,35 @@ namespace rhi {
 
 					// Also a heuristic: "indirect trace" is not a single clean DX12 bit in core options;
 					out->indirect = hasRayTracing11;
+					out->accelerationStructure = hasRayTracingPipeline;
+					out->accelerationStructureUpdate = hasRayTracingPipeline;
+					out->accelerationStructureCompaction = hasRayTracingPipeline;
+					out->accelerationStructureCopy = hasRayTracingPipeline;
+					out->accelerationStructureSerialization = hasRayTracingPipeline;
+					out->hostAccelerationStructureBuild = false;
+					out->indirectAccelerationStructureBuild = false;
+					out->pipelineLibrary = hasRayTracingPipeline;
+					out->deferredHostOperations = false;
+					out->shaderGroupHandleCaptureReplay = false;
+					out->opacityMicromap = false;
+					out->shaderExecutionReordering = false;
+					out->clusterAccelerationStructure = false;
+					out->partitionedAccelerationStructure = false;
+					out->backendTier = hasRayTracing11 ? RayTracingBackendTier::DXR_1_1 : (hasRayTracingPipeline ? RayTracingBackendTier::DXR_1_0 : RayTracingBackendTier::None);
+					out->shaderGroupHandleSize = hasRayTracingPipeline ? D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES : 0;
+					out->shaderGroupHandleAlignment = hasRayTracingPipeline ? D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES : 0;
+					out->shaderGroupBaseAlignment = hasRayTracingPipeline ? D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT : 0;
+					out->shaderTableStrideAlignment = hasRayTracingPipeline ? D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT : 0;
+					out->shaderTableMaxStride = hasRayTracingPipeline ? D3D12_RAYTRACING_MAX_SHADER_RECORD_STRIDE : 0;
+					out->maxRayRecursionDepth = hasRayTracingPipeline ? D3D12_RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH : 0;
+					out->maxRayDispatchWidth = hasRayTracingPipeline ? D3D12_RAYTRACING_MAX_RAY_GENERATION_SHADER_THREADS : 0;
+					out->maxRayDispatchHeight = hasRayTracingPipeline ? D3D12_RAYTRACING_MAX_RAY_GENERATION_SHADER_THREADS : 0;
+					out->maxRayDispatchDepth = hasRayTracingPipeline ? D3D12_RAYTRACING_MAX_RAY_GENERATION_SHADER_THREADS : 0;
+					out->maxGeometryCount = hasRayTracingPipeline ? D3D12_RAYTRACING_MAX_GEOMETRIES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE : 0;
+					out->maxInstanceCount = hasRayTracingPipeline ? D3D12_RAYTRACING_MAX_INSTANCES_PER_TOP_LEVEL_ACCELERATION_STRUCTURE : 0;
+					out->maxPrimitiveCount = hasRayTracingPipeline ? D3D12_RAYTRACING_MAX_PRIMITIVES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE : 0;
+					out->scratchAlignment = hasRayTracingPipeline ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
+					out->resultAlignment = hasRayTracingPipeline ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
 				} break;
 
 				case FeatureInfoStructType::ShadingRate: {
@@ -2093,6 +2332,9 @@ namespace rhi {
 			case IndirectArgKind::Dispatch:
 				out.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
 				return true;
+			case IndirectArgKind::DispatchRays:
+				out.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
+				return true;
 			case IndirectArgKind::Draw:
 				out.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
 				return true;
@@ -2107,6 +2349,24 @@ namespace rhi {
 				return true;
 			default: return false;
 			}
+		}
+
+		static ID3D12CommandSignature* Dx12DispatchRaysIndirectSignature(Dx12Device* impl) noexcept {
+			if (!impl || !impl->pNativeDevice) {
+				return nullptr;
+			}
+			if (impl->dispatchRaysIndirectSignature) {
+				return impl->dispatchRaysIndirectSignature.Get();
+			}
+
+			D3D12_INDIRECT_ARGUMENT_DESC arg{};
+			arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
+			D3D12_COMMAND_SIGNATURE_DESC desc{};
+			desc.ByteStride = sizeof(D3D12_DISPATCH_RAYS_DESC);
+			desc.NumArgumentDescs = 1;
+			desc.pArgumentDescs = &arg;
+			HRESULT hr = impl->pNativeDevice->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&impl->dispatchRaysIndirectSignature));
+			return SUCCEEDED(hr) ? impl->dispatchRaysIndirectSignature.Get() : nullptr;
 		}
 
 		static Result d_createCommandSignature(Device* d,
@@ -2222,6 +2482,8 @@ namespace rhi {
 			out.ptr += static_cast<UINT64>(s.index) * H->inc;
 			return true;
 		}
+
+		static D3D12_GPU_VIRTUAL_ADDRESS Dx12AccelerationStructureAddress(Dx12Device* impl, AccelerationStructureHandle handle) noexcept;
 
 		static Result d_createShaderResourceView(Device* d, DescriptorSlot s, const ResourceHandle& resource, const SrvDesc& dv) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
@@ -2378,12 +2640,13 @@ namespace rhi {
 			}
 
 			case SrvDim::AccelerationStruct: {
-				// AS is stored in a buffer with ResourceFlags::RaytracingAccelerationStructure
-				auto* B = impl->resources.get(resource); if (!B || !B->res) return Result::InvalidArgument;
+				(void)resource;
+				const D3D12_GPU_VIRTUAL_ADDRESS address = Dx12AccelerationStructureAddress(impl, dv.accel.accelerationStructure);
+				if (address == 0) return Result::InvalidArgument;
 				desc.Format = DXGI_FORMAT_UNKNOWN;
 				desc.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
-				desc.RaytracingAccelerationStructure.Location = B->res->GetGPUVirtualAddress();
-				impl->pNativeDevice->CreateShaderResourceView(B->res.Get(), &desc, dst);
+				desc.RaytracingAccelerationStructure.Location = address;
+				impl->pNativeDevice->CreateShaderResourceView(nullptr, &desc, dst);
 				return Result::Ok;
 			}
 
@@ -3348,6 +3611,232 @@ namespace rhi {
 
 		static void d_destroyQueryPool(DeviceDeletionContext* d, QueryPoolHandle h) noexcept {
 			dx12_detail::Dev(d)->queryPools.free(h);
+		}
+
+		static D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE Dx12AsType(RayTracingAccelerationStructureType type) noexcept {
+			switch (type) {
+			case RayTracingAccelerationStructureType::TopLevel: return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+			case RayTracingAccelerationStructureType::BottomLevel:
+			default: return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+			}
+		}
+
+		static D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS Dx12AsBuildFlags(RayTracingAccelerationStructureBuildFlags flags) noexcept {
+			const uint32_t bits = static_cast<uint32_t>(flags);
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS out = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE;
+			if ((bits & RTASBuild_AllowUpdate) != 0) out |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+			if ((bits & RTASBuild_AllowCompaction) != 0) out |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
+			if ((bits & RTASBuild_PreferFastTrace) != 0) out |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+			if ((bits & RTASBuild_PreferFastBuild) != 0) out |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+			if ((bits & RTASBuild_MinimizeMemory) != 0) out |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY;
+			return out;
+		}
+
+		static D3D12_RAYTRACING_GEOMETRY_FLAGS Dx12GeometryFlags(RayTracingGeometryFlags flags) noexcept {
+			const uint32_t bits = static_cast<uint32_t>(flags);
+			D3D12_RAYTRACING_GEOMETRY_FLAGS out = D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+			if ((bits & RTGeometry_Opaque) != 0) out |= D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+			if ((bits & RTGeometry_NoDuplicateAnyHitInvocation) != 0) out |= D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION;
+			return out;
+		}
+
+		static D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE Dx12AsCopyMode(RayTracingAccelerationStructureCopyMode mode) noexcept {
+			switch (mode) {
+			case RayTracingAccelerationStructureCopyMode::Compact: return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT;
+			case RayTracingAccelerationStructureCopyMode::Serialize: return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE;
+			case RayTracingAccelerationStructureCopyMode::Deserialize: return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE;
+			case RayTracingAccelerationStructureCopyMode::Clone:
+			default: return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE;
+			}
+		}
+
+		static D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TYPE Dx12AsPropertyType(RayTracingAccelerationStructureProperty property) noexcept {
+			switch (property) {
+			case RayTracingAccelerationStructureProperty::SerializationSize: return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION;
+			case RayTracingAccelerationStructureProperty::CurrentSize: return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE;
+			case RayTracingAccelerationStructureProperty::CompactedSize:
+			default: return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE;
+			}
+		}
+
+		static D3D12_GPU_VIRTUAL_ADDRESS Dx12BufferAddress(Dx12Device* impl, GpuBufferAddress address) noexcept {
+			if (!impl || !address.buffer.valid()) return 0;
+			Dx12Resource* resource = impl->resources.get(address.buffer);
+			if (!resource || !resource->res || resource->kind != Dx12ResourceKind::Buffer) return 0;
+			return resource->res->GetGPUVirtualAddress() + address.offset;
+		}
+
+		static D3D12_GPU_VIRTUAL_ADDRESS Dx12BufferAddress(Dx12Device* impl, GpuBufferRange range) noexcept {
+			return Dx12BufferAddress(impl, GpuBufferAddress{ range.buffer, range.offset });
+		}
+
+		static D3D12_GPU_VIRTUAL_ADDRESS Dx12AccelerationStructureAddress(Dx12Device* impl, AccelerationStructureHandle handle) noexcept {
+			if (!impl || !handle.valid()) return 0;
+			Dx12AccelerationStructure* as = impl->accelerationStructures.get(handle);
+			if (!as) return 0;
+			return Dx12BufferAddress(impl, GpuBufferAddress{ as->storage, as->storageOffset });
+		}
+
+		struct Dx12BuildInputsStorage {
+			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+			std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geometries;
+		};
+
+		static bool Dx12FillBuildInputs(Dx12Device* impl, const AccelerationStructureBuildInputs& src, Dx12BuildInputsStorage& out) noexcept {
+			if (!impl) return false;
+			out = {};
+			out.inputs.Type = Dx12AsType(src.type);
+			out.inputs.Flags = Dx12AsBuildFlags(src.flags);
+			out.inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+
+			if (src.type == RayTracingAccelerationStructureType::TopLevel) {
+				if (src.geometries.size != 1 || src.geometries[0].type != RayTracingGeometryType::Instances) return false;
+				const RayTracingInstanceGeometryDesc& instances = src.geometries[0].instances;
+				const D3D12_GPU_VIRTUAL_ADDRESS instanceDescs = Dx12BufferAddress(impl, instances.instanceBuffer);
+				if (instanceDescs == 0 || instances.count == 0) return false;
+				out.inputs.NumDescs = instances.count;
+				out.inputs.InstanceDescs = instanceDescs;
+				return true;
+			}
+
+			if (src.geometries.size == 0) return false;
+			out.geometries.reserve(src.geometries.size);
+			for (const RayTracingGeometryDesc& geometry : src.geometries) {
+				D3D12_RAYTRACING_GEOMETRY_DESC native{};
+				native.Flags = Dx12GeometryFlags(geometry.flags);
+				switch (geometry.type) {
+				case RayTracingGeometryType::Triangles: {
+					const auto& triangles = geometry.triangles;
+					const D3D12_GPU_VIRTUAL_ADDRESS vertexAddress = Dx12BufferAddress(impl, triangles.vertexBuffer);
+					if (vertexAddress == 0 || triangles.vertexCount == 0 || triangles.vertexStride == 0) return false;
+					native.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+					native.Triangles.VertexBuffer.StartAddress = vertexAddress;
+					native.Triangles.VertexBuffer.StrideInBytes = triangles.vertexStride;
+					native.Triangles.VertexCount = triangles.vertexCount;
+					native.Triangles.VertexFormat = ToDxgi(triangles.vertexFormat);
+					if (native.Triangles.VertexFormat == DXGI_FORMAT_UNKNOWN) return false;
+					if (triangles.indexCount != 0) {
+						const D3D12_GPU_VIRTUAL_ADDRESS indexAddress = Dx12BufferAddress(impl, triangles.indexBuffer);
+						if (indexAddress == 0) return false;
+						native.Triangles.IndexBuffer = indexAddress;
+						native.Triangles.IndexCount = triangles.indexCount;
+						native.Triangles.IndexFormat = ToDxgi(triangles.indexFormat);
+						if (native.Triangles.IndexFormat != DXGI_FORMAT_R16_UINT && native.Triangles.IndexFormat != DXGI_FORMAT_R32_UINT) return false;
+					}
+					if (triangles.transform3x4Buffer.buffer.valid()) {
+						native.Triangles.Transform3x4 = Dx12BufferAddress(impl, triangles.transform3x4Buffer);
+						if (native.Triangles.Transform3x4 == 0) return false;
+					}
+				} break;
+				case RayTracingGeometryType::Aabbs: {
+					const auto& aabbs = geometry.aabbs;
+					const D3D12_GPU_VIRTUAL_ADDRESS aabbAddress = Dx12BufferAddress(impl, aabbs.aabbBuffer);
+					if (aabbAddress == 0 || aabbs.count == 0 || aabbs.stride == 0) return false;
+					native.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS;
+					native.AABBs.AABBCount = aabbs.count;
+					native.AABBs.AABBs.StartAddress = aabbAddress;
+					native.AABBs.AABBs.StrideInBytes = aabbs.stride;
+				} break;
+				case RayTracingGeometryType::Instances:
+				default:
+					return false;
+				}
+				out.geometries.push_back(native);
+			}
+
+			out.inputs.NumDescs = static_cast<UINT>(out.geometries.size());
+			out.inputs.pGeometryDescs = out.geometries.data();
+			return true;
+		}
+
+		static Result d_getAccelerationStructurePrebuildInfo(Device* d, const AccelerationStructureBuildInputs& inputs, AccelerationStructurePrebuildInfo* out) noexcept {
+			auto* impl = static_cast<Dx12Device*>(d ? d->impl : nullptr);
+			if (!impl || !impl->pNativeDevice || !out) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			Dx12BuildInputsStorage storage{};
+			if (!Dx12FillBuildInputs(impl, inputs, storage)) {
+				*out = {};
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO native{};
+			impl->pNativeDevice->GetRaytracingAccelerationStructurePrebuildInfo(&storage.inputs, &native);
+			out->resultDataMaxSizeInBytes = native.ResultDataMaxSizeInBytes;
+			out->scratchDataSizeInBytes = native.ScratchDataSizeInBytes;
+			out->updateScratchDataSizeInBytes = native.UpdateScratchDataSizeInBytes;
+			return native.ResultDataMaxSizeInBytes != 0 ? Result::Ok : Result::Unsupported;
+		}
+
+		static Result d_createAccelerationStructure(Device* d, const AccelerationStructureDesc& desc, AccelerationStructurePtr& out) noexcept {
+			auto* impl = static_cast<Dx12Device*>(d ? d->impl : nullptr);
+			if (!impl || !desc.storage.valid() || desc.sizeBytes == 0) {
+				out.Reset();
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			Dx12Resource* storage = impl->resources.get(desc.storage);
+			if (!storage || !storage->res || storage->kind != Dx12ResourceKind::Buffer || desc.storageOffset + desc.sizeBytes > storage->buf.size) {
+				out.Reset();
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			const auto handle = impl->accelerationStructures.alloc(Dx12AccelerationStructure(desc.type, desc.storage, desc.storageOffset, desc.sizeBytes, impl));
+			AccelerationStructure ret{ handle };
+			ret.impl = impl;
+			ret.vt = &g_asvt;
+			if (desc.debugName) {
+				storage->res->SetName(s2ws(desc.debugName).c_str());
+			}
+			out = MakeAccelerationStructurePtr(d, ret, impl->selfWeak.lock());
+			return Result::Ok;
+		}
+
+		static uint64_t d_getAccelerationStructureDeviceAddress(Device* d, AccelerationStructureHandle handle) noexcept {
+			auto* impl = static_cast<Dx12Device*>(d ? d->impl : nullptr);
+			return Dx12AccelerationStructureAddress(impl, handle);
+		}
+
+		static Result d_getRayTracingShaderGroupHandles(Device* d, PipelineHandle pipeline, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept {
+			auto* impl = static_cast<Dx12Device*>(d ? d->impl : nullptr);
+			if (!impl || !outData || (groupCount != 0 && outDataBytes < groupCount * D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES)) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			auto* p = impl->pipelines.get(pipeline);
+			if (!p || !p->isRayTracing || !p->stateObjectProperties) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (firstGroup > p->rayTracingGroupExportNames.size() || groupCount > p->rayTracingGroupExportNames.size() - firstGroup) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			uint8_t* dst = static_cast<uint8_t*>(outData);
+			for (uint32_t group = 0; group < groupCount; ++group) {
+				const std::wstring& exportName = p->rayTracingGroupExportNames[firstGroup + group];
+				void* identifier = p->stateObjectProperties->GetShaderIdentifier(exportName.c_str());
+				if (!identifier) {
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				std::memcpy(dst + group * D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES, identifier, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+			}
+			return Result::Ok;
+		}
+
+		static Result d_setRayTracingPipelineStackSize(Device* d, PipelineHandle pipeline, uint64_t stackSizeBytes) noexcept {
+			auto* impl = static_cast<Dx12Device*>(d ? d->impl : nullptr);
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			auto* p = impl->pipelines.get(pipeline);
+			if (!p || !p->isRayTracing || !p->stateObjectProperties) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			p->stateObjectProperties->SetPipelineStackSize(stackSizeBytes);
+			return Result::Ok;
+		}
+
+		static void d_destroyAccelerationStructure(DeviceDeletionContext* d, AccelerationStructureHandle handle) noexcept {
+			auto* impl = dx12_detail::Dev(d);
+			if (impl) impl->accelerationStructures.free(handle);
 		}
 
 		static TimestampCalibration d_getTimestampCalibration(Device* d, QueueKind q) noexcept {
@@ -6376,6 +6865,14 @@ namespace rhi {
 #if BUILD_MODE == BUILD_DEBUG
 				l->boundPipeline = P;
 #endif
+				if (P->isRayTracing) {
+					if (!P->stateObject || P->isRayTracingLibrary) {
+						BreakIfDebugging();
+						return;
+					}
+					l->cl->SetPipelineState1(P->stateObject.Get());
+					return;
+				}
 				l->cl->SetPipelineState(P->pso.Get());
 				#if BASICRHI_ENABLE_RESHAPE
 				if (dev->debugInstrumentation.state.active && P->pso) {
@@ -6444,6 +6941,163 @@ namespace rhi {
 		static void cl_dispatch(CommandList* cl, uint32_t x, uint32_t y, uint32_t z) noexcept {
 			auto* l = dx12_detail::CL(cl);
 			l->cl->Dispatch(x, y, z);
+		}
+
+		static void cl_buildAccelerationStructures(CommandList* cl, const AccelerationStructureBuildDesc* descs, uint32_t count) noexcept {
+			auto* list = dx12_detail::CL(cl);
+			if (!list || !list->cl || (!descs && count != 0)) {
+				BreakIfDebugging();
+				return;
+			}
+
+			for (uint32_t index = 0; index < count; ++index) {
+				const AccelerationStructureBuildDesc& desc = descs[index];
+				Dx12BuildInputsStorage inputs{};
+				if (!Dx12FillBuildInputs(list->dev, desc.inputs, inputs)) {
+					BreakIfDebugging();
+					return;
+				}
+
+				D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC native{};
+				native.Inputs = inputs.inputs;
+				if (desc.mode == RayTracingAccelerationStructureBuildMode::Update) {
+					native.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+					native.SourceAccelerationStructureData = Dx12AccelerationStructureAddress(list->dev, desc.source);
+					if (native.SourceAccelerationStructureData == 0) {
+						BreakIfDebugging();
+						return;
+					}
+				}
+				native.DestAccelerationStructureData = Dx12AccelerationStructureAddress(list->dev, desc.destination);
+				native.ScratchAccelerationStructureData = Dx12BufferAddress(list->dev, desc.scratch);
+				if (native.DestAccelerationStructureData == 0 || native.ScratchAccelerationStructureData == 0) {
+					BreakIfDebugging();
+					return;
+				}
+
+				list->cl->BuildRaytracingAccelerationStructure(&native, 0, nullptr);
+			}
+		}
+
+		static void cl_copyAccelerationStructure(CommandList* cl, const AccelerationStructureCopyDesc& desc) noexcept {
+			auto* list = dx12_detail::CL(cl);
+			if (!list || !list->cl) {
+				BreakIfDebugging();
+				return;
+			}
+
+			D3D12_GPU_VIRTUAL_ADDRESS dst = 0;
+			D3D12_GPU_VIRTUAL_ADDRESS src = 0;
+			switch (desc.mode) {
+			case RayTracingAccelerationStructureCopyMode::Serialize:
+				dst = Dx12BufferAddress(list->dev, desc.destinationBuffer);
+				src = Dx12AccelerationStructureAddress(list->dev, desc.source);
+				break;
+			case RayTracingAccelerationStructureCopyMode::Deserialize:
+				dst = Dx12AccelerationStructureAddress(list->dev, desc.destination);
+				src = Dx12BufferAddress(list->dev, desc.sourceBuffer);
+				break;
+			case RayTracingAccelerationStructureCopyMode::Clone:
+			case RayTracingAccelerationStructureCopyMode::Compact:
+			default:
+				dst = Dx12AccelerationStructureAddress(list->dev, desc.destination);
+				src = Dx12AccelerationStructureAddress(list->dev, desc.source);
+				break;
+			}
+
+			if (dst == 0 || src == 0) {
+				BreakIfDebugging();
+				return;
+			}
+			list->cl->CopyRaytracingAccelerationStructure(dst, src, Dx12AsCopyMode(desc.mode));
+		}
+
+		static void cl_writeAccelerationStructureProperties(CommandList* cl, const AccelerationStructurePropertiesDesc& desc) noexcept {
+			auto* list = dx12_detail::CL(cl);
+			if (!list || !list->cl || desc.accelerationStructures.size == 0) {
+				BreakIfDebugging();
+				return;
+			}
+
+			const D3D12_GPU_VIRTUAL_ADDRESS destination = Dx12BufferAddress(list->dev, desc.destinationBuffer);
+			if (destination == 0) {
+				BreakIfDebugging();
+				return;
+			}
+
+			std::vector<D3D12_GPU_VIRTUAL_ADDRESS> sources;
+			sources.reserve(desc.accelerationStructures.size);
+			for (const AccelerationStructureHandle handle : desc.accelerationStructures) {
+				const D3D12_GPU_VIRTUAL_ADDRESS address = Dx12AccelerationStructureAddress(list->dev, handle);
+				if (address == 0) {
+					BreakIfDebugging();
+					return;
+				}
+				sources.push_back(address);
+			}
+
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC native{};
+			native.DestBuffer = destination;
+			native.InfoType = Dx12AsPropertyType(desc.property);
+			list->cl->EmitRaytracingAccelerationStructurePostbuildInfo(&native, static_cast<UINT>(sources.size()), sources.data());
+		}
+
+		static void cl_traceRays(CommandList* cl, const RayTracingDispatchDesc& desc) noexcept {
+			auto* list = dx12_detail::CL(cl);
+			if (!list || !list->cl || desc.width == 0 || desc.height == 0 || desc.depth == 0) {
+				BreakIfDebugging();
+				return;
+			}
+
+			auto fillRequiredRecord = [&](const RayTracingShaderTableRegion& region, D3D12_GPU_VIRTUAL_ADDRESS_RANGE& out) noexcept -> bool {
+				if (region.size == 0 || !region.buffer.valid()) return false;
+				const D3D12_GPU_VIRTUAL_ADDRESS address = Dx12BufferAddress(list->dev, GpuBufferAddress{ region.buffer, region.offset });
+				if (address == 0) return false;
+				out.StartAddress = address;
+				out.SizeInBytes = region.size;
+				return true;
+			};
+
+			auto fillOptionalTable = [&](const RayTracingShaderTableRegion& region, D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE& out) noexcept -> bool {
+				if (region.size == 0) return true;
+				if (!region.buffer.valid() || region.stride == 0) return false;
+				const D3D12_GPU_VIRTUAL_ADDRESS address = Dx12BufferAddress(list->dev, GpuBufferAddress{ region.buffer, region.offset });
+				if (address == 0) return false;
+				out.StartAddress = address;
+				out.SizeInBytes = region.size;
+				out.StrideInBytes = region.stride;
+				return true;
+			};
+
+			D3D12_DISPATCH_RAYS_DESC native{};
+			if (!fillRequiredRecord(desc.rayGenerationShaderTable, native.RayGenerationShaderRecord) ||
+				!fillOptionalTable(desc.missShaderTable, native.MissShaderTable) ||
+				!fillOptionalTable(desc.hitGroupTable, native.HitGroupTable) ||
+				!fillOptionalTable(desc.callableShaderTable, native.CallableShaderTable)) {
+				BreakIfDebugging();
+				return;
+			}
+			native.Width = desc.width;
+			native.Height = desc.height;
+			native.Depth = desc.depth;
+			list->cl->DispatchRays(&native);
+		}
+
+		static void cl_traceRaysIndirect(CommandList* cl, const RayTracingDispatchIndirectDesc& desc) noexcept {
+			auto* list = dx12_detail::CL(cl);
+			if (!list || !list->cl || !list->dev || !desc.dispatchRaysDescBuffer.buffer.valid()) {
+				BreakIfDebugging();
+				return;
+			}
+
+			Dx12Resource* argumentBuffer = list->dev->resources.get(desc.dispatchRaysDescBuffer.buffer);
+			ID3D12CommandSignature* signature = Dx12DispatchRaysIndirectSignature(list->dev);
+			if (!argumentBuffer || !argumentBuffer->res || !signature) {
+				BreakIfDebugging();
+				return;
+			}
+
+			list->cl->ExecuteIndirect(signature, 1, argumentBuffer->res.Get(), desc.dispatchRaysDescBuffer.offset, nullptr, 0);
 		}
 
 		static void cl_clearRTV_slot(CommandList* c, DescriptorSlot s, const rhi::ClearValue& cv) noexcept {
@@ -7442,6 +8096,24 @@ namespace rhi {
 			T->res->SetName(s2ws(n).c_str());
 		}
 
+		static void as_setName(AccelerationStructure* as, const char* n) noexcept {
+			if (!n) {
+				BreakIfDebugging();
+				return;
+			}
+			auto* A = dx12_detail::AS(as);
+			if (!A || !A->dev) {
+				BreakIfDebugging();
+				return;
+			}
+			auto* storage = A->dev->resources.get(A->storage);
+			if (!storage || !storage->res) {
+				BreakIfDebugging();
+				return;
+			}
+			storage->res->SetName(s2ws(n).c_str());
+		}
+
 		// ------------------ Allocator vtable funcs ----------------
 		static void ca_reset(CommandAllocator* ca) noexcept {
 			if (!ca || !ca->impl) {
@@ -7583,11 +8255,12 @@ namespace rhi {
 				return;
 			}
 			auto* P = dx12_detail::Pso(p);
-			if (!P || !P->pso) {
+			if (!P || (!P->pso && !P->stateObject)) {
 				BreakIfDebugging();
 				return;
 			}
-			P->pso->SetName(s2ws(n).c_str());
+			if (P->stateObject) P->stateObject->SetName(s2ws(n).c_str());
+			else P->pso->SetName(s2ws(n).c_str());
 		}
 
 		// ------------------ WorkGraph vtable funcs ----------------
@@ -7831,6 +8504,7 @@ namespace rhi {
 		pipelines.clear();
 		pipelineLayouts.clear();
 		samplers.clear();
+		accelerationStructures.clear();
 		resources.clear();
 
 		queues.clear();
@@ -7887,6 +8561,11 @@ namespace rhi {
 		&d_createHeap,
 		&d_createPlacedResource,
 		&d_createQueryPool,
+		&d_getAccelerationStructurePrebuildInfo,
+		&d_createAccelerationStructure,
+		&d_getAccelerationStructureDeviceAddress,
+		&d_getRayTracingShaderGroupHandles,
+		&d_setRayTracingPipelineStackSize,
 
 		&d_destroySampler,
 		&d_destroyPipelineLayout,
@@ -7902,6 +8581,7 @@ namespace rhi {
 		&d_destroyTimeline,
 		&d_destroyHeap,
 		&d_destroyQueryPool,
+		&d_destroyAccelerationStructure,
 
 		&d_getQueue,
 		&d_createQueue,
@@ -7943,7 +8623,7 @@ namespace rhi {
 		&d_setDebugSynchronousRecording,
 		&d_setDebugTexelAddressing,
 		&d_destroyDevice,
-		8u
+		10u
 	};
 
 	const QueueVTable g_qvt = {
@@ -7972,6 +8652,11 @@ namespace rhi {
 		&cl_draw,
 		&cl_drawIndexed,
 		&cl_dispatch,
+		&cl_buildAccelerationStructures,
+		&cl_copyAccelerationStructure,
+		&cl_writeAccelerationStructureProperties,
+		&cl_traceRays,
+		&cl_traceRaysIndirect,
 		cl_clearRTV_slot,
 		cl_clearDSV_slot,
 		&cl_executeIndirect,
@@ -7994,7 +8679,7 @@ namespace rhi {
 		&cl_dispatchWorkGraph,
 		&cl_setName,
 		&cl_setDebugInstrumentationContext,
-		2u
+		3u
 	};
 	const SwapchainVTable g_scvt = {
 		&sc_count,
@@ -8016,6 +8701,10 @@ namespace rhi {
 		&tex_unmap,
 		&tex_setName,
 		1
+	};
+	const AccelerationStructureVTable g_asvt = {
+		&as_setName,
+		1u
 	};
 	const QueryPoolVTable g_qpvt = {
 		&qp_getQueryResultInfo,

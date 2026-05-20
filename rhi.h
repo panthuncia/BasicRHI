@@ -10,6 +10,7 @@
 #include <memory>
 #include <utility> // C++23: std::to_underlying
 #include <string>
+#include <cstring>
 
 #include "resource_states.h"
 #include "rhi_feature_info.h"
@@ -45,6 +46,7 @@ namespace rhi {
 	inline constexpr uint32_t RHI_SAMPLER_ABI_MIN = 1;
 	inline constexpr uint32_t RHI_DESCRIPTORHEAP_ABI_MIN = 1;
 	inline constexpr uint32_t RHI_TIMELINE_ABI_MIN = 1;
+	inline constexpr uint32_t RHI_ACCELERATION_STRUCTURE_ABI_MIN = 1;
 	inline constexpr uint32_t VULKAN_DESCRIPTOR_HEAP_SET = 0;
 	inline constexpr uint32_t VULKAN_RESOURCE_DESCRIPTOR_HEAP_BINDING = 1000000;
 	inline constexpr uint32_t VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING = 1000001;
@@ -70,6 +72,7 @@ namespace rhi {
 		struct HQueryPool {};
 		struct HSwapChain {};
 		struct HQueue {};
+		struct HAccelerationStructure {};
 
 		// forward-declared trait; default is no-op (safe in release)
 		template<class Tag> struct NameOps {
@@ -120,6 +123,7 @@ namespace rhi {
 	using QueryPoolHandle = Handle<detail::HQueryPool>;
 	using SwapChainHandle = Handle<detail::HSwapChain>;
 	using QueueHandle = Handle<detail::HQueue>;
+	using AccelerationStructureHandle = Handle<detail::HAccelerationStructure>;
 
 	// ---------------- Enums & structs ----------------
 
@@ -636,7 +640,14 @@ namespace rhi {
 		Compute = 4,
 		Mesh = 8,
 		Task = 16,
+		RayGen = 32,
+		Miss = 64,
+		ClosestHit = 128,
+		AnyHit = 256,
+		Intersection = 512,
+		Callable = 1024,
 		AllGraphics = Vertex | Pixel | Mesh | Task,
+		AllRayTracing = RayGen | Miss | ClosestHit | AnyHit | Intersection | Callable,
 		All = 0xFFFFFFFFu
 	};
 
@@ -818,9 +829,195 @@ namespace rhi {
 			} cubeArray;
 
 			struct { // ===== ACCEL STRUCT =====
-				// no fields; resource is the AS buffer
+				AccelerationStructureHandle accelerationStructure{};
 			} accel;
 		};
+	};
+
+	struct GpuBufferAddress {
+		ResourceHandle buffer{};
+		uint64_t offset{ 0 };
+	};
+
+	struct GpuBufferRange {
+		ResourceHandle buffer{};
+		uint64_t offset{ 0 };
+		uint64_t size{ 0 };
+	};
+
+	enum class RayTracingAccelerationStructureType : uint32_t { BottomLevel, TopLevel };
+	enum class RayTracingAccelerationStructureBuildMode : uint32_t { Build, Update };
+	enum class RayTracingGeometryType : uint32_t { Triangles, Aabbs, Instances };
+	enum class RayTracingAccelerationStructureCopyMode : uint32_t { Clone, Compact, Serialize, Deserialize };
+	enum class RayTracingAccelerationStructureProperty : uint32_t { CompactedSize, SerializationSize, CurrentSize };
+
+	enum RayTracingAccelerationStructureBuildFlags : uint32_t {
+		RTASBuild_None = 0,
+		RTASBuild_AllowUpdate = 1u << 0,
+		RTASBuild_AllowCompaction = 1u << 1,
+		RTASBuild_PreferFastTrace = 1u << 2,
+		RTASBuild_PreferFastBuild = 1u << 3,
+		RTASBuild_MinimizeMemory = 1u << 4,
+	};
+
+	enum RayTracingGeometryFlags : uint32_t {
+		RTGeometry_None = 0,
+		RTGeometry_Opaque = 1u << 0,
+		RTGeometry_NoDuplicateAnyHitInvocation = 1u << 1,
+	};
+
+	enum RayTracingInstanceFlags : uint32_t {
+		RTInstance_None = 0,
+		RTInstance_TriangleCullDisable = 1u << 0,
+		RTInstance_TriangleFrontCounterClockwise = 1u << 1,
+		RTInstance_ForceOpaque = 1u << 2,
+		RTInstance_ForceNonOpaque = 1u << 3,
+	};
+
+	struct RayTracingTriangleGeometryDesc {
+		GpuBufferRange vertexBuffer{};
+		uint64_t vertexStride{ 0 };
+		Format vertexFormat{ Format::R32G32B32_Float };
+		uint32_t vertexCount{ 0 };
+		GpuBufferRange indexBuffer{};
+		Format indexFormat{ Format::Unknown };
+		uint32_t indexCount{ 0 };
+		GpuBufferAddress transform3x4Buffer{};
+	};
+
+	struct RayTracingAabbGeometryDesc {
+		GpuBufferRange aabbBuffer{};
+		uint64_t stride{ 24 };
+		uint32_t count{ 0 };
+	};
+
+	struct RayTracingInstanceGeometryDesc {
+		GpuBufferRange instanceBuffer{};
+		uint64_t stride{ 0 };
+		uint32_t count{ 0 };
+	};
+
+	struct RayTracingGeometryDesc {
+		RayTracingGeometryType type{ RayTracingGeometryType::Triangles };
+		RayTracingGeometryFlags flags{ RTGeometry_None };
+		RayTracingTriangleGeometryDesc triangles{};
+		RayTracingAabbGeometryDesc aabbs{};
+		RayTracingInstanceGeometryDesc instances{};
+	};
+
+	struct AccelerationStructureBuildInputs {
+		RayTracingAccelerationStructureType type{ RayTracingAccelerationStructureType::BottomLevel };
+		RayTracingAccelerationStructureBuildFlags flags{ RTASBuild_None };
+		Span<RayTracingGeometryDesc> geometries{};
+	};
+
+	struct AccelerationStructurePrebuildInfo {
+		uint64_t resultDataMaxSizeInBytes{ 0 };
+		uint64_t scratchDataSizeInBytes{ 0 };
+		uint64_t updateScratchDataSizeInBytes{ 0 };
+	};
+
+	struct AccelerationStructureDesc {
+		RayTracingAccelerationStructureType type{ RayTracingAccelerationStructureType::BottomLevel };
+		ResourceHandle storage{};
+		uint64_t storageOffset{ 0 };
+		uint64_t sizeBytes{ 0 };
+		RayTracingAccelerationStructureBuildFlags flags{ RTASBuild_None };
+		const char* debugName{ nullptr };
+	};
+
+	struct AccelerationStructureBuildDesc {
+		RayTracingAccelerationStructureBuildMode mode{ RayTracingAccelerationStructureBuildMode::Build };
+		AccelerationStructureHandle destination{};
+		AccelerationStructureHandle source{};
+		AccelerationStructureBuildInputs inputs{};
+		GpuBufferRange scratch{};
+	};
+
+	struct AccelerationStructureCopyDesc {
+		RayTracingAccelerationStructureCopyMode mode{ RayTracingAccelerationStructureCopyMode::Clone };
+		AccelerationStructureHandle destination{};
+		AccelerationStructureHandle source{};
+		GpuBufferRange destinationBuffer{};
+		GpuBufferRange sourceBuffer{};
+	};
+
+	struct AccelerationStructurePropertiesDesc {
+		Span<AccelerationStructureHandle> accelerationStructures{};
+		RayTracingAccelerationStructureProperty property{ RayTracingAccelerationStructureProperty::CompactedSize };
+		GpuBufferRange destinationBuffer{};
+	};
+
+	struct RayTracingInstanceDesc {
+		float transform[3][4]{};
+		uint32_t instanceID{ 0 };
+		uint32_t instanceMask{ 0xFF };
+		uint32_t instanceContributionToHitGroupIndex{ 0 };
+		RayTracingInstanceFlags flags{ RTInstance_None };
+		AccelerationStructureHandle accelerationStructure{};
+	};
+
+	struct PackedRayTracingInstanceDesc {
+		float transform[3][4]{};
+		uint32_t instanceIDAndMask{ 0 };
+		uint32_t contributionAndFlags{ 0 };
+		uint64_t accelerationStructureDeviceAddress{ 0 };
+	};
+	static_assert(sizeof(PackedRayTracingInstanceDesc) == 64);
+
+	inline PackedRayTracingInstanceDesc PackRayTracingInstanceDesc(const RayTracingInstanceDesc& desc, uint64_t accelerationStructureDeviceAddress) noexcept {
+		PackedRayTracingInstanceDesc out{};
+		for (uint32_t row = 0; row < 3; ++row) {
+			for (uint32_t column = 0; column < 4; ++column) {
+				out.transform[row][column] = desc.transform[row][column];
+			}
+		}
+		out.instanceIDAndMask = (desc.instanceID & 0x00FFFFFFu) | ((desc.instanceMask & 0xFFu) << 24);
+		out.contributionAndFlags = (desc.instanceContributionToHitGroupIndex & 0x00FFFFFFu) | ((static_cast<uint32_t>(desc.flags) & 0xFFu) << 24);
+		out.accelerationStructureDeviceAddress = accelerationStructureDeviceAddress;
+		return out;
+	}
+
+	inline uint64_t AlignRayTracingShaderRecordSize(uint64_t byteSize, uint64_t strideAlignment) noexcept {
+		if (strideAlignment == 0) return byteSize;
+		const uint64_t mask = strideAlignment - 1;
+		return (byteSize + mask) & ~mask;
+	}
+
+	inline bool WriteRayTracingShaderRecord(void* dst, uint64_t dstBytes, const void* shaderIdentifier, uint32_t shaderIdentifierBytes, const void* localData = nullptr, uint32_t localDataBytes = 0) noexcept {
+		if (!dst || !shaderIdentifier || dstBytes < static_cast<uint64_t>(shaderIdentifierBytes) + localDataBytes) return false;
+		std::memcpy(dst, shaderIdentifier, shaderIdentifierBytes);
+		if (localDataBytes != 0) {
+			if (!localData) return false;
+			std::memcpy(static_cast<uint8_t*>(dst) + shaderIdentifierBytes, localData, localDataBytes);
+		}
+		return true;
+	}
+
+	struct RayTracingShaderTableRegion {
+		ResourceHandle buffer{};
+		uint64_t offset{ 0 };
+		uint64_t size{ 0 };
+		uint64_t stride{ 0 };
+	};
+
+	struct RayTracingDispatchDesc {
+		RayTracingShaderTableRegion rayGenerationShaderTable{};
+		RayTracingShaderTableRegion missShaderTable{};
+		RayTracingShaderTableRegion hitGroupTable{};
+		RayTracingShaderTableRegion callableShaderTable{};
+		uint32_t width{ 0 };
+		uint32_t height{ 1 };
+		uint32_t depth{ 1 };
+	};
+
+	struct RayTracingDispatchIndirectDesc {
+		RayTracingShaderTableRegion rayGenerationShaderTable{};
+		RayTracingShaderTableRegion missShaderTable{};
+		RayTracingShaderTableRegion hitGroupTable{};
+		RayTracingShaderTableRegion callableShaderTable{};
+		GpuBufferAddress dimensionsBuffer{};
+		GpuBufferAddress dispatchRaysDescBuffer{};
 	};
 
 	struct UavDesc {
@@ -1183,6 +1380,8 @@ namespace rhi {
 	}
 
 	enum class PrimitiveTopology : uint32_t { Unknown, PointList, LineList, LineStrip, TriangleList, TriangleStrip, TriangleFan };
+	enum class RayTracingShaderGroupType : uint32_t { General, TrianglesHitGroup, ProceduralHitGroup };
+	enum RayTracingPipelineFlags : uint32_t { RTPipeline_None = 0, RTPipeline_SkipTriangles = 1u << 0, RTPipeline_SkipProceduralPrimitives = 1u << 1 };
 
 	enum class PsoSubobj : uint32_t {
 		Layout,
@@ -1195,8 +1394,21 @@ namespace rhi {
 		Sample,
 		Flags,             // optional backend-specific flags bitset
 		InputLayout,    // optional, graphics only
-		PrimitiveTopology // required, graphics only
+		PrimitiveTopology, // required, graphics only
+		RayTracingPipeline
 	};
+
+	struct RayTracingShaderGroupDesc {
+		RayTracingShaderGroupType type{ RayTracingShaderGroupType::General };
+		const char* name{};
+		const char* generalShader{};
+		const char* closestHitShader{};
+		const char* anyHitShader{};
+		const char* intersectionShader{};
+	};
+
+	struct RayTracingShaderConfigDesc { uint32_t maxPayloadSizeInBytes{ 0 }; uint32_t maxAttributeSizeInBytes{ 8 }; };
+	struct RayTracingPipelineConfigDesc { uint32_t maxTraceRecursionDepth{ 1 }; };
 
 	struct SubobjLayout { PipelineLayoutHandle layout{}; };
 	struct SubobjShader { ShaderStage stage{}; ShaderBinary bytecode{}; std::string entryPoint{}; };
@@ -1208,6 +1420,17 @@ namespace rhi {
 	struct SubobjSample { SampleDesc sd{}; };
 	struct SubobjInputLayout { FinalizedInputLayout il{}; }; // optional, for graphics
 	struct SubobjPrimitiveTopology { PrimitiveTopology pt{}; }; // required for graphics
+	struct SubobjRayTracingPipeline {
+		PipelineLayoutHandle globalLayout{};
+		Span<SubobjShader> shaders{};
+		Span<RayTracingShaderGroupDesc> shaderGroups{};
+		Span<LocalRootAssociation> localRootAssociations{};
+		Span<PipelineHandle> libraries{};
+		RayTracingShaderConfigDesc shaderConfig{};
+		RayTracingPipelineConfigDesc pipelineConfig{};
+		RayTracingPipelineFlags flags{ RTPipeline_None };
+		bool library{ false };
+	};
 	// struct SubobjFlags { uint64_t mask = 0; }; // optional
 
 	struct PipelineStreamItem {
@@ -1227,6 +1450,7 @@ namespace rhi {
 	inline PipelineStreamItem Make(const SubobjSample& x) { return { PsoSubobj::Sample, &x,  sizeof(x) }; }
 	inline PipelineStreamItem Make(const SubobjInputLayout& x) { return { PsoSubobj::InputLayout, &x, sizeof(x) }; }
 	inline PipelineStreamItem Make(const SubobjPrimitiveTopology& x) { return { PsoSubobj::PrimitiveTopology, &x, sizeof(x) }; }
+	inline PipelineStreamItem Make(const SubobjRayTracingPipeline& x) { return { PsoSubobj::RayTracingPipeline, &x, sizeof(x) }; }
 
 	// ---------------- Pass & barriers (minimal) ----------------
 
@@ -1908,6 +2132,28 @@ namespace rhi {
 		bool isTexture = false;
 	};
 
+	class AccelerationStructure;
+	struct AccelerationStructureVTable {
+		void (*setName)(AccelerationStructure*, const char*) noexcept;
+		uint32_t abi_version = 1;
+	};
+	class AccelerationStructure {
+	public:
+		AccelerationStructure() = default;
+		explicit AccelerationStructure(AccelerationStructureHandle h) : handle(h) {}
+		void* impl{};
+		const AccelerationStructureVTable* vt{};
+		explicit constexpr operator bool() const noexcept {
+			return impl != nullptr && vt != nullptr && vt->abi_version >= RHI_ACCELERATION_STRUCTURE_ABI_MIN;
+		}
+		const AccelerationStructureHandle& GetHandle() const noexcept { return handle; }
+		constexpr bool IsValid() const noexcept { return static_cast<bool>(*this); }
+		constexpr void Reset() noexcept { impl = nullptr; vt = nullptr; }
+		inline void SetName(const char* n) noexcept { if (vt && vt->setName) vt->setName(this, n); }
+	private:
+		AccelerationStructureHandle handle{};
+	};
+
 	struct UavClearInfo {
 		DescriptorSlot shaderVisible;   // SRV/UAV heap, shader-visible; REQUIRED on DX12
 		DescriptorSlot cpuVisible;      // SRV/UAV heap, non shader-visible; REQUIRED on DX12
@@ -1973,6 +2219,11 @@ namespace rhi {
 		void (*draw)(CommandList*, uint32_t vtxCount, uint32_t instCount, uint32_t firstVtx, uint32_t firstInst) noexcept;
 		void (*drawIndexed)(CommandList*, uint32_t idxCount, uint32_t instCount, uint32_t firstIdx, int32_t vtxOffset, uint32_t firstInst) noexcept;
 		void (*dispatch)(CommandList*, uint32_t x, uint32_t y, uint32_t z) noexcept;
+		void (*buildAccelerationStructures)(CommandList*, const AccelerationStructureBuildDesc*, uint32_t) noexcept;
+		void (*copyAccelerationStructure)(CommandList*, const AccelerationStructureCopyDesc&) noexcept;
+		void (*writeAccelerationStructureProperties)(CommandList*, const AccelerationStructurePropertiesDesc&) noexcept;
+		void (*traceRays)(CommandList*, const RayTracingDispatchDesc&) noexcept;
+		void (*traceRaysIndirect)(CommandList*, const RayTracingDispatchIndirectDesc&) noexcept;
 		void (*clearRenderTargetViewBySlot)(CommandList*, DescriptorSlot, const ClearValue&) noexcept;
 		void (*clearDepthStencilViewBySlot)(CommandList*, DescriptorSlot,
 			bool clearDepth, bool clearStencil,
@@ -2005,7 +2256,7 @@ namespace rhi {
 		void (*dispatchWorkGraph)(CommandList*, const WorkGraphDispatchDesc& desc) noexcept; // if supported by the backend
 		void (*setName)(CommandList*, const char*) noexcept;
 		void (*setDebugInstrumentationContext)(CommandList*, const char* passName, const char* techniquePath) noexcept;
-		uint32_t abi_version = 2;
+		uint32_t abi_version = 3;
 	};
 
 	class CommandList {
@@ -2032,6 +2283,11 @@ namespace rhi {
 		void Draw(uint32_t v, uint32_t i, uint32_t fv, uint32_t fi) noexcept;
 		void DrawIndexed(uint32_t i, uint32_t inst, uint32_t firstIdx, int32_t vOff, uint32_t firstI) noexcept;
 		void Dispatch(uint32_t x, uint32_t y, uint32_t z) noexcept;
+		void BuildAccelerationStructures(const AccelerationStructureBuildDesc* descs, uint32_t count) noexcept;
+		void CopyAccelerationStructure(const AccelerationStructureCopyDesc& desc) noexcept;
+		void WriteAccelerationStructureProperties(const AccelerationStructurePropertiesDesc& desc) noexcept;
+		void TraceRays(const RayTracingDispatchDesc& desc) noexcept;
+		void TraceRaysIndirect(const RayTracingDispatchIndirectDesc& desc) noexcept;
 		inline void ClearRenderTargetView(DescriptorSlot s, const ClearValue& c) noexcept { vt->clearRenderTargetViewBySlot(this, s, c); }
 		inline void ClearDepthStencilView(DescriptorSlot s, bool clearDepth, bool clearStencil, float depth, uint8_t stencil) noexcept {
 			vt->clearDepthStencilViewBySlot(this, s, clearDepth, clearStencil, depth, stencil);
@@ -2116,6 +2372,7 @@ namespace rhi {
 	using CommandListPtr = ObjectPtr<CommandList>;
 	using SwapchainPtr = ObjectPtr<Swapchain>;
 	using ResourcePtr = ObjectPtr<Resource>;
+	using AccelerationStructurePtr = ObjectPtr<AccelerationStructure>;
 	using QueryPoolPtr = ObjectPtr<QueryPool>;
 	using PipelinePtr = ObjectPtr<Pipeline>;
 	using WorkGraphPtr = ObjectPtr<WorkGraph>;
@@ -2149,6 +2406,11 @@ namespace rhi {
 		Result(*createHeap)(const Device*, const HeapDesc&, HeapPtr&) noexcept;
 		Result(*createPlacedResource)(Device*, HeapHandle, uint64_t, const ResourceDesc&, ResourcePtr&) noexcept;
 		Result(*createQueryPool)(Device*, const QueryPoolDesc&, QueryPoolPtr&) noexcept;
+		Result(*getAccelerationStructurePrebuildInfo)(Device*, const AccelerationStructureBuildInputs&, AccelerationStructurePrebuildInfo*) noexcept;
+		Result(*createAccelerationStructure)(Device*, const AccelerationStructureDesc&, AccelerationStructurePtr&) noexcept;
+		uint64_t(*getAccelerationStructureDeviceAddress)(Device*, AccelerationStructureHandle) noexcept;
+		Result(*getRayTracingShaderGroupHandles)(Device*, PipelineHandle, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept;
+		Result(*setRayTracingPipelineStackSize)(Device*, PipelineHandle, uint64_t stackSizeBytes) noexcept;
 
 		void (*destroySampler)(DeviceDeletionContext*, SamplerHandle) noexcept;
 		void (*destroyPipelineLayout)(DeviceDeletionContext*, PipelineLayoutHandle) noexcept;
@@ -2164,6 +2426,7 @@ namespace rhi {
 		void (*destroyTimeline)(DeviceDeletionContext*, TimelineHandle) noexcept;
 		void (*destroyHeap)(DeviceDeletionContext*, HeapHandle) noexcept;
 		void (*destroyQueryPool)(DeviceDeletionContext*, QueryPoolHandle) noexcept;
+		void (*destroyAccelerationStructure)(DeviceDeletionContext*, AccelerationStructureHandle) noexcept;
 
 		Queue(*getQueue)(Device*, QueueKind) noexcept;
 		Result(*createQueue)(Device*, QueueKind, const char* name, Queue&) noexcept;
@@ -2207,7 +2470,7 @@ namespace rhi {
 		Result(*setDebugTexelAddressing)(Device*, bool) noexcept;
 
 		void (*destroyDevice)(Device*) noexcept;
-		uint32_t abi_version = 9;
+		uint32_t abi_version = 10;
 	};
 
 
@@ -2231,6 +2494,7 @@ namespace rhi {
 		inline void DestroyTimeline(TimelineHandle t) noexcept { vt->destroyTimeline(this, t); }
 		inline void DestroyHeap(HeapHandle h) noexcept { vt->destroyHeap(this, h); }
 		inline void DestroyQueryPool(QueryPoolHandle h) noexcept { vt->destroyQueryPool(this, h); }
+		inline void DestroyAccelerationStructure(AccelerationStructureHandle h) noexcept { vt->destroyAccelerationStructure(this, h); }
 	};
 
 	struct CommandAllocatorVTable {
@@ -2309,6 +2573,12 @@ namespace rhi {
 		Result CreatePlacedResource(const HeapHandle heap, const uint64_t offset, const ResourceDesc& rd, ResourcePtr& out) noexcept { return vt->createPlacedResource(this, heap, offset, rd, out); }
 		Result CreateQueryPool(const QueryPoolDesc& d, QueryPoolPtr& out) noexcept { return vt->createQueryPool(this, d, out); }
 		void DestroyQueryPool(QueryPoolHandle h) noexcept { deletionContext.DestroyQueryPool(h); }
+		Result GetAccelerationStructurePrebuildInfo(const AccelerationStructureBuildInputs& inputs, AccelerationStructurePrebuildInfo& out) noexcept { return vt->getAccelerationStructurePrebuildInfo(this, inputs, &out); }
+		Result CreateAccelerationStructure(const AccelerationStructureDesc& d, AccelerationStructurePtr& out) noexcept { return vt->createAccelerationStructure(this, d, out); }
+		void DestroyAccelerationStructure(AccelerationStructureHandle h) noexcept { deletionContext.DestroyAccelerationStructure(h); }
+		uint64_t GetAccelerationStructureDeviceAddress(AccelerationStructureHandle h) noexcept { return vt->getAccelerationStructureDeviceAddress(this, h); }
+		Result GetRayTracingShaderGroupHandles(PipelineHandle p, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept { return vt->getRayTracingShaderGroupHandles(this, p, firstGroup, groupCount, outData, outDataBytes); }
+		Result SetRayTracingPipelineStackSize(PipelineHandle p, uint64_t stackSizeBytes) noexcept { return vt->setRayTracingPipelineStackSize(this, p, stackSizeBytes); }
 		TimestampCalibration GetTimestampCalibration(QueueKind q) noexcept { return vt->getTimestampCalibration(this, q); }
 		CopyableFootprintsInfo GetCopyableFootprints(const FootprintRangeDesc& r, CopyableFootprint* out, uint32_t outCap) noexcept {
 			return vt->getCopyableFootprints(this, r, out, outCap);
@@ -2448,6 +2718,11 @@ namespace rhi {
 	inline void CommandList::Draw(uint32_t v, uint32_t i, uint32_t fv, uint32_t fi) noexcept { vt->draw(this, v, i, fv, fi); }
 	inline void CommandList::DrawIndexed(uint32_t i, uint32_t inst, uint32_t firstIdx, int32_t vOff, uint32_t firstI) noexcept { vt->drawIndexed(this, i, inst, firstIdx, vOff, firstI); }
 	inline void CommandList::Dispatch(uint32_t x, uint32_t y, uint32_t z) noexcept { vt->dispatch(this, x, y, z); }
+	inline void CommandList::BuildAccelerationStructures(const AccelerationStructureBuildDesc* descs, uint32_t count) noexcept { vt->buildAccelerationStructures(this, descs, count); }
+	inline void CommandList::CopyAccelerationStructure(const AccelerationStructureCopyDesc& desc) noexcept { vt->copyAccelerationStructure(this, desc); }
+	inline void CommandList::WriteAccelerationStructureProperties(const AccelerationStructurePropertiesDesc& desc) noexcept { vt->writeAccelerationStructureProperties(this, desc); }
+	inline void CommandList::TraceRays(const RayTracingDispatchDesc& desc) noexcept { vt->traceRays(this, desc); }
+	inline void CommandList::TraceRaysIndirect(const RayTracingDispatchIndirectDesc& desc) noexcept { vt->traceRaysIndirect(this, desc); }
 	inline void CommandList::ExecuteIndirect(CommandSignatureHandle sig, ResourceHandle argBuf, uint64_t argOff, ResourceHandle cntBuf, uint64_t cntOff, uint32_t maxCount) noexcept {
 		vt->executeIndirect(this, sig, argBuf, argOff, cntBuf, cntOff, maxCount);
 	}
@@ -2557,6 +2832,14 @@ namespace rhi {
 		return ResourcePtr(
 			*d, r,
 			[](Device& dev, Resource& p) noexcept { if (dev && p) dev.DestroyBuffer(p.GetHandle()); },
+			std::move(keepAlive)
+		);
+	}
+
+	inline AccelerationStructurePtr MakeAccelerationStructurePtr(const Device* d, AccelerationStructure a, std::shared_ptr<void> keepAlive = {}) noexcept {
+		return AccelerationStructurePtr(
+			*d, a,
+			[](Device& dev, AccelerationStructure& p) noexcept { if (dev && p) dev.DestroyAccelerationStructure(p.GetHandle()); },
 			std::move(keepAlive)
 		);
 	}
