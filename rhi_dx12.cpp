@@ -701,6 +701,9 @@ namespace rhi {
 			D3D12_RAYTRACING_PIPELINE_FLAGS out = D3D12_RAYTRACING_PIPELINE_FLAG_NONE;
 			if ((bits & RTPipeline_SkipTriangles) != 0) out |= D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_TRIANGLES;
 			if ((bits & RTPipeline_SkipProceduralPrimitives) != 0) out |= D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_PROCEDURAL_PRIMITIVES;
+#if BASICRHI_HAS_DXR2_HEADERS && defined(D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY)
+			if ((bits & RTPipeline_AllowClusteredGeometry) != 0) out |= D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY;
+#endif
 			return out;
 		}
 
@@ -716,6 +719,12 @@ namespace rhi {
 			if (FAILED(featureHr) || options5.RaytracingTier == D3D12_RAYTRACING_TIER_NOT_SUPPORTED) {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
+			}
+			if ((static_cast<uint32_t>(rt.flags) & RTPipeline_AllowClusteredGeometry) != 0) {
+#if !(BASICRHI_HAS_DXR2_HEADERS && defined(D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY))
+				out.Reset();
+				RHI_FAIL(Result::Unsupported);
+#endif
 			}
 
 			struct StringStore {
@@ -2070,6 +2079,11 @@ namespace rhi {
 			const bool hasRayTracing11 =
 				(opt5.RaytracingTier == D3D12_RAYTRACING_TIER_1_1);
 
+			bool hasRayTracing20 = false;
+#if BASICRHI_HAS_DXR2_HEADERS && defined(D3D12_RAYTRACING_TIER_2_0)
+			hasRayTracing20 = opt5.RaytracingTier >= D3D12_RAYTRACING_TIER_2_0;
+#endif
+
 			const bool hasVrsPerDraw =
 				(opt6.VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_1) ||
 				(opt6.VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_2);
@@ -2191,9 +2205,15 @@ namespace rhi {
 					out->shaderGroupHandleCaptureReplay = false;
 					out->opacityMicromap = false;
 					out->shaderExecutionReordering = false;
-					out->clusterAccelerationStructure = false;
-					out->partitionedAccelerationStructure = false;
-					out->backendTier = hasRayTracing11 ? RayTracingBackendTier::DXR_1_1 : (hasRayTracingPipeline ? RayTracingBackendTier::DXR_1_0 : RayTracingBackendTier::None);
+					out->gpuRtasOperations = hasRayTracing20;
+					out->clusterAccelerationStructure = hasRayTracing20;
+					out->clusterTemplates = hasRayTracing20;
+					out->clusterTemplateIndexFetch = false;
+					out->clusterAccelerationStructureSerialization = false;
+					out->partitionedAccelerationStructure = hasRayTracing20;
+					out->partitionTranslation = hasRayTracing20;
+					out->partitionedAccelerationStructureSerialization = false;
+					out->backendTier = hasRayTracing20 ? RayTracingBackendTier::DXR_2_0 : (hasRayTracing11 ? RayTracingBackendTier::DXR_1_1 : (hasRayTracingPipeline ? RayTracingBackendTier::DXR_1_0 : RayTracingBackendTier::None));
 					out->shaderGroupHandleSize = hasRayTracingPipeline ? D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES : 0;
 					out->shaderGroupHandleAlignment = hasRayTracingPipeline ? D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES : 0;
 					out->shaderGroupBaseAlignment = hasRayTracingPipeline ? D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT : 0;
@@ -2208,6 +2228,16 @@ namespace rhi {
 					out->maxPrimitiveCount = hasRayTracingPipeline ? D3D12_RAYTRACING_MAX_PRIMITIVES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE : 0;
 					out->scratchAlignment = hasRayTracingPipeline ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
 					out->resultAlignment = hasRayTracingPipeline ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
+					out->maxClusterVertices = 0;
+					out->maxClusterTriangles = 0;
+					out->maxClusterGeometryIndex = 0;
+					out->maxClusterUniqueGeometryCount = 0;
+					out->maxPartitionCount = 0;
+					out->clusterScratchAlignment = hasRayTracing20 ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
+					out->clusterAlignment = hasRayTracing20 ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
+					out->clusterTemplateAlignment = hasRayTracing20 ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
+					out->clusterBottomLevelAlignment = hasRayTracing20 ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
+					out->clusterTemplateBoundsAlignment = 0;
 				} break;
 
 				case FeatureInfoStructType::ShadingRate: {
@@ -2484,6 +2514,7 @@ namespace rhi {
 		}
 
 		static D3D12_GPU_VIRTUAL_ADDRESS Dx12AccelerationStructureAddress(Dx12Device* impl, AccelerationStructureHandle handle) noexcept;
+		static D3D12_GPU_VIRTUAL_ADDRESS Dx12BufferAddress(Dx12Device* impl, GpuBufferAddress address) noexcept;
 
 		static Result d_createShaderResourceView(Device* d, DescriptorSlot s, const ResourceHandle& resource, const SrvDesc& dv) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
@@ -2641,7 +2672,13 @@ namespace rhi {
 
 			case SrvDim::AccelerationStruct: {
 				(void)resource;
-				const D3D12_GPU_VIRTUAL_ADDRESS address = Dx12AccelerationStructureAddress(impl, dv.accel.accelerationStructure);
+				D3D12_GPU_VIRTUAL_ADDRESS address = dv.accel.deviceAddress;
+				if (address == 0 && dv.accel.address.buffer.valid()) {
+					address = Dx12BufferAddress(impl, dv.accel.address);
+				}
+				if (address == 0) {
+					address = Dx12AccelerationStructureAddress(impl, dv.accel.accelerationStructure);
+				}
 				if (address == 0) return Result::InvalidArgument;
 				desc.Format = DXGI_FORMAT_UNKNOWN;
 				desc.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
@@ -3794,6 +3831,21 @@ namespace rhi {
 		static uint64_t d_getAccelerationStructureDeviceAddress(Device* d, AccelerationStructureHandle handle) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d ? d->impl : nullptr);
 			return Dx12AccelerationStructureAddress(impl, handle);
+		}
+
+		static uint64_t d_getBufferDeviceAddress(Device* d, GpuBufferAddress address) noexcept {
+			auto* impl = static_cast<Dx12Device*>(d ? d->impl : nullptr);
+			return Dx12BufferAddress(impl, address);
+		}
+
+		static Result d_getRayTracingAccelerationStructureOperationPrebuildInfo(Device* d, const RayTracingRtasOperationInputs& inputs, RayTracingRtasPrebuildInfo* out) noexcept {
+			(void)d;
+			(void)inputs;
+			if (!out) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			*out = {};
+			RHI_FAIL(Result::Unsupported);
 		}
 
 		static Result d_getRayTracingShaderGroupHandles(Device* d, PipelineHandle pipeline, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept {
@@ -7100,6 +7152,12 @@ namespace rhi {
 			list->cl->ExecuteIndirect(signature, 1, argumentBuffer->res.Get(), desc.dispatchRaysDescBuffer.offset, nullptr, 0);
 		}
 
+		static void cl_executeIndirectRtasOperations(CommandList* cl, const RayTracingRtasOperationDesc* descs, uint32_t count) noexcept {
+			(void)cl;
+			(void)descs;
+			(void)count;
+		}
+
 		static void cl_clearRTV_slot(CommandList* c, DescriptorSlot s, const rhi::ClearValue& cv) noexcept {
 			auto* impl = dx12_detail::CL(c);
 			if (!impl) {
@@ -8564,8 +8622,10 @@ namespace rhi {
 		&d_getAccelerationStructurePrebuildInfo,
 		&d_createAccelerationStructure,
 		&d_getAccelerationStructureDeviceAddress,
+		&d_getBufferDeviceAddress,
 		&d_getRayTracingShaderGroupHandles,
 		&d_setRayTracingPipelineStackSize,
+		&d_getRayTracingAccelerationStructureOperationPrebuildInfo,
 
 		&d_destroySampler,
 		&d_destroyPipelineLayout,
@@ -8623,7 +8683,7 @@ namespace rhi {
 		&d_setDebugSynchronousRecording,
 		&d_setDebugTexelAddressing,
 		&d_destroyDevice,
-		10u
+		11u
 	};
 
 	const QueueVTable g_qvt = {
@@ -8657,6 +8717,7 @@ namespace rhi {
 		&cl_writeAccelerationStructureProperties,
 		&cl_traceRays,
 		&cl_traceRaysIndirect,
+		&cl_executeIndirectRtasOperations,
 		cl_clearRTV_slot,
 		cl_clearDSV_slot,
 		&cl_executeIndirect,
@@ -8679,7 +8740,7 @@ namespace rhi {
 		&cl_dispatchWorkGraph,
 		&cl_setName,
 		&cl_setDebugInstrumentationContext,
-		3u
+		4u
 	};
 	const SwapchainVTable g_scvt = {
 		&sc_count,

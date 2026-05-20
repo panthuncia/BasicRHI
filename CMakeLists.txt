@@ -10,6 +10,7 @@ include(GNUInstallDirs)
 option(BASICRHI_ENABLE_STREAMLINE "Enable Streamline integration in BasicRHI" ON)
 option(BASICRHI_ENABLE_PIX "Enable PIX integration in BasicRHI" ON)
 option(BASICRHI_ENABLE_RESHAPE "Enable GPU-Reshape debug instrumentation scaffolding in BasicRHI" OFF)
+option(BASICRHI_ENABLE_DXR2_HEADERS "Enable native DXR 2.0 header-dependent code paths in BasicRHI" OFF)
 set(BASICRHI_STREAMLINE_HEADERS_DIR "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/Streamline" CACHE PATH "Directory containing Streamline headers (e.g. sl.h)")
 set(BASICRHI_PIX_HEADERS_DIR "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/pix" CACHE PATH "Directory containing PIX headers (e.g. pix3.h)")
 
@@ -265,6 +266,7 @@ target_compile_definitions(BasicRHI PUBLIC
     BASICRHI_ENABLE_STREAMLINE=$<IF:$<BOOL:${_basicrhi_streamline_available}>,1,0>
     BASICRHI_ENABLE_PIX=$<IF:$<BOOL:${_basicrhi_pix_available}>,1,0>
     BASICRHI_ENABLE_RESHAPE=$<IF:$<BOOL:${_basicrhi_reshape_available}>,1,0>
+    BASICRHI_HAS_DXR2_HEADERS=$<IF:$<BOOL:${BASICRHI_ENABLE_DXR2_HEADERS}>,1,0>
 )
 
 add_executable(BasicRHIVulkanSmoke

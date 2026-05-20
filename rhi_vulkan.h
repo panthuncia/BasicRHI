@@ -186,6 +186,8 @@ namespace rhi {
 		CbvDesc cbv{};
 		SamplerDesc samplerDesc{};
 		AccelerationStructureHandle accelerationStructure{};
+		VkDeviceAddress accelerationStructureDeviceAddress = 0;
+		bool partitionedAccelerationStructure = false;
 	};
 
 	struct VulkanDescriptorHeap {
@@ -391,6 +393,14 @@ namespace rhi {
 		VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
 		VkPhysicalDeviceAccelerationStructurePropertiesKHR accelerationStructureProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR };
 		VkPhysicalDeviceRayTracingPipelinePropertiesKHR rayTracingPipelineProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR };
+#if defined(VK_NV_cluster_acceleration_structure)
+		VkPhysicalDeviceClusterAccelerationStructureFeaturesNV clusterAccelerationStructureFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV };
+		VkPhysicalDeviceClusterAccelerationStructurePropertiesNV clusterAccelerationStructureProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_PROPERTIES_NV };
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+		VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV partitionedAccelerationStructureFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV };
+		VkPhysicalDevicePartitionedAccelerationStructurePropertiesNV partitionedAccelerationStructureProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_PROPERTIES_NV };
+#endif
 		uint32_t loaderApiVersion = VK_API_VERSION_1_0;
 		uint32_t instanceApiVersion = VK_API_VERSION_1_0;
 		bool swapchainExtensionEnabled = false;
@@ -418,6 +428,8 @@ namespace rhi {
 		bool rayTracingPipelineEnabled = false;
 		bool rayQueryEnabled = false;
 		bool rayTracingPipelineLibraryEnabled = false;
+		bool clusterAccelerationStructureEnabled = false;
+		bool partitionedAccelerationStructureEnabled = false;
 		bool validateBarrierTransitions = false;
 		bool streamlineInitialized = false;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;

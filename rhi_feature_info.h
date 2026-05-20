@@ -24,13 +24,13 @@ struct FeatureInfoHeader {
 
 enum class ShaderModel : uint16_t {
     Unknown = 0,
-	SM_6_0, SM_6_1, SM_6_2, SM_6_3, SM_6_4, SM_6_5, SM_6_6, SM_6_7, SM_6_8, SM_6_9,
+    SM_6_0, SM_6_1, SM_6_2, SM_6_3, SM_6_4, SM_6_5, SM_6_6, SM_6_7, SM_6_8, SM_6_9, SM_6_10,
 };
 
 // "quality level" enums that are RHI-defined (NOT necessarily DX tiers).
 enum class MeshShaderLevel : uint8_t { None, Mesh, MeshPlusTask };
 enum class RayTracingLevel : uint8_t { None, Pipeline, PipelinePlusQuery };
-enum class RayTracingBackendTier : uint8_t { None, DXR_1_0, DXR_1_1, VulkanKHR };
+enum class RayTracingBackendTier : uint8_t { None, DXR_1_0, DXR_1_1, VulkanKHR, DXR_2_0 };
 enum class ShadingRateLevel : uint8_t { None, PerDraw, Attachment };
 enum class WorkGraphLevel : uint8_t { None, ComputeNodes, MeshNodes };
 
@@ -91,7 +91,7 @@ struct MeshShaderFeatureInfo {
 };
 
 struct RayTracingFeatureInfo {
-    FeatureInfoHeader header{ FeatureInfoStructType::RayTracing, nullptr, sizeof(RayTracingFeatureInfo), 2 };
+    FeatureInfoHeader header{ FeatureInfoStructType::RayTracing, nullptr, sizeof(RayTracingFeatureInfo), 3 };
 
     bool pipeline = false;   // RT pipeline + shader tables (DXR pipeline / VK ray_tracing_pipeline)
     bool rayQuery = false;   // inline ray queries (DXR 1.1-ish / VK ray_query)
@@ -114,8 +114,14 @@ struct RayTracingFeatureInfo {
     // Optional/newer features. These are false unless the backend can expose a real native path.
     bool opacityMicromap = false;
     bool shaderExecutionReordering = false;
+    bool gpuRtasOperations = false;
     bool clusterAccelerationStructure = false;
+    bool clusterTemplates = false;
+    bool clusterTemplateIndexFetch = false;
+    bool clusterAccelerationStructureSerialization = false;
     bool partitionedAccelerationStructure = false;
+    bool partitionTranslation = false;
+    bool partitionedAccelerationStructureSerialization = false;
 
     RayTracingBackendTier backendTier = RayTracingBackendTier::None;
 
@@ -133,6 +139,16 @@ struct RayTracingFeatureInfo {
     uint32_t maxPrimitiveCount = 0;
     uint64_t scratchAlignment = 0;
     uint64_t resultAlignment = 0;
+    uint32_t maxClusterVertices = 0;
+    uint32_t maxClusterTriangles = 0;
+    uint32_t maxClusterGeometryIndex = 0;
+    uint32_t maxClusterUniqueGeometryCount = 0;
+    uint32_t maxPartitionCount = 0;
+    uint64_t clusterScratchAlignment = 0;
+    uint64_t clusterAlignment = 0;
+    uint64_t clusterTemplateAlignment = 0;
+    uint64_t clusterBottomLevelAlignment = 0;
+    uint64_t clusterTemplateBoundsAlignment = 0;
 
     [[nodiscard]] constexpr RayTracingLevel Level() const noexcept {
         if (!pipeline) return RayTracingLevel::None;

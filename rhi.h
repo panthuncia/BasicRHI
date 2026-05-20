@@ -15,6 +15,10 @@
 #include "resource_states.h"
 #include "rhi_feature_info.h"
 
+#ifndef BASICRHI_HAS_DXR2_HEADERS
+#define BASICRHI_HAS_DXR2_HEADERS 0
+#endif
+
 namespace rhi {
 
 	// Optional callback invoked by BreakIfDebugging (set by DX12 backend to log DRED data)
@@ -754,6 +758,11 @@ namespace rhi {
 	// 0 => use API default (DX12_DEFAULT_SHADER_4_COMPONENT_MAPPING / RGBA identity in VK)
 	using ComponentMapping = uint32_t;
 
+	struct GpuBufferAddress {
+		ResourceHandle buffer{};
+		uint64_t offset{ 0 };
+	};
+
 	struct SrvDesc {
 		SrvDim	dimension{ SrvDim::Undefined };
 		Format	formatOverride{ Format::Unknown }; // textures + typed buffers
@@ -830,19 +839,35 @@ namespace rhi {
 
 			struct { // ===== ACCEL STRUCT =====
 				AccelerationStructureHandle accelerationStructure{};
+				GpuBufferAddress address{};
+				uint64_t deviceAddress{ 0 };
+				uint64_t sizeBytes{ 0 };
+				bool partitioned{ false };
 			} accel;
 		};
-	};
-
-	struct GpuBufferAddress {
-		ResourceHandle buffer{};
-		uint64_t offset{ 0 };
 	};
 
 	struct GpuBufferRange {
 		ResourceHandle buffer{};
 		uint64_t offset{ 0 };
 		uint64_t size{ 0 };
+	};
+
+	struct GpuBufferStridedRange {
+		ResourceHandle buffer{};
+		uint64_t offset{ 0 };
+		uint64_t size{ 0 };
+		uint64_t stride{ 0 };
+	};
+
+	enum class RayTracingAccelerationStructureReferenceType : uint32_t { None, Handle, BufferAddress, DeviceAddress };
+	struct RayTracingAccelerationStructureReference {
+		RayTracingAccelerationStructureReferenceType type{ RayTracingAccelerationStructureReferenceType::None };
+		AccelerationStructureHandle handle{};
+		GpuBufferAddress address{};
+		uint64_t deviceAddress{ 0 };
+		uint64_t sizeBytes{ 0 };
+		bool partitioned{ false };
 	};
 
 	enum class RayTracingAccelerationStructureType : uint32_t { BottomLevel, TopLevel };
@@ -947,6 +972,233 @@ namespace rhi {
 		RayTracingAccelerationStructureProperty property{ RayTracingAccelerationStructureProperty::CompactedSize };
 		GpuBufferRange destinationBuffer{};
 	};
+
+	enum class RayTracingClusterAccelerationStructureType : uint32_t { ClustersBottomLevel, TriangleCluster, TriangleClusterTemplate };
+	enum class RayTracingClusterVertexFormat : uint32_t { Unknown, Float32x3, Float16x3, Float16x4, Snorm16x3, Snorm16x4 };
+	enum class RayTracingClusterIndexFormat : uint32_t { None = 0, Uint8 = 1, Uint16 = 2, Uint32 = 4 };
+	enum class RayTracingRtasOperationType : uint32_t { MoveObjects, BuildClustersBottomLevel, BuildTriangleCluster, BuildTriangleClusterTemplate, InstantiateTriangleCluster, GetClusterTemplateIndices, BuildPartitionedTopLevel };
+	enum class RayTracingRtasOperationMode : uint32_t { ImplicitDestinations, ExplicitDestinations, ComputeSizes };
+	enum class RayTracingPartitionedTlasOperationType : uint32_t { WriteInstance, UpdateInstance, WritePartitionTranslation };
+
+	enum RayTracingClusterFlags : uint32_t {
+		RTCluster_None = 0,
+		RTCluster_AllowDisableOpacityMicromaps = 1u << 0,
+	};
+
+	enum RayTracingClusterGeometryFlags : uint32_t {
+		RTClusterGeometry_None = 0,
+		RTClusterGeometry_CullDisable = 1u << 0,
+		RTClusterGeometry_NoDuplicateAnyHitInvocation = 1u << 1,
+		RTClusterGeometry_Opaque = 1u << 2,
+	};
+
+	enum RayTracingRtasAddressResolutionFlags : uint32_t {
+		RTASAddressResolution_None = 0,
+		RTASAddressResolution_IndirectedDstImplicitData = 1u << 0,
+		RTASAddressResolution_IndirectedScratchData = 1u << 1,
+		RTASAddressResolution_IndirectedDstAddressArray = 1u << 2,
+		RTASAddressResolution_IndirectedDstSizesArray = 1u << 3,
+		RTASAddressResolution_IndirectedSrcInfosArray = 1u << 4,
+		RTASAddressResolution_IndirectedSrcInfosCount = 1u << 5,
+	};
+
+	enum RayTracingPartitionedTlasInstanceFlags : uint32_t {
+		RTPartitionedTlasInstance_None = 0,
+		RTPartitionedTlasInstance_TriangleFacingCullDisable = 1u << 0,
+		RTPartitionedTlasInstance_TriangleFlipFacing = 1u << 1,
+		RTPartitionedTlasInstance_ForceOpaque = 1u << 2,
+		RTPartitionedTlasInstance_ForceNonOpaque = 1u << 3,
+		RTPartitionedTlasInstance_EnableExplicitBoundingBox = 1u << 4,
+	};
+
+	inline constexpr uint32_t RayTracingPartitionedTlasPartitionIndex_Global = ~0u;
+
+	struct RayTracingClusterTriangleInputsDesc {
+		RayTracingClusterVertexFormat vertexFormat{ RayTracingClusterVertexFormat::Float32x3 };
+		uint32_t maxGeometryIndexValue{ 0 };
+		uint32_t maxClusterUniqueGeometryCount{ 1 };
+		uint32_t maxClusterTriangleCount{ 0 };
+		uint32_t maxClusterVertexCount{ 0 };
+		uint32_t maxTotalTriangleCount{ 0 };
+		uint32_t maxTotalVertexCount{ 0 };
+		uint32_t minPositionTruncateBitCount{ 0 };
+	};
+
+	using RayTracingClusterTemplateTriangleInputsDesc = RayTracingClusterTriangleInputsDesc;
+	using RayTracingInstantiateClusterTemplateInputsDesc = RayTracingClusterTriangleInputsDesc;
+
+	struct RayTracingClusterBottomLevelInputsDesc {
+		uint32_t maxTotalClusterCount{ 0 };
+		uint32_t maxClusterCountPerAccelerationStructure{ 0 };
+	};
+
+	struct RayTracingClusterMovesDesc {
+		RayTracingClusterAccelerationStructureType type{ RayTracingClusterAccelerationStructureType::TriangleCluster };
+		bool noMoveOverlap{ false };
+		uint64_t maxMovedBytes{ 0 };
+	};
+
+	struct RayTracingPartitionedTlasInputsDesc {
+		RayTracingAccelerationStructureBuildFlags flags{ RTASBuild_None };
+		uint32_t instanceCount{ 0 };
+		uint32_t maxInstancePerPartitionCount{ 0 };
+		uint32_t partitionCount{ 0 };
+		uint32_t maxInstanceInGlobalPartitionCount{ 0 };
+		bool enablePartitionTranslation{ false };
+	};
+
+	struct RayTracingRtasOperationInputs {
+		RayTracingRtasOperationType operationType{ RayTracingRtasOperationType::BuildTriangleCluster };
+		RayTracingRtasOperationMode operationMode{ RayTracingRtasOperationMode::ImplicitDestinations };
+		RayTracingAccelerationStructureBuildFlags flags{ RTASBuild_None };
+		uint32_t maxAccelerationStructureCount{ 1 };
+		const RayTracingClusterBottomLevelInputsDesc* clustersBottomLevel{ nullptr };
+		const RayTracingClusterTriangleInputsDesc* triangleClusters{ nullptr };
+		const RayTracingClusterMovesDesc* moveObjects{ nullptr };
+		const RayTracingPartitionedTlasInputsDesc* partitionedTopLevel{ nullptr };
+	};
+
+	struct RayTracingRtasPrebuildInfo {
+		uint64_t resultDataMaxSizeInBytes{ 0 };
+		uint64_t scratchDataSizeInBytes{ 0 };
+		uint64_t updateScratchDataSizeInBytes{ 0 };
+	};
+
+	struct RayTracingRtasBatchedOperationData {
+		GpuBufferAddress dstImplicitData{};
+		GpuBufferAddress scratchData{};
+		GpuBufferStridedRange dstAddressesArray{};
+		GpuBufferStridedRange dstSizesArray{};
+		GpuBufferStridedRange srcInfosArray{};
+		GpuBufferAddress srcInfosCount{};
+		RayTracingRtasAddressResolutionFlags addressResolutionFlags{ RTASAddressResolution_None };
+	};
+
+	struct RayTracingPartitionedTlasOperationData {
+		RayTracingPartitionedTlasInputsDesc input{};
+		GpuBufferAddress srcAccelerationStructureData{};
+		GpuBufferAddress dstAccelerationStructureData{};
+		GpuBufferAddress scratchData{};
+		GpuBufferAddress srcInfos{};
+		GpuBufferAddress srcInfosCount{};
+	};
+
+	struct RayTracingRtasOperationDesc {
+		RayTracingRtasOperationInputs inputs{};
+		RayTracingRtasBatchedOperationData batched{};
+		RayTracingPartitionedTlasOperationData partitionedTopLevel{};
+	};
+
+	struct alignas(8) PackedRayTracingClusterMoveObjectsInfo {
+		uint64_t sourceAccelerationStructure{ 0 };
+	};
+	static_assert(sizeof(PackedRayTracingClusterMoveObjectsInfo) == 8);
+
+	struct alignas(8) PackedRayTracingClusterBuildBottomLevelInfo {
+		uint32_t clusterReferencesCount{ 0 };
+		uint32_t clusterReferencesStride{ 0 };
+		uint64_t clusterReferences{ 0 };
+	};
+	static_assert(sizeof(PackedRayTracingClusterBuildBottomLevelInfo) == 16);
+
+	struct alignas(8) PackedRayTracingClusterBuildTriangleInfo {
+		uint32_t clusterID{ 0 };
+		uint32_t clusterFlags{ RTCluster_None };
+		uint32_t countsAndFormats{ 0 };
+		uint32_t baseGeometryIndexAndFlags{ 0 };
+		uint16_t indexBufferStride{ 0 };
+		uint16_t vertexBufferStride{ 0 };
+		uint16_t geometryIndexAndFlagsBufferStride{ 0 };
+		uint16_t opacityMicromapIndexBufferStride{ 0 };
+		uint64_t indexBuffer{ 0 };
+		uint64_t vertexBuffer{ 0 };
+		uint64_t geometryIndexAndFlagsBuffer{ 0 };
+		uint64_t opacityMicromapArray{ 0 };
+		uint64_t opacityMicromapIndexBuffer{ 0 };
+	};
+	static_assert(sizeof(PackedRayTracingClusterBuildTriangleInfo) == 64);
+
+	struct alignas(8) PackedRayTracingClusterBuildTriangleTemplateInfo {
+		uint32_t clusterID{ 0 };
+		uint32_t clusterFlags{ RTCluster_None };
+		uint32_t countsAndFormats{ 0 };
+		uint32_t baseGeometryIndexAndFlags{ 0 };
+		uint16_t indexBufferStride{ 0 };
+		uint16_t vertexBufferStride{ 0 };
+		uint16_t geometryIndexAndFlagsBufferStride{ 0 };
+		uint16_t opacityMicromapIndexBufferStride{ 0 };
+		uint64_t indexBuffer{ 0 };
+		uint64_t vertexBuffer{ 0 };
+		uint64_t geometryIndexAndFlagsBuffer{ 0 };
+		uint64_t opacityMicromapArray{ 0 };
+		uint64_t opacityMicromapIndexBuffer{ 0 };
+		uint64_t instantiationBoundingBoxLimit{ 0 };
+	};
+	static_assert(sizeof(PackedRayTracingClusterBuildTriangleTemplateInfo) == 72);
+
+	struct alignas(8) PackedRayTracingClusterInstantiateTemplateInfo {
+		uint32_t clusterIdOffset{ 0 };
+		uint32_t geometryIndexOffset{ 0 };
+		uint64_t clusterTemplateAddress{ 0 };
+		uint64_t vertexBufferStartAddress{ 0 };
+		uint64_t vertexBufferStrideInBytes{ 0 };
+	};
+	static_assert(sizeof(PackedRayTracingClusterInstantiateTemplateInfo) == 32);
+
+	struct alignas(8) PackedRayTracingClusterGetTemplateIndicesInfo {
+		uint64_t clusterTemplateAddress{ 0 };
+	};
+	static_assert(sizeof(PackedRayTracingClusterGetTemplateIndicesInfo) == 8);
+
+	struct alignas(8) PackedRayTracingPartitionedTlasIndirectCommand {
+		RayTracingPartitionedTlasOperationType operationType{ RayTracingPartitionedTlasOperationType::WriteInstance };
+		uint32_t argumentCount{ 0 };
+		uint64_t argumentDataStartAddress{ 0 };
+		uint64_t argumentDataStrideInBytes{ 0 };
+	};
+	static_assert(sizeof(PackedRayTracingPartitionedTlasIndirectCommand) == 24);
+
+	struct alignas(8) PackedRayTracingPartitionedTlasWriteInstanceData {
+		float transform[3][4]{};
+		float explicitAabb[6]{};
+		uint32_t instanceID{ 0 };
+		uint32_t instanceMask{ 0xFF };
+		uint32_t instanceContributionToHitGroupIndex{ 0 };
+		uint32_t instanceFlags{ RTPartitionedTlasInstance_None };
+		uint32_t instanceIndex{ 0 };
+		uint32_t partitionIndex{ 0 };
+		uint64_t accelerationStructure{ 0 };
+	};
+	static_assert(sizeof(PackedRayTracingPartitionedTlasWriteInstanceData) == 104);
+
+	struct alignas(8) PackedRayTracingPartitionedTlasUpdateInstanceData {
+		uint32_t instanceIndex{ 0 };
+		uint32_t instanceContributionToHitGroupIndex{ 0 };
+		uint64_t accelerationStructure{ 0 };
+	};
+	static_assert(sizeof(PackedRayTracingPartitionedTlasUpdateInstanceData) == 16);
+
+	struct PackedRayTracingPartitionedTlasWritePartitionTranslationData {
+		uint32_t partitionIndex{ 0 };
+		float partitionTranslation[3]{};
+	};
+	static_assert(sizeof(PackedRayTracingPartitionedTlasWritePartitionTranslationData) == 16);
+
+	inline constexpr uint32_t PackRayTracingClusterCountsAndFormats(uint32_t triangleCount, uint32_t vertexCount, uint32_t positionTruncateBitCount, RayTracingClusterIndexFormat indexFormat, RayTracingClusterIndexFormat opacityMicromapIndexFormat = RayTracingClusterIndexFormat::None) noexcept {
+		return (triangleCount & 0x1FFu) |
+			((vertexCount & 0x1FFu) << 9) |
+			((positionTruncateBitCount & 0x3Fu) << 18) |
+			((static_cast<uint32_t>(indexFormat) & 0xFu) << 24) |
+			((static_cast<uint32_t>(opacityMicromapIndexFormat) & 0xFu) << 28);
+	}
+
+	inline constexpr uint32_t PackRayTracingClusterGeometryIndexAndFlags(uint32_t geometryIndex, RayTracingClusterGeometryFlags geometryFlags) noexcept {
+		return (geometryIndex & 0x00FFFFFFu) | ((static_cast<uint32_t>(geometryFlags) & 0x7u) << 29);
+	}
+
+	inline constexpr uint32_t PackRayTracingClusterInstantiationGeometryIndexOffset(uint32_t geometryIndexOffset) noexcept {
+		return geometryIndexOffset & 0x00FFFFFFu;
+	}
 
 	struct RayTracingInstanceDesc {
 		float transform[3][4]{};
@@ -1381,7 +1633,7 @@ namespace rhi {
 
 	enum class PrimitiveTopology : uint32_t { Unknown, PointList, LineList, LineStrip, TriangleList, TriangleStrip, TriangleFan };
 	enum class RayTracingShaderGroupType : uint32_t { General, TrianglesHitGroup, ProceduralHitGroup };
-	enum RayTracingPipelineFlags : uint32_t { RTPipeline_None = 0, RTPipeline_SkipTriangles = 1u << 0, RTPipeline_SkipProceduralPrimitives = 1u << 1 };
+	enum RayTracingPipelineFlags : uint32_t { RTPipeline_None = 0, RTPipeline_SkipTriangles = 1u << 0, RTPipeline_SkipProceduralPrimitives = 1u << 1, RTPipeline_AllowClusteredGeometry = 1u << 2 };
 
 	enum class PsoSubobj : uint32_t {
 		Layout,
@@ -2224,6 +2476,7 @@ namespace rhi {
 		void (*writeAccelerationStructureProperties)(CommandList*, const AccelerationStructurePropertiesDesc&) noexcept;
 		void (*traceRays)(CommandList*, const RayTracingDispatchDesc&) noexcept;
 		void (*traceRaysIndirect)(CommandList*, const RayTracingDispatchIndirectDesc&) noexcept;
+		void (*executeIndirectRtasOperations)(CommandList*, const RayTracingRtasOperationDesc*, uint32_t) noexcept;
 		void (*clearRenderTargetViewBySlot)(CommandList*, DescriptorSlot, const ClearValue&) noexcept;
 		void (*clearDepthStencilViewBySlot)(CommandList*, DescriptorSlot,
 			bool clearDepth, bool clearStencil,
@@ -2256,7 +2509,7 @@ namespace rhi {
 		void (*dispatchWorkGraph)(CommandList*, const WorkGraphDispatchDesc& desc) noexcept; // if supported by the backend
 		void (*setName)(CommandList*, const char*) noexcept;
 		void (*setDebugInstrumentationContext)(CommandList*, const char* passName, const char* techniquePath) noexcept;
-		uint32_t abi_version = 3;
+		uint32_t abi_version = 4;
 	};
 
 	class CommandList {
@@ -2288,6 +2541,7 @@ namespace rhi {
 		void WriteAccelerationStructureProperties(const AccelerationStructurePropertiesDesc& desc) noexcept;
 		void TraceRays(const RayTracingDispatchDesc& desc) noexcept;
 		void TraceRaysIndirect(const RayTracingDispatchIndirectDesc& desc) noexcept;
+		void ExecuteIndirectRtasOperations(const RayTracingRtasOperationDesc* descs, uint32_t count) noexcept;
 		inline void ClearRenderTargetView(DescriptorSlot s, const ClearValue& c) noexcept { vt->clearRenderTargetViewBySlot(this, s, c); }
 		inline void ClearDepthStencilView(DescriptorSlot s, bool clearDepth, bool clearStencil, float depth, uint8_t stencil) noexcept {
 			vt->clearDepthStencilViewBySlot(this, s, clearDepth, clearStencil, depth, stencil);
@@ -2409,8 +2663,10 @@ namespace rhi {
 		Result(*getAccelerationStructurePrebuildInfo)(Device*, const AccelerationStructureBuildInputs&, AccelerationStructurePrebuildInfo*) noexcept;
 		Result(*createAccelerationStructure)(Device*, const AccelerationStructureDesc&, AccelerationStructurePtr&) noexcept;
 		uint64_t(*getAccelerationStructureDeviceAddress)(Device*, AccelerationStructureHandle) noexcept;
+		uint64_t(*getBufferDeviceAddress)(Device*, GpuBufferAddress) noexcept;
 		Result(*getRayTracingShaderGroupHandles)(Device*, PipelineHandle, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept;
 		Result(*setRayTracingPipelineStackSize)(Device*, PipelineHandle, uint64_t stackSizeBytes) noexcept;
+		Result(*getRayTracingAccelerationStructureOperationPrebuildInfo)(Device*, const RayTracingRtasOperationInputs&, RayTracingRtasPrebuildInfo*) noexcept;
 
 		void (*destroySampler)(DeviceDeletionContext*, SamplerHandle) noexcept;
 		void (*destroyPipelineLayout)(DeviceDeletionContext*, PipelineLayoutHandle) noexcept;
@@ -2470,7 +2726,7 @@ namespace rhi {
 		Result(*setDebugTexelAddressing)(Device*, bool) noexcept;
 
 		void (*destroyDevice)(Device*) noexcept;
-		uint32_t abi_version = 10;
+		uint32_t abi_version = 11;
 	};
 
 
@@ -2577,8 +2833,10 @@ namespace rhi {
 		Result CreateAccelerationStructure(const AccelerationStructureDesc& d, AccelerationStructurePtr& out) noexcept { return vt->createAccelerationStructure(this, d, out); }
 		void DestroyAccelerationStructure(AccelerationStructureHandle h) noexcept { deletionContext.DestroyAccelerationStructure(h); }
 		uint64_t GetAccelerationStructureDeviceAddress(AccelerationStructureHandle h) noexcept { return vt->getAccelerationStructureDeviceAddress(this, h); }
+		uint64_t GetBufferDeviceAddress(GpuBufferAddress address) noexcept { return vt->getBufferDeviceAddress ? vt->getBufferDeviceAddress(this, address) : 0; }
 		Result GetRayTracingShaderGroupHandles(PipelineHandle p, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept { return vt->getRayTracingShaderGroupHandles(this, p, firstGroup, groupCount, outData, outDataBytes); }
 		Result SetRayTracingPipelineStackSize(PipelineHandle p, uint64_t stackSizeBytes) noexcept { return vt->setRayTracingPipelineStackSize(this, p, stackSizeBytes); }
+		Result GetRayTracingAccelerationStructureOperationPrebuildInfo(const RayTracingRtasOperationInputs& inputs, RayTracingRtasPrebuildInfo& out) noexcept { return vt->getRayTracingAccelerationStructureOperationPrebuildInfo ? vt->getRayTracingAccelerationStructureOperationPrebuildInfo(this, inputs, &out) : Result::Unsupported; }
 		TimestampCalibration GetTimestampCalibration(QueueKind q) noexcept { return vt->getTimestampCalibration(this, q); }
 		CopyableFootprintsInfo GetCopyableFootprints(const FootprintRangeDesc& r, CopyableFootprint* out, uint32_t outCap) noexcept {
 			return vt->getCopyableFootprints(this, r, out, outCap);
@@ -2723,6 +2981,7 @@ namespace rhi {
 	inline void CommandList::WriteAccelerationStructureProperties(const AccelerationStructurePropertiesDesc& desc) noexcept { vt->writeAccelerationStructureProperties(this, desc); }
 	inline void CommandList::TraceRays(const RayTracingDispatchDesc& desc) noexcept { vt->traceRays(this, desc); }
 	inline void CommandList::TraceRaysIndirect(const RayTracingDispatchIndirectDesc& desc) noexcept { vt->traceRaysIndirect(this, desc); }
+	inline void CommandList::ExecuteIndirectRtasOperations(const RayTracingRtasOperationDesc* descs, uint32_t count) noexcept { if (vt->executeIndirectRtasOperations) vt->executeIndirectRtasOperations(this, descs, count); }
 	inline void CommandList::ExecuteIndirect(CommandSignatureHandle sig, ResourceHandle argBuf, uint64_t argOff, ResourceHandle cntBuf, uint64_t cntOff, uint32_t maxCount) noexcept {
 		vt->executeIndirect(this, sig, argBuf, argOff, cntBuf, cntOff, maxCount);
 	}
