@@ -118,6 +118,10 @@ target_include_directories(BasicRHI PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty"
 )
 
+if(BASICRENDERER_DETECTED_VULKAN_INCLUDE_DIR)
+    target_include_directories(BasicRHI BEFORE PRIVATE "${BASICRENDERER_DETECTED_VULKAN_INCLUDE_DIR}")
+endif()
+
 if(WIN32)
     target_compile_definitions(BasicRHI PRIVATE VK_USE_PLATFORM_WIN32_KHR)
 endif()
