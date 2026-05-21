@@ -8397,6 +8397,10 @@ namespace rhi {
 		// ------------------ Timeline vtable funcs ----------------
 		static uint64_t tl_timelineCompletedValue(Timeline* t) noexcept {
 			auto* impl = dx12_detail::TL(t);
+			if (!impl) {
+				BreakIfDebugging();
+				return 0;
+			}
 			return impl->fence ? impl->fence->GetCompletedValue() : 0;
 		}
 
