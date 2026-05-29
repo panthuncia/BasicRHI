@@ -144,7 +144,11 @@ endif()
 
 if(_basicrhi_reshape_available)
     set(_basicrhi_reshape_source_root "${CMAKE_CURRENT_LIST_DIR}/../GPU-Reshape/Source")
-    set(_basicrhi_reshape_binary_root "${CMAKE_BINARY_DIR}/GPU-Reshape/Source")
+    get_filename_component(
+        _basicrhi_reshape_binary_root
+        "${CMAKE_CURRENT_BINARY_DIR}/../GPU-Reshape/Source"
+        ABSOLUTE
+    )
     set(_basicrhi_reshape_common_include_dirs
         "${_basicrhi_reshape_source_root}/Features/Descriptor/Backend/Include"
         "${_basicrhi_reshape_binary_root}/Features/Descriptor/Backend/Include"
@@ -182,6 +186,12 @@ if(_basicrhi_reshape_available)
     )
 
     set(_basicrhi_reshape_schema_targets)
+    if(TARGET GRS.Backends.DX12.Layer)
+        list(APPEND _basicrhi_reshape_schema_targets GRS.Backends.DX12.Layer)
+    endif()
+    if(TARGET GRS.Backends.Vulkan.Layer)
+        list(APPEND _basicrhi_reshape_schema_targets GRS.Backends.Vulkan.Layer)
+    endif()
     if(TARGET GRS.Features.Descriptor.Backend)
         list(APPEND _basicrhi_reshape_schema_targets GRS.Features.Descriptor.Backend)
     endif()

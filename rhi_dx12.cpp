@@ -659,6 +659,18 @@ namespace rhi {
 			}
 		}
 
+		static UINT64 Dx12GetInfoQueueMessageCount(ID3D12Device* device) noexcept
+		{
+			if (!device) return 0;
+
+			ComPtr<ID3D12InfoQueue> iq;
+			if (FAILED(device->QueryInterface(IID_PPV_ARGS(&iq))) || !iq) {
+				return 0;
+			}
+
+			return iq->GetNumStoredMessagesAllowedByRetrievalFilter();
+		}
+
 		static void DxgiReportLiveObjects(const char* phase) noexcept
 		{
 			Microsoft::WRL::ComPtr<IDXGIDebug1> dxgiDebug;
@@ -4132,7 +4144,12 @@ namespace rhi {
 				auto* w = dx12_detail::CL(&L);
 				native.push_back(w->cl.Get());
 			}
-			if (!native.empty()) qs->pNativeQueue->ExecuteCommandLists(static_cast<uint32_t>(native.size()), native.data());
+			if (!native.empty()) {
+				const UINT64 infoQueueStart = Dx12GetInfoQueueMessageCount(dev->pNativeDevice.Get());
+				qs->pNativeQueue->ExecuteCommandLists(static_cast<uint32_t>(native.size()), native.data());
+				Dx12LogInfoQueueMessagesSince(dev->pNativeDevice.Get(), infoQueueStart, 64);
+				spdlog::default_logger()->flush();
+			}
 
 			// Post-signals
 			for (auto& sgn : s.signals) {
@@ -8471,8 +8488,10 @@ namespace rhi {
 			ComPtr<ID3D12InfoQueue> iq; if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&iq)))) {
 				D3D12_MESSAGE_ID blocked[] = { (D3D12_MESSAGE_ID)1356, (D3D12_MESSAGE_ID)1328, (D3D12_MESSAGE_ID)1008 };
 				D3D12_INFO_QUEUE_FILTER f{}; f.DenyList.NumIDs = (UINT)_countof(blocked); f.DenyList.pIDList = blocked; iq->AddStorageFilterEntries(&f);
-				iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, true);
-				iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, true);
+				iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, false);
+				iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, false);
+				iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, false);
+				spdlog::info("D3D12 debug layer enabled; break-on-severity disabled so InfoQueue messages can be logged.");
 			}
 		}
 
