@@ -491,6 +491,61 @@ namespace rhi {
 		default:                                             return "Unknown";
 		}
 	}
+
+	static void Dx12LogInfoQueueMessagesSince(ID3D12Device* device, UINT64 startIndex, UINT64 maxMessages = 16) noexcept
+	{
+		if (!device) return;
+
+		ComPtr<ID3D12InfoQueue> iq;
+		if (FAILED(device->QueryInterface(IID_PPV_ARGS(&iq))) || !iq) {
+			return;
+		}
+
+		const UINT64 endIndex = iq->GetNumStoredMessagesAllowedByRetrievalFilter();
+		if (endIndex <= startIndex) {
+			return;
+		}
+
+		UINT64 firstIndex = startIndex;
+		if (endIndex - firstIndex > maxMessages) {
+			firstIndex = endIndex - maxMessages;
+		}
+
+		for (UINT64 index = firstIndex; index < endIndex; ++index) {
+			SIZE_T messageBytes = 0;
+			if (FAILED(iq->GetMessage(index, nullptr, &messageBytes)) || messageBytes == 0) {
+				continue;
+			}
+
+			std::vector<char> storage(messageBytes);
+			auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+			if (FAILED(iq->GetMessage(index, message, &messageBytes))) {
+				continue;
+			}
+
+			spdlog::error(
+				"D3D12 InfoQueue[{}]: severity={} category={} id={} {}",
+				index,
+				static_cast<uint32_t>(message->Severity),
+				static_cast<uint32_t>(message->Category),
+				static_cast<uint32_t>(message->ID),
+				message->pDescription ? message->pDescription : "<no description>");
+		}
+	}
+
+	static std::string Dx12WideToUtf8(const wchar_t* text) {
+		if (!text) {
+			return {};
+		}
+		const int required = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+		if (required <= 0) {
+			return {};
+		}
+		std::string result(static_cast<size_t>(required - 1), '\0');
+		WideCharToMultiByte(CP_UTF8, 0, text, -1, result.data(), required, nullptr, nullptr);
+		return result;
+	}
+
 	static void LogDredData() noexcept {
 		if (!g_dredDevice) return;
 
@@ -502,6 +557,7 @@ namespace rhi {
 		ComPtr<ID3D12DeviceRemovedExtendedData1> pDred;
 		if (FAILED(g_dredDevice->QueryInterface(IID_PPV_ARGS(&pDred)))) {
 			spdlog::error("  Could not query ID3D12DeviceRemovedExtendedData1.");
+			Dx12LogInfoQueueMessagesSince(g_dredDevice, 0, 256);
 			return;
 		}
 
@@ -527,6 +583,21 @@ namespace rhi {
 						const char* marker = (i == last) ? " <<< LAST COMPLETED" :
 						                     (i == last + 1) ? " <<< LIKELY FAULTING OP" : "";
 						spdlog::error("    [{:5}] {}{}", i, BreadcrumbOpToString(node->pCommandHistory[i]), marker);
+					}
+				}
+				if (node->pBreadcrumbContexts && node->BreadcrumbContextsCount > 0) {
+					const UINT32 contextStart = last >= 4 ? last - 4 : 0;
+					const UINT32 contextEnd = last + 5;
+					for (UINT32 contextIndex = 0; contextIndex < node->BreadcrumbContextsCount; ++contextIndex) {
+						const auto& context = node->pBreadcrumbContexts[contextIndex];
+						if (context.BreadcrumbIndex < contextStart || context.BreadcrumbIndex > contextEnd) {
+							continue;
+						}
+						spdlog::error(
+							"      context[{}] breadcrumb={} '{}'",
+							contextIndex,
+							context.BreadcrumbIndex,
+							context.pContextString ? Dx12WideToUtf8(context.pContextString) : "<null>");
 					}
 				}
 				node = node->pNext;
@@ -561,6 +632,8 @@ namespace rhi {
 		} else {
 			spdlog::error("  GetPageFaultAllocationOutput1 failed.");
 		}
+
+		Dx12LogInfoQueueMessagesSince(g_dredDevice, 0, 256);
 
 		spdlog::error("======== END DRED Report ========");
 	}
@@ -615,47 +688,6 @@ namespace rhi {
 				(void)dbgDev->ReportLiveDeviceObjects(
 					D3D12_RLDO_DETAIL | D3D12_RLDO_IGNORE_INTERNAL
 				);
-			}
-		}
-
-		static void Dx12LogInfoQueueMessagesSince(ID3D12Device* device, UINT64 startIndex, UINT64 maxMessages = 16) noexcept
-		{
-			if (!device) return;
-
-			ComPtr<ID3D12InfoQueue> iq;
-			if (FAILED(device->QueryInterface(IID_PPV_ARGS(&iq))) || !iq) {
-				return;
-			}
-
-			const UINT64 endIndex = iq->GetNumStoredMessagesAllowedByRetrievalFilter();
-			if (endIndex <= startIndex) {
-				return;
-			}
-
-			UINT64 firstIndex = startIndex;
-			if (endIndex - firstIndex > maxMessages) {
-				firstIndex = endIndex - maxMessages;
-			}
-
-			for (UINT64 index = firstIndex; index < endIndex; ++index) {
-				SIZE_T messageBytes = 0;
-				if (FAILED(iq->GetMessage(index, nullptr, &messageBytes)) || messageBytes == 0) {
-					continue;
-				}
-
-				std::vector<char> storage(messageBytes);
-				auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
-				if (FAILED(iq->GetMessage(index, message, &messageBytes))) {
-					continue;
-				}
-
-				spdlog::error(
-					"D3D12 InfoQueue[{}]: severity={} category={} id={} {}",
-					index,
-					static_cast<uint32_t>(message->Severity),
-					static_cast<uint32_t>(message->Category),
-					static_cast<uint32_t>(message->ID),
-					message->pDescription ? message->pDescription : "<no description>");
 			}
 		}
 
@@ -858,7 +890,7 @@ namespace rhi {
 			}
 			ComPtr<ID3D12StateObject> stateObject;
 			if (const HRESULT hr = dimpl->pNativeDevice->CreateStateObject(soDesc, IID_PPV_ARGS(&stateObject)); FAILED(hr)) {
-				Dx12LogInfoQueueMessagesSince(dimpl->pNativeDevice.Get(), infoQueueStart);
+				Dx12LogInfoQueueMessagesSince(dimpl->pNativeDevice.Get(), infoQueueStart, 16);
 				out.Reset();
 				RHI_FAIL(ToRHI(hr));
 			}
@@ -1097,7 +1129,7 @@ namespace rhi {
 					depth.DepthEnable,
 					depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL,
 					sd.SizeInBytes);
-				Dx12LogInfoQueueMessagesSince(dimpl->pNativeDevice.Get(), infoQueueStart);
+				Dx12LogInfoQueueMessagesSince(dimpl->pNativeDevice.Get(), infoQueueStart, 16);
 				RHI_FAIL(ToRHI(hr));
 			}
 
@@ -1942,7 +1974,7 @@ namespace rhi {
 					static_cast<uint32_t>(ld.pushConstants.size),
 					static_cast<uint32_t>(ld.staticSamplers.size),
 					blob ? blob->GetBufferSize() : 0);
-				Dx12LogInfoQueueMessagesSince(impl->pNativeDevice.Get(), infoQueueStart);
+				Dx12LogInfoQueueMessagesSince(impl->pNativeDevice.Get(), infoQueueStart, 16);
 				RHI_FAIL(ToRHI(hr));
 				}
 			}
@@ -4146,6 +4178,13 @@ namespace rhi {
 			}
 			if (!native.empty()) {
 				const UINT64 infoQueueStart = Dx12GetInfoQueueMessageCount(dev->pNativeDevice.Get());
+				for (auto& L : lists) {
+					auto* commandList = dx12_detail::CL(&L);
+					spdlog::debug(
+						"DX12 ExecuteCommandLists queue={} list='{}'",
+						static_cast<int>(q->GetKind()),
+						commandList ? commandList->debugName : "<null>");
+				}
 				qs->pNativeQueue->ExecuteCommandLists(static_cast<uint32_t>(native.size()), native.data());
 				Dx12LogInfoQueueMessagesSince(dev->pNativeDevice.Get(), infoQueueStart, 64);
 				spdlog::default_logger()->flush();
@@ -6568,6 +6607,16 @@ namespace rhi {
 			}
 
 			{
+				char message[128] = {};
+				std::snprintf(
+					message,
+					sizeof(message),
+					"GPU-Reshape SetGlobalInstrumentationMask requested featureMask=0x%016llX",
+					static_cast<unsigned long long>(featureMask));
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Info, message);
+			}
+
+			{
 				std::lock_guard guard(impl->debugInstrumentation.mutex);
 				impl->debugInstrumentation.explicitGlobalFeatureMaskConfigured = true;
 				impl->debugInstrumentation.defaultDescriptorMaskApplied = true;
@@ -6593,6 +6642,10 @@ namespace rhi {
 
 			std::lock_guard guard(impl->debugInstrumentation.mutex);
 			impl->debugInstrumentation.state.globalFeatureMask = featureMask;
+			Dx12AppendInstrumentationDiagnostic(
+				impl,
+				DebugInstrumentationDiagnosticSeverity::Info,
+				"GPU-Reshape SetGlobalInstrumentationMask completed.");
 			return Result::Ok;
 		}
 
@@ -6608,6 +6661,17 @@ namespace rhi {
 
 			if (!impl->debugInstrumentation.state.active) {
 				RHI_FAIL(Result::Unsupported);
+			}
+
+			{
+				char message[192] = {};
+				std::snprintf(
+					message,
+					sizeof(message),
+					"GPU-Reshape SetPipelineInstrumentationMask requested pipeline=%llu featureMask=0x%016llX",
+					static_cast<unsigned long long>(pipelineUid),
+					static_cast<unsigned long long>(featureMask));
+				Dx12AppendInstrumentationDiagnostic(impl, DebugInstrumentationDiagnosticSeverity::Info, message);
 			}
 
 			#if BASICRHI_ENABLE_RESHAPE
@@ -6634,6 +6698,10 @@ namespace rhi {
 			metadata.explicitlyInstrumented = featureMask != 0;
 			metadata.explicitFeatureMask = featureMask;
 			impl->debugInstrumentation.pendingPipelineStatusRequests.insert(pipelineUid);
+			Dx12AppendInstrumentationDiagnostic(
+				impl,
+				DebugInstrumentationDiagnosticSeverity::Info,
+				"GPU-Reshape SetPipelineInstrumentationMask completed.");
 			return Result::Ok;
 		}
 
@@ -7631,6 +7699,7 @@ namespace rhi {
 				BreakIfDebugging();
 				return;
 			}
+			l->debugName = n;
 			l->cl->SetName(std::wstring(n, n + ::strlen(n)).c_str());
 		}
 

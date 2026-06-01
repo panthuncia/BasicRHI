@@ -2343,6 +2343,7 @@ namespace rhi {
 		Result Signal(const TimelinePoint& p) noexcept;
 		Result Wait(const TimelinePoint& p) noexcept;
 		void CheckDebugMessages() noexcept;
+		void SetName(const char* n) noexcept { vt->setName(this, n); }
 		QueueKind GetKind() const noexcept { return kind; }
 		QueueHandle GetQueueHandle() const noexcept { return queueHandle; }
 	private:

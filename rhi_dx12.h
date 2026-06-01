@@ -187,6 +187,7 @@ namespace rhi {
 		Dx12PipelineLayout* boundLayoutPtr = nullptr;
 		Dx12Device* dev = nullptr;
 		Dx12Pipeline* boundPipeline = nullptr; // For debug validation
+		std::string debugName;
 		std::string instrumentationPassName;
 		std::string instrumentationTechniquePath;
 		std::vector<RootCbvScratchPage> rootCbvScratchPages;
