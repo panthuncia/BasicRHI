@@ -3378,7 +3378,9 @@ namespace rhi {
 				RHI_FAIL(ToRHI(hr));
 			}
 			if (dbg) { std::wstring w(dbg, dbg + ::strlen(dbg)); f->SetName(w.c_str()); }
-			const Dx12Timeline T(f, impl);
+			Dx12Timeline T(f, impl);
+			T.lastSubmittedSignalValue = initial;
+			T.debugName = dbg ? dbg : "";
 			const auto h = impl->timelines.alloc(T);
 			Timeline ret{ h };
 			ret.impl = impl;
@@ -3495,6 +3497,7 @@ namespace rhi {
 			if (!n) return;
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 			if (auto* TL = impl->timelines.get(t)) {
+				TL->debugName = n;
 				std::wstring w(n, n + ::strlen(n));
 				TL->fence->SetName(w.c_str());
 			}
@@ -4152,6 +4155,97 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		static void Dx12CopyTimelineRecordSource(char* dst, size_t dstSize, const char* src) noexcept {
+			if (!dst || dstSize == 0) {
+				return;
+			}
+			dst[0] = '\0';
+			if (!src) {
+				return;
+			}
+			const size_t srcLen = std::strlen(src);
+			const size_t copyLen = (std::min)(srcLen, dstSize - 1);
+			std::memcpy(dst, src, copyLen);
+			dst[copyLen] = '\0';
+		}
+
+		static void Dx12RecordTimelineSignal(
+			Dx12Timeline& timeline,
+			const Queue& queue,
+			uint64_t value,
+			uint64_t completedBefore,
+			uint32_t commandListCount,
+			const char* source) noexcept {
+			Dx12Timeline::SignalRecord record{};
+			record.value = value;
+			record.completedBefore = completedBefore;
+			record.queueHandleIndex = queue.GetQueueHandle().index;
+			record.queueHandleGeneration = queue.GetQueueHandle().generation;
+			record.queueKind = static_cast<uint32_t>(queue.GetKind());
+			record.commandListCount = commandListCount;
+			Dx12CopyTimelineRecordSource(record.source, sizeof(record.source), source);
+			timeline.recentSignals.push_back(record);
+			while (timeline.recentSignals.size() > 32) {
+				timeline.recentSignals.pop_front();
+			}
+			timeline.lastSubmittedSignalValue = (std::max)(timeline.lastSubmittedSignalValue, value);
+		}
+
+		static void Dx12RecordTimelineWait(
+			Dx12Timeline& timeline,
+			const Queue& queue,
+			uint64_t value,
+			uint64_t completedBefore,
+			const char* source) noexcept {
+			Dx12Timeline::WaitRecord record{};
+			record.value = value;
+			record.completedBefore = completedBefore;
+			record.queueHandleIndex = queue.GetQueueHandle().index;
+			record.queueHandleGeneration = queue.GetQueueHandle().generation;
+			record.queueKind = static_cast<uint32_t>(queue.GetKind());
+			Dx12CopyTimelineRecordSource(record.source, sizeof(record.source), source);
+			timeline.recentWaits.push_back(record);
+			while (timeline.recentWaits.size() > 32) {
+				timeline.recentWaits.pop_front();
+			}
+		}
+
+		static void Dx12LogTimelineHistory(const char* context, const TimelineHandle handle, const Dx12Timeline& timeline, uint64_t completedValue) noexcept {
+			spdlog::critical(
+				"DX12 timeline diagnostics [{}]: timeline(index={}, gen={}, name='{}') completed={} lastSubmittedSignal={} recentSignals={} recentWaits={}",
+				context ? context : "",
+				handle.index,
+				handle.generation,
+				timeline.debugName,
+				completedValue,
+				timeline.lastSubmittedSignalValue,
+				timeline.recentSignals.size(),
+				timeline.recentWaits.size());
+			for (const auto& signal : timeline.recentSignals) {
+				spdlog::critical(
+					"  recent signal: source={} value={} completedBefore={} queueHandle(index={}, gen={}) queueKind={} commandLists={}",
+					signal.source,
+					signal.value,
+					signal.completedBefore,
+					signal.queueHandleIndex,
+					signal.queueHandleGeneration,
+					signal.queueKind,
+					signal.commandListCount);
+			}
+			for (const auto& wait : timeline.recentWaits) {
+				spdlog::critical(
+					"  recent wait: source={} value={} completedBefore={} queueHandle(index={}, gen={}) queueKind={}",
+					wait.source,
+					wait.value,
+					wait.completedBefore,
+					wait.queueHandleIndex,
+					wait.queueHandleGeneration,
+					wait.queueKind);
+			}
+			LogDredData();
+			spdlog::default_logger()->flush();
+		}
+
 		// ---------------- Queue vtable funcs ----------------
 		static Result q_submit(Queue* q, Span<CommandList> lists, const SubmitDesc& s) noexcept {
 			auto* qs = dx12_detail::QState(q);
@@ -4164,6 +4258,21 @@ namespace rhi {
 			for (auto& w : s.waits) {
 				auto* TL = dev->timelines.get(w.t); if (!TL) {
 					RHI_FAIL(Result::InvalidArgument);
+				}
+				if (w.value == 0 || w.value == UINT64_MAX) {
+					spdlog::error(
+						"q_submit pre-wait rejected invalid timeline value: timeline(index={}, gen={}, name='{}') value={}",
+						w.t.index,
+						w.t.generation,
+						TL->debugName,
+						w.value);
+					return Result::InvalidArgument;
+				}
+				const uint64_t completedBefore = TL->fence ? TL->fence->GetCompletedValue() : 0;
+				Dx12RecordTimelineWait(*TL, *q, w.value, completedBefore, "q_submit");
+				if (completedBefore == UINT64_MAX) {
+					Dx12LogTimelineHistory("q_submit pre-wait saw UINT64_MAX", w.t, *TL, completedBefore);
+					return Result::InvalidArgument;
 				}
 				if (FAILED(qs->pNativeQueue->Wait(TL->fence.Get(), w.value))) {
 					RHI_FAIL(Result::InvalidArgument);
@@ -4195,13 +4304,18 @@ namespace rhi {
 				auto* TL = dev->timelines.get(sgn.t); if (!TL) {
 					RHI_FAIL(Result::InvalidArgument);
 				}
-				if (sgn.value == 0) {
+				if (sgn.value == 0 || sgn.value == UINT64_MAX) {
 					spdlog::error(
 						"q_submit post-signal: attempted to signal timeline(index={}, gen={}) "
-						"with value 0 via SubmitDesc. Break to inspect callstack.",
-						sgn.t.index, sgn.t.generation);
+						"with invalid value {} via SubmitDesc. Break to inspect callstack.",
+						sgn.t.index, sgn.t.generation, sgn.value);
 					BreakIfDebugging();
-					continue;
+					return Result::InvalidArgument;
+				}
+				const uint64_t completedBefore = TL->fence ? TL->fence->GetCompletedValue() : 0;
+				if (completedBefore == UINT64_MAX) {
+					Dx12LogTimelineHistory("q_submit post-signal saw UINT64_MAX before signal", sgn.t, *TL, completedBefore);
+					return Result::InvalidArgument;
 				}
 #if BUILD_TYPE == BUILD_DEBUG
 				{
@@ -4221,6 +4335,7 @@ namespace rhi {
 				if (const auto hr = qs->pNativeQueue->Signal(TL->fence.Get(), sgn.value); FAILED(hr)) {
 					RHI_FAIL(ToRHI(hr));
 				}
+				Dx12RecordTimelineSignal(*TL, *q, sgn.value, completedBefore, lists.size, "q_submit");
 			}
 			return Result::Ok;
 		}
@@ -6765,15 +6880,20 @@ namespace rhi {
 				BreakIfDebugging();
 				return Result::InvalidArgument;
 			}
-			// Catch zero-value signals early - these are almost always bugs.
+			// Catch invalid signals early - these are almost always bugs.
 			// Break here to get a callstack showing who triggered this.
-			if (p.value == 0) {
+			if (p.value == 0 || p.value == UINT64_MAX) {
 				spdlog::error(
 					"q_signal: attempted to signal timeline(index={}, gen={}) with "
-					"value 0. This will violate monotonic ordering if the timeline "
+					"invalid value {}. This will violate monotonic ordering if the timeline "
 					"has ever been signaled before. Break here to inspect callstack.",
-					p.t.index, p.t.generation);
+					p.t.index, p.t.generation, p.value);
 				BreakIfDebugging();
+				return Result::InvalidArgument;
+			}
+			const uint64_t completedBefore = TL->fence ? TL->fence->GetCompletedValue() : 0;
+			if (completedBefore == UINT64_MAX) {
+				Dx12LogTimelineHistory("q_signal saw UINT64_MAX before signal", p.t, *TL, completedBefore);
 				return Result::InvalidArgument;
 			}
 #if BUILD_TYPE == BUILD_DEBUG
@@ -6789,7 +6909,12 @@ namespace rhi {
 			}
 			qs->lastSignaledValue[p.t] = p.value;
 #endif
-			return SUCCEEDED(qs->pNativeQueue->Signal(TL->fence.Get(), p.value)) ? Result::Ok : Result::Failed;
+			const HRESULT hr = qs->pNativeQueue->Signal(TL->fence.Get(), p.value);
+			if (FAILED(hr)) {
+				return Result::Failed;
+			}
+			Dx12RecordTimelineSignal(*TL, *q, p.value, completedBefore, 0, "q_signal");
+			return Result::Ok;
 		}
 
 		static Result q_wait(Queue* q, const TimelinePoint& p) noexcept {
@@ -6799,6 +6924,21 @@ namespace rhi {
 			}
 			auto* TL = dev->timelines.get(p.t); if (!TL) {
 				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (p.value == 0 || p.value == UINT64_MAX) {
+				spdlog::error(
+					"q_wait rejected invalid timeline value: timeline(index={}, gen={}, name='{}') value={}",
+					p.t.index,
+					p.t.generation,
+					TL->debugName,
+					p.value);
+				return Result::InvalidArgument;
+			}
+			const uint64_t completedBefore = TL->fence ? TL->fence->GetCompletedValue() : 0;
+			Dx12RecordTimelineWait(*TL, *q, p.value, completedBefore, "q_wait");
+			if (completedBefore == UINT64_MAX) {
+				Dx12LogTimelineHistory("q_wait saw UINT64_MAX before wait", p.t, *TL, completedBefore);
+				return Result::InvalidArgument;
 			}
 			return SUCCEEDED(qs->pNativeQueue->Wait(TL->fence.Get(), p.value)) ? Result::Ok : Result::Failed;
 		}
@@ -8487,7 +8627,11 @@ namespace rhi {
 				BreakIfDebugging();
 				return 0;
 			}
-			return impl->fence ? impl->fence->GetCompletedValue() : 0;
+			const uint64_t value = impl->fence ? impl->fence->GetCompletedValue() : 0;
+			if (value == UINT64_MAX) {
+				Dx12LogTimelineHistory("GetCompletedValue returned UINT64_MAX", t->GetHandle(), *impl, value);
+			}
+			return value;
 		}
 
 		static Result tl_timelineHostWait(Timeline* tl, const uint64_t p, uint32_t timeout_ms) noexcept {
@@ -8521,6 +8665,7 @@ namespace rhi {
 				BreakIfDebugging();
 				return;
 			}
+			T->debugName = n;
 			T->fence->SetName(s2ws(n).c_str());
 		}
 

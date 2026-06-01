@@ -257,10 +257,33 @@ namespace rhi {
 	};
 
 	struct Dx12Timeline {
+		struct SignalRecord {
+			uint64_t value = 0;
+			uint64_t completedBefore = 0;
+			uint64_t queueHandleIndex = 0;
+			uint32_t queueHandleGeneration = 0;
+			uint32_t queueKind = 0;
+			uint32_t commandListCount = 0;
+			char source[32]{};
+		};
+
+		struct WaitRecord {
+			uint64_t value = 0;
+			uint64_t completedBefore = 0;
+			uint64_t queueHandleIndex = 0;
+			uint32_t queueHandleGeneration = 0;
+			uint32_t queueKind = 0;
+			char source[32]{};
+		};
+
 		Dx12Timeline() {}
 		explicit Dx12Timeline(Microsoft::WRL::ComPtr<ID3D12Fence> f, Dx12Device* d) : fence(f), dev(d) {}
 		Microsoft::WRL::ComPtr<ID3D12Fence> fence;
 		Dx12Device* dev = nullptr;
+		uint64_t lastSubmittedSignalValue = 0;
+		std::string debugName;
+		std::deque<SignalRecord> recentSignals;
+		std::deque<WaitRecord> recentWaits;
 	};
 
 	struct Dx12QueueState {
