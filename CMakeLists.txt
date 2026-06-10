@@ -19,6 +19,9 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(DirectX12-Agility CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
+if(COMMAND basicrenderer_use_release_library_for_debug)
+    basicrenderer_use_release_library_for_debug(fmt::fmt)
+endif()
 if(TARGET imgui::imgui)
     set_property(TARGET imgui::imgui PROPERTY INTERFACE_LINK_LIBRARIES "")
 endif()
@@ -95,9 +98,8 @@ add_library(BasicRHI STATIC
     "rhi_allocator.h" 
     "rhi_allocator.cpp" "rhi_feature_info.h" "rhi_dx12_casting.h")
 
-target_compile_options(BasicRHI PRIVATE /WX)
+target_compile_options(BasicRHI PRIVATE $<$<NOT:$<CXX_COMPILER_ID:Clang>>:/WX>)
 target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
-# Clang warns about things MSVC silently accepts; demote to warnings (keep /WX for everything else)
 target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:Clang>:
     -Wno-error=switch
     -Wno-error=reorder-ctor
