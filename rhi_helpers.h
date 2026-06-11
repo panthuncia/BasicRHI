@@ -461,7 +461,6 @@ namespace rhi {
                 ResourceFlags flags = {},
                 const char* name = nullptr) noexcept
             {
-                const bool isArray = (cubes > 1);
                 const uint16_t totalLayers = static_cast<uint16_t>(6 * cubes);
                 return Texture(ResourceType::Texture2D,
                     fmt, memory, edge, edge, totalLayers, mips, sampleCount, initial, clear, flags, name);
@@ -588,8 +587,9 @@ namespace rhi {
                 				return Format::B8G8R8A8_Typeless;
 	        case Format::R8G8B8A8_UNorm_sRGB:
 				return Format::R8G8B8A8_Typeless;
+            default:
+                return f;
 	        }
-            return f;
         }
 
         static inline rhi::Format stripSrgb(Format f) {
@@ -598,8 +598,9 @@ namespace rhi {
 				return Format::B8G8R8A8_UNorm;
 	        case Format::R8G8B8A8_UNorm_sRGB:
 				return Format::R8G8B8A8_UNorm;
+            default:
+                return f;
 	        }
-			return f;
         }
 
         static inline uint32_t AlignUp(uint32_t v, uint32_t a) { return (v + (a - 1)) & ~(a - 1); }
