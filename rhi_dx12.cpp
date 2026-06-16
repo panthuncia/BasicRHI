@@ -546,6 +546,71 @@ namespace rhi {
 		return result;
 	}
 
+	static bool Dx12IsUsableHardwareAdapter(IDXGIAdapter1* adapter) noexcept {
+		if (!adapter) {
+			return false;
+		}
+
+		DXGI_ADAPTER_DESC1 desc{};
+		if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+			return false;
+		}
+
+		return SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr));
+	}
+
+	static std::string Dx12AdapterName(IDXGIAdapter1* adapter) {
+		if (!adapter) {
+			return {};
+		}
+
+		DXGI_ADAPTER_DESC1 desc{};
+		if (FAILED(adapter->GetDesc1(&desc))) {
+			return {};
+		}
+
+		return Dx12WideToUtf8(desc.Description);
+	}
+
+	static ComPtr<IDXGIAdapter1> Dx12ChooseAdapter(IDXGIFactory7* factory) noexcept {
+		ComPtr<IDXGIAdapter1> selected;
+		if (!factory) {
+			return selected;
+		}
+
+		ComPtr<IDXGIFactory6> factory6;
+		if (SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&factory6))) && factory6) {
+			for (UINT index = 0;; ++index) {
+				ComPtr<IDXGIAdapter1> candidate;
+				if (factory6->EnumAdapterByGpuPreference(
+					index,
+					DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+					IID_PPV_ARGS(&candidate)) == DXGI_ERROR_NOT_FOUND) {
+					break;
+				}
+
+				if (Dx12IsUsableHardwareAdapter(candidate.Get())) {
+					selected = candidate;
+					return selected;
+				}
+			}
+		}
+
+		for (UINT index = 0;; ++index) {
+			ComPtr<IDXGIAdapter1> candidate;
+			if (factory->EnumAdapters1(index, &candidate) == DXGI_ERROR_NOT_FOUND) {
+				break;
+			}
+
+			if (Dx12IsUsableHardwareAdapter(candidate.Get())) {
+				selected = candidate;
+				return selected;
+			}
+		}
+
+		return selected;
+	}
+
 	static void LogDredData() noexcept {
 		if (!g_dredDevice) return;
 
@@ -2451,11 +2516,27 @@ namespace rhi {
 
 			std::vector<D3D12_INDIRECT_ARGUMENT_DESC> dxArgs(cd.args.size);
 			bool hasRoot = false;
+			bool hasDispatchMesh = false;
 			for (uint32_t i = 0; i < cd.args.size; ++i) {
 				if (!FillDx12Arg(cd.args.data[i], dxArgs[i])) {
 					RHI_FAIL(Result::InvalidArgument);
 				}
 				hasRoot |= (cd.args.data[i].kind == IndirectArgKind::Constant);
+				hasDispatchMesh |= (cd.args.data[i].kind == IndirectArgKind::DispatchMesh);
+			}
+
+			if (hasDispatchMesh) {
+				D3D12_FEATURE_DATA_D3D12_OPTIONS7 opt7{};
+				const HRESULT featureHr = impl->pNativeDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &opt7, sizeof(opt7));
+				if (FAILED(featureHr) || opt7.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED) {
+					spdlog::error(
+						"DX12 CreateCommandSignature rejected mesh-dispatch indirect signature: featureHr=0x{:08X} meshShaderTier={} byteStride={} argCount={}",
+						static_cast<uint32_t>(featureHr),
+						static_cast<uint32_t>(opt7.MeshShaderTier),
+						cd.byteStride,
+						cd.args.size);
+					RHI_FAIL(Result::Unsupported);
+				}
 			}
 
 			ID3D12RootSignature* rs = nullptr;
@@ -2498,6 +2579,15 @@ namespace rhi {
 
 			Microsoft::WRL::ComPtr<ID3D12CommandSignature> cs;
 			if (const auto hr = impl->pNativeDevice->CreateCommandSignature(&desc, rs, IID_PPV_ARGS(&cs)); FAILED(hr)) {
+				spdlog::error(
+					"DX12 CreateCommandSignature failed: hr=0x{:08X} byteStride={} argCount={} hasRoot={} hasDispatchMesh={} rootSignature={}",
+					static_cast<uint32_t>(hr),
+					cd.byteStride,
+					dxArgs.size(),
+					hasRoot,
+					hasDispatchMesh,
+					static_cast<const void*>(rs));
+				Dx12LogInfoQueueMessagesSince(impl->pNativeDevice.Get(), 0, 32);
 				RHI_FAIL(ToRHI(hr));
 			}
 			const Dx12CommandSignature s(cs, cd.byteStride, impl);
@@ -9083,8 +9173,21 @@ namespace rhi {
 		impl->pSLProxyFactory = impl->pNativeFactory;
 
 		ComPtr<IDXGIAdapter1> adapter;
-		impl->pNativeFactory->EnumAdapters1(0, &adapter);
+		adapter = Dx12ChooseAdapter(impl->pNativeFactory.Get());
+		if (!adapter) {
+			spdlog::error("DX12 device setup: failed to find a hardware adapter supporting D3D feature level 12_0");
+			RHI_FAIL(Result::Unsupported);
+		}
 		adapter.As(&impl->adapter);
+		DXGI_ADAPTER_DESC1 adapterDesc{};
+		adapter->GetDesc1(&adapterDesc);
+		spdlog::info(
+			"DX12 device setup: selected adapter '{}' vendor=0x{:04X} device=0x{:04X} dedicatedVideoMemoryMiB={} flags=0x{:X}",
+			Dx12AdapterName(adapter.Get()),
+			adapterDesc.VendorId,
+			adapterDesc.DeviceId,
+			static_cast<unsigned long long>(adapterDesc.DedicatedVideoMemory / (1024ull * 1024ull)),
+			adapterDesc.Flags);
 
 		bool reshapeWrappedDevice = false;
 	#if BASICRHI_ENABLE_RESHAPE
@@ -9109,7 +9212,14 @@ namespace rhi {
 
 		if (!reshapeWrappedDevice) {
 			ComPtr<ID3D12Device> base;
-			D3D12CreateDevice(impl->adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&base));
+			const HRESULT createDeviceHr = D3D12CreateDevice(impl->adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&base));
+			if (FAILED(createDeviceHr)) {
+				spdlog::error(
+					"DX12 device setup: D3D12CreateDevice failed for adapter '{}' hr=0x{:08X}",
+					Dx12AdapterName(adapter.Get()),
+					static_cast<uint32_t>(createDeviceHr));
+				RHI_FAIL(ToRHI(createDeviceHr));
+			}
 
 			auto hasDevice10 = base.As(&impl->pNativeDevice);
 			if (FAILED(hasDevice10)) {
