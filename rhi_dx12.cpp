@@ -704,18 +704,67 @@ namespace rhi {
 	}
 
 	namespace {
+		static const char* Dx12CommandQueueTypeName(D3D12_COMMAND_LIST_TYPE type) noexcept
+		{
+			switch (type) {
+			case D3D12_COMMAND_LIST_TYPE_DIRECT: return "direct";
+			case D3D12_COMMAND_LIST_TYPE_BUNDLE: return "bundle";
+			case D3D12_COMMAND_LIST_TYPE_COMPUTE: return "compute";
+			case D3D12_COMMAND_LIST_TYPE_COPY: return "copy";
+			case D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE: return "video_decode";
+			case D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS: return "video_process";
+			case D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE: return "video_encode";
+			default: return "unknown";
+			}
+		}
+
 		static void Dx12WaitQueueIdle(Dx12QueueState& q) noexcept
 		{
 			if (!q.pNativeQueue || !q.fence) return;
 
 			const UINT64 v = ++q.value;
-			(void)q.pNativeQueue->Signal(q.fence.Get(), v);
+			const D3D12_COMMAND_QUEUE_DESC queueDesc = q.pNativeQueue->GetDesc();
+			const char* queueType = Dx12CommandQueueTypeName(queueDesc.Type);
+			const HRESULT signalHr = q.pNativeQueue->Signal(q.fence.Get(), v);
+			if (FAILED(signalHr)) {
+				spdlog::warn(
+					"DX12 WaitQueueIdle failed to signal queue type={} target={} hr=0x{:08X} completed={}",
+					queueType,
+					v,
+					static_cast<unsigned>(signalHr),
+					q.fence->GetCompletedValue());
+				return;
+			}
 
 			if (q.fence->GetCompletedValue() < v) {
 				const HANDLE e = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 				if (!e) return; // best-effort teardown
 				(void)q.fence->SetEventOnCompletion(v, e);
-				(void)WaitForSingleObject(e, INFINITE);
+				uint32_t waitTimeouts = 0u;
+				for (;;) {
+					const DWORD waitResult = WaitForSingleObject(e, 1000);
+					if (waitResult == WAIT_OBJECT_0) {
+						break;
+					}
+					if (waitResult != WAIT_TIMEOUT) {
+						spdlog::warn(
+							"DX12 WaitQueueIdle wait failed queue type={} target={} completed={} waitResult={}",
+							queueType,
+							v,
+							q.fence->GetCompletedValue(),
+							waitResult);
+						break;
+					}
+					++waitTimeouts;
+					if (waitTimeouts == 5u || waitTimeouts == 30u || (waitTimeouts % 60u) == 0u) {
+						spdlog::warn(
+							"DX12 WaitQueueIdle timed out: queue type={} target={} completed={} waitTimeouts={}",
+							queueType,
+							v,
+							q.fence->GetCompletedValue(),
+							waitTimeouts);
+					}
+				}
 				CloseHandle(e);
 			}
 		}
