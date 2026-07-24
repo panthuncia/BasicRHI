@@ -31,6 +31,11 @@ namespace rhi::dx12 {
         if (!QueryNativeCmdList(cl, RHI_IID_D3D12_CMD_LIST, &info, sizeof(info))) return nullptr;
         return static_cast<ID3D12GraphicsCommandList*>(info.cmdList);
     }
+    inline ID3D12GraphicsCommandList* get_streamline_cmd_list(rhi::CommandList cl) {
+        D3D12CmdListInfo info{};
+        if (!QueryNativeCmdList(cl, RHI_IID_D3D12_STREAMLINE_CMD_LIST, &info, sizeof(info))) return nullptr;
+        return static_cast<ID3D12GraphicsCommandList*>(info.cmdList);
+    }
     inline ID3D12CommandAllocator* get_allocator(rhi::CommandList cl) {
         D3D12CmdListInfo info{};
         if (!QueryNativeCmdList(cl, RHI_IID_D3D12_CMD_LIST, &info, sizeof(info))) return nullptr;

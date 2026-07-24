@@ -560,7 +560,7 @@ namespace rhi::debug {
 
             ImGui::PushID(node.fullPath.c_str());
             ImGui::SetNextItemAllowOverlap();
-            const bool open = ImGui::TreeNodeEx(node.label.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_AllowItemOverlap);
+            const bool open = ImGui::TreeNodeEx(node.label.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth);
             if (!subtreePipelineIndices.empty()) {
                 size_t enabledPipelineCount = 0;
                 for (size_t pipelineIndex : subtreePipelineIndices) {

@@ -560,7 +560,11 @@ namespace rhi {
 	}
 
 	enum class ViewKind : uint32_t { SRV, UAV, RTV, DSV };
-	struct TextureSubresourceRange { uint32_t baseMip = 0, mipCount = 1; uint32_t baseLayer = 0, layerCount = 1; };
+	struct TextureSubresourceRange {
+		uint32_t baseMip = 0, mipCount = 1;
+		uint32_t baseLayer = 0, layerCount = 1;
+		uint32_t basePlane = 0, planeCount = 1;
+	};
 	struct ViewDesc { ViewKind kind = ViewKind::SRV; ResourceHandle texture{}; TextureSubresourceRange range{}; Format formatOverride = Format::Unknown; };
 
 	enum class Filter : uint8_t { Nearest, Linear };

@@ -116,19 +116,27 @@ namespace rhi {
             return true;
         }
         if (!IsDx12CommandList(cl)) return false;
-        if (iid != RHI_IID_D3D12_CMD_LIST) return false;
+		const bool requestStreamlineProxy = iid == RHI_IID_D3D12_STREAMLINE_CMD_LIST;
+        if (iid != RHI_IID_D3D12_CMD_LIST && !requestStreamlineProxy) return false;
         if (outSize < sizeof(D3D12CmdListInfo)) return false;
 
         auto* rec = dx12_detail::CL(&cl);
         if (!rec || !rec->cl) return false;
 
         // Hand out ID3D12GraphicsCommandList* (QI from v7 to base)
-        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> baseCl;
-        (void)rec->cl.As(&baseCl);
+		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> baseCl;
+		if (requestStreamlineProxy && rec->slProxyCl) {
+			baseCl = rec->slProxyCl;
+		}
+		else {
+			(void)rec->cl.As(&baseCl);
+		}
 
         auto* out = reinterpret_cast<D3D12CmdListInfo*>(outStruct);
         out->cmdList = baseCl.Get();              // ID3D12GraphicsCommandList*
-        out->allocator = rec->alloc.Get();          // ID3D12CommandAllocator* (may be null if not tracked)
+		out->allocator = requestStreamlineProxy && rec->slProxyCl
+			? nullptr
+			: rec->alloc.Get(); // ID3D12CommandAllocator* (may be null if not tracked)
         out->version = 1;
         return true;
     }

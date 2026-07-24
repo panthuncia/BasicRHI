@@ -289,6 +289,23 @@ add_executable(BasicRHIVulkanSmoke
     tests/VulkanSmoke.cpp
 )
 
+if(WIN32)
+    add_executable(BasicRHID3D12AliasingSmoke
+        tests/D3D12AliasingSmoke.cpp
+    )
+    target_link_libraries(BasicRHID3D12AliasingSmoke PRIVATE BasicRHI::BasicRHI)
+    if(_basicrhi_streamline_available)
+        target_link_libraries(BasicRHID3D12AliasingSmoke PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/sl.interposer.lib"
+        )
+        add_custom_command(TARGET BasicRHID3D12AliasingSmoke POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/sl.interposer.dll"
+                "$<TARGET_FILE_DIR:BasicRHID3D12AliasingSmoke>/sl.interposer.dll"
+        )
+    endif()
+endif()
+
 set_target_properties(BasicRHIVulkanSmoke PROPERTIES
     OUTPUT_NAME "BasicRHIVulkanSmoke_v2"
 )

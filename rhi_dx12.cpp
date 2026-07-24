@@ -556,7 +556,21 @@ namespace rhi {
 			return false;
 		}
 
-		return SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr));
+		ComPtr<ID3D12Device> device;
+		if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device)))) {
+			return false;
+		}
+
+		// This backend records ID3D12GraphicsCommandList7::Barrier exclusively; there is
+		// no legacy ResourceBarrier fallback.  Accepting a feature-level-12 adapter that
+		// lacks enhanced barriers creates command lists which compile but are rejected at
+		// execution, leaving uploads and render targets inaccessible.
+		D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12{};
+		return SUCCEEDED(device->CheckFeatureSupport(
+			D3D12_FEATURE_D3D12_OPTIONS12,
+			&options12,
+			sizeof(options12)))
+			&& options12.EnhancedBarriersSupported != FALSE;
 	}
 
 	static std::string Dx12AdapterName(IDXGIAdapter1* adapter) {
@@ -3312,14 +3326,30 @@ namespace rhi {
 		static Result d_createCommandAllocator(Device* d, QueueKind q, CommandAllocatorPtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 			ID3D12Device* createDevice = impl->steamlineInitialized ? impl->pSLProxyDevice.Get() : impl->pNativeDevice.Get();
-			Microsoft::WRL::ComPtr<ID3D12CommandAllocator> a;
-			if (const auto hr = createDevice->CreateCommandAllocator(ToDX(q), IID_PPV_ARGS(&a)); FAILED(hr)) {
+			Microsoft::WRL::ComPtr<ID3D12CommandAllocator> createdAllocator;
+			if (const auto hr = createDevice->CreateCommandAllocator(ToDX(q), IID_PPV_ARGS(&createdAllocator)); FAILED(hr)) {
 				spdlog::error("DX12 create command allocator failed queue={} hr=0x{:08X}", static_cast<int>(q), static_cast<unsigned>(hr));
 				BreakIfDebugging();
 				return ToRHI(hr);
 			}
 
-			Dx12Allocator A(a, ToDX(q), impl);
+			Microsoft::WRL::ComPtr<ID3D12CommandAllocator> nativeAllocator = createdAllocator;
+			Microsoft::WRL::ComPtr<ID3D12CommandAllocator> proxyAllocator;
+			if (impl->steamlineInitialized) {
+#if BASICRHI_ENABLE_STREAMLINE
+				proxyAllocator = createdAllocator;
+				ID3D12CommandAllocator* extractedAllocator = nullptr;
+				if (SL_FAILED(res, slGetNativeInterface(proxyAllocator.Get(), reinterpret_cast<void**>(&extractedAllocator))) || !extractedAllocator) {
+					spdlog::error("DX12 Streamline failed to expose the native command allocator for queue={}", static_cast<int>(q));
+					return Result::Failed;
+				}
+				nativeAllocator.Attach(extractedAllocator);
+#else
+				return Result::Unsupported;
+#endif
+			}
+
+			Dx12Allocator A(nativeAllocator, ToDX(q), impl, proxyAllocator);
 			const auto h = impl->allocators.alloc(A);
 
 			CommandAllocator ret{ h };
@@ -3341,20 +3371,40 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			ComPtr<ID3D12GraphicsCommandList> cl0; // Needs at least version 10 for work graphs
-			if (const auto hr = createDevice->CreateCommandList(0, A->type, A->alloc.Get(), nullptr, IID_PPV_ARGS(&cl0)); FAILED(hr)) {
+			ID3D12CommandAllocator* creationAllocator = impl->steamlineInitialized && A->slProxyAlloc
+				? A->slProxyAlloc.Get()
+				: A->alloc.Get();
+			ComPtr<ID3D12GraphicsCommandList> createdCl;
+			if (const auto hr = createDevice->CreateCommandList(0, A->type, creationAllocator, nullptr, IID_PPV_ARGS(&createdCl)); FAILED(hr)) {
 				spdlog::error("DX12 create command list CreateCommandList failed queue={} hr=0x{:08X}", static_cast<int>(q), static_cast<unsigned>(hr));
 				RHI_FAIL(ToRHI(hr));
 			}
 
+			ComPtr<ID3D12GraphicsCommandList> nativeCl0 = createdCl;
+			ComPtr<ID3D12GraphicsCommandList> proxyCl;
+			if (impl->steamlineInitialized) {
+#if BASICRHI_ENABLE_STREAMLINE
+				proxyCl = createdCl;
+				ID3D12GraphicsCommandList* extractedCl = nullptr;
+				if (SL_FAILED(res, slGetNativeInterface(proxyCl.Get(), reinterpret_cast<void**>(&extractedCl))) || !extractedCl) {
+					spdlog::error("DX12 Streamline failed to expose the native command list for queue={}", static_cast<int>(q));
+					return Result::Failed;
+				}
+				nativeCl0.Attach(extractedCl);
+#else
+				return Result::Unsupported;
+#endif
+			}
+
 			// Attempt upcast to ID3D12GraphicsCommandList10
 			Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList10> cl;
-			if (const auto hr = cl0.As(&cl); FAILED(hr)) {
+			if (const auto hr = nativeCl0.As(&cl); FAILED(hr)) {
 				spdlog::error("DX12 create command list As(ID3D12GraphicsCommandList10) failed queue={} hr=0x{:08X}", static_cast<int>(q), static_cast<unsigned>(hr));
 				RHI_FAIL(ToRHI(hr));
 			}
 			
-			const Dx12CommandList rec(cl, A->alloc, A->type, impl);
+			Dx12CommandList rec(cl, A->alloc, A->type, impl);
+			rec.slProxyCl = proxyCl;
 			Dx12CommandList recWithScratch = rec;
 			if (!Dx12EnsureRootCbvScratchPage(impl, recWithScratch, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT)) {
 				spdlog::error("DX12 create command list EnsureRootCbvScratchPage failed queue={}", static_cast<int>(q));
@@ -7653,6 +7703,35 @@ namespace rhi {
 				auto* T = dev->resources.get(t.texture);
 				if (!T || !T->res) continue;
 
+#if BUILD_MODE == BUILD_DEBUG
+				if (t.discard) {
+					const auto desc = T->res->GetDesc();
+					const uint32_t mipCount = desc.MipLevels;
+					const uint32_t layerCount = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+						? 1u
+						: static_cast<uint32_t>(desc.DepthOrArraySize);
+					const uint32_t planeCount = D3D12GetFormatPlaneCount(dev->pNativeDevice.Get(), desc.Format);
+					const bool undefinedBefore = t.beforeLayout == ResourceLayout::Undefined;
+					const bool wholeResource =
+						t.range.baseMip == 0 && t.range.mipCount == mipCount
+						&& t.range.baseLayer == 0 && t.range.layerCount == layerCount
+						&& t.range.basePlane == 0 && t.range.planeCount == planeCount;
+					if (!undefinedBefore || !wholeResource) {
+						spdlog::error(
+							"Invalid D3D12 discard texture barrier: resource={} beforeLayout={} "
+							"range=mips[{},{}]/{} layers[{},{}]/{} planes[{},{}]/{}. "
+							"Discard requires UNDEFINED and the complete texture.",
+							static_cast<const void*>(T->res.Get()),
+							static_cast<uint32_t>(t.beforeLayout),
+							t.range.baseMip, t.range.mipCount, mipCount,
+							t.range.baseLayer, t.range.layerCount, layerCount,
+							t.range.basePlane, t.range.planeCount, planeCount);
+						BreakIfDebugging();
+						continue;
+					}
+				}
+#endif
+
 				D3D12_TEXTURE_BARRIER tb{};
 				tb.SyncBefore = ToDX(t.discard ? ResourceSyncState::None : t.beforeSync);
 				tb.SyncAfter = ToDX(t.afterSync);
@@ -8763,6 +8842,15 @@ namespace rhi {
 		static uint64_t tl_timelineCompletedValue(Timeline* t) noexcept {
 			auto* impl = dx12_detail::TL(t);
 			if (!impl) {
+				if (t) {
+					spdlog::error(
+						"DX12 GetCompletedValue called with a stale timeline handle (index={}, gen={})",
+						t->GetHandle().index,
+						t->GetHandle().generation);
+				}
+				else {
+					spdlog::error("DX12 GetCompletedValue called with a null timeline");
+				}
 				BreakIfDebugging();
 				return 0;
 			}

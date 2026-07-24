@@ -24,6 +24,9 @@ namespace rhi {
 	constexpr uint32_t RHI_IID_D3D12_DESCRIPTOR_HEAP = 0x100B;
 	constexpr uint32_t RHI_IID_D3D12_TIMELINE = 0x100C;
 	constexpr uint32_t RHI_IID_D3D12_WORK_GRAPH = 0x100D;
+	// Streamline manual-hooking proxy. Engine and other native interop callers must
+	// continue to request RHI_IID_D3D12_CMD_LIST.
+	constexpr uint32_t RHI_IID_D3D12_STREAMLINE_CMD_LIST = 0x100E;
 
 	constexpr uint32_t RHI_IID_VK_DEVICE = 0x2001;
 	constexpr uint32_t RHI_IID_VK_QUEUE = 0x2002;

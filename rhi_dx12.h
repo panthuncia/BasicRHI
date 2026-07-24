@@ -155,8 +155,16 @@ namespace rhi {
 
 	struct Dx12Allocator {
 		Dx12Allocator() {}
-		explicit Dx12Allocator(Microsoft::WRL::ComPtr<ID3D12CommandAllocator> a, D3D12_COMMAND_LIST_TYPE t, Dx12Device* d) : alloc(a), type(t), dev(d) {}
+		explicit Dx12Allocator(
+			Microsoft::WRL::ComPtr<ID3D12CommandAllocator> a,
+			D3D12_COMMAND_LIST_TYPE t,
+			Dx12Device* d,
+			Microsoft::WRL::ComPtr<ID3D12CommandAllocator> proxy = {})
+			: alloc(a), slProxyAlloc(proxy), type(t), dev(d) {}
+		// Engine recording and submission always use the native interface.  Streamline's
+		// proxy is retained so the object created through the hooked device remains alive.
 		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc;
+		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> slProxyAlloc;
 		D3D12_COMMAND_LIST_TYPE type{};
 		Dx12Device* dev = nullptr;
 	};
@@ -181,6 +189,7 @@ namespace rhi {
 			: cl(c), alloc(a), type(t), dev(d) {
 		}
 		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList10> cl;
+		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> slProxyCl;
 		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc;
 		D3D12_COMMAND_LIST_TYPE type{};
 		PipelineLayoutHandle boundLayout{};
