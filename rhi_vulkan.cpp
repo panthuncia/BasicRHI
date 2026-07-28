@@ -16,6 +16,12 @@
 
 #include <spdlog/spdlog.h>
 
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+#include <tracy/Tracy.hpp>
+#define TRACY_VK_USE_SYMBOL_TABLE
+#include <tracy/TracyVulkan.hpp>
+#endif
+
 #if BASICRHI_ENABLE_STREAMLINE
 #include <sl.h>
 #include <sl_core_api.h>
@@ -38,6 +44,7 @@
 namespace rhi {
 	namespace {
 		static constexpr uint32_t kVkInvalidQueueFamily = 0xFFFFFFFFu;
+		static void VkDestroyTracyGpuContext(VulkanQueueState& queueState) noexcept;
 
 		template <typename... TArgs>
 		constexpr void VkIgnoreUnused(TArgs&&...) noexcept {}
@@ -3314,6 +3321,48 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+		static void VkEmitSubmittedTracyGpuZones(VulkanCommandList& list) {
+			if (list.tracyGpuZoneEventsSubmitted || list.tracyGpuZoneEvents.empty()) {
+				return;
+			}
+			for (const auto& event : list.tracyGpuZoneEvents) {
+				auto* context = static_cast<tracy::VkCtx*>(event.context);
+				if (!context) {
+					continue;
+				}
+				if (event.begin) {
+					const uint64_t sourceLocation = tracy::Profiler::AllocSourceLocation(
+						0,
+						"BasicRHI",
+						sizeof("BasicRHI") - 1,
+						"GPU",
+						sizeof("GPU") - 1,
+						event.name.data(),
+						event.name.size());
+					auto* item = tracy::Profiler::QueueSerial();
+					tracy::MemWrite(&item->hdr.type, tracy::QueueType::GpuZoneBeginAllocSrcLocSerial);
+					tracy::MemWrite(&item->gpuZoneBegin.cpuTime, tracy::Profiler::GetTime());
+					tracy::MemWrite(&item->gpuZoneBegin.srcloc, sourceLocation);
+					tracy::MemWrite(&item->gpuZoneBegin.thread, uint32_t{ 0 });
+					tracy::MemWrite(&item->gpuZoneBegin.queryId, static_cast<uint16_t>(event.queryId));
+					tracy::MemWrite(&item->gpuZoneBegin.context, context->GetId());
+					tracy::Profiler::QueueSerialFinish();
+				}
+				else {
+					auto* item = tracy::Profiler::QueueSerial();
+					tracy::MemWrite(&item->hdr.type, tracy::QueueType::GpuZoneEndSerial);
+					tracy::MemWrite(&item->gpuZoneEnd.cpuTime, tracy::Profiler::GetTime());
+					tracy::MemWrite(&item->gpuZoneEnd.thread, uint32_t{ 0 });
+					tracy::MemWrite(&item->gpuZoneEnd.queryId, static_cast<uint16_t>(event.queryId));
+					tracy::MemWrite(&item->gpuZoneEnd.context, context->GetId());
+					tracy::Profiler::QueueSerialFinish();
+				}
+			}
+			list.tracyGpuZoneEventsSubmitted = true;
+		}
+#endif
+
 		static Result q_submit(Queue* queue, Span<CommandList> lists, const SubmitDesc& submit) noexcept {
 			auto* impl = queue ? static_cast<VulkanDevice*>(queue->impl) : nullptr;
 			if (!impl || impl->device == VK_NULL_HANDLE) {
@@ -3349,6 +3398,13 @@ namespace rhi {
 					spdlog::error("Vulkan queue submit rejected a command list that is still recording");
 					RHI_FAIL(Result::InvalidArgument);
 				}
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+				if (!commandListState->tracyGpuZoneEvents.empty() &&
+					commandListState->tracyGpuZoneEvents.front().context != queueState->tracyGpuContext) {
+					spdlog::error("Vulkan Tracy GPU zones must be submitted to the queue context used while recording.");
+					return Result::InvalidArgument;
+				}
+#endif
 
 				commandBuffers.push_back(commandListState->commandBuffer);
 			}
@@ -3418,6 +3474,13 @@ namespace rhi {
 
 			const Result submitResult = ToRHI(vkQueueSubmit(queueState->queue, 1, &submitInfo, VK_NULL_HANDLE));
 			if (submitResult == Result::Ok) {
+				for (uint32_t index = 0; index < lists.size; ++index) {
+					if (VulkanCommandList* commandListState = VkCommandListState(impl, lists.data[index].GetHandle())) {
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+						VkEmitSubmittedTracyGpuZones(*commandListState);
+#endif
+					}
+				}
 				for (const TimelinePoint& signal : submit.signals) {
 					if (VulkanTimeline* timeline = VkTimelineState(impl, signal.t)) {
 						timeline->lastSubmittedSignalValue = (std::max)(timeline->lastSubmittedSignalValue, signal.value);
@@ -3457,7 +3520,106 @@ namespace rhi {
 			VulkanQueueState* queueState = VkQueueStateForHandle(impl, queue ? queue->GetQueueHandle() : QueueHandle{});
 			if (queueState) {
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(queueState->queue), VK_OBJECT_TYPE_QUEUE, name);
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+				if (queueState->tracyGpuContext && name) {
+					static_cast<tracy::VkCtx*>(queueState->tracyGpuContext)->Name(
+						name,
+						static_cast<uint16_t>((std::min)(std::strlen(name), size_t{ UINT16_MAX })));
+				}
+#endif
 			}
+		}
+
+		static void VkDestroyTracyGpuContext(VulkanQueueState& queueState) noexcept {
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+			if (queueState.tracyGpuContext) {
+				TracyVkDestroy(static_cast<tracy::VkCtx*>(queueState.tracyGpuContext));
+				queueState.tracyGpuContext = nullptr;
+			}
+#else
+			(void)queueState;
+#endif
+		}
+
+		static Result q_initializeTracyGpuContext(Queue* queue, const char* name) noexcept {
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+			auto* impl = queue ? static_cast<VulkanDevice*>(queue->impl) : nullptr;
+			auto* queueState = VkQueueStateForHandle(impl, queue ? queue->GetQueueHandle() : QueueHandle{});
+			if (!impl || !queueState || impl->device == VK_NULL_HANDLE || queueState->queue == VK_NULL_HANDLE) {
+				return Result::InvalidArgument;
+			}
+			if (queueState->tracyGpuContext) {
+				if (name) {
+					static_cast<tracy::VkCtx*>(queueState->tracyGpuContext)->Name(
+						name,
+						static_cast<uint16_t>((std::min)(std::strlen(name), size_t{ UINT16_MAX })));
+				}
+				return Result::Ok;
+			}
+
+			VkCommandPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+			poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+			poolInfo.queueFamilyIndex = queueState->familyIndex;
+			VkCommandPool commandPool = VK_NULL_HANDLE;
+			if (vkCreateCommandPool(impl->device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS) {
+				return Result::Failed;
+			}
+
+			VkCommandBufferAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+			allocateInfo.commandPool = commandPool;
+			allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+			allocateInfo.commandBufferCount = 1;
+			VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+			if (vkAllocateCommandBuffers(impl->device, &allocateInfo, &commandBuffer) != VK_SUCCESS) {
+				vkDestroyCommandPool(impl->device, commandPool, nullptr);
+				return Result::Failed;
+			}
+
+			auto* context = tracy::CreateVkContext(
+				impl->instance,
+				impl->physicalDevice,
+				impl->device,
+				queueState->queue,
+				commandBuffer,
+				vkGetInstanceProcAddr,
+				vkGetDeviceProcAddr,
+				true);
+			vkDestroyCommandPool(impl->device, commandPool, nullptr);
+			if (!context) {
+				return Result::Failed;
+			}
+			queueState->tracyGpuContext = context;
+			if (name) {
+				context->Name(name, static_cast<uint16_t>((std::min)(std::strlen(name), size_t{ UINT16_MAX })));
+			}
+			return Result::Ok;
+#else
+			(void)queue;
+			(void)name;
+			return Result::Unsupported;
+#endif
+		}
+
+		static bool q_hasTracyGpuContext(const Queue* queue) noexcept {
+			auto* impl = queue ? static_cast<VulkanDevice*>(queue->impl) : nullptr;
+			const auto* queueState = VkQueueStateForHandle(impl, queue ? queue->GetQueueHandle() : QueueHandle{});
+			return queueState && queueState->tracyGpuContext;
+		}
+
+		static void q_tracyGpuFrameBegin(Queue* queue, CommandList* firstCommandList) noexcept {
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+			auto* impl = queue ? static_cast<VulkanDevice*>(queue->impl) : nullptr;
+			auto* queueState = VkQueueStateForHandle(impl, queue ? queue->GetQueueHandle() : QueueHandle{});
+			auto* listState = VkCommandListState(firstCommandList);
+			if (!queueState || !queueState->tracyGpuContext || !listState ||
+				listState->commandBuffer == VK_NULL_HANDLE || !listState->isRecording) {
+				return;
+			}
+			static_cast<tracy::VkCtx*>(queueState->tracyGpuContext)->Collect(listState->commandBuffer);
+#else
+			(void)queue;
+			(void)firstCommandList;
+#endif
 		}
 
 		static void buf_map(Resource* resource, void** data, uint64_t offset, uint64_t size) noexcept {
@@ -3538,6 +3700,23 @@ namespace rhi {
 				cl_endPass(commandList);
 			}
 
+			while (!commandListState->tracyGpuZoneStack.empty()) {
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+				const auto openZone = commandListState->tracyGpuZoneStack.back();
+				auto* context = static_cast<tracy::VkCtx*>(openZone.context);
+				if (context) {
+					const uint32_t queryId = context->NextQueryId();
+					vkCmdWriteTimestamp(
+						commandListState->commandBuffer,
+						VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+						context->GetQueryPool(),
+						queryId);
+					commandListState->tracyGpuZoneEvents.push_back({ context, queryId, false, {} });
+				}
+#endif
+				commandListState->tracyGpuZoneStack.pop_back();
+			}
+
 			if (commandListState->pendingError != Result::Ok) {
 				BreakIfDebugging();
 				return;
@@ -3552,6 +3731,84 @@ namespace rhi {
 			commandListState->isRecording = false;
 		}
 
+		static Result cl_beginTracyGpuZone(CommandList* commandList, const Queue& queue, const char* name) noexcept {
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			auto* listState = VkCommandListState(commandList);
+			auto* queueState = VkQueueStateForHandle(
+				impl,
+				queue.GetQueueHandle());
+			if (!impl || queue.impl != impl || !listState || !listState->isRecording ||
+				!queueState || !queueState->tracyGpuContext || !name) {
+				return Result::InvalidArgument;
+			}
+			if (listState->kind != queue.GetKind()) {
+				return Result::InvalidArgument;
+			}
+#ifdef TRACY_ON_DEMAND
+			if (!tracy::GetProfiler().IsConnected()) {
+				try {
+					listState->tracyGpuZoneStack.reserve(listState->tracyGpuZoneStack.size() + 1);
+					listState->tracyGpuZoneStack.push_back({});
+				}
+				catch (...) {
+					return Result::OutOfMemory;
+				}
+				return Result::Ok;
+			}
+#endif
+			std::string zoneName;
+			try {
+				zoneName = name;
+				listState->tracyGpuZoneEvents.reserve(listState->tracyGpuZoneEvents.size() + 2);
+				listState->tracyGpuZoneStack.reserve(listState->tracyGpuZoneStack.size() + 1);
+			}
+			catch (...) {
+				return Result::OutOfMemory;
+			}
+			auto* context = static_cast<tracy::VkCtx*>(queueState->tracyGpuContext);
+			if (!listState->tracyGpuZoneEvents.empty() &&
+				listState->tracyGpuZoneEvents.front().context != context) {
+				return Result::InvalidArgument;
+			}
+			const uint32_t queryId = context->NextQueryId();
+			vkCmdWriteTimestamp(
+				listState->commandBuffer,
+				VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+				context->GetQueryPool(),
+				queryId);
+			listState->tracyGpuZoneEvents.push_back({ context, queryId, true, std::move(zoneName) });
+			listState->tracyGpuZoneStack.push_back({ context, queryId });
+			return Result::Ok;
+#else
+			(void)commandList;
+			(void)queue;
+			(void)name;
+			return Result::Unsupported;
+#endif
+		}
+
+		static void cl_endTracyGpuZone(CommandList* commandList) noexcept {
+			auto* listState = VkCommandListState(commandList);
+			if (!listState || listState->tracyGpuZoneStack.empty()) {
+				return;
+			}
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+			const auto openZone = listState->tracyGpuZoneStack.back();
+			auto* context = static_cast<tracy::VkCtx*>(openZone.context);
+			if (context) {
+				const uint32_t queryId = context->NextQueryId();
+				vkCmdWriteTimestamp(
+					listState->commandBuffer,
+					VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+					context->GetQueryPool(),
+					queryId);
+				listState->tracyGpuZoneEvents.push_back({ context, queryId, false, {} });
+			}
+#endif
+			listState->tracyGpuZoneStack.pop_back();
+		}
+
 		static void cl_reset(CommandList* commandList, const CommandAllocator& allocator) noexcept {
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
@@ -3561,6 +3818,9 @@ namespace rhi {
 				return;
 			}
 			VkDestroyCommandListTransientQueryPools(impl, *commandListState);
+			commandListState->tracyGpuZoneStack.clear();
+			commandListState->tracyGpuZoneEvents.clear();
+			commandListState->tracyGpuZoneEventsSubmitted = false;
 
 			if (commandListState->commandBuffer == VK_NULL_HANDLE || commandListState->allocatorHandle.index != allocator.GetHandle().index
 				|| commandListState->allocatorHandle.generation != allocator.GetHandle().generation) {
@@ -5858,6 +6118,12 @@ namespace rhi {
 			if (queueState && queueState->familyIndex < impl->queueFamilyFreeQueueIndices.size()) {
 				impl->queueFamilyFreeQueueIndices[queueState->familyIndex].push_back(queueState->queueIndex);
 			}
+			if (auto* mutableQueueState = impl->queues.get(handle)) {
+				if (mutableQueueState->queue != VK_NULL_HANDLE) {
+					vkQueueWaitIdle(mutableQueueState->queue);
+				}
+				VkDestroyTracyGpuContext(*mutableQueueState);
+			}
 			impl->queues.free(handle);
 		}
 
@@ -8114,6 +8380,11 @@ namespace rhi {
 		if (device != VK_NULL_HANDLE) {
 			VkDeviceWaitIdleHooked(device);
 		}
+		for (auto& slot : queues.slots) {
+			if (slot.alive) {
+				VkDestroyTracyGpuContext(slot.obj);
+			}
+		}
 
 #if BASICRHI_ENABLE_STREAMLINE
 		if (streamlineInitialized) {
@@ -8376,7 +8647,10 @@ namespace rhi {
 		&q_wait,
 		&q_checkDebugMessages,
 		&q_setName,
-		2u
+		&q_initializeTracyGpuContext,
+		&q_hasTracyGpuContext,
+		&q_tracyGpuFrameBegin,
+		3u
 	};
 
 	const CommandAllocatorVTable g_vkcalvt = {
@@ -8425,7 +8699,9 @@ namespace rhi {
 		&cl_dispatchWorkGraph,
 		&cl_setName,
 		&cl_setDebugInstrumentationContext,
-		4u
+		&cl_beginTracyGpuZone,
+		&cl_endTracyGpuZone,
+		5u
 	};
 
 	const SwapchainVTable g_vkscvt = {
@@ -8882,6 +9158,7 @@ namespace rhi {
 		const bool hasShaderSubgroupPartitionedExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
 		const bool hasNvShaderSubgroupPartitionedExtension = !hasShaderSubgroupPartitionedExtension && VkHasDeviceExtension(physicalDevice, VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
 		const bool hasPushDescriptorExtension = VkHasDeviceExtension(physicalDevice, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+		const bool hasCalibratedTimestampsExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
 		const bool hasDeferredHostOperationsExtension = VkHasDeviceExtension(physicalDevice, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
 		const bool hasAccelerationStructureExtension = VkHasDeviceExtension(physicalDevice, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
 		const bool hasRayTracingPipelineExtension = VkHasDeviceExtension(physicalDevice, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
@@ -8913,6 +9190,9 @@ namespace rhi {
 		}
 		if (hasMeshShaderExtension) {
 			enabledDeviceExtensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+		}
+		if (BASICRHI_ENABLE_TRACY_GPU_PROFILING && hasCalibratedTimestampsExtension) {
+			enabledDeviceExtensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
 		}
 		if (hasComputeShaderDerivativesExtension) {
 			enabledDeviceExtensions.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);

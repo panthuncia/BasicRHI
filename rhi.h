@@ -2329,7 +2329,10 @@ namespace rhi {
 		Result(*wait)(Queue*, const TimelinePoint&) noexcept;
 		void (*checkDebugMessages)(Queue*) noexcept;
 		void (*setName)(Queue*, const char*) noexcept;
-		uint32_t abi_version = 2;
+		Result(*initializeTracyGpuContext)(Queue*, const char*) noexcept;
+		bool (*hasTracyGpuContext)(const Queue*) noexcept;
+		void (*tracyGpuFrameBegin)(Queue*, CommandList*) noexcept;
+		uint32_t abi_version = 3;
 	};
 
 	class Queue {
@@ -2348,6 +2351,17 @@ namespace rhi {
 		Result Wait(const TimelinePoint& p) noexcept;
 		void CheckDebugMessages() noexcept;
 		void SetName(const char* n) noexcept { vt->setName(this, n); }
+		Result InitializeTracyGpuContext(const char* name = nullptr) noexcept {
+			return vt->abi_version >= 3 && vt->initializeTracyGpuContext
+				? vt->initializeTracyGpuContext(this, name)
+				: Result::Unsupported;
+		}
+		bool HasTracyGpuContext() const noexcept {
+			return vt->abi_version >= 3 && vt->hasTracyGpuContext && vt->hasTracyGpuContext(this);
+		}
+		void TracyGpuFrameBegin(CommandList& firstCommandList) noexcept {
+			if (vt->abi_version >= 3 && vt->tracyGpuFrameBegin) vt->tracyGpuFrameBegin(this, &firstCommandList);
+		}
 		QueueKind GetKind() const noexcept { return kind; }
 		QueueHandle GetQueueHandle() const noexcept { return queueHandle; }
 	private:
@@ -2514,7 +2528,9 @@ namespace rhi {
 		void (*dispatchWorkGraph)(CommandList*, const WorkGraphDispatchDesc& desc) noexcept; // if supported by the backend
 		void (*setName)(CommandList*, const char*) noexcept;
 		void (*setDebugInstrumentationContext)(CommandList*, const char* passName, const char* techniquePath) noexcept;
-		uint32_t abi_version = 4;
+		Result(*beginTracyGpuZone)(CommandList*, const Queue&, const char*) noexcept;
+		void (*endTracyGpuZone)(CommandList*) noexcept;
+		uint32_t abi_version = 5;
 	};
 
 	class CommandList {
@@ -2580,6 +2596,14 @@ namespace rhi {
 		void DispatchMesh(uint32_t x, uint32_t y, uint32_t z) noexcept;
 		void SetWorkGraph(const WorkGraphHandle& wg, const ResourceHandle& backingMemory, bool resetBackingMemory) noexcept;
 		void DispatchWorkGraph(const WorkGraphDispatchDesc& desc) noexcept;
+		Result BeginTracyGpuZone(const Queue& queue, const char* name) noexcept {
+			return vt->abi_version >= 5 && vt->beginTracyGpuZone
+				? vt->beginTracyGpuZone(this, queue, name)
+				: Result::Unsupported;
+		}
+		void EndTracyGpuZone() noexcept {
+			if (vt->abi_version >= 5 && vt->endTracyGpuZone) vt->endTracyGpuZone(this);
+		}
 
 	private:
 		CommandListHandle handle;

@@ -42,9 +42,23 @@
 #include <cctype>
 #include <filesystem>
 #include <deque>
+#include <queue>
 #include <cstring>
 #include <charconv>
 #include <new>
+
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+#include <tracy/Tracy.hpp>
+// Tracy's D3D12 context does not expose the query allocator used by its zone
+// helper. BasicRHI needs that allocator so timestamp recording can remain
+// parallel while zone metadata is deferred until queue submission order is
+// known. Keep this narrowly scoped to Tracy's backend header.
+#define private public
+#define class struct
+#include <tracy/TracyD3D12.hpp>
+#undef class
+#undef private
+#endif
 
 #include "rhi_dx12_casting.h"
 #include "rhi_debug_internal.h"
@@ -60,6 +74,7 @@ namespace rhi {
 		static void Dx12EnsureReShapePipelineInventory(Dx12Device* impl) noexcept;
 		static bool Dx12InitializeReShapeRuntime(Dx12Device* impl, const DeviceCreateInfo& ci) noexcept;
 		static void Dx12ShutdownReShapeRuntime(Dx12Device* impl) noexcept;
+		static void Dx12DestroyTracyGpuContext(Dx12QueueState& queueState) noexcept;
 	}
 	#if BASICRHI_ENABLE_RESHAPE
 	namespace {
@@ -1606,6 +1621,7 @@ namespace rhi {
 			if (!qs) return;
 			// Drain the queue before destroying it
 			Dx12WaitQueueIdle(*qs);
+			Dx12DestroyTracyGpuContext(*qs);
 			impl->queues.free(h);
 		}
 
@@ -4436,12 +4452,64 @@ namespace rhi {
 		}
 
 		// ---------------- Queue vtable funcs ----------------
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+		static void Dx12EmitSubmittedTracyGpuZones(Dx12CommandList& list) {
+			if (list.tracyGpuZoneEventsSubmitted || list.tracyGpuZoneEvents.empty()) {
+				return;
+			}
+			for (const auto& event : list.tracyGpuZoneEvents) {
+				auto* context = static_cast<tracy::D3D12QueueCtx*>(event.context);
+				if (!context) {
+					continue;
+				}
+				if (event.begin) {
+					const uint64_t sourceLocation = tracy::Profiler::AllocSourceLocation(
+						0,
+						"BasicRHI",
+						sizeof("BasicRHI") - 1,
+						"GPU",
+						sizeof("GPU") - 1,
+						event.name.data(),
+						event.name.size());
+					auto* item = tracy::Profiler::QueueSerial();
+					tracy::MemWrite(&item->hdr.type, tracy::QueueType::GpuZoneBeginAllocSrcLocSerial);
+					tracy::MemWrite(&item->gpuZoneBegin.cpuTime, tracy::Profiler::GetTime());
+					tracy::MemWrite(&item->gpuZoneBegin.srcloc, sourceLocation);
+					tracy::MemWrite(&item->gpuZoneBegin.thread, uint32_t{ 0 });
+					tracy::MemWrite(&item->gpuZoneBegin.queryId, static_cast<uint16_t>(event.queryId));
+					tracy::MemWrite(&item->gpuZoneBegin.context, context->GetId());
+					tracy::Profiler::QueueSerialFinish();
+				}
+				else {
+					auto* item = tracy::Profiler::QueueSerial();
+					tracy::MemWrite(&item->hdr.type, tracy::QueueType::GpuZoneEndSerial);
+					tracy::MemWrite(&item->gpuZoneEnd.cpuTime, tracy::Profiler::GetTime());
+					tracy::MemWrite(&item->gpuZoneEnd.thread, uint32_t{ 0 });
+					tracy::MemWrite(&item->gpuZoneEnd.queryId, static_cast<uint16_t>(event.queryId));
+					tracy::MemWrite(&item->gpuZoneEnd.context, context->GetId());
+					tracy::Profiler::QueueSerialFinish();
+				}
+			}
+			list.tracyGpuZoneEventsSubmitted = true;
+		}
+#endif
+
 		static Result q_submit(Queue* q, Span<CommandList> lists, const SubmitDesc& s) noexcept {
 			auto* qs = dx12_detail::QState(q);
 			auto* dev = qs->dev;
 			if (!dev) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+			for (auto& list : lists) {
+				auto* listState = dx12_detail::CL(&list);
+				if (!listState->tracyGpuZoneEvents.empty() &&
+					listState->tracyGpuZoneEvents.front().context != qs->tracyGpuContext) {
+					spdlog::error("D3D12 Tracy GPU zones must be submitted to the queue context used while recording.");
+					return Result::InvalidArgument;
+				}
+			}
+#endif
 
 			// Pre-waits
 			for (auto& w : s.waits) {
@@ -4484,6 +4552,11 @@ namespace rhi {
 						commandList ? commandList->debugName : "<null>");
 				}
 				qs->pNativeQueue->ExecuteCommandLists(static_cast<uint32_t>(native.size()), native.data());
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+				for (auto& L : lists) {
+					Dx12EmitSubmittedTracyGpuZones(*dx12_detail::CL(&L));
+				}
+#endif
 				Dx12LogInfoQueueMessagesSince(dev->pNativeDevice.Get(), infoQueueStart, 64);
 				spdlog::default_logger()->flush();
 			}
@@ -7144,6 +7217,86 @@ namespace rhi {
 			}
 			std::wstring w(n, n + ::strlen(n));
 			qs->pNativeQueue->SetName(w.c_str());
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+			if (qs->tracyGpuContext) {
+				auto* context = static_cast<tracy::D3D12QueueCtx*>(qs->tracyGpuContext);
+				context->Name(n, static_cast<uint16_t>((std::min)(::strlen(n), size_t{ UINT16_MAX })));
+			}
+#endif
+		}
+
+		static void Dx12DestroyTracyGpuContext(Dx12QueueState& queueState) noexcept {
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+			if (queueState.tracyGpuContext) {
+				TracyD3D12Destroy(static_cast<tracy::D3D12QueueCtx*>(queueState.tracyGpuContext));
+				queueState.tracyGpuContext = nullptr;
+			}
+#else
+			(void)queueState;
+#endif
+		}
+
+		static Result q_initializeTracyGpuContext(Queue* queue, const char* name) noexcept {
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+			auto* queueState = dx12_detail::QState(queue);
+			if (!queueState || !queueState->dev || !queueState->pNativeQueue) {
+				return Result::InvalidArgument;
+			}
+			if (queueState->tracyGpuContext) {
+				if (name) {
+					static_cast<tracy::D3D12QueueCtx*>(queueState->tracyGpuContext)->Name(
+						name,
+						static_cast<uint16_t>((std::min)(::strlen(name), size_t{ UINT16_MAX })));
+				}
+				return Result::Ok;
+			}
+
+			if (queueState->pNativeQueue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_COPY) {
+				D3D12_FEATURE_DATA_D3D12_OPTIONS3 options{};
+				if (FAILED(queueState->dev->pNativeDevice->CheckFeatureSupport(
+					D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof(options))) ||
+					options.CopyQueueTimestampQueriesSupported == FALSE) {
+					spdlog::warn("Tracy GPU profiling is unavailable on this D3D12 copy queue.");
+					return Result::Unsupported;
+				}
+			}
+
+			auto* context = TracyD3D12Context(
+				queueState->dev->pNativeDevice.Get(),
+				queueState->pNativeQueue.Get());
+			if (!context) {
+				return Result::Failed;
+			}
+			queueState->tracyGpuContext = context;
+			if (name) {
+				context->Name(name, static_cast<uint16_t>((std::min)(::strlen(name), size_t{ UINT16_MAX })));
+			}
+			return Result::Ok;
+#else
+			(void)queue;
+			(void)name;
+			return Result::Unsupported;
+#endif
+		}
+
+		static bool q_hasTracyGpuContext(const Queue* queue) noexcept {
+			const auto* queueState = dx12_detail::QState(queue);
+			return queueState && queueState->tracyGpuContext;
+		}
+
+		static void q_tracyGpuFrameBegin(Queue* queue, CommandList* firstCommandList) noexcept {
+			(void)firstCommandList;
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+			auto* queueState = dx12_detail::QState(queue);
+			if (!queueState || !queueState->tracyGpuContext) {
+				return;
+			}
+			auto* context = static_cast<tracy::D3D12QueueCtx*>(queueState->tracyGpuContext);
+			context->NewFrame();
+			context->Collect();
+#else
+			(void)queue;
+#endif
 		}
 
 		// ---------------- CommandList vtable funcs ----------------
@@ -7159,6 +7312,26 @@ namespace rhi {
 
 		static void cl_end(CommandList* cl) noexcept {
 			auto* w = dx12_detail::CL(cl);
+			while (w && !w->tracyGpuZoneStack.empty()) {
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+				const auto openZone = w->tracyGpuZoneStack.back();
+				auto* context = static_cast<tracy::D3D12QueueCtx*>(openZone.context);
+				if (context) {
+					const uint32_t beginQueryId = openZone.beginQueryId;
+					const uint32_t endQueryId = beginQueryId + 1;
+					w->cl->EndQuery(context->m_queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, endQueryId);
+					w->cl->ResolveQueryData(
+						context->m_queryHeap,
+						D3D12_QUERY_TYPE_TIMESTAMP,
+						beginQueryId,
+						2,
+						context->m_readbackBuffer,
+						beginQueryId * sizeof(uint64_t));
+					w->tracyGpuZoneEvents.push_back({ context, endQueryId, false, {} });
+				}
+#endif
+				w->tracyGpuZoneStack.pop_back();
+			}
 			w->cl->Close();
 		}
 		static void cl_reset(CommandList* cl, const CommandAllocator& ca) noexcept {
@@ -7181,7 +7354,84 @@ namespace rhi {
 			for (auto& page : l->rootCbvScratchPages) {
 				page.cursor = 0;
 			}
+			l->tracyGpuZoneStack.clear();
+			l->tracyGpuZoneEvents.clear();
+			l->tracyGpuZoneEventsSubmitted = false;
 			l->cl->Reset(a->alloc.Get(), nullptr);
+		}
+
+		static Result cl_beginTracyGpuZone(CommandList* commandList, const Queue& queue, const char* name) noexcept {
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+			auto* listState = dx12_detail::CL(commandList);
+			auto* queueState = dx12_detail::QState(&queue);
+			if (!listState || !listState->cl || !queueState || !queueState->tracyGpuContext || !name) {
+				return Result::InvalidArgument;
+			}
+			if (listState->dev != queueState->dev || listState->type != queueState->pNativeQueue->GetDesc().Type) {
+				return Result::InvalidArgument;
+			}
+#ifdef TRACY_ON_DEMAND
+			if (!tracy::GetProfiler().IsConnected()) {
+				try {
+					listState->tracyGpuZoneStack.reserve(listState->tracyGpuZoneStack.size() + 1);
+					listState->tracyGpuZoneStack.push_back({});
+				}
+				catch (...) {
+					return Result::OutOfMemory;
+				}
+				return Result::Ok;
+			}
+#endif
+			std::string zoneName;
+			try {
+				zoneName = name;
+				listState->tracyGpuZoneEvents.reserve(listState->tracyGpuZoneEvents.size() + 2);
+				listState->tracyGpuZoneStack.reserve(listState->tracyGpuZoneStack.size() + 1);
+			}
+			catch (...) {
+				return Result::OutOfMemory;
+			}
+			auto* context = static_cast<tracy::D3D12QueueCtx*>(queueState->tracyGpuContext);
+			if (!listState->tracyGpuZoneEvents.empty() &&
+				listState->tracyGpuZoneEvents.front().context != context) {
+				return Result::InvalidArgument;
+			}
+			const uint32_t queryId = context->NextQueryId();
+			listState->cl->EndQuery(context->m_queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, queryId);
+			listState->tracyGpuZoneEvents.push_back({ context, queryId, true, std::move(zoneName) });
+			listState->tracyGpuZoneStack.push_back({ context, queryId });
+			return Result::Ok;
+#else
+			(void)commandList;
+			(void)queue;
+			(void)name;
+			return Result::Unsupported;
+#endif
+		}
+
+		static void cl_endTracyGpuZone(CommandList* commandList) noexcept {
+			auto* listState = dx12_detail::CL(commandList);
+			if (!listState || listState->tracyGpuZoneStack.empty()) {
+				return;
+			}
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+			const auto openZone = listState->tracyGpuZoneStack.back();
+			auto* context = static_cast<tracy::D3D12QueueCtx*>(openZone.context);
+			if (context) {
+				const uint32_t beginQueryId = openZone.beginQueryId;
+				const uint32_t endQueryId = beginQueryId + 1;
+				listState->cl->EndQuery(context->m_queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, endQueryId);
+				listState->cl->ResolveQueryData(
+					context->m_queryHeap,
+					D3D12_QUERY_TYPE_TIMESTAMP,
+					beginQueryId,
+					2,
+					context->m_readbackBuffer,
+					beginQueryId * sizeof(uint64_t));
+				listState->tracyGpuZoneEvents.push_back({ context, endQueryId, false, {} });
+			}
+#endif
+			listState->tracyGpuZoneStack.pop_back();
 		}
 
 		static bool DxSafeClearRenderTargetView(
@@ -9014,6 +9264,9 @@ namespace rhi {
 		for (auto& slot : queues.slots) {
 			if (slot.alive) Dx12WaitQueueIdle(slot.obj);
 		}
+		for (auto& slot : queues.slots) {
+			if (slot.alive) Dx12DestroyTracyGpuContext(slot.obj);
+		}
 
 		swapchains.clear();
 		queryPools.clear();
@@ -9156,7 +9409,10 @@ namespace rhi {
 		&q_wait,
 		&q_checkDebugMessages,
 		&q_setName,
-		2u };
+		&q_initializeTracyGpuContext,
+		&q_hasTracyGpuContext,
+		&q_tracyGpuFrameBegin,
+		3u };
 
 	const CommandAllocatorVTable g_calvt = {
 		&ca_reset,
@@ -9204,7 +9460,9 @@ namespace rhi {
 		&cl_dispatchWorkGraph,
 		&cl_setName,
 		&cl_setDebugInstrumentationContext,
-		4u
+		&cl_beginTracyGpuZone,
+		&cl_endTracyGpuZone,
+		5u
 	};
 	const SwapchainVTable g_scvt = {
 		&sc_count,

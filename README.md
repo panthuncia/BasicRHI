@@ -2,6 +2,27 @@
 
 `BasicRHI` is the low-level rendering hardware abstraction used by `OpenRenderGraph` and `BasicRenderer`.
 
+## Tracy GPU profiling
+
+`BASICRHI_ENABLE_TRACY_GPU_PROFILING` is enabled by default. It adds D3D12 and
+Vulkan GPU timestamp contexts without exposing native API objects:
+
+- `Queue::InitializeTracyGpuContext()` creates one named Tracy context for that
+  queue.
+- `Queue::TracyGpuFrameBegin()` advances timestamp collection once per frame.
+- `CommandList::BeginTracyGpuZone()` / `EndTracyGpuZone()` record a transient
+  GPU range against a specific queue context.
+
+OpenRenderGraph uses these APIs automatically, including for additional queue
+instances of the same queue kind. GPU zones are attributed to their queue
+context rather than to the CPU worker that recorded the command list, producing
+one GPU timeline per API queue even during parallel command-list recording.
+Timestamp commands are recorded with the pass, while Tracy zone metadata is
+deferred until submission and emitted in command-list order. This preserves
+Tracy's zone nesting without serializing parallel command-list recording.
+Disable the CMake option to build BasicRHI without the Tracy dependency; the
+profiling entry points then return `rhi::Result::Unsupported`.
+
 ## CMake target
 
 - Exported target: `BasicRHI::BasicRHI`

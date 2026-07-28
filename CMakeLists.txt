@@ -11,6 +11,7 @@ option(BASICRHI_ENABLE_STREAMLINE "Enable Streamline integration in BasicRHI" ON
 option(BASICRHI_ENABLE_PIX "Enable PIX integration in BasicRHI" ON)
 option(BASICRHI_ENABLE_RESHAPE "Enable GPU-Reshape debug instrumentation scaffolding in BasicRHI" OFF)
 option(BASICRHI_ENABLE_DXR2_HEADERS "Enable native DXR 2.0 header-dependent code paths in BasicRHI" OFF)
+option(BASICRHI_ENABLE_TRACY_GPU_PROFILING "Enable Tracy GPU timeline support in BasicRHI" ON)
 set(BASICRHI_STREAMLINE_HEADERS_DIR "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/Streamline" CACHE PATH "Directory containing Streamline headers (e.g. sl.h)")
 set(BASICRHI_PIX_HEADERS_DIR "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/pix" CACHE PATH "Directory containing PIX headers (e.g. pix3.h)")
 
@@ -19,8 +20,14 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(DirectX12-Agility CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
+if(BASICRHI_ENABLE_TRACY_GPU_PROFILING)
+    find_package(Tracy REQUIRED CONFIG)
+endif()
 if(COMMAND basicrenderer_use_release_library_for_debug)
     basicrenderer_use_release_library_for_debug(fmt::fmt)
+    if(BASICRHI_ENABLE_TRACY_GPU_PROFILING)
+        basicrenderer_use_release_library_for_debug(Tracy::TracyClient)
+    endif()
 endif()
 if(TARGET imgui::imgui)
     set_property(TARGET imgui::imgui PROPERTY INTERFACE_LINK_LIBRARIES "")
@@ -272,6 +279,7 @@ install(FILES
 target_link_libraries(BasicRHI
 PUBLIC
     Microsoft::DirectX-Headers
+    $<$<BOOL:${BASICRHI_ENABLE_TRACY_GPU_PROFILING}>:Tracy::TracyClient>
 PRIVATE 
     Microsoft::DirectX12-Agility 
     fmt::fmt
@@ -283,6 +291,7 @@ target_compile_definitions(BasicRHI PUBLIC
     BASICRHI_ENABLE_PIX=$<IF:$<BOOL:${_basicrhi_pix_available}>,1,0>
     BASICRHI_ENABLE_RESHAPE=$<IF:$<BOOL:${_basicrhi_reshape_available}>,1,0>
     BASICRHI_HAS_DXR2_HEADERS=$<IF:$<BOOL:${BASICRHI_ENABLE_DXR2_HEADERS}>,1,0>
+    BASICRHI_ENABLE_TRACY_GPU_PROFILING=$<IF:$<BOOL:${BASICRHI_ENABLE_TRACY_GPU_PROFILING}>,1,0>
 )
 
 add_executable(BasicRHIVulkanSmoke
@@ -311,6 +320,21 @@ set_target_properties(BasicRHIVulkanSmoke PROPERTIES
 )
 
 target_link_libraries(BasicRHIVulkanSmoke PRIVATE BasicRHI::BasicRHI)
+
+if(BASICRHI_ENABLE_TRACY_GPU_PROFILING)
+    add_custom_command(TARGET BasicRHIVulkanSmoke POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Tracy::TracyClient>"
+            "$<TARGET_FILE_DIR:BasicRHIVulkanSmoke>"
+    )
+    if(WIN32)
+        add_custom_command(TARGET BasicRHID3D12AliasingSmoke POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:Tracy::TracyClient>"
+                "$<TARGET_FILE_DIR:BasicRHID3D12AliasingSmoke>"
+        )
+    endif()
+endif()
 
 if(_basicrhi_streamline_available AND WIN32)
     target_link_libraries(BasicRHIVulkanSmoke PRIVATE

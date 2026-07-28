@@ -169,6 +169,17 @@ namespace rhi {
 		Dx12Device* dev = nullptr;
 	};
 	struct Dx12CommandList {
+		struct TracyGpuZoneEvent {
+			void* context = nullptr;
+			uint32_t queryId = 0;
+			bool begin = false;
+			std::string name;
+		};
+		struct TracyGpuOpenZone {
+			void* context = nullptr;
+			uint32_t beginQueryId = 0;
+		};
+
 		struct RootCbvScratchPage {
 			Microsoft::WRL::ComPtr<ID3D12Resource> resource;
 			uint8_t* mapped = nullptr;
@@ -201,6 +212,9 @@ namespace rhi {
 		std::string instrumentationTechniquePath;
 		std::vector<RootCbvScratchPage> rootCbvScratchPages;
 		std::vector<RootCbvShadowState> rootCbvShadowStates;
+		std::vector<TracyGpuOpenZone> tracyGpuZoneStack;
+		std::vector<TracyGpuZoneEvent> tracyGpuZoneEvents;
+		bool tracyGpuZoneEventsSubmitted = false;
 	};
 
 	// Build D3D12_RESOURCE_DESC1 for buffers
@@ -305,6 +319,7 @@ namespace rhi {
 		std::unordered_map<TimelineHandle, uint64_t, HandleHash<TimelineHandle>, HandleEqual<TimelineHandle>> lastSignaledValue; // track last signaled value per timeline
 #endif
 		Dx12Device* dev = nullptr;
+		void* tracyGpuContext = nullptr;
 	};
 
 	struct Dx12Swapchain {

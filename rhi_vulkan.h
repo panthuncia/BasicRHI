@@ -130,6 +130,7 @@ namespace rhi {
 		VkQueue queue = VK_NULL_HANDLE;
 		uint32_t familyIndex = 0xFFFFFFFFu;
 		uint32_t queueIndex = 0;
+		void* tracyGpuContext = nullptr;
 	};
 
 	struct VulkanResource {
@@ -300,6 +301,17 @@ namespace rhi {
 	};
 
 	struct VulkanCommandList {
+		struct TracyGpuZoneEvent {
+			void* context = nullptr;
+			uint32_t queryId = 0;
+			bool begin = false;
+			std::string name;
+		};
+		struct TracyGpuOpenZone {
+			void* context = nullptr;
+			uint32_t beginQueryId = 0;
+		};
+
 		struct RecordedTextureBarrier {
 			ResourceHandle texture{};
 			ResourceAccessType beforeAccess = ResourceAccessType::Common;
@@ -372,6 +384,9 @@ namespace rhi {
 		std::vector<EmulatedRootConstantScratchPage> emulatedRootConstantScratchPages;
 		std::vector<EmulatedRootConstantShadowState> emulatedRootConstantShadowStates;
 		std::vector<VkQueryPool> transientQueryPools;
+		std::vector<TracyGpuOpenZone> tracyGpuZoneStack;
+		std::vector<TracyGpuZoneEvent> tracyGpuZoneEvents;
+		bool tracyGpuZoneEventsSubmitted = false;
 	};
 
 	struct VulkanDevice {

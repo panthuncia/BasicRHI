@@ -2,6 +2,7 @@
   "name": "basicrhi",
   "version": "0.1.0",
   "dependencies": [
+    "tracy",
     "directx-headers",
     "directx12-agility",
     "spdlog"
