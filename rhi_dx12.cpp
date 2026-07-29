@@ -46,6 +46,7 @@
 #include <cstring>
 #include <charconv>
 #include <new>
+#include <atomic>
 
 #if BASICRHI_ENABLE_TRACY_GPU_PROFILING
 #include <tracy/Tracy.hpp>
@@ -432,6 +433,9 @@ namespace rhi {
 	// ---- DRED (Device Removed Extended Data) support ----
 
 	static ID3D12Device* g_dredDevice = nullptr;
+	// Device removal is observed from several queue/device polling paths. Keep
+	// the report single-writer so concurrent threads cannot interleave copies.
+	static std::atomic_uint32_t g_dredReportState{ 0 }; // 0=ready, 1=writing, 2=written
 
 	static const char* BreadcrumbOpToString(D3D12_AUTO_BREADCRUMB_OP op) noexcept {
 		switch (op) {
@@ -646,12 +650,22 @@ namespace rhi {
 		HRESULT reason = g_dredDevice->GetDeviceRemovedReason();
 		if (reason == S_OK) return; // device is fine
 
+		uint32_t expectedState = 0;
+		if (!g_dredReportState.compare_exchange_strong(
+				expectedState,
+				1,
+				std::memory_order_acq_rel,
+				std::memory_order_acquire)) {
+			return;
+		}
+
 		spdlog::error("======== DEVICE REMOVED (reason 0x{:08X}) – DRED Report ========", static_cast<unsigned>(reason));
 
 		ComPtr<ID3D12DeviceRemovedExtendedData1> pDred;
 		if (FAILED(g_dredDevice->QueryInterface(IID_PPV_ARGS(&pDred)))) {
 			spdlog::error("  Could not query ID3D12DeviceRemovedExtendedData1.");
 			Dx12LogInfoQueueMessagesSince(g_dredDevice, 0, 256);
+			g_dredReportState.store(2, std::memory_order_release);
 			return;
 		}
 
@@ -661,8 +675,16 @@ namespace rhi {
 			const D3D12_AUTO_BREADCRUMB_NODE1* node = breadcrumbsOutput.pHeadAutoBreadcrumbNode;
 			int nodeIdx = 0;
 			while (node) {
-				const char*    clName = node->pCommandListDebugNameA  ? node->pCommandListDebugNameA  : "<unnamed>";
-				const char*    cqName = node->pCommandQueueDebugNameA ? node->pCommandQueueDebugNameA : "<unnamed>";
+				const std::string clName = node->pCommandListDebugNameA
+					? node->pCommandListDebugNameA
+					: (node->pCommandListDebugNameW
+						? Dx12WideToUtf8(node->pCommandListDebugNameW)
+						: "<unnamed>");
+				const std::string cqName = node->pCommandQueueDebugNameA
+					? node->pCommandQueueDebugNameA
+					: (node->pCommandQueueDebugNameW
+						? Dx12WideToUtf8(node->pCommandQueueDebugNameW)
+						: "<unnamed>");
 				const UINT32   count  = node->BreadcrumbCount;
 				const UINT32   last   = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
 
@@ -730,6 +752,7 @@ namespace rhi {
 		Dx12LogInfoQueueMessagesSince(g_dredDevice, 0, 256);
 
 		spdlog::error("======== END DRED Report ========");
+		g_dredReportState.store(2, std::memory_order_release);
 	}
 
 	namespace {
@@ -1682,6 +1705,8 @@ namespace rhi {
 				if (FAILED(hr)) {
 					RHI_FAIL(ToRHI(hr));
 				}
+				const std::wstring backbufferName = L"DX12 Swapchain Backbuffer " + std::to_wstring(i);
+				imgs[i]->SetName(backbufferName.c_str());
 				// Register as a TextureHandle
 				Dx12Resource t(imgs[i], desc.Format, w, h, 1, 1, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1, impl);
 				imgHandles[i] = impl->resources.alloc(t);
@@ -8586,10 +8611,26 @@ namespace rhi {
 		//static ViewHandle sc_rtv(Swapchain* sc, uint32_t i) noexcept { return dx12_detail::SC(sc)->rtvHandles[i]; }
 		static ResourceHandle sc_img(Swapchain* sc, uint32_t i) noexcept { return dx12_detail::SC(sc)->imageHandles[i]; }
 		static Result sc_present(Swapchain* sc, bool vsync, const PresentSyncDesc* presentSync) noexcept {
-			(void)presentSync;
 			auto* s = dx12_detail::SC(sc);
 			UINT syncInterval = vsync ? 1 : 0; UINT flags = 0;
-			return s->pSlProxySC->Present(syncInterval, flags) == S_OK ? Result::Ok : Result::Failed;
+			const HRESULT hr = s->pSlProxySC->Present(syncInterval, flags);
+			if (FAILED(hr)) {
+				const uint64_t waitValue = presentSync ? presentSync->wait.value : 0;
+				const auto queueKind = presentSync ? presentSync->queue.GetKind() : QueueKind::Graphics;
+				spdlog::critical(
+					"DX12 Present failed: hr=0x{:08X} deviceReason=0x{:08X} syncInterval={} "
+					"dependencyQueueKind={} dependencyTimeline(index={}, gen={}) dependencyValue={}",
+					static_cast<unsigned>(hr),
+					static_cast<unsigned>(s->dev->pNativeDevice->GetDeviceRemovedReason()),
+					syncInterval,
+					static_cast<unsigned>(queueKind),
+					presentSync ? presentSync->wait.t.index : 0,
+					presentSync ? presentSync->wait.t.generation : 0,
+					waitValue);
+				LogDredData();
+				return ToRHI(hr);
+			}
+			return Result::Ok;
 		}
 
 		static Result sc_resizeBuffers(
@@ -9255,6 +9296,7 @@ namespace rhi {
 
 		// Clear DRED globals before tearing down the device
 		g_dredDevice = nullptr;
+		g_dredReportState.store(0, std::memory_order_release);
 		g_breakCallback = nullptr;
 
 		Dx12WaitQueueIdle(*queues.get(gfxHandle));
@@ -9711,6 +9753,7 @@ namespace rhi {
 			// Register the DRED device and break callback so BreakIfDebugging
 			// automatically checks for device removal and dumps DRED data.
 			g_dredDevice = impl->pNativeDevice.Get();
+			g_dredReportState.store(0, std::memory_order_release);
 			g_breakCallback = &LogDredData;
 		}
 
