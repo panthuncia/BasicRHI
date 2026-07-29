@@ -473,8 +473,10 @@ namespace rhi {
 
 		std::deque<Slot<T>> slots;
 		std::vector<uint32_t> freelist;
+		std::mutex mutex;
 
 		HandleT alloc(const T& v) {
+			std::lock_guard lock(mutex);
 			if (!freelist.empty()) {
 				const uint32_t i = freelist.back(); freelist.pop_back();
 				auto& s = slots[i]; s.obj = v; s.alive = true; ++s.generation;
@@ -486,6 +488,7 @@ namespace rhi {
 		}
 
 		void free(HandleT h) {
+			std::lock_guard lock(mutex);
 			uint32_t i = h.index;
 			if (i >= slots.size()) return;
 			auto& s = slots[i];
@@ -496,6 +499,7 @@ namespace rhi {
 		}
 
 		T* get(HandleT h) {
+			std::lock_guard lock(mutex);
 			uint32_t i = h.index;
 			if (i >= slots.size()) return nullptr;
 			auto& s = slots[i];
@@ -504,6 +508,7 @@ namespace rhi {
 		}
 
 		void clear() {
+			std::lock_guard lock(mutex);
 			slots.clear();
 			freelist.clear();
 		}
