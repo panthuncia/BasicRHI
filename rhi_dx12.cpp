@@ -8613,7 +8613,9 @@ namespace rhi {
 		static Result sc_present(Swapchain* sc, bool vsync, const PresentSyncDesc* presentSync) noexcept {
 			auto* s = dx12_detail::SC(sc);
 			UINT syncInterval = vsync ? 1 : 0; UINT flags = 0;
+			const UINT64 infoQueueStart = Dx12GetInfoQueueMessageCount(s->dev->pNativeDevice.Get());
 			const HRESULT hr = s->pSlProxySC->Present(syncInterval, flags);
+			Dx12LogInfoQueueMessagesSince(s->dev->pNativeDevice.Get(), infoQueueStart, 64);
 			if (FAILED(hr)) {
 				const uint64_t waitValue = presentSync ? presentSync->wait.value : 0;
 				const auto queueKind = presentSync ? presentSync->queue.GetKind() : QueueKind::Graphics;
@@ -9586,6 +9588,16 @@ namespace rhi {
 			ComPtr<ID3D12Debug> dbg;
 			if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
 				dbg->EnableDebugLayer(), flags |= DXGI_CREATE_FACTORY_DEBUG;
+				const char* gpuValidation = std::getenv("SARP_D3D12_GPU_VALIDATION");
+				if (gpuValidation &&
+					(std::strcmp(gpuValidation, "1") == 0 || _stricmp(gpuValidation, "true") == 0)) {
+					ComPtr<ID3D12Debug1> debug1;
+					if (SUCCEEDED(dbg.As(&debug1))) {
+						debug1->SetEnableGPUBasedValidation(true);
+						debug1->SetEnableSynchronizedCommandQueueValidation(true);
+						spdlog::info("D3D12 GPU-based and synchronized command-queue validation enabled.");
+					}
+				}
 			}
 
 			// Enable DRED auto-breadcrumbs and page fault reporting
