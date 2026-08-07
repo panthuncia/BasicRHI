@@ -3064,6 +3064,9 @@ namespace rhi {
 		uint32_t framesInFlight = 3;
 		bool enableDebug = true;
 		bool validateBarrierTransitions = false;
+		// Optional borrowed IDXGIAdapter. D3D12 creation uses this exact adapter
+		// instead of performing adapter selection. BasicRHI does not retain it.
+		void* nativeAdapter = nullptr;
 		DebugInstrumentationCreateInfo instrumentation{};
 	};
 

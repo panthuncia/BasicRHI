@@ -1685,12 +1685,16 @@ namespace rhi {
 			}
 
 			ComPtr<IDXGISwapChain3> nativeSc3;
+		#if BASICRHI_ENABLE_STREAMLINE
 			if (impl->steamlineInitialized) {
 				IDXGISwapChain3* nativeSc3Raw = nullptr;
 				slGetNativeInterface(proxySc3.Get(), reinterpret_cast<void**>(&nativeSc3Raw));
 				nativeSc3.Attach(nativeSc3Raw);
 			}
 			else {
+		#else
+			{
+		#endif
 				nativeSc3 = proxySc3;
 			}
 			if (!nativeSc3) {
@@ -2245,7 +2249,9 @@ namespace rhi {
 			D3D12_FEATURE_DATA_D3D12_OPTIONS14 opt14{};
 			D3D12_FEATURE_DATA_D3D12_OPTIONS16 opt16{};
 			D3D12_FEATURE_DATA_D3D12_OPTIONS21 opt21{};
+#if defined(D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT)
 			D3D12_FEATURE_DATA_TIGHT_ALIGNMENT ta{};
+#endif
 
 			// Note: if a CheckFeatureSupport fails, the struct stays zeroed => "unsupported".
 			(void)dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opt0, sizeof(opt0));
@@ -2260,7 +2266,9 @@ namespace rhi {
 			auto hasOptions14 = SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS14, &opt14, sizeof(opt14)));
 			auto hasOptions16 = SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &opt16, sizeof(opt16)));
 			auto hasOptions21 = SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS21, &opt21, sizeof(opt21)));
+#if defined(D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT)
 			auto hasTightAlignment = SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT, &ta, sizeof(ta)));
+#endif
 
 			D3D12_FEATURE_DATA_SHADER_MODEL sm{};
 			sm.HighestShaderModel = getHighestShaderModel(dev);
@@ -2276,9 +2284,11 @@ namespace rhi {
 			}
 
 			bool tightAlignmentSupported = false;
+#if defined(D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT)
 			if (hasTightAlignment) {
 				tightAlignmentSupported = (ta.SupportTier >= D3D12_TIGHT_ALIGNMENT_TIER_1);
 			}
+#endif
 
 			const bool createNotZeroedSupported = hasOptions7;
 
@@ -8697,12 +8707,16 @@ namespace rhi {
 			}
 
 			ComPtr<IDXGISwapChain3> nativeSc3;
+		#if BASICRHI_ENABLE_STREAMLINE
 			if (s->dev->steamlineInitialized) {
 				IDXGISwapChain3* nativeSc3Raw = nullptr;
 				slGetNativeInterface(s->pSlProxySC.Get(), reinterpret_cast<void**>(&nativeSc3Raw));
 				nativeSc3.Attach(nativeSc3Raw);
 			}
 			else {
+		#else
+			{
+		#endif
 				nativeSc3 = s->pSlProxySC;
 			}
 			if (!nativeSc3) {
@@ -9622,7 +9636,15 @@ namespace rhi {
 		impl->pSLProxyFactory = impl->pNativeFactory;
 
 		ComPtr<IDXGIAdapter1> adapter;
-		adapter = Dx12ChooseAdapter(impl->pNativeFactory.Get());
+		if (ci.nativeAdapter) {
+			const HRESULT adapterHr = static_cast<IDXGIAdapter*>(ci.nativeAdapter)->QueryInterface(IID_PPV_ARGS(&adapter));
+			if (FAILED(adapterHr)) {
+				spdlog::error("DX12 device setup: supplied native adapter does not implement IDXGIAdapter1");
+				RHI_FAIL(ToRHI(adapterHr));
+			}
+		} else {
+			adapter = Dx12ChooseAdapter(impl->pNativeFactory.Get());
+		}
 		if (!adapter) {
 			spdlog::error("DX12 device setup: failed to find a hardware adapter supporting D3D feature level 12_0");
 			RHI_FAIL(Result::Unsupported);

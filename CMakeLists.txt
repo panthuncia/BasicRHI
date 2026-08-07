@@ -12,14 +12,25 @@ option(BASICRHI_ENABLE_PIX "Enable PIX integration in BasicRHI" ON)
 option(BASICRHI_ENABLE_RESHAPE "Enable GPU-Reshape debug instrumentation scaffolding in BasicRHI" OFF)
 option(BASICRHI_ENABLE_DXR2_HEADERS "Enable native DXR 2.0 header-dependent code paths in BasicRHI" OFF)
 option(BASICRHI_ENABLE_TRACY_GPU_PROFILING "Enable Tracy GPU timeline support in BasicRHI" ON)
-set(BASICRHI_STREAMLINE_HEADERS_DIR "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/Streamline" CACHE PATH "Directory containing Streamline headers (e.g. sl.h)")
-set(BASICRHI_PIX_HEADERS_DIR "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty/pix" CACHE PATH "Directory containing PIX headers (e.g. pix3.h)")
+option(BASICRHI_ENABLE_D3D12 "Build the D3D12 backend" ON)
+option(BASICRHI_ENABLE_VULKAN "Build the Vulkan backend" OFF)
+option(BASICRHI_ENABLE_IMGUI "Build ImGui instrumentation widgets" OFF)
+option(BASICRHI_BUILD_TESTS "Build BasicRHI smoke tests" OFF)
+set(BASICRHI_STREAMLINE_HEADERS_DIR "" CACHE PATH "Optional directory containing Streamline headers")
+set(BASICRHI_PIX_HEADERS_DIR "" CACHE PATH "Optional directory containing PIX headers")
 
-find_package(DirectX-Headers CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
-find_package(DirectX12-Agility CONFIG REQUIRED)
-find_package(imgui CONFIG REQUIRED)
+if(BASICRHI_ENABLE_D3D12)
+    find_package(DirectX-Headers CONFIG REQUIRED)
+endif()
+if(BASICRHI_ENABLE_VULKAN)
+    find_package(Vulkan REQUIRED)
+    find_package(volk CONFIG REQUIRED)
+endif()
+if(BASICRHI_ENABLE_IMGUI)
+    find_package(imgui CONFIG REQUIRED)
+endif()
 if(BASICRHI_ENABLE_TRACY_GPU_PROFILING)
     find_package(Tracy REQUIRED CONFIG)
 endif()
@@ -29,7 +40,7 @@ if(COMMAND basicrenderer_use_release_library_for_debug)
         basicrenderer_use_release_library_for_debug(Tracy::TracyClient)
     endif()
 endif()
-if(TARGET imgui::imgui)
+if(BASICRHI_ENABLE_IMGUI AND TARGET imgui::imgui)
     set_property(TARGET imgui::imgui PROPERTY INTERFACE_LINK_LIBRARIES "")
 endif()
 
@@ -84,11 +95,6 @@ endif()
 
 # Build a static library for now.
 add_library(BasicRHI STATIC 
-    rhi_dx12.cpp
-    rhi_vulkan.cpp
-    ../volk/volk.c
-    rhi_imgui_widgets.cpp
-    ImGuiColorTextEdit/TextEditor.cpp
     "rhi_interop.h" 
     "rhi_reshape_shared.h"
     "rhi_dx12.h"  
@@ -99,8 +105,6 @@ add_library(BasicRHI STATIC
     "rhi_interop_dx12.cpp" 
     "rhi_conversions_dx12.h" 
     "rhi_debug.h"
-    "rhi_imgui_widgets.h"
-    "ImGuiColorTextEdit/TextEditor.h"
     "rhi_colors.h"
     "rhi_allocator.h" 
     "rhi_allocator.cpp" "rhi_feature_info.h" "rhi_dx12_casting.h")
@@ -118,20 +122,12 @@ target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:Clang>:
 >)
 add_library(BasicRHI::BasicRHI ALIAS BasicRHI)
 
-set(_basicrhi_volk_source "${CMAKE_CURRENT_LIST_DIR}/../volk/volk.c")
-set_source_files_properties(${_basicrhi_volk_source} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "/w")
-
-target_link_libraries(BasicRHI PRIVATE imgui::imgui)
-target_include_directories(BasicRHI PRIVATE
-    "${CMAKE_CURRENT_LIST_DIR}/../volk"
-    "${CMAKE_CURRENT_LIST_DIR}/../ThirdParty"
-)
-
-if(BASICRENDERER_DETECTED_VULKAN_INCLUDE_DIR)
-    target_include_directories(BasicRHI BEFORE PRIVATE "${BASICRENDERER_DETECTED_VULKAN_INCLUDE_DIR}")
+if(BASICRHI_ENABLE_IMGUI)
+    target_sources(BasicRHI PRIVATE rhi_imgui_widgets.cpp ImGuiColorTextEdit/TextEditor.cpp)
+    target_link_libraries(BasicRHI PRIVATE imgui::imgui)
 endif()
 
-if(WIN32)
+if(WIN32 AND BASICRHI_ENABLE_VULKAN)
     target_compile_definitions(BasicRHI PRIVATE VK_USE_PLATFORM_WIN32_KHR)
 endif()
 
@@ -217,23 +213,30 @@ if(_basicrhi_reshape_available)
 endif()
 
 # Public header(s)
-set_target_properties(BasicRHI PROPERTIES
-    PUBLIC_HEADER "rhi.h;rhi_debug.h;rhi_imgui_widgets.h"
-)
+set(_basicrhi_public_headers "rhi.h;rhi_debug.h")
+if(BASICRHI_ENABLE_IMGUI)
+    list(APPEND _basicrhi_public_headers "rhi_imgui_widgets.h")
+endif()
+set_target_properties(BasicRHI PROPERTIES PUBLIC_HEADER "${_basicrhi_public_headers}")
 
 # Set sources
-target_sources(BasicRHI PRIVATE
-    rhi_dx12.cpp
-    rhi_vulkan.cpp
-    rhi_interop_dx12.cpp
-)
+if(BASICRHI_ENABLE_D3D12)
+    target_sources(BasicRHI PRIVATE rhi_dx12.cpp rhi_interop_dx12.cpp)
+else()
+    target_sources(BasicRHI PRIVATE rhi_dx12_stub.cpp)
+endif()
+if(BASICRHI_ENABLE_VULKAN)
+    target_sources(BasicRHI PRIVATE rhi_vulkan.cpp)
+    target_link_libraries(BasicRHI PRIVATE Vulkan::Vulkan volk::volk)
+else()
+    target_sources(BasicRHI PRIVATE rhi_vulkan_stub.cpp)
+endif()
 
 # Public include paths:
 # - During build (add_subdirectory consumers): this source dir
 # - After install (find_package consumers): ${prefix}/include
 target_include_directories(BasicRHI
     PUBLIC
-        ${DIRECTX_HEADERS_INCLUDE_DIR}
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/BasicRHI>
 )
@@ -278,13 +281,14 @@ install(FILES
 
 target_link_libraries(BasicRHI
 PUBLIC
-    Microsoft::DirectX-Headers
     $<$<BOOL:${BASICRHI_ENABLE_TRACY_GPU_PROFILING}>:Tracy::TracyClient>
 PRIVATE 
-    Microsoft::DirectX12-Agility 
     fmt::fmt
-    spdlog::spdlog_header_only
+    spdlog::spdlog
 )
+if(BASICRHI_ENABLE_D3D12)
+    target_link_libraries(BasicRHI PUBLIC Microsoft::DirectX-Headers PRIVATE d3d12 dxgi dxguid)
+endif()
 
 target_compile_definitions(BasicRHI PUBLIC
     BASICRHI_ENABLE_STREAMLINE=$<IF:$<BOOL:${_basicrhi_streamline_available}>,1,0>
@@ -292,76 +296,19 @@ target_compile_definitions(BasicRHI PUBLIC
     BASICRHI_ENABLE_RESHAPE=$<IF:$<BOOL:${_basicrhi_reshape_available}>,1,0>
     BASICRHI_HAS_DXR2_HEADERS=$<IF:$<BOOL:${BASICRHI_ENABLE_DXR2_HEADERS}>,1,0>
     BASICRHI_ENABLE_TRACY_GPU_PROFILING=$<IF:$<BOOL:${BASICRHI_ENABLE_TRACY_GPU_PROFILING}>,1,0>
+    BASICRHI_ENABLE_D3D12=$<IF:$<BOOL:${BASICRHI_ENABLE_D3D12}>,1,0>
+    BASICRHI_ENABLE_VULKAN=$<IF:$<BOOL:${BASICRHI_ENABLE_VULKAN}>,1,0>
 )
+target_compile_definitions(BasicRHI PRIVATE NOMINMAX)
 
-add_executable(BasicRHIVulkanSmoke
-    tests/VulkanSmoke.cpp
-)
-
-if(WIN32)
-    add_executable(BasicRHID3D12AliasingSmoke
-        tests/D3D12AliasingSmoke.cpp
-    )
-    target_link_libraries(BasicRHID3D12AliasingSmoke PRIVATE BasicRHI::BasicRHI)
-    if(_basicrhi_streamline_available)
-        target_link_libraries(BasicRHID3D12AliasingSmoke PRIVATE
-            "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/sl.interposer.lib"
-        )
-        add_custom_command(TARGET BasicRHID3D12AliasingSmoke POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/sl.interposer.dll"
-                "$<TARGET_FILE_DIR:BasicRHID3D12AliasingSmoke>/sl.interposer.dll"
-        )
+if(BASICRHI_BUILD_TESTS)
+    if(BASICRHI_ENABLE_VULKAN)
+        add_executable(BasicRHIVulkanSmoke tests/VulkanSmoke.cpp)
+        set_target_properties(BasicRHIVulkanSmoke PROPERTIES OUTPUT_NAME "BasicRHIVulkanSmoke_v2")
+        target_link_libraries(BasicRHIVulkanSmoke PRIVATE BasicRHI::BasicRHI)
     endif()
-endif()
-
-set_target_properties(BasicRHIVulkanSmoke PROPERTIES
-    OUTPUT_NAME "BasicRHIVulkanSmoke_v2"
-)
-
-target_link_libraries(BasicRHIVulkanSmoke PRIVATE BasicRHI::BasicRHI)
-
-if(BASICRHI_ENABLE_TRACY_GPU_PROFILING)
-    add_custom_command(TARGET BasicRHIVulkanSmoke POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:Tracy::TracyClient>"
-            "$<TARGET_FILE_DIR:BasicRHIVulkanSmoke>"
-    )
-    if(WIN32)
-        add_custom_command(TARGET BasicRHID3D12AliasingSmoke POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_FILE:Tracy::TracyClient>"
-                "$<TARGET_FILE_DIR:BasicRHID3D12AliasingSmoke>"
-        )
+    if(BASICRHI_ENABLE_D3D12 AND WIN32)
+        add_executable(BasicRHID3D12AliasingSmoke tests/D3D12AliasingSmoke.cpp)
+        target_link_libraries(BasicRHID3D12AliasingSmoke PRIVATE BasicRHI::BasicRHI)
     endif()
-endif()
-
-if(_basicrhi_streamline_available AND WIN32)
-    target_link_libraries(BasicRHIVulkanSmoke PRIVATE
-        "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/sl.interposer.lib"
-    )
-endif()
-
-target_include_directories(BasicRHIVulkanSmoke PRIVATE
-    "${CMAKE_CURRENT_LIST_DIR}/../volk"
-    "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/include"
-    "${CMAKE_CURRENT_LIST_DIR}/../FidelityFX-SDK/sdk/include"
-)
-
-if(WIN32)
-    add_custom_command(TARGET BasicRHIVulkanSmoke POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/sl.interposer.dll"
-            "$<TARGET_FILE_DIR:BasicRHIVulkanSmoke>/sl.interposer.dll"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/FFX/amd_fidelityfx_vk.dll"
-            "$<TARGET_FILE_DIR:BasicRHIVulkanSmoke>/amd_fidelityfx_vk.dll"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_LIST_DIR}/../BasicRenderer/FFX/ffx_backend_vk_x64drel.dll"
-            "$<TARGET_FILE_DIR:BasicRHIVulkanSmoke>/ffx_backend_vk_x64drel.dll"
-    )
-endif()
-
-if(WIN32)
-    target_link_libraries(BasicRHIVulkanSmoke PRIVATE user32)
 endif()

@@ -1,7 +1,9 @@
 #include "rhi_dx12.h"
 #include "rhi_interop.h"
 #include "rhi_dx12_casting.h"
+#if BASICRHI_ENABLE_VULKAN
 #include "rhi_vulkan.h"
+#endif
 
 #include <cstdint>
 #include <type_traits>
@@ -21,20 +23,23 @@ namespace rhi {
         }
 
         bool IsDx12Device(const Device& device) noexcept { return device.vt == &g_devvt; }
-        bool IsVulkanDevice(const Device& device) noexcept { return device.vt == &g_vkdevvt; }
         bool IsDx12Queue(const Queue& queue) noexcept { return queue.vt == &g_qvt; }
-        bool IsVulkanQueue(const Queue& queue) noexcept { return queue.vt == &g_vkqvt; }
         bool IsDx12CommandList(const CommandList& commandList) noexcept { return commandList.vt == &g_clvt; }
-        bool IsVulkanCommandList(const CommandList& commandList) noexcept { return commandList.vt == &g_vkclvt; }
         bool IsDx12Swapchain(const Swapchain& swapchain) noexcept { return swapchain.vt == &g_scvt; }
-        bool IsVulkanSwapchain(const Swapchain& swapchain) noexcept { return swapchain.vt == &g_vkscvt; }
         bool IsDx12Resource(const Resource& resource) noexcept { return resource.vt == &g_buf_rvt || resource.vt == &g_tex_rvt; }
+#if BASICRHI_ENABLE_VULKAN
+        bool IsVulkanDevice(const Device& device) noexcept { return device.vt == &g_vkdevvt; }
+        bool IsVulkanQueue(const Queue& queue) noexcept { return queue.vt == &g_vkqvt; }
+        bool IsVulkanCommandList(const CommandList& commandList) noexcept { return commandList.vt == &g_vkclvt; }
+        bool IsVulkanSwapchain(const Swapchain& swapchain) noexcept { return swapchain.vt == &g_vkscvt; }
         bool IsVulkanResource(const Resource& resource) noexcept { return resource.vt == &g_vkbuf_rvt || resource.vt == &g_vktex_rvt; }
+#endif
     }
 
     bool QueryNativeDevice(Device d, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
         if (!d.IsValid() || !outStruct) return false;
 
+#if BASICRHI_ENABLE_VULKAN
         if (IsVulkanDevice(d)) {
             if (iid != RHI_IID_VK_DEVICE || outSize < sizeof(VulkanDeviceInfo)) return false;
             auto* impl = static_cast<VulkanDevice*>(d.impl);
@@ -48,6 +53,7 @@ namespace rhi {
             out->deviceApiVersion = impl->physicalDeviceProperties.apiVersion;
             return true;
         }
+#endif
 
         if (!IsDx12Device(d)) return false;
 
@@ -77,6 +83,7 @@ namespace rhi {
 
     bool QueryNativeQueue(Queue q, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
         if (!q.IsValid() || !outStruct) return false;
+#if BASICRHI_ENABLE_VULKAN
         if (IsVulkanQueue(q)) {
             if (iid != RHI_IID_VK_QUEUE || outSize < sizeof(VulkanQueueInfo)) return false;
             auto* impl = static_cast<VulkanDevice*>(q.impl);
@@ -89,6 +96,7 @@ namespace rhi {
             out->version = 1;
             return true;
         }
+#endif
         if (!IsDx12Queue(q)) return false;
         if (iid != RHI_IID_D3D12_QUEUE) return false;
         if (outSize < sizeof(D3D12QueueInfo)) return false;
@@ -104,6 +112,7 @@ namespace rhi {
 
     bool QueryNativeCmdList(CommandList cl, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
         if (!cl.IsValid() || !outStruct) return false;
+#if BASICRHI_ENABLE_VULKAN
         if (IsVulkanCommandList(cl)) {
             if (iid != RHI_IID_VK_COMMAND_BUFFER || outSize < sizeof(VulkanCmdBufInfo)) return false;
             auto* impl = static_cast<VulkanDevice*>(cl.impl);
@@ -115,6 +124,7 @@ namespace rhi {
             out->version = 1;
             return true;
         }
+#endif
         if (!IsDx12CommandList(cl)) return false;
 		const bool requestStreamlineProxy = iid == RHI_IID_D3D12_STREAMLINE_CMD_LIST;
         if (iid != RHI_IID_D3D12_CMD_LIST && !requestStreamlineProxy) return false;
@@ -143,6 +153,7 @@ namespace rhi {
 
     bool QueryNativeSwapchain(Swapchain sc, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
         if (!sc.IsValid() || !outStruct) return false;
+#if BASICRHI_ENABLE_VULKAN
         if (IsVulkanSwapchain(sc)) {
             if (iid != RHI_IID_VK_SWAPCHAIN || outSize < sizeof(VulkanSwapchainInfo)) return false;
             auto* impl = static_cast<VulkanDevice*>(sc.impl);
@@ -154,6 +165,7 @@ namespace rhi {
             out->version = 1;
             return true;
         }
+#endif
         if (!IsDx12Swapchain(sc)) return false;
         if (iid != RHI_IID_D3D12_SWAPCHAIN) return false;
         if (outSize < sizeof(D3D12SwapchainInfo)) return false;
@@ -169,6 +181,7 @@ namespace rhi {
 
     bool QueryNativeResource(Resource h, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
         if (!h.IsValid() || !outStruct) return false;
+#if BASICRHI_ENABLE_VULKAN
         if (IsVulkanResource(h)) {
             if (iid != RHI_IID_VK_RESOURCE || outSize < sizeof(VulkanResourceInfo)) return false;
             auto* impl = static_cast<VulkanDevice*>(h.impl);
@@ -188,6 +201,7 @@ namespace rhi {
             out->usage = rec->imageUsage;
             return true;
         }
+#endif
         if (!IsDx12Resource(h)) return false;
         if (iid != RHI_IID_D3D12_RESOURCE) return false;
         if (outSize < sizeof(D3D12ResourceInfo)) return false;
@@ -205,6 +219,7 @@ namespace rhi {
 
     bool QueryNativeHeap(Heap h, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
         if (!h.IsValid() || !outStruct) return false;
+#if BASICRHI_ENABLE_VULKAN
         if (h.vt == &g_vkhevt) {
             if (iid != RHI_IID_VK_HEAP || outSize < sizeof(VulkanHeapInfo)) return false;
             auto* impl = static_cast<VulkanDevice*>(h.impl);
@@ -216,6 +231,7 @@ namespace rhi {
             out->version = 1;
             return true;
         }
+#endif
         if (h.vt != &g_hevt) return false;
         if (iid != RHI_IID_D3D12_HEAP) return false;
         if (outSize < sizeof(D3D12HeapInfo)) return false;
@@ -229,6 +245,7 @@ namespace rhi {
 
     bool QueryNativeQueryPool(QueryPool qp, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
 		if (!qp.IsValid() || !outStruct) return false;
+#if BASICRHI_ENABLE_VULKAN
         if (qp.vt == &g_vkqpvt) {
             if (iid != RHI_IID_VK_QUERY_POOL || outSize < sizeof(VulkanQueryPoolInfo)) return false;
             auto* impl = static_cast<VulkanDevice*>(qp.impl);
@@ -240,6 +257,7 @@ namespace rhi {
             out->version = 1;
             return true;
         }
+#endif
         if (qp.vt != &g_qpvt) return false;
 		if (iid != RHI_IID_D3D12_QUERY_POOL) return false;
 		if (outSize < sizeof(D3D12QueryPoolInfo)) return false;
@@ -253,6 +271,7 @@ namespace rhi {
 
     bool QueryNativePipeline(Pipeline p, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
         if (!p.IsValid() || !outStruct) return false;
+#if BASICRHI_ENABLE_VULKAN
         if (p.vt == &g_vkpsovt) {
             if (iid != RHI_IID_VK_PIPELINE || outSize < sizeof(VulkanPipelineInfo)) return false;
             auto* impl = static_cast<VulkanDevice*>(p.impl);
@@ -264,6 +283,7 @@ namespace rhi {
             out->version = 1;
             return true;
         }
+#endif
         if (p.vt != &g_psovt) return false;
         if (iid != RHI_IID_D3D12_PIPELINE) return false;
         if (outSize < sizeof(D3D12PipelineInfo)) return false;
@@ -277,7 +297,9 @@ namespace rhi {
 
     bool QueryNativePipelineLayout(PipelineLayout pl, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
         if (!pl.IsValid() || !outStruct) return false;
+#if BASICRHI_ENABLE_VULKAN
 		if (pl.vt == &g_vkplvt) return false;
+#endif
 		if (pl.vt != &g_plvt) return false;
         if (iid != RHI_IID_D3D12_PIPELINE_LAYOUT) return false;
         if (outSize < sizeof(D3D12PipelineLayoutInfo)) return false;
@@ -291,6 +313,7 @@ namespace rhi {
 
     bool QueryNativeDescriptorHeap(DescriptorHeap dh, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
         if (!dh.IsValid() || !outStruct) return false;
+#if BASICRHI_ENABLE_VULKAN
         if (dh.vt == &g_vkdhvt) {
             if (iid != RHI_IID_VK_DESCRIPTOR_HEAP || outSize < sizeof(VulkanDescriptorHeapInfo)) return false;
             auto* impl = static_cast<VulkanDevice*>(dh.impl);
@@ -302,6 +325,7 @@ namespace rhi {
             out->version = 1;
             return true;
         }
+#endif
         if (dh.vt != &g_dhvt) return false;
         if (iid != RHI_IID_D3D12_DESCRIPTOR_HEAP) return false;
         if (outSize < sizeof(D3D12DescriptorHeapInfo)) return false;
@@ -315,7 +339,9 @@ namespace rhi {
 
     bool QueryNativeCommandSignature(CommandSignature cs, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
         if (!cs.IsValid() || !outStruct) return false;
+#if BASICRHI_ENABLE_VULKAN
 		if (cs.vt == &g_vkcsvt) return false;
+#endif
 		if (cs.vt != &g_csvt) return false;
         if (iid != RHI_IID_D3D12_COMMAND_SIGNATURE) return false;
         if (outSize < sizeof(D3D12CommandSignatureInfo)) return false;
@@ -329,6 +355,7 @@ namespace rhi {
 
     bool QueryNativeTimeline(Timeline t, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
         if (!t.IsValid() || !outStruct) return false;
+#if BASICRHI_ENABLE_VULKAN
         if (t.vt == &g_vktlvt) {
             if (iid != RHI_IID_VK_TIMELINE || outSize < sizeof(VulkanTimelineInfo)) return false;
             auto* impl = static_cast<VulkanDevice*>(t.impl);
@@ -340,6 +367,7 @@ namespace rhi {
             out->version = 1;
             return true;
         }
+#endif
         if (t.vt != &g_tlvt) return false;
         if (iid != RHI_IID_D3D12_TIMELINE) return false;
         if (outSize < sizeof(D3D12TimelineInfo)) return false;
@@ -352,6 +380,7 @@ namespace rhi {
 	}
 
     bool QueryNativeDescriptorSlot(Device device, DescriptorSlot slot, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
+#if BASICRHI_ENABLE_VULKAN
         if (!device.IsValid() || !outStruct) return false;
         if (!IsVulkanDevice(device)) return false;
         if (iid != RHI_IID_VK_DESCRIPTOR_SLOT || outSize < sizeof(VulkanDescriptorSlotInfo)) return false;
@@ -373,6 +402,10 @@ namespace rhi {
         out->baseArrayLayer = rec.range.baseLayer;
         out->layerCount = rec.range.layerCount;
         return true;
+#else
+        (void)device; (void)slot; (void)iid; (void)outStruct; (void)outSize;
+        return false;
+#endif
     }
 
     namespace dx12 {
