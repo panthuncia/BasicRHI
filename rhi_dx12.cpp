@@ -3611,10 +3611,11 @@ namespace rhi {
 			return (uint32_t)impl->pNativeDevice->GetDescriptorHandleIncrementSize(t);
 		}
 
-		static Result d_createTimeline(Device* d, uint64_t initial, const char* dbg, TimelinePtr& out) noexcept {
+		static Result d_createTimeline(Device* d, uint64_t initial, const char* dbg, bool shared, TimelinePtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 			Microsoft::WRL::ComPtr<ID3D12Fence> f;
-			if (const auto hr = impl->pNativeDevice->CreateFence(initial, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f)); FAILED(hr)) {
+			const auto flags = shared ? D3D12_FENCE_FLAG_SHARED : D3D12_FENCE_FLAG_NONE;
+			if (const auto hr = impl->pNativeDevice->CreateFence(initial, flags, IID_PPV_ARGS(&f)); FAILED(hr)) {
 				RHI_FAIL(ToRHI(hr));
 			}
 			if (dbg) { std::wstring w(dbg, dbg + ::strlen(dbg)); f->SetName(w.c_str()); }
@@ -9602,7 +9603,9 @@ namespace rhi {
 			ComPtr<ID3D12Debug> dbg;
 			if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
 				dbg->EnableDebugLayer(), flags |= DXGI_CREATE_FACTORY_DEBUG;
-				const char* gpuValidation = std::getenv("SARP_D3D12_GPU_VALIDATION");
+				char* gpuValidation = nullptr;
+				size_t gpuValidationLength = 0;
+				_dupenv_s(&gpuValidation, &gpuValidationLength, "SARP_D3D12_GPU_VALIDATION");
 				if (gpuValidation &&
 					(std::strcmp(gpuValidation, "1") == 0 || _stricmp(gpuValidation, "true") == 0)) {
 					ComPtr<ID3D12Debug1> debug1;
@@ -9612,6 +9615,7 @@ namespace rhi {
 						spdlog::info("D3D12 GPU-based and synchronized command-queue validation enabled.");
 					}
 				}
+				std::free(gpuValidation);
 			}
 
 			// Enable DRED auto-breadcrumbs and page fault reporting

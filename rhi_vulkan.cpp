@@ -7564,7 +7564,8 @@ namespace rhi {
 			return static_cast<uint32_t>(VkDescriptorHeapStride(impl, type));
 		}
 
-		static Result d_createTimeline(Device* device, uint64_t initialValue, const char* debugName, TimelinePtr& out) noexcept {
+		static Result d_createTimeline(Device* device, uint64_t initialValue, const char* debugName, bool shared, TimelinePtr& out) noexcept {
+			(void)shared;
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || !impl->timelineSemaphoreEnabled) {
 				out.Reset();

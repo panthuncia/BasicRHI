@@ -2685,7 +2685,7 @@ namespace rhi {
 		Result(*createDepthStencilView)(Device*, DescriptorSlot, const ResourceHandle&, const DsvDesc&) noexcept;
 		Result(*createSampler)(Device*, DescriptorSlot, const SamplerDesc&) noexcept;
 		Result(*createCommittedResource)(Device*, const ResourceDesc&, ResourcePtr&) noexcept;
-		Result(*createTimeline)(Device*, uint64_t, const char*, TimelinePtr&) noexcept;
+		Result(*createTimeline)(Device*, uint64_t, const char*, bool shared, TimelinePtr&) noexcept;
 		Result(*createHeap)(const Device*, const HeapDesc&, HeapPtr&) noexcept;
 		Result(*createPlacedResource)(Device*, HeapHandle, uint64_t, const ResourceDesc&, ResourcePtr&) noexcept;
 		Result(*createQueryPool)(Device*, const QueryPoolDesc&, QueryPoolPtr&) noexcept;
@@ -2851,7 +2851,7 @@ namespace rhi {
 		void DestroyBuffer(ResourceHandle h) noexcept { deletionContext.DestroyBuffer(h); }
 		void DestroyTexture(ResourceHandle h) noexcept { deletionContext.DestroyTexture(h); }
 		uint32_t GetDescriptorHandleIncrementSize(DescriptorHeapType t) noexcept { return vt->getDescriptorHandleIncrementSize(this, t); }
-		Result CreateTimeline(TimelinePtr& out, uint64_t initial = 0, const char* name = nullptr) noexcept { return vt->createTimeline(this, initial, name, out); }
+		Result CreateTimeline(TimelinePtr& out, uint64_t initial = 0, const char* name = nullptr, bool shared = false) noexcept { return vt->createTimeline(this, initial, name, shared, out); }
 		void DestroyTimeline(TimelineHandle t) noexcept { deletionContext.DestroyTimeline(t); }
 		Result CreateHeap(const HeapDesc& h, HeapPtr& out) const noexcept { return vt->createHeap(this, h, out); }
 		void DestroyHeap(HeapHandle h) noexcept { deletionContext.DestroyHeap(h); }
