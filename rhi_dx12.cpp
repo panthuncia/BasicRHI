@@ -9853,6 +9853,41 @@ namespace rhi {
 		return Result::Ok;
 	}
 
+	namespace dx12 {
+		Result import_resource(Device device, ID3D12Resource* resource, ResourcePtr& out) noexcept
+		{
+			if (!device || device.vt != &g_devvt || !device.impl || !resource)
+				return Result::InvalidArgument;
+
+			auto* impl = static_cast<Dx12Device*>(device.impl);
+			const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+			Microsoft::WRL::ComPtr<ID3D12Resource> retained = resource;
+			Resource imported{};
+			if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+				const auto handle = impl->resources.alloc(Dx12Resource(std::move(retained), desc.Width, impl));
+				imported = Resource{ handle, false };
+				imported.impl = impl;
+				imported.vt = &g_buf_rvt;
+				out = MakeBufferPtr(&device, imported, impl->selfWeak.lock());
+			} else if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ||
+				desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+				desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+				const uint16_t arraySize = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize;
+				const uint16_t depth = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? desc.DepthOrArraySize : 1;
+				const auto handle = impl->resources.alloc(Dx12Resource(std::move(retained), desc.Format,
+					static_cast<uint32_t>(desc.Width), desc.Height, desc.MipLevels, arraySize,
+					desc.Dimension, depth, impl));
+				imported = Resource{ handle, true };
+				imported.impl = impl;
+				imported.vt = &g_tex_rvt;
+				out = MakeTexturePtr(&device, imported, impl->selfWeak.lock());
+			} else {
+				return Result::InvalidArgument;
+			}
+			return Result::Ok;
+		}
+	}
+
 	namespace debug {
 		std::vector<InstrumentationExecutionDetailSnapshot> GetInstrumentationExecutionDetails(
 			Device device,

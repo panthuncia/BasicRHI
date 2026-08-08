@@ -6,6 +6,10 @@
 
 namespace rhi::dx12 {
 
+    // Retains and imports a native resource into BasicRHI. The returned handle owns only
+    // its COM reference; the resource allocation remains owned by the creating API.
+    Result import_resource(rhi::Device device, ID3D12Resource* resource, rhi::ResourcePtr& out) noexcept;
+
     inline ID3D12Device* get_device(rhi::Device d) {
         D3D12DeviceInfo info{};
         if (!QueryNativeDevice(d, RHI_IID_D3D12_DEVICE, &info, sizeof(info))) return nullptr;
