@@ -428,6 +428,10 @@ namespace rhi {
 		constexpr Span(const T* d, uint32_t s) noexcept
 			: data(d), size(s) {
 		}
+		template<size_t N>
+		constexpr Span(const T (&d)[N]) noexcept
+			: data(d), size(static_cast<uint32_t>(N)) {
+		}
 		constexpr Span(const T* d) noexcept
 			: data(d), size(d ? 1 : 0) {
 		}
