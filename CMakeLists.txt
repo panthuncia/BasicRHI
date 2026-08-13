@@ -95,6 +95,7 @@ endif()
 
 # Build a static library for now.
 add_library(BasicRHI STATIC 
+    "rhi_c.h"
     "rhi_interop.h" 
     "rhi_reshape_shared.h"
     "rhi_dx12.h"  
@@ -284,7 +285,7 @@ PUBLIC
     $<$<BOOL:${BASICRHI_ENABLE_TRACY_GPU_PROFILING}>:Tracy::TracyClient>
 PRIVATE 
     fmt::fmt
-    spdlog::spdlog
+    spdlog::spdlog_header_only
 )
 if(BASICRHI_ENABLE_D3D12)
     target_link_libraries(BasicRHI PUBLIC Microsoft::DirectX-Headers PRIVATE d3d12 dxgi dxguid)
