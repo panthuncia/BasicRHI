@@ -25,9 +25,19 @@ namespace rhi {
 	using BreakCallbackFn = void(*)();
 	inline BreakCallbackFn g_breakCallback = nullptr;
 
+	// Best-effort backend diagnostics for process-wide abnormal-exit handlers.
+	// Unlike BreakIfDebugging, this is intentionally available in every build.
+	inline void CaptureAbnormalExitDiagnostics() noexcept {
+		try {
+			if (g_breakCallback) g_breakCallback();
+		} catch (...) {
+			// Diagnostics must never obscure the original failure.
+		}
+	}
+
 	inline void BreakIfDebugging() {
 #if BUILD_TYPE == BUILD_DEBUG
-		if (g_breakCallback) g_breakCallback();
+		CaptureAbnormalExitDiagnostics();
 		if (IsDebuggerPresent()) {
 			__debugbreak();
 		}

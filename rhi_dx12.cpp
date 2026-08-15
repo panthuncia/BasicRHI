@@ -4565,6 +4565,7 @@ namespace rhi {
 				Dx12RecordTimelineWait(*TL, *q, w.value, completedBefore, "q_submit");
 				if (completedBefore == UINT64_MAX) {
 					Dx12LogTimelineHistory("q_submit pre-wait saw UINT64_MAX", w.t, *TL, completedBefore);
+					LogDredData();
 					return Result::InvalidArgument;
 				}
 				if (FAILED(qs->pNativeQueue->Wait(TL->fence.Get(), w.value))) {
@@ -4613,6 +4614,7 @@ namespace rhi {
 				const uint64_t completedBefore = TL->fence ? TL->fence->GetCompletedValue() : 0;
 				if (completedBefore == UINT64_MAX) {
 					Dx12LogTimelineHistory("q_submit post-signal saw UINT64_MAX before signal", sgn.t, *TL, completedBefore);
+					LogDredData();
 					return Result::InvalidArgument;
 				}
 #if BUILD_TYPE == BUILD_DEBUG
@@ -7192,6 +7194,7 @@ namespace rhi {
 			const uint64_t completedBefore = TL->fence ? TL->fence->GetCompletedValue() : 0;
 			if (completedBefore == UINT64_MAX) {
 				Dx12LogTimelineHistory("q_signal saw UINT64_MAX before signal", p.t, *TL, completedBefore);
+				LogDredData();
 				return Result::InvalidArgument;
 			}
 #if BUILD_TYPE == BUILD_DEBUG
@@ -7236,6 +7239,7 @@ namespace rhi {
 			Dx12RecordTimelineWait(*TL, *q, p.value, completedBefore, "q_wait");
 			if (completedBefore == UINT64_MAX) {
 				Dx12LogTimelineHistory("q_wait saw UINT64_MAX before wait", p.t, *TL, completedBefore);
+				LogDredData();
 				return Result::InvalidArgument;
 			}
 			return SUCCEEDED(qs->pNativeQueue->Wait(TL->fence.Get(), p.value)) ? Result::Ok : Result::Failed;
@@ -9165,6 +9169,7 @@ namespace rhi {
 			const uint64_t value = impl->fence ? impl->fence->GetCompletedValue() : 0;
 			if (value == UINT64_MAX) {
 				Dx12LogTimelineHistory("GetCompletedValue returned UINT64_MAX", t->GetHandle(), *impl, value);
+				LogDredData();
 			}
 			return value;
 		}
@@ -9618,15 +9623,16 @@ namespace rhi {
 				std::free(gpuValidation);
 			}
 
-			// Enable DRED auto-breadcrumbs and page fault reporting
-			// Must be configured *before* D3D12 device creation.
-			ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> dredSettings;
-			if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings)))) {
-				dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-				dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-				dredSettings->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-				spdlog::info("DRED auto-breadcrumbs and page fault reporting enabled.");
-			}
+		}
+
+		// DRED is crash diagnostics, not debug validation. Keep it enabled in
+		// production builds too, and configure it before creating the device.
+		ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> dredSettings;
+		if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings)))) {
+			dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			dredSettings->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			spdlog::info("DRED auto-breadcrumbs and page fault reporting enabled.");
 		}
 
 		auto impl = std::make_shared<Dx12Device>();
@@ -9787,13 +9793,12 @@ namespace rhi {
 
 		if (ci.enableDebug) {
 			EnableDebug(impl->pNativeDevice.Get());
-
-			// Register the DRED device and break callback so BreakIfDebugging
-			// automatically checks for device removal and dumps DRED data.
-			g_dredDevice = impl->pNativeDevice.Get();
-			g_dredReportState.store(0, std::memory_order_release);
-			g_breakCallback = &LogDredData;
 		}
+
+		// Register for process-wide abnormal-exit diagnostics in every build.
+		g_dredDevice = impl->pNativeDevice.Get();
+		g_dredReportState.store(0, std::memory_order_release);
+		g_breakCallback = &LogDredData;
 
 		// Queue creation: MUST go through proxy device, store both proxy+native
 		auto makeQ = [&](D3D12_COMMAND_LIST_TYPE t, const wchar_t* debugName) -> QueueHandle
