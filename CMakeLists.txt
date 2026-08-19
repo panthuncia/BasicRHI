@@ -26,7 +26,18 @@ if(BASICRHI_ENABLE_D3D12)
 endif()
 if(BASICRHI_ENABLE_VULKAN)
     find_package(Vulkan REQUIRED)
-    find_package(volk CONFIG REQUIRED)
+    find_package(volk CONFIG QUIET)
+    if(NOT TARGET volk::volk)
+        # A renderer host can import vulkan-1 through other SDKs while also
+        # using Volk's writable vk* dispatch globals.  Keep those symbols in
+        # Volk's C++ namespace so the linker cannot bind them to loader import
+        # thunks in a mixed D3D12/Vulkan executable.
+        set(VOLK_NAMESPACE ON CACHE BOOL "Use C++ namespace for vk* functions" FORCE)
+        add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../volk" "${CMAKE_CURRENT_BINARY_DIR}/_deps/volk" EXCLUDE_FROM_ALL)
+    endif()
+    if(WIN32 AND TARGET volk)
+        target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+    endif()
 endif()
 if(BASICRHI_ENABLE_IMGUI)
     find_package(imgui CONFIG REQUIRED)
@@ -129,7 +140,7 @@ if(BASICRHI_ENABLE_IMGUI)
 endif()
 
 if(WIN32 AND BASICRHI_ENABLE_VULKAN)
-    target_compile_definitions(BasicRHI PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+    target_compile_definitions(BasicRHI PUBLIC VK_USE_PLATFORM_WIN32_KHR)
 endif()
 
 if(_basicrhi_streamline_available)
@@ -228,7 +239,12 @@ else()
 endif()
 if(BASICRHI_ENABLE_VULKAN)
     target_sources(BasicRHI PRIVATE rhi_vulkan.cpp)
-    target_link_libraries(BasicRHI PRIVATE Vulkan::Vulkan volk::volk)
+    # volk owns Vulkan dispatch. Linking vulkan-1 as well can resolve volk's
+    # function-pointer globals to loader import thunks in a mixed DX12/Vulkan
+    # executable, making volkInitialize write through an invalid address.
+    # Public because BasicRHI's Vulkan interop header includes volk.h and its
+    # namespace choice must be identical in every consumer translation unit.
+    target_link_libraries(BasicRHI PUBLIC $<BUILD_INTERFACE:volk::volk>)
 else()
     target_sources(BasicRHI PRIVATE rhi_vulkan_stub.cpp)
 endif()
@@ -311,5 +327,13 @@ if(BASICRHI_BUILD_TESTS)
     if(BASICRHI_ENABLE_D3D12 AND WIN32)
         add_executable(BasicRHID3D12AliasingSmoke tests/D3D12AliasingSmoke.cpp)
         target_link_libraries(BasicRHID3D12AliasingSmoke PRIVATE BasicRHI::BasicRHI)
+    endif()
+    if(BASICRHI_ENABLE_D3D12 AND BASICRHI_ENABLE_VULKAN AND WIN32)
+        add_executable(BasicRHIWin32InteropSmoke tests/Win32InteropSmoke.cpp tests/StreamlineStubs.cpp)
+        target_link_libraries(BasicRHIWin32InteropSmoke PRIVATE BasicRHI::BasicRHI)
+        if(TARGET Streamline::headers)
+            target_link_libraries(BasicRHIWin32InteropSmoke PRIVATE Streamline::headers)
+        endif()
+        add_test(NAME BasicRHIWin32InteropSmoke COMMAND BasicRHIWin32InteropSmoke)
     endif()
 endif()

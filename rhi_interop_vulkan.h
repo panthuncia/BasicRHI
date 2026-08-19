@@ -10,6 +10,9 @@
 
 #if __has_include("volk.h")
 #include "volk.h"
+#ifdef VOLK_NAMESPACE
+using namespace volk;
+#endif
 #elif __has_include(<vulkan/vulkan.h>)
 #include <vulkan/vulkan.h>
 #endif
@@ -19,6 +22,49 @@
 #define BASICRHI_HAS_VULKAN_HEADERS 1
 
 namespace rhi::vulkan {
+
+    struct Win32ExternalInteropCapabilities {
+        bool memory = false;
+        bool timeline = false;
+        bool d3d12ResourceBuffers = false;
+		bool d3d12ResourceImages = false;
+		bool d3d12Heaps = false;
+    };
+
+	struct ExternalImageSupport {
+		bool supported = false;
+		bool importable = false;
+		bool dedicatedOnly = false;
+		uint64_t allocationSize = 0;
+		uint64_t alignment = 0;
+		uint32_t memoryTypeBits = 0;
+	};
+
+    Win32ExternalInteropCapabilities query_win32_external_interop(rhi::Device device) noexcept;
+    Result import_d3d12_buffer(
+        rhi::Device device,
+        void* sharedHandle,
+        const rhi::ResourceDesc& desc,
+        rhi::ResourcePtr& out) noexcept;
+	ExternalImageSupport query_d3d12_texture_support(
+		rhi::Device device,
+		const rhi::ResourceDesc& desc) noexcept;
+	Result import_d3d12_texture(
+		rhi::Device device,
+		void* sharedHandle,
+		const rhi::ResourceDesc& desc,
+		rhi::ResourcePtr& out) noexcept;
+	Result import_d3d12_heap(
+		rhi::Device device,
+		void* sharedHandle,
+		const rhi::HeapDesc& desc,
+		rhi::HeapPtr& out) noexcept;
+    Result import_d3d12_timeline(
+        rhi::Device device,
+        void* sharedHandle,
+        uint64_t initialValue,
+        const char* debugName,
+        rhi::TimelinePtr& out) noexcept;
 
     inline bool spirv_instruction_string_equals(const uint32_t* words, uint32_t wordCount, const char* expected) noexcept {
         const char* bytes = reinterpret_cast<const char*>(words);
@@ -191,6 +237,8 @@ namespace rhi::vulkan {
         if (!QueryNativeDevice(device, RHI_IID_VK_DEVICE, &info, sizeof(info))) return VK_NULL_HANDLE;
 		return from_native_void<VkPhysicalDevice>(info.physicalDevice);
     }
+
+    uint64_t get_adapter_luid(rhi::Device device) noexcept;
 
     inline VkDevice get_device(rhi::Device device) {
         VulkanDeviceInfo info{};

@@ -1,4 +1,5 @@
 #include "rhi_dx12.h"
+#include "rhi_interop_dx12.h"
 #include <atlbase.h>
 #include <d3d12sdklayers.h>   // ID3D12DebugDevice + D3D12_RLDO_*
 #include <initguid.h>   // defines INITGUID
@@ -641,6 +642,20 @@ namespace rhi {
 			}
 		}
 
+		return selected;
+	}
+
+	static ComPtr<IDXGIAdapter1> Dx12FindAdapterByLuid(IDXGIFactory7* factory, uint64_t encodedLuid) noexcept {
+		ComPtr<IDXGIAdapter1> selected;
+		if (!factory) return selected;
+		LUID luid{};
+		luid.LowPart = static_cast<DWORD>(encodedLuid & 0xffffffffull);
+		luid.HighPart = static_cast<LONG>((encodedLuid >> 32u) & 0xffffffffull);
+		ComPtr<IDXGIAdapter4> adapter4;
+		if (SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter4))) && adapter4 &&
+			Dx12IsUsableHardwareAdapter(adapter4.Get())) {
+			adapter4.As(&selected);
+		}
 		return selected;
 	}
 
@@ -7979,6 +7994,18 @@ namespace rhi {
 				return;
 			}
 
+			// Enhanced texture-barrier layouts are command-queue specific.  COPY
+			// command lists do not accept the generic COPY_SOURCE/COPY_DEST layouts;
+			// textures copied by a copy queue remain in COMMON.  The access/sync
+			// scopes still describe the ordering of the copy operation.
+			auto textureLayout = [l](ResourceLayout layout) noexcept {
+				if (l->type == D3D12_COMMAND_LIST_TYPE_COPY &&
+					(layout == ResourceLayout::CopySource || layout == ResourceLayout::CopyDest)) {
+					return D3D12_BARRIER_LAYOUT_COMMON;
+				}
+				return ToDX(layout);
+			};
+
 			std::vector<D3D12_TEXTURE_BARRIER> tex;
 			std::vector<D3D12_BUFFER_BARRIER>  buf;
 			std::vector<D3D12_GLOBAL_BARRIER>  glob;
@@ -8027,8 +8054,8 @@ namespace rhi {
 				tb.SyncAfter = ToDX(t.afterSync);
 				tb.AccessBefore = ToDX(t.discard ? ResourceAccessType::None : t.beforeAccess);
 				tb.AccessAfter = ToDX(t.afterAccess);
-				tb.LayoutBefore = ToDX(t.beforeLayout);
-				tb.LayoutAfter = ToDX(t.afterLayout);
+				tb.LayoutBefore = textureLayout(t.beforeLayout);
+				tb.LayoutAfter = textureLayout(t.afterLayout);
 				tb.pResource = T->res.Get();
 				tb.Subresources = ToDX(t.range);
 				tb.Flags = t.discard ? D3D12_TEXTURE_BARRIER_FLAG_DISCARD : D3D12_TEXTURE_BARRIER_FLAG_NONE;
@@ -9652,6 +9679,8 @@ namespace rhi {
 				spdlog::error("DX12 device setup: supplied native adapter does not implement IDXGIAdapter1");
 				RHI_FAIL(ToRHI(adapterHr));
 			}
+		} else if (ci.requireAdapterLuid) {
+			adapter = Dx12FindAdapterByLuid(impl->pNativeFactory.Get(), ci.adapterLuid);
 		} else {
 			adapter = Dx12ChooseAdapter(impl->pNativeFactory.Get());
 		}
@@ -9889,6 +9918,55 @@ namespace rhi {
 			} else {
 				return Result::InvalidArgument;
 			}
+			return Result::Ok;
+		}
+
+		Result export_shared_resource(Device device, Resource resource, SharedHandle& out) noexcept
+		{
+			out = {};
+			if (!device || device.vt != &g_devvt || resource.impl != device.impl ||
+				(resource.vt != &g_buf_rvt && resource.vt != &g_tex_rvt)) {
+				return Result::InvalidArgument;
+			}
+			auto* impl = static_cast<Dx12Device*>(device.impl);
+			auto* native = impl->resources.get(resource.GetHandle());
+			if (!native || !native->res) return Result::InvalidArgument;
+			HANDLE handle = nullptr;
+			const HRESULT hr = impl->pNativeDevice->CreateSharedHandle(native->res.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
+			if (FAILED(hr)) return ToRHI(hr);
+			out.value = handle;
+			return Result::Ok;
+		}
+
+		Result export_shared_heap(Device device, Heap heap, SharedHandle& out) noexcept
+		{
+			out = {};
+			if (!device || device.vt != &g_devvt || heap.impl != device.impl || heap.vt != &g_hevt) {
+				return Result::InvalidArgument;
+			}
+			auto* impl = static_cast<Dx12Device*>(device.impl);
+			auto* native = impl->heaps.get(heap.GetHandle());
+			if (!native || !native->heap) return Result::InvalidArgument;
+			HANDLE handle = nullptr;
+			const HRESULT hr = impl->pNativeDevice->CreateSharedHandle(native->heap.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
+			if (FAILED(hr)) return ToRHI(hr);
+			out.value = handle;
+			return Result::Ok;
+		}
+
+		Result export_shared_timeline(Device device, Timeline timeline, SharedHandle& out) noexcept
+		{
+			out = {};
+			if (!device || device.vt != &g_devvt || timeline.impl != device.impl || timeline.vt != &g_tlvt) {
+				return Result::InvalidArgument;
+			}
+			auto* impl = static_cast<Dx12Device*>(device.impl);
+			auto* native = impl->timelines.get(timeline.GetHandle());
+			if (!native || !native->fence) return Result::InvalidArgument;
+			HANDLE handle = nullptr;
+			const HRESULT hr = impl->pNativeDevice->CreateSharedHandle(native->fence.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
+			if (FAILED(hr)) return ToRHI(hr);
+			out.value = handle;
 			return Result::Ok;
 		}
 	}

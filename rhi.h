@@ -1917,6 +1917,7 @@ namespace rhi {
 
 	// --- Texture / Buffer / Global barrier descriptions ---
 	struct TextureBarrier {
+		enum class ExternalOwnership : uint8_t { None, Acquire, Release };
 		ResourceHandle        texture{};
 		TextureSubresourceRange range{}; // baseMip/mipCount, baseLayer/layerCount
 		ResourceSyncState    beforeSync{ ResourceSyncState::None };
@@ -1926,9 +1927,11 @@ namespace rhi {
 		ResourceLayout       beforeLayout{ ResourceLayout::Undefined };
 		ResourceLayout       afterLayout{ ResourceLayout::Undefined };
 		bool discard{ false }; // if true, contents before the barrier are undefined (can skip some sync on certain APIs)
+		ExternalOwnership externalOwnership{ ExternalOwnership::None };
 	};
 
 	struct BufferBarrier {
+		enum class ExternalOwnership : uint8_t { None, Acquire, Release };
 		ResourceHandle       buffer{};
 		uint64_t             offset{ 0 };
 		uint64_t             size{ ~0ull }; // ~0 -> whole resource from offset
@@ -1937,6 +1940,7 @@ namespace rhi {
 		ResourceAccessType   beforeAccess{ ResourceAccessType::None };
 		ResourceAccessType   afterAccess{ ResourceAccessType::None };
 		bool discard{ false };
+		ExternalOwnership externalOwnership{ ExternalOwnership::None };
 	};
 
 	struct GlobalBarrier {
@@ -3078,6 +3082,16 @@ namespace rhi {
 		uint32_t framesInFlight = 3;
 		bool enableDebug = true;
 		bool validateBarrierTransitions = false;
+		// Enables the platform external-memory and external-timeline capabilities used
+		// by multi-RHI applications. Backends fail creation when the requested
+		// capabilities are unavailable instead of silently selecting a non-interoperable
+		// device.
+		bool enableExternalInterop = false;
+		// Windows adapter LUID encoded as the unsigned 64-bit LowPart/HighPart bit
+		// pattern. When requiredAdapterLuid is true, device creation must use the
+		// matching physical adapter.
+		uint64_t adapterLuid = 0;
+		bool requireAdapterLuid = false;
 		// Optional borrowed IDXGIAdapter. D3D12 creation uses this exact adapter
 		// instead of performing adapter selection. BasicRHI does not retain it.
 		void* nativeAdapter = nullptr;

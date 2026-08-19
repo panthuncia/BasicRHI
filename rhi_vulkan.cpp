@@ -1,4 +1,5 @@
 #include "rhi_vulkan.h"
+#include "rhi_interop_vulkan.h"
 
 #include <algorithm>
 #include <cmath>
@@ -763,6 +764,7 @@ namespace rhi {
 
 		static bool VkSelectPhysicalDeviceAndQueues(
 			VkInstance instance,
+			const DeviceCreateInfo& deviceCreateInfo,
 			VkPhysicalDevice& selectedDevice,
 			VkPhysicalDeviceProperties& selectedProperties,
 			VkPhysicalDeviceMemoryProperties& selectedMemoryProperties,
@@ -791,6 +793,21 @@ namespace rhi {
 				VkPhysicalDevice candidate = physicalDevices[deviceIndex];
 				VkPhysicalDeviceProperties properties{};
 				vkGetPhysicalDeviceProperties(candidate, &properties);
+				if (deviceCreateInfo.requireAdapterLuid) {
+#ifdef _WIN32
+					VkPhysicalDeviceIDProperties ids{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+					VkPhysicalDeviceProperties2 properties2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+					properties2.pNext = &ids;
+					vkGetPhysicalDeviceProperties2(candidate, &properties2);
+					uint64_t candidateLuid = 0;
+					if (!ids.deviceLUIDValid) continue;
+					static_assert(VK_LUID_SIZE == sizeof(candidateLuid));
+					std::memcpy(&candidateLuid, ids.deviceLUID, sizeof(candidateLuid));
+					if (candidateLuid != deviceCreateInfo.adapterLuid) continue;
+#else
+					continue;
+#endif
+				}
 
 				uint32_t familyCount = 0;
 				vkGetPhysicalDeviceQueueFamilyProperties(candidate, &familyCount, nullptr);
@@ -4070,19 +4087,23 @@ namespace rhi {
 				VkImageMemoryBarrier vkBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
 				const bool beforePresent = barrier.beforeLayout == ResourceLayout::Present;
 				const bool afterPresent = barrier.afterLayout == ResourceLayout::Present;
-				vkBarrier.srcAccessMask = (barrier.discard || firstUseFromUndefined || beforePresent) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
-				vkBarrier.dstAccessMask = afterPresent ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
+				const bool externalAcquire = barrier.externalOwnership == TextureBarrier::ExternalOwnership::Acquire;
+				const bool externalRelease = barrier.externalOwnership == TextureBarrier::ExternalOwnership::Release;
+				const VulkanQueueState* recordingQueue = VkPrimaryQueueStateForKind(impl, commandListState->kind);
+				const uint32_t recordingFamily = recordingQueue ? recordingQueue->familyIndex : VK_QUEUE_FAMILY_IGNORED;
+				vkBarrier.srcAccessMask = (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
+				vkBarrier.dstAccessMask = (afterPresent || externalRelease) ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
 				vkBarrier.oldLayout = (barrier.discard || firstUseFromUndefined) ? VK_IMAGE_LAYOUT_UNDEFINED : VkToImageLayout(barrier.beforeLayout, aspect);
 				vkBarrier.newLayout = VkToImageLayout(barrier.afterLayout, aspect);
-				vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-				vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				vkBarrier.srcQueueFamilyIndex = externalAcquire ? VK_QUEUE_FAMILY_EXTERNAL : (externalRelease ? recordingFamily : VK_QUEUE_FAMILY_IGNORED);
+				vkBarrier.dstQueueFamilyIndex = externalAcquire ? recordingFamily : (externalRelease ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED);
 				vkBarrier.image = resource->image;
 				vkBarrier.subresourceRange = VkMakeImageSubresourceRange(*resource, barrier.range, aspect);
 				imageBarriers.push_back(vkBarrier);
 				const bool beforeTransferClear = (barrier.beforeAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
 				const bool afterTransferClear = (barrier.afterAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
-				srcStages |= (barrier.discard || firstUseFromUndefined || beforePresent) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (VkStageMaskForSync(barrier.beforeSync) | (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
-				dstStages |= afterPresent ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : (VkStageMaskForSync(barrier.afterSync) | (afterTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
+				srcStages |= (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (VkStageMaskForSync(barrier.beforeSync) | (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
+				dstStages |= (afterPresent || externalRelease) ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : (VkStageMaskForSync(barrier.afterSync) | (afterTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
 				if (impl->validateBarrierTransitions) {
 					recordedBatch.textures.push_back(VulkanCommandList::RecordedTextureBarrier{
 						barrier.texture,
@@ -4103,16 +4124,20 @@ namespace rhi {
 					continue;
 				}
 				VkBufferMemoryBarrier vkBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
-				vkBarrier.srcAccessMask = barrier.discard ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
-				vkBarrier.dstAccessMask = VkAccessMaskForAccess(barrier.afterAccess);
-				vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-				vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				const bool externalAcquire = barrier.externalOwnership == BufferBarrier::ExternalOwnership::Acquire;
+				const bool externalRelease = barrier.externalOwnership == BufferBarrier::ExternalOwnership::Release;
+				const VulkanQueueState* recordingQueue = VkPrimaryQueueStateForKind(impl, commandListState->kind);
+				const uint32_t recordingFamily = recordingQueue ? recordingQueue->familyIndex : VK_QUEUE_FAMILY_IGNORED;
+				vkBarrier.srcAccessMask = (barrier.discard || externalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
+				vkBarrier.dstAccessMask = externalRelease ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
+				vkBarrier.srcQueueFamilyIndex = externalAcquire ? VK_QUEUE_FAMILY_EXTERNAL : (externalRelease ? recordingFamily : VK_QUEUE_FAMILY_IGNORED);
+				vkBarrier.dstQueueFamilyIndex = externalAcquire ? recordingFamily : (externalRelease ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED);
 				vkBarrier.buffer = resource->buffer;
 				vkBarrier.offset = barrier.offset;
 				vkBarrier.size = barrier.size == ~0ull ? VK_WHOLE_SIZE : barrier.size;
 				bufferBarriers.push_back(vkBarrier);
-				srcStages |= barrier.discard ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VkStageMaskForSync(barrier.beforeSync);
-				dstStages |= VkStageMaskForSync(barrier.afterSync);
+				srcStages |= (barrier.discard || externalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VkStageMaskForSync(barrier.beforeSync);
+				dstStages |= externalRelease ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VkStageMaskForSync(barrier.afterSync);
 				if (impl->validateBarrierTransitions) {
 					recordedBatch.buffers.push_back(VulkanCommandList::RecordedBufferBarrier{
 						barrier.buffer,
@@ -7358,7 +7383,6 @@ namespace rhi {
 				createInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 			}
 			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
 			VkBuffer buffer = VK_NULL_HANDLE;
 			VkResult result = vkCreateBuffer(impl->device, &createInfo, nullptr, &buffer);
 			if (result != VK_SUCCESS) {
@@ -7766,6 +7790,12 @@ namespace rhi {
 			createInfo.usage = VkImageUsageForDesc(desc, format);
 			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 			createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			VkExternalMemoryImageCreateInfo externalInfo{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+			if (heapState->externalD3D12) {
+				externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+				createInfo.pNext = &externalInfo;
+				createInfo.flags |= VK_IMAGE_CREATE_ALIAS_BIT;
+			}
 
 			VkImage image = VK_NULL_HANDLE;
 			VkResult result = vkCreateImage(impl->device, &createInfo, nullptr, &image);
@@ -7830,6 +7860,11 @@ namespace rhi {
 				createInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 			}
 			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			VkExternalMemoryBufferCreateInfo externalInfo{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+			if (heapState->externalD3D12) {
+				externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+				createInfo.pNext = &externalInfo;
+			}
 
 			VkBuffer buffer = VK_NULL_HANDLE;
 			VkResult result = vkCreateBuffer(impl->device, &createInfo, nullptr, &buffer);
@@ -9031,6 +9066,7 @@ namespace rhi {
 		std::array<uint32_t, 3> selectedQueueFamilies{};
 		if (!VkSelectPhysicalDeviceAndQueues(
 			instance,
+			ci,
 			physicalDevice,
 			physicalDeviceProperties,
 			memoryProperties,
@@ -9179,7 +9215,30 @@ namespace rhi {
 #endif
 		const bool hasSpirv14Extension = VkHasDeviceExtension(physicalDevice, VK_KHR_SPIRV_1_4_EXTENSION_NAME);
 		const bool hasShaderFloatControlsExtension = VkHasDeviceExtension(physicalDevice, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+		const bool hasExternalMemoryWin32Extension =
+#ifdef _WIN32
+			VkHasDeviceExtension(physicalDevice, VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+#else
+			false;
+#endif
+		const bool hasExternalSemaphoreWin32Extension =
+#ifdef _WIN32
+			VkHasDeviceExtension(physicalDevice, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+#else
+			false;
+#endif
+		if (ci.enableExternalInterop && (!hasExternalMemoryWin32Extension || !hasExternalSemaphoreWin32Extension)) {
+			spdlog::error("CreateVulkanDevice: selected adapter lacks required Win32 external memory/semaphore extensions.");
+			vkDestroyInstance(instance, nullptr);
+			RHI_FAIL(Result::Unsupported);
+		}
 		std::vector<const char*> enabledDeviceExtensions;
+		if (ci.enableExternalInterop) {
+#ifdef _WIN32
+			enabledDeviceExtensions.push_back(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+			enabledDeviceExtensions.push_back(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+#endif
+		}
 		if (enableSwapchainExtension) {
 			enabledDeviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 		}
@@ -9529,6 +9588,8 @@ namespace rhi {
 		impl->bufferDeviceAddressEnabled = enabledVulkan12Features.bufferDeviceAddress == VK_TRUE;
 		impl->bufferDeviceAddressCaptureReplayEnabled = enabledVulkan12Features.bufferDeviceAddressCaptureReplay == VK_TRUE;
 		impl->timelineSemaphoreEnabled = enabledVulkan12Features.timelineSemaphore == VK_TRUE;
+		impl->externalMemoryWin32Enabled = ci.enableExternalInterop && hasExternalMemoryWin32Extension;
+		impl->externalSemaphoreWin32Enabled = ci.enableExternalInterop && hasExternalSemaphoreWin32Extension;
 		impl->descriptorIndexingEnabled = enabledVulkan12Features.descriptorIndexing == VK_TRUE;
 		impl->runtimeDescriptorArrayEnabled = enabledVulkan12Features.runtimeDescriptorArray == VK_TRUE;
 		impl->scalarBlockLayoutEnabled = enabledVulkan12Features.scalarBlockLayout == VK_TRUE;
@@ -9650,6 +9711,362 @@ namespace rhi {
 
 		outPtr = MakeDevicePtr(&impl->self, impl);
 		return Result::Ok;
+	}
+
+	namespace vulkan {
+		uint64_t get_adapter_luid(Device device) noexcept {
+#ifdef _WIN32
+			if (!device || device.vt != &g_vkdevvt || !device.impl) return 0;
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			VkPhysicalDeviceIDProperties ids{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+			VkPhysicalDeviceProperties2 properties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+			properties.pNext = &ids;
+			vkGetPhysicalDeviceProperties2(impl->physicalDevice, &properties);
+			if (!ids.deviceLUIDValid) return 0;
+			uint64_t luid = 0;
+			static_assert(VK_LUID_SIZE == sizeof(luid));
+			std::memcpy(&luid, ids.deviceLUID, sizeof(luid));
+			return luid;
+#else
+			(void)device;
+			return 0;
+#endif
+		}
+
+		Win32ExternalInteropCapabilities query_win32_external_interop(Device device) noexcept {
+			Win32ExternalInteropCapabilities caps{};
+#ifdef _WIN32
+			if (!device || device.vt != &g_vkdevvt || !device.impl) return caps;
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			caps.memory = impl->externalMemoryWin32Enabled;
+			caps.timeline = impl->externalSemaphoreWin32Enabled && impl->timelineSemaphoreEnabled;
+			if (caps.memory) {
+				VkPhysicalDeviceExternalBufferInfo info{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO };
+				info.flags = 0;
+				info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+				info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+				VkExternalBufferProperties properties{ VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES };
+				vkGetPhysicalDeviceExternalBufferProperties(impl->physicalDevice, &info, &properties);
+				caps.d3d12ResourceBuffers =
+					(properties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0;
+				info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+				vkGetPhysicalDeviceExternalBufferProperties(impl->physicalDevice, &info, &properties);
+				caps.d3d12Heaps =
+					(properties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0;
+				ResourceDesc probe{};
+				probe.type = ResourceType::Texture2D;
+				probe.heapType = HeapType::DeviceLocal;
+				probe.texture.format = Format::R8G8B8A8_UNorm;
+				probe.texture.width = probe.texture.height = 1;
+				probe.texture.depthOrLayers = probe.texture.mipLevels = probe.texture.sampleCount = 1;
+				caps.d3d12ResourceImages = query_d3d12_texture_support(device, probe).importable;
+			}
+#else
+			(void)device;
+#endif
+			return caps;
+		}
+
+		ExternalImageSupport query_d3d12_texture_support(Device device, const ResourceDesc& desc) noexcept {
+			ExternalImageSupport support{};
+#ifdef _WIN32
+			if (!device || device.vt != &g_vkdevvt || !device.impl || desc.type != ResourceType::Texture2D ||
+				desc.heapType != HeapType::DeviceLocal || desc.texture.width == 0 || desc.texture.height == 0 ||
+				desc.texture.depthOrLayers == 0 || desc.texture.mipLevels == 0 || desc.texture.sampleCount != 1 ||
+				(desc.resourceFlags & (RF_AllowDepthStencil | RF_AllowCrossAdapter | RF_AllowSimultaneousAccess)) != 0) return support;
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			if (!impl->externalMemoryWin32Enabled) return support;
+			const VkFormat format = ToVkFormat(desc.texture.format);
+			if (format == VK_FORMAT_UNDEFINED || VkIsDepthStencilFormat(format)) return support;
+
+			VkPhysicalDeviceExternalImageFormatInfo externalQuery{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO };
+			externalQuery.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+			VkPhysicalDeviceImageFormatInfo2 query{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2 };
+			query.pNext = &externalQuery;
+			query.format = format;
+			query.type = VK_IMAGE_TYPE_2D;
+			query.tiling = VK_IMAGE_TILING_OPTIMAL;
+			query.usage = VkImageUsageForDesc(desc, format);
+			VkExternalImageFormatProperties externalProperties{ VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+			VkImageFormatProperties2 properties{ VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2 };
+			properties.pNext = &externalProperties;
+			if (vkGetPhysicalDeviceImageFormatProperties2(impl->physicalDevice, &query, &properties) != VK_SUCCESS) return support;
+			const auto features = externalProperties.externalMemoryProperties.externalMemoryFeatures;
+			support.importable = (features & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0;
+			support.dedicatedOnly = (features & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) != 0;
+			support.supported = support.importable;
+			if (!support.supported) return support;
+
+			VkExternalMemoryImageCreateInfo externalInfo{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+			externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+			VkImageCreateInfo createInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+			createInfo.pNext = &externalInfo;
+			createInfo.imageType = VK_IMAGE_TYPE_2D;
+			createInfo.format = format;
+			createInfo.extent = { desc.texture.width, desc.texture.height, 1 };
+			createInfo.mipLevels = desc.texture.mipLevels;
+			createInfo.arrayLayers = desc.texture.depthOrLayers;
+			createInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+			createInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+			createInfo.usage = query.usage;
+			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			VkImage image = VK_NULL_HANDLE;
+			if (vkCreateImage(impl->device, &createInfo, nullptr, &image) == VK_SUCCESS) {
+				VkMemoryRequirements requirements{};
+				vkGetImageMemoryRequirements(impl->device, image, &requirements);
+				support.allocationSize = requirements.size;
+				support.alignment = requirements.alignment;
+				support.memoryTypeBits = requirements.memoryTypeBits;
+				vkDestroyImage(impl->device, image, nullptr);
+			}
+#else
+			(void)device; (void)desc;
+#endif
+			return support;
+		}
+
+		Result import_d3d12_texture(Device device, void* sharedHandle, const ResourceDesc& desc, ResourcePtr& out) noexcept {
+			out.Reset();
+#ifdef _WIN32
+			const ExternalImageSupport support = query_d3d12_texture_support(device, desc);
+			if (!sharedHandle || !support.supported) return sharedHandle ? Result::Unsupported : Result::InvalidArgument;
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			const auto getHandleProperties = reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
+				vkGetDeviceProcAddr(impl->device, "vkGetMemoryWin32HandlePropertiesKHR"));
+			if (!getHandleProperties) return Result::Unsupported;
+			const VkFormat format = ToVkFormat(desc.texture.format);
+			VkExternalMemoryImageCreateInfo externalInfo{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+			externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+			VkImageCreateInfo createInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+			createInfo.pNext = &externalInfo;
+			createInfo.imageType = VK_IMAGE_TYPE_2D;
+			createInfo.format = format;
+			createInfo.extent = { desc.texture.width, desc.texture.height, 1 };
+			createInfo.mipLevels = desc.texture.mipLevels;
+			createInfo.arrayLayers = desc.texture.depthOrLayers;
+			createInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+			createInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+			createInfo.usage = VkImageUsageForDesc(desc, format);
+			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			VkImage image = VK_NULL_HANDLE;
+			VkResult result = vkCreateImage(impl->device, &createInfo, nullptr, &image);
+			if (result != VK_SUCCESS) return ToRHI(result);
+			VkMemoryRequirements requirements{};
+			vkGetImageMemoryRequirements(impl->device, image, &requirements);
+			VkMemoryWin32HandlePropertiesKHR handleProperties{ VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
+			result = getHandleProperties(impl->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT, sharedHandle, &handleProperties);
+			uint32_t memoryTypeIndex = 0;
+			if (result != VK_SUCCESS || !VkFindMemoryTypeIndex(impl->memoryProperties,
+				requirements.memoryTypeBits & handleProperties.memoryTypeBits,
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memoryTypeIndex)) {
+				vkDestroyImage(impl->device, image, nullptr);
+				return result != VK_SUCCESS ? ToRHI(result) : Result::Unsupported;
+			}
+			VkMemoryDedicatedAllocateInfo dedicated{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+			dedicated.image = image;
+			VkImportMemoryWin32HandleInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+			importInfo.pNext = &dedicated;
+			importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+			importInfo.handle = static_cast<HANDLE>(sharedHandle);
+			VkMemoryAllocateInfo allocation{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+			allocation.pNext = &importInfo;
+			allocation.allocationSize = requirements.size;
+			allocation.memoryTypeIndex = memoryTypeIndex;
+			VkDeviceMemory memory = VK_NULL_HANDLE;
+			result = vkAllocateMemory(impl->device, &allocation, nullptr, &memory);
+			if (result == VK_SUCCESS) result = vkBindImageMemory(impl->device, image, memory, 0);
+			if (result != VK_SUCCESS) {
+				if (memory) vkFreeMemory(impl->device, memory, nullptr);
+				vkDestroyImage(impl->device, image, nullptr);
+				return ToRHI(result);
+			}
+			VulkanResource state{};
+			state.image = image; state.memory = memory; state.format = format; state.type = ResourceType::Texture2D;
+			state.currentLayout = ResourceLayout::Undefined; state.submittedLayout = ResourceLayout::Undefined;
+			state.width = desc.texture.width; state.height = desc.texture.height;
+			state.depthOrLayers = desc.texture.depthOrLayers; state.mipLevels = desc.texture.mipLevels;
+			state.imageUsage = createInfo.usage; state.ownsImage = true; state.ownsMemory = true;
+			const ResourceHandle handle = impl->resources.alloc(state);
+			Resource texture{ handle, true }; texture.impl = impl; texture.vt = &g_vktex_rvt;
+			out = MakeTexturePtr(&device, texture, impl->selfWeak.lock());
+			return Result::Ok;
+#else
+			(void)device; (void)sharedHandle; (void)desc;
+			return Result::Unsupported;
+#endif
+		}
+
+		Result import_d3d12_heap(Device device, void* sharedHandle, const HeapDesc& desc, HeapPtr& out) noexcept {
+			out.Reset();
+#ifdef _WIN32
+			if (!device || device.vt != &g_vkdevvt || !device.impl || !sharedHandle || desc.sizeBytes == 0 ||
+				desc.memory != HeapType::DeviceLocal) return Result::InvalidArgument;
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			const auto getHandleProperties = reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
+				vkGetDeviceProcAddr(impl->device, "vkGetMemoryWin32HandlePropertiesKHR"));
+			if (!impl->externalMemoryWin32Enabled || !getHandleProperties) return Result::Unsupported;
+			VkMemoryWin32HandlePropertiesKHR properties{ VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
+			VkResult result = getHandleProperties(impl->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT, sharedHandle, &properties);
+			uint32_t memoryTypeIndex = 0;
+			if (result != VK_SUCCESS || !VkFindMemoryTypeIndex(impl->memoryProperties, properties.memoryTypeBits,
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memoryTypeIndex)) {
+				return result != VK_SUCCESS ? ToRHI(result) : Result::Unsupported;
+			}
+			VkImportMemoryWin32HandleInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+			importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+			importInfo.handle = static_cast<HANDLE>(sharedHandle);
+			VkMemoryAllocateFlagsInfo flags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+			if (impl->bufferDeviceAddressEnabled) { flags.flags = VkMemoryDeviceAddressAllocateFlags(impl); importInfo.pNext = &flags; }
+			VkMemoryAllocateInfo allocation{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+			allocation.pNext = &importInfo; allocation.allocationSize = desc.sizeBytes; allocation.memoryTypeIndex = memoryTypeIndex;
+			VkDeviceMemory memory = VK_NULL_HANDLE;
+			result = vkAllocateMemory(impl->device, &allocation, nullptr, &memory);
+			if (result != VK_SUCCESS) return ToRHI(result);
+			const HeapHandle handle = impl->heaps.alloc(VulkanHeap{ memory, desc.sizeBytes, memoryTypeIndex, desc.memory, true });
+			Heap heap{ handle }; heap.impl = impl; heap.vt = &g_vkhevt;
+			out = MakeHeapPtr(&device, heap, impl->selfWeak.lock());
+			if (desc.debugName) VkSetObjectName(impl, reinterpret_cast<uint64_t>(memory), VK_OBJECT_TYPE_DEVICE_MEMORY, desc.debugName);
+			return Result::Ok;
+#else
+			(void)device; (void)sharedHandle; (void)desc;
+			return Result::Unsupported;
+#endif
+		}
+
+		Result import_d3d12_buffer(Device device, void* sharedHandle, const ResourceDesc& desc, ResourcePtr& out) noexcept {
+			out.Reset();
+#ifdef _WIN32
+			if (!device || device.vt != &g_vkdevvt || !device.impl || !sharedHandle ||
+				desc.type != ResourceType::Buffer || desc.heapType != HeapType::DeviceLocal || desc.buffer.sizeBytes == 0) {
+				return Result::InvalidArgument;
+			}
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			const auto getHandleProperties = reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
+				vkGetDeviceProcAddr(impl->device, "vkGetMemoryWin32HandlePropertiesKHR"));
+			if (!impl->externalMemoryWin32Enabled || !getHandleProperties) return Result::Unsupported;
+
+			VkExternalMemoryBufferCreateInfo externalInfo{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+			externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+			VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			createInfo.pNext = &externalInfo;
+			createInfo.size = desc.buffer.sizeBytes;
+			createInfo.usage = VkBufferUsageForDesc(impl, desc);
+			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			VkPhysicalDeviceExternalBufferInfo query{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO };
+			query.usage = createInfo.usage;
+			query.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+			VkExternalBufferProperties externalProperties{ VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES };
+			vkGetPhysicalDeviceExternalBufferProperties(impl->physicalDevice, &query, &externalProperties);
+			if ((externalProperties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) == 0) {
+				return Result::Unsupported;
+			}
+
+			VkBuffer buffer = VK_NULL_HANDLE;
+			VkResult vkResult = vkCreateBuffer(impl->device, &createInfo, nullptr, &buffer);
+			if (vkResult != VK_SUCCESS) return ToRHI(vkResult);
+			VkMemoryRequirements requirements{};
+			vkGetBufferMemoryRequirements(impl->device, buffer, &requirements);
+			VkMemoryWin32HandlePropertiesKHR handleProperties{ VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
+			vkResult = getHandleProperties(
+				impl->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT, sharedHandle, &handleProperties);
+			if (vkResult != VK_SUCCESS) {
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				return ToRHI(vkResult);
+			}
+			const uint32_t memoryTypeBits = requirements.memoryTypeBits & handleProperties.memoryTypeBits;
+			uint32_t memoryTypeIndex = 0;
+			if (!VkFindMemoryTypeIndex(impl->memoryProperties, memoryTypeBits,
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memoryTypeIndex)) {
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				return Result::Unsupported;
+			}
+
+			VkMemoryDedicatedAllocateInfo dedicated{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+			dedicated.buffer = buffer;
+			VkImportMemoryWin32HandleInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+			importInfo.pNext = &dedicated;
+			importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+			importInfo.handle = static_cast<HANDLE>(sharedHandle);
+			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+			allocateInfo.pNext = &importInfo;
+			allocateInfo.allocationSize = requirements.size;
+			allocateInfo.memoryTypeIndex = memoryTypeIndex;
+			VkDeviceMemory memory = VK_NULL_HANDLE;
+			vkResult = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &memory);
+			if (vkResult != VK_SUCCESS) {
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				return ToRHI(vkResult);
+			}
+			vkResult = vkBindBufferMemory(impl->device, buffer, memory, 0);
+			if (vkResult != VK_SUCCESS) {
+				vkFreeMemory(impl->device, memory, nullptr);
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				return ToRHI(vkResult);
+			}
+
+			VulkanResource state{};
+			state.buffer = buffer;
+			state.memory = memory;
+			state.bufferSize = desc.buffer.sizeBytes;
+			state.type = ResourceType::Buffer;
+			state.currentLayout = ResourceLayout::Common;
+			state.submittedLayout = ResourceLayout::Common;
+			state.ownsBuffer = true;
+			state.ownsMemory = true;
+			const ResourceHandle handle = impl->resources.alloc(state);
+			Resource resource{ handle, false };
+			resource.impl = impl;
+			resource.vt = &g_vkbuf_rvt;
+			out = MakeBufferPtr(&device, resource, impl->selfWeak.lock());
+			return Result::Ok;
+#else
+			(void)device; (void)sharedHandle; (void)desc;
+			return Result::Unsupported;
+#endif
+		}
+
+		Result import_d3d12_timeline(Device device, void* sharedHandle, uint64_t initialValue,
+			const char* debugName, TimelinePtr& out) noexcept {
+			out.Reset();
+#ifdef _WIN32
+			if (!device || device.vt != &g_vkdevvt || !device.impl || !sharedHandle) return Result::InvalidArgument;
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			const auto importSemaphore = reinterpret_cast<PFN_vkImportSemaphoreWin32HandleKHR>(
+				vkGetDeviceProcAddr(impl->device, "vkImportSemaphoreWin32HandleKHR"));
+			if (!impl->externalSemaphoreWin32Enabled || !impl->timelineSemaphoreEnabled || !importSemaphore) {
+				return Result::Unsupported;
+			}
+			VkSemaphoreTypeCreateInfo typeInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+			typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+			typeInfo.initialValue = initialValue;
+			VkSemaphoreCreateInfo createInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+			createInfo.pNext = &typeInfo;
+			VkSemaphore semaphore = VK_NULL_HANDLE;
+			VkResult vkResult = vkCreateSemaphore(impl->device, &createInfo, nullptr, &semaphore);
+			if (vkResult != VK_SUCCESS) return ToRHI(vkResult);
+			VkImportSemaphoreWin32HandleInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
+			importInfo.semaphore = semaphore;
+			importInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+			importInfo.handle = static_cast<HANDLE>(sharedHandle);
+			vkResult = importSemaphore(impl->device, &importInfo);
+			if (vkResult != VK_SUCCESS) {
+				vkDestroySemaphore(impl->device, semaphore, nullptr);
+				return ToRHI(vkResult);
+			}
+			const TimelineHandle handle = impl->timelines.alloc(VulkanTimeline{ semaphore, initialValue });
+			Timeline timeline{ handle };
+			timeline.impl = impl;
+			timeline.vt = &g_vktlvt;
+			out = MakeTimelinePtr(&device, timeline, impl->selfWeak.lock());
+			if (debugName) out->SetName(debugName);
+			return Result::Ok;
+#else
+			(void)device; (void)sharedHandle; (void)initialValue; (void)debugName;
+			return Result::Unsupported;
+#endif
+		}
 	}
 
 } // namespace rhi

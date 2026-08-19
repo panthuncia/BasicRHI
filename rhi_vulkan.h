@@ -4,6 +4,13 @@
 
 #include "volk.h"
 
+#ifdef VOLK_NAMESPACE
+// BasicRHI historically uses Vulkan entry points unqualified.  Volk's
+// namespace mode is required when DX12 and Vulkan coexist in an executable;
+// make its dispatch table visible without changing the public RHI surface.
+using namespace volk;
+#endif
+
 #include <array>
 #include <deque>
 #include <memory>
@@ -290,6 +297,7 @@ namespace rhi {
 		VkDeviceSize size = 0;
 		uint32_t memoryTypeIndex = 0;
 		HeapType heapType = HeapType::DeviceLocal;
+		bool externalD3D12 = false;
 	};
 
 	struct VulkanQueryPool {
@@ -422,6 +430,8 @@ namespace rhi {
 		bool bufferDeviceAddressEnabled = false;
 		bool bufferDeviceAddressCaptureReplayEnabled = false;
 		bool timelineSemaphoreEnabled = false;
+		bool externalMemoryWin32Enabled = false;
+		bool externalSemaphoreWin32Enabled = false;
 		bool descriptorIndexingEnabled = false;
 		bool runtimeDescriptorArrayEnabled = false;
 		bool scalarBlockLayoutEnabled = false;

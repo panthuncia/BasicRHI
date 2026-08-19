@@ -6,9 +6,19 @@
 
 namespace rhi::dx12 {
 
+    struct SharedHandle {
+        void* value = nullptr;
+    };
+
     // Retains and imports a native resource into BasicRHI. The returned handle owns only
     // its COM reference; the resource allocation remains owned by the creating API.
     Result import_resource(rhi::Device device, ID3D12Resource* resource, rhi::ResourcePtr& out) noexcept;
+
+    // The caller owns the returned Win32 HANDLE and must close it after every
+    // target API has imported it.
+    Result export_shared_resource(rhi::Device device, rhi::Resource resource, SharedHandle& out) noexcept;
+	Result export_shared_heap(rhi::Device device, rhi::Heap heap, SharedHandle& out) noexcept;
+    Result export_shared_timeline(rhi::Device device, rhi::Timeline timeline, SharedHandle& out) noexcept;
 
     inline ID3D12Device* get_device(rhi::Device d) {
         D3D12DeviceInfo info{};
@@ -24,6 +34,14 @@ namespace rhi::dx12 {
         D3D12DeviceInfo info{};
         if (!QueryNativeDevice(d, RHI_IID_D3D12_DEVICE, &info, sizeof(info))) return nullptr;
         return static_cast<IDXGIAdapter4*>(info.adapter);
+    }
+    inline uint64_t get_adapter_luid(rhi::Device d) {
+        auto* adapter = get_adapter(d);
+        if (!adapter) return 0;
+        DXGI_ADAPTER_DESC3 desc{};
+        if (FAILED(adapter->GetDesc3(&desc))) return 0;
+        return static_cast<uint64_t>(static_cast<uint32_t>(desc.AdapterLuid.LowPart)) |
+            (static_cast<uint64_t>(static_cast<uint32_t>(desc.AdapterLuid.HighPart)) << 32u);
     }
     inline ID3D12CommandQueue* get_queue(rhi::Queue q) {
         D3D12QueueInfo info{};
