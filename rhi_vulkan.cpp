@@ -44,6 +44,23 @@
 
 namespace rhi {
 	namespace {
+		static VKAPI_ATTR VkBool32 VKAPI_CALL VkValidationLogCallback(
+			VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+			VkDebugUtilsMessageTypeFlagsEXT,
+			const VkDebugUtilsMessengerCallbackDataEXT* callbackData,
+			void*) noexcept {
+			const char* message = callbackData && callbackData->pMessage ? callbackData->pMessage : "<no validation message>";
+			if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
+				spdlog::error("Vulkan validation: {}", message);
+			}
+			else if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0) {
+				spdlog::warn("Vulkan validation: {}", message);
+			}
+			else {
+				spdlog::debug("Vulkan validation: {}", message);
+			}
+			return VK_FALSE;
+		}
 		static constexpr uint32_t kVkInvalidQueueFamily = 0xFFFFFFFFu;
 		static void VkDestroyTracyGpuContext(VulkanQueueState& queueState) noexcept;
 
@@ -838,6 +855,9 @@ namespace rhi {
 				if (copyFamily == kVkInvalidQueueFamily) {
 					copyFamily = graphicsFamily;
 				}
+				if (copyFamily == kVkInvalidQueueFamily) {
+					copyFamily = graphicsFamily;
+				}
 
 				const int rank = VkDeviceTypeRank(properties.deviceType);
 				if (rank >= bestRank) {
@@ -1271,6 +1291,31 @@ namespace rhi {
 				stages |= VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
 #else
 				stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+#endif
+			}
+			return stages != 0 ? stages : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+		}
+
+		static VkPipelineStageFlags VkStagesForQueue(VkPipelineStageFlags stages, VkQueueFlags queueFlags) noexcept {
+			if ((queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) {
+				stages &= ~(VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT |
+					VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+					VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+					VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
+					VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT |
+					VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT |
+					VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+					VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+					VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+					VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+			}
+			if ((queueFlags & VK_QUEUE_COMPUTE_BIT) == 0) {
+				stages &= ~VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+#ifdef VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+				stages &= ~VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+#endif
+#ifdef VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+				stages &= ~VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
 #endif
 			}
 			return stages != 0 ? stages : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
@@ -3154,8 +3199,16 @@ namespace rhi {
 
 		static uint64_t tl_timelineCompletedValue(Timeline* timeline) noexcept {
 			auto* impl = timeline ? static_cast<VulkanDevice*>(timeline->impl) : nullptr;
+			if (!impl) {
+				return 0;
+			}
+			const std::lock_guard lock(impl->timelinesMutex);
 			VulkanTimeline* timelineState = VkTimelineState(impl, timeline ? timeline->GetHandle() : TimelineHandle{});
-			if (!impl || !timelineState || timelineState->semaphore == VK_NULL_HANDLE) {
+			if (!timelineState || timelineState->semaphore == VK_NULL_HANDLE) {
+				return 0;
+			}
+			if (timelineState->integrityCookie != 0x564B54494D454C4Eull) {
+				spdlog::critical("Vulkan timeline registry integrity cookie was overwritten before completion polling.");
 				return 0;
 			}
 
@@ -3171,14 +3224,19 @@ namespace rhi {
 					handle.generation,
 					timelineState->lastSubmittedSignalValue,
 					reinterpret_cast<uint64_t>(timelineState->semaphore));
+				spdlog::critical("Vulkan poisoned timeline kind={}", timelineState->importedD3D12Fence ? "imported-d3d12-fence" : "native-vulkan");
 			}
 			return value;
 		}
 
 		static Result tl_timelineHostWait(Timeline* timeline, const uint64_t value, uint32_t timeoutMs) noexcept {
 			auto* impl = timeline ? static_cast<VulkanDevice*>(timeline->impl) : nullptr;
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			const std::lock_guard lock(impl->timelinesMutex);
 			VulkanTimeline* timelineState = VkTimelineState(impl, timeline ? timeline->GetHandle() : TimelineHandle{});
-			if (!impl || !timelineState || timelineState->semaphore == VK_NULL_HANDLE) {
+			if (!timelineState || timelineState->semaphore == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
@@ -3194,6 +3252,8 @@ namespace rhi {
 
 		static void tl_setName(Timeline* timeline, const char* name) noexcept {
 			auto* impl = timeline ? static_cast<VulkanDevice*>(timeline->impl) : nullptr;
+			if (!impl) return;
+			const std::lock_guard lock(impl->timelinesMutex);
 			VulkanTimeline* timelineState = VkTimelineState(impl, timeline ? timeline->GetHandle() : TimelineHandle{});
 			if (timelineState) {
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(timelineState->semaphore), VK_OBJECT_TYPE_SEMAPHORE, name);
@@ -3385,6 +3445,7 @@ namespace rhi {
 			if (!impl || impl->device == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
+			const std::lock_guard timelineLock(impl->timelinesMutex);
 
 			if ((submit.waits.size != 0 || submit.signals.size != 0) && !impl->timelineSemaphoreEnabled) {
 				RHI_FAIL(Result::Unsupported);
@@ -3650,7 +3711,9 @@ namespace rhi {
 			}
 
 			if (resourceState->mappedData == nullptr) {
-				const VkDeviceSize mapSize = size == ~0ull ? VK_WHOLE_SIZE : static_cast<VkDeviceSize>(size);
+				// RHI callers use size==0 to request the remaining resource, matching
+				// the legacy D3D12 path. Vulkan rejects an explicit zero map size.
+				const VkDeviceSize mapSize = (size == 0 || size == ~0ull) ? VK_WHOLE_SIZE : static_cast<VkDeviceSize>(size);
 				void* mappedData = nullptr;
 				if (vkMapMemory(impl->device, resourceState->memory, static_cast<VkDeviceSize>(offset), mapSize, 0, &mappedData) != VK_SUCCESS) {
 					return;
@@ -4160,9 +4223,15 @@ namespace rhi {
 			}
 
 			if (!imageBarriers.empty() || !bufferBarriers.empty() || !memoryBarriers.empty()) {
+				const VulkanQueueState* barrierQueue = VkPrimaryQueueStateForKind(impl, commandListState->kind);
+				const VkQueueFlags queueFlags = barrierQueue && barrierQueue->familyIndex < impl->queueFamilyProperties.size()
+					? impl->queueFamilyProperties[barrierQueue->familyIndex].queueFlags
+					: (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT);
+				srcStages = VkStagesForQueue(srcStages != 0 ? srcStages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queueFlags);
+				dstStages = VkStagesForQueue(dstStages != 0 ? dstStages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queueFlags);
 				vkCmdPipelineBarrier(commandListState->commandBuffer,
-					srcStages != 0 ? srcStages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-					dstStages != 0 ? dstStages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+					srcStages,
+					dstStages,
 					0,
 					static_cast<uint32_t>(memoryBarriers.size()), memoryBarriers.empty() ? nullptr : memoryBarriers.data(),
 					static_cast<uint32_t>(bufferBarriers.size()), bufferBarriers.empty() ? nullptr : bufferBarriers.data(),
@@ -4656,7 +4725,14 @@ namespace rhi {
 			VkQueryPool queryPool = VK_NULL_HANDLE;
 			if (vkCreateQueryPool(impl->device, &queryInfo, nullptr, &queryPool) != VK_SUCCESS) return;
 			commandListState->transientQueryPools.push_back(queryPool);
-			vkCmdResetQueryPool(commandListState->commandBuffer, queryPool, 0, queryInfo.queryCount);
+			// Host reset is valid independently of the command pool's queue-family
+			// capabilities.  Graph queue assignment may record query work through a
+			// transfer-only family, where vkCmdResetQueryPool is prohibited.
+			if (commandListState->kind == QueueKind::Copy) {
+				vkResetQueryPool(impl->device, queryPool, 0, queryInfo.queryCount);
+			} else {
+				vkCmdResetQueryPool(commandListState->commandBuffer, queryPool, 0, queryInfo.queryCount);
+			}
 			vkCmdWriteAccelerationStructuresPropertiesKHR(commandListState->commandBuffer, queryInfo.queryCount, handles.data(), queryInfo.queryType, queryPool, 0);
 			vkCmdCopyQueryPoolResults(commandListState->commandBuffer, queryPool, 0, queryInfo.queryCount, destination->buffer, desc.destinationBuffer.offset, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
 		}
@@ -5157,7 +5233,11 @@ namespace rhi {
 			if (commandListState->passActive) {
 				cl_endPass(commandList);
 			}
-			vkCmdResetQueryPool(commandListState->commandBuffer, queryPoolState->pool, firstQuery, queryCount);
+			if (commandListState->kind == QueueKind::Copy) {
+				vkResetQueryPool(impl->device, queryPoolState->pool, firstQuery, queryCount);
+			} else {
+				vkCmdResetQueryPool(commandListState->commandBuffer, queryPoolState->pool, firstQuery, queryCount);
+			}
 		}
 
 		static void cl_pushConstants(CommandList* commandList,
@@ -5316,6 +5396,7 @@ namespace rhi {
 			if (!impl || !swapchainState || swapchainState->swapchain == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
+			const std::lock_guard timelineLock(impl->timelinesMutex);
 			if (swapchainState->currentImageIndex >= swapchainState->presentWaitSemaphores.size()) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
@@ -7354,7 +7435,7 @@ namespace rhi {
 			VulkanCommandList commandListState{};
 			commandListState.commandBuffer = commandBuffer;
 			commandListState.allocatorHandle = allocator.GetHandle();
-			commandListState.kind = kind;
+			commandListState.kind = allocatorState->kind;
 			commandListState.isRecording = true;
 			const CommandListHandle handle = impl->commandLists.alloc(commandListState);
 			CommandList commandList{ handle };
@@ -7608,7 +7689,11 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
-			const TimelineHandle handle = impl->timelines.alloc(VulkanTimeline{ semaphore, initialValue });
+			TimelineHandle handle{};
+			{
+				const std::lock_guard lock(impl->timelinesMutex);
+				handle = impl->timelines.alloc(VulkanTimeline{ semaphore, initialValue });
+			}
 			Timeline timeline{ handle };
 			timeline.impl = impl;
 			timeline.vt = &g_vktlvt;
@@ -7621,8 +7706,10 @@ namespace rhi {
 
 		static void d_destroyTimeline(DeviceDeletionContext* context, TimelineHandle handle) noexcept {
 			auto* impl = context ? static_cast<VulkanDevice*>(context->impl) : nullptr;
+			if (!impl) return;
+			const std::lock_guard lock(impl->timelinesMutex);
 			VulkanTimeline* timeline = VkTimelineState(impl, handle);
-			if (!impl || !timeline) {
+			if (!timeline) {
 				return;
 			}
 			if (timeline->semaphore != VK_NULL_HANDLE) {
@@ -7735,6 +7822,8 @@ namespace rhi {
 
 		static void d_setNameTimeline(Device* device, TimelineHandle handle, const char* name) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl) return;
+			const std::lock_guard lock(impl->timelinesMutex);
 			VulkanTimeline* timeline = VkTimelineState(impl, handle);
 			if (timeline) {
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(timeline->semaphore), VK_OBJECT_TYPE_SEMAPHORE, name);
@@ -8575,6 +8664,10 @@ namespace rhi {
 			device = VK_NULL_HANDLE;
 		}
 
+		if (instance != VK_NULL_HANDLE && debugMessenger != VK_NULL_HANDLE && vkDestroyDebugUtilsMessengerEXT) {
+			vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
+			debugMessenger = VK_NULL_HANDLE;
+		}
 		if (instance != VK_NULL_HANDLE) {
 			vkDestroyInstance(instance, nullptr);
 			instance = VK_NULL_HANDLE;
@@ -9353,6 +9446,9 @@ namespace rhi {
 		if (supportedVulkan12Features.timelineSemaphore == VK_TRUE) {
 			enabledVulkan12Features.timelineSemaphore = VK_TRUE;
 		}
+		if (supportedVulkan12Features.hostQueryReset == VK_TRUE) {
+			enabledVulkan12Features.hostQueryReset = VK_TRUE;
+		}
 		if (supportedVulkan12Features.descriptorIndexing == VK_TRUE) {
 			enabledVulkan12Features.descriptorIndexing = VK_TRUE;
 		}
@@ -9379,6 +9475,12 @@ namespace rhi {
 		}
 		if (supportedVulkan12Features.shaderFloat16 == VK_TRUE) {
 			enabledVulkan12Features.shaderFloat16 = VK_TRUE;
+		}
+		if (supportedVulkan12Features.shaderBufferInt64Atomics == VK_TRUE) {
+			enabledVulkan12Features.shaderBufferInt64Atomics = VK_TRUE;
+		}
+		if (supportedVulkan12Features.shaderSharedInt64Atomics == VK_TRUE) {
+			enabledVulkan12Features.shaderSharedInt64Atomics = VK_TRUE;
 		}
 		if (hasDescriptorHeapExtension &&
 			hasMaintenance5Extension &&
@@ -9564,6 +9666,18 @@ namespace rhi {
 		auto impl = std::make_shared<VulkanDevice>();
 		impl->selfWeak = impl;
 		impl->instance = instance;
+		if (ci.enableDebug && vkCreateDebugUtilsMessengerEXT) {
+			VkDebugUtilsMessengerCreateInfoEXT debugInfo{ VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
+			debugInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+				VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+			debugInfo.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+				VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+				VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+			debugInfo.pfnUserCallback = &VkValidationLogCallback;
+			if (vkCreateDebugUtilsMessengerEXT(instance, &debugInfo, nullptr, &impl->debugMessenger) != VK_SUCCESS) {
+				spdlog::warn("CreateVulkanDevice: failed to create the validation log messenger.");
+			}
+		}
 		impl->physicalDevice = physicalDevice;
 		impl->device = device;
 		impl->physicalDeviceProperties = physicalDeviceProperties;
@@ -10055,7 +10169,13 @@ namespace rhi {
 				vkDestroySemaphore(impl->device, semaphore, nullptr);
 				return ToRHI(vkResult);
 			}
-			const TimelineHandle handle = impl->timelines.alloc(VulkanTimeline{ semaphore, initialValue });
+			TimelineHandle handle{};
+			{
+				const std::lock_guard lock(impl->timelinesMutex);
+				VulkanTimeline importedTimeline{ semaphore, initialValue };
+				importedTimeline.importedD3D12Fence = true;
+				handle = impl->timelines.alloc(importedTimeline);
+			}
 			Timeline timeline{ handle };
 			timeline.impl = impl;
 			timeline.vt = &g_vktlvt;

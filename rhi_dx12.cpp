@@ -7541,18 +7541,12 @@ namespace rhi {
 						}
 					}
 					else if (p.colors.data[i].loadOp == LoadOp::DontCare) {
-						auto* R = l->dev->resources.get(p.colors.data[i].resource);
-						if (R && R->res) {
-							D3D12_DISCARD_REGION discardRegion{};
-							discardRegion.NumRects = 1;
-							discardRegion.pRects = nullptr;
-							if (p.colors.data[i].mipSlice == -1) {
-								BreakIfDebugging();
-							}
-							discardRegion.FirstSubresource = p.colors.data[i].mipSlice;
-							discardRegion.NumSubresources = 1;
-							l->cl->DiscardResource(R->res.Get(), &discardRegion);
-						}
+						// DontCare is a promise that the attachment's old contents are not
+						// needed, not a requirement to call DiscardResource.  Explicit
+						// discard is sensitive to the resource's layout at execution time and
+						// is unsafe when independently recorded graph command lists transition
+						// different mips.  The subsequent render-target write provides the
+						// intended invalidation without imposing another layout requirement.
 					}
 				}
 				else {
@@ -7579,10 +7573,8 @@ namespace rhi {
 							c.depthStencil.depth, c.depthStencil.stencil, 0, nullptr);
 					}
 					else if (p.depth->depthLoad == LoadOp::DontCare || p.depth->stencilLoad == LoadOp::DontCare) {
-						auto* R = l->dev->resources.get(p.depth->resource);
-						if (R && R->res) {
-							l->cl->DiscardResource(R->res.Get(), nullptr);
-						}
+						// See the color-attachment DontCare handling above.  A depth/stencil
+						// write does not need an explicit DiscardResource call either.
 					}
 				}
 			}
@@ -8020,45 +8012,35 @@ namespace rhi {
 				auto* T = dev->resources.get(t.texture);
 				if (!T || !T->res) continue;
 
-#if BUILD_MODE == BUILD_DEBUG
-				if (t.discard) {
-					const auto desc = T->res->GetDesc();
-					const uint32_t mipCount = desc.MipLevels;
-					const uint32_t layerCount = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-						? 1u
-						: static_cast<uint32_t>(desc.DepthOrArraySize);
-					const uint32_t planeCount = D3D12GetFormatPlaneCount(dev->pNativeDevice.Get(), desc.Format);
-					const bool undefinedBefore = t.beforeLayout == ResourceLayout::Undefined;
-					const bool wholeResource =
-						t.range.baseMip == 0 && t.range.mipCount == mipCount
-						&& t.range.baseLayer == 0 && t.range.layerCount == layerCount
-						&& t.range.basePlane == 0 && t.range.planeCount == planeCount;
-					if (!undefinedBefore || !wholeResource) {
-						spdlog::error(
-							"Invalid D3D12 discard texture barrier: resource={} beforeLayout={} "
-							"range=mips[{},{}]/{} layers[{},{}]/{} planes[{},{}]/{}. "
-							"Discard requires UNDEFINED and the complete texture.",
-							static_cast<const void*>(T->res.Get()),
-							static_cast<uint32_t>(t.beforeLayout),
-							t.range.baseMip, t.range.mipCount, mipCount,
-							t.range.baseLayer, t.range.layerCount, layerCount,
-							t.range.basePlane, t.range.planeCount, planeCount);
-						BreakIfDebugging();
-						continue;
-					}
-				}
-#endif
+				// D3D12's enhanced DISCARD flag is legal only for a whole-resource
+				// transition from UNDEFINED.  Render-graph "discard previous contents"
+				// is a broader semantic promise and can also occur on a reused backing or
+				// a subresource.  In those cases preserve the real before scopes and emit
+				// an ordinary transition instead of an invalid SYNC_NONE barrier.
+				const auto desc = T->res->GetDesc();
+				const uint32_t mipCount = desc.MipLevels;
+				const uint32_t layerCount = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+					? 1u
+					: static_cast<uint32_t>(desc.DepthOrArraySize);
+				const uint32_t planeCount = D3D12GetFormatPlaneCount(dev->pNativeDevice.Get(), desc.Format);
+				const bool wholeResource =
+					t.range.baseMip == 0 && t.range.mipCount == mipCount
+					&& t.range.baseLayer == 0 && t.range.layerCount == layerCount
+					&& t.range.basePlane == 0 && t.range.planeCount == planeCount;
+				const bool nativeDiscard = t.discard
+					&& t.beforeLayout == ResourceLayout::Undefined
+					&& wholeResource;
 
 				D3D12_TEXTURE_BARRIER tb{};
-				tb.SyncBefore = ToDX(t.discard ? ResourceSyncState::None : t.beforeSync);
+				tb.SyncBefore = ToDX(nativeDiscard ? ResourceSyncState::None : t.beforeSync);
 				tb.SyncAfter = ToDX(t.afterSync);
-				tb.AccessBefore = ToDX(t.discard ? ResourceAccessType::None : t.beforeAccess);
+				tb.AccessBefore = ToDX(nativeDiscard ? ResourceAccessType::None : t.beforeAccess);
 				tb.AccessAfter = ToDX(t.afterAccess);
 				tb.LayoutBefore = textureLayout(t.beforeLayout);
 				tb.LayoutAfter = textureLayout(t.afterLayout);
 				tb.pResource = T->res.Get();
 				tb.Subresources = ToDX(t.range);
-				tb.Flags = t.discard ? D3D12_TEXTURE_BARRIER_FLAG_DISCARD : D3D12_TEXTURE_BARRIER_FLAG_NONE;
+				tb.Flags = nativeDiscard ? D3D12_TEXTURE_BARRIER_FLAG_DISCARD : D3D12_TEXTURE_BARRIER_FLAG_NONE;
 				tex.push_back(tb);
 			}
 
@@ -8069,9 +8051,11 @@ namespace rhi {
 				if (!B || !B->res) continue;
 
 				D3D12_BUFFER_BARRIER bb{};
-				bb.SyncBefore = ToDX(br.discard ? ResourceSyncState::None : br.beforeSync);
+				// Enhanced buffer barriers have no discard operation.  Retain the
+				// tracked before scopes even when prior contents are irrelevant.
+				bb.SyncBefore = ToDX(br.beforeSync);
 				bb.SyncAfter = ToDX(br.afterSync);
-				bb.AccessBefore = ToDX(br.discard ? ResourceAccessType::None : br.beforeAccess);
+				bb.AccessBefore = ToDX(br.beforeAccess);
 				bb.AccessAfter = ToDX(br.afterAccess);
 				bb.pResource = B->res.Get();
 				bb.Offset = br.offset;

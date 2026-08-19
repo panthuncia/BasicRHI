@@ -14,6 +14,7 @@ using namespace volk;
 #include <array>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <vector>
@@ -290,6 +291,8 @@ namespace rhi {
 	struct VulkanTimeline {
 		VkSemaphore semaphore = VK_NULL_HANDLE;
 		uint64_t lastSubmittedSignalValue = 0;
+		uint64_t integrityCookie = 0x564B54494D454C4Eull;
+		bool importedD3D12Fence = false;
 	};
 
 	struct VulkanHeap {
@@ -403,6 +406,7 @@ namespace rhi {
 
 		Device self{};
 		VkInstance instance = VK_NULL_HANDLE;
+		VkDebugUtilsMessengerEXT debugMessenger = VK_NULL_HANDLE;
 		VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 		VkDevice device = VK_NULL_HANDLE;
 		VkPhysicalDeviceProperties physicalDeviceProperties{};
@@ -466,6 +470,11 @@ namespace rhi {
 		VulkanRegistry<VulkanPipelineLayout> pipelineLayouts;
 		VulkanRegistry<VulkanCommandSignature> commandSignatures;
 		VulkanRegistry<VulkanTimeline> timelines;
+		// Timeline completion is polled from retirement/streaming threads while the
+		// render threads submit and deferred deletion can recycle registry slots.
+		// Keep registry lookup and the Vulkan operation using the returned object in
+		// one critical section so a slot cannot be destroyed or reused underneath it.
+		mutable std::mutex timelinesMutex;
 		VulkanRegistry<VulkanHeap> heaps;
 		VulkanRegistry<VulkanQueryPool> queryPools;
 		VulkanRegistry<VulkanAccelerationStructure> accelerationStructures;
