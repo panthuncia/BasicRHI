@@ -12,10 +12,12 @@ using namespace volk;
 #endif
 
 #include <array>
+#include <condition_variable>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include <vector>
 
@@ -67,8 +69,15 @@ namespace rhi {
 
 		std::deque<VulkanSlot<T>> slots;
 		std::vector<uint32_t> freelist;
+		// Graph compilation and command recording can lazily create backend
+		// objects on worker threads.  In particular, concurrent deque growth
+		// corrupts its block map even though references to existing elements are
+		// otherwise stable.  Serialize registry metadata access; callers retain
+		// the normal RHI lifetime responsibility for an object returned by get().
+		mutable std::mutex mutex;
 
 		HandleT alloc(const T& value) {
+			const std::scoped_lock lock(mutex);
 			if (!freelist.empty()) {
 				const uint32_t index = freelist.back();
 				freelist.pop_back();
@@ -85,6 +94,7 @@ namespace rhi {
 		}
 
 		void free(HandleT handle) {
+			const std::scoped_lock lock(mutex);
 			const uint32_t index = handle.index;
 			if (index >= slots.size()) {
 				return;
@@ -101,6 +111,7 @@ namespace rhi {
 		}
 
 		T* get(HandleT handle) {
+			const std::scoped_lock lock(mutex);
 			const uint32_t index = handle.index;
 			if (index >= slots.size()) {
 				return nullptr;
@@ -115,6 +126,7 @@ namespace rhi {
 		}
 
 		const T* get(HandleT handle) const {
+			const std::scoped_lock lock(mutex);
 			const uint32_t index = handle.index;
 			if (index >= slots.size()) {
 				return nullptr;
@@ -129,6 +141,7 @@ namespace rhi {
 		}
 
 		void clear() {
+			const std::scoped_lock lock(mutex);
 			slots.clear();
 			freelist.clear();
 		}
@@ -145,7 +158,9 @@ namespace rhi {
 		VkBuffer buffer = VK_NULL_HANDLE;
 		VkImage image = VK_NULL_HANDLE;
 		VkDeviceMemory memory = VK_NULL_HANDLE;
+		VkDeviceSize memoryOffset = 0;
 		void* mappedData = nullptr;
+		uint32_t mapRefCount = 0;
 		VkDeviceAddress deviceAddress = 0;
 		uint64_t bufferSize = 0;
 		VkFormat format = VK_FORMAT_UNDEFINED;
@@ -227,6 +242,7 @@ namespace rhi {
 		std::vector<VkImage> images;
 		std::vector<ResourceHandle> imageHandles;
 		std::vector<VkSemaphore> presentWaitSemaphores;
+		VkSemaphore acquireSemaphore = VK_NULL_HANDLE;
 		VkFence acquireFence = VK_NULL_HANDLE;
 	};
 
@@ -293,6 +309,7 @@ namespace rhi {
 		uint64_t lastSubmittedSignalValue = 0;
 		uint64_t integrityCookie = 0x564B54494D454C4Eull;
 		bool importedD3D12Fence = false;
+		uint32_t activeHostWaits = 0;
 	};
 
 	struct VulkanHeap {
@@ -464,6 +481,15 @@ namespace rhi {
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		VulkanRegistry<VulkanDescriptorHeap> descriptorHeaps;
 		VulkanRegistry<VulkanResource> resources;
+		// Vulkan requires host access to each VkDeviceMemory object to be
+		// externally synchronized. Resource setup and upload mapping can occur on
+		// parallel graph/setup threads, so serialize memory bind/map operations.
+		mutable std::mutex deviceMemoryMutex;
+		struct HostMemoryMapping {
+			void* base = nullptr;
+			uint32_t refCount = 0;
+		};
+		std::unordered_map<VkDeviceMemory, HostMemoryMapping> hostMemoryMappings;
 		VulkanRegistry<VulkanSwapchain> swapchains;
 		VulkanRegistry<VulkanCommandAllocator> allocators;
 		VulkanRegistry<VulkanPipeline> pipelines;
@@ -475,8 +501,12 @@ namespace rhi {
 		// Keep registry lookup and the Vulkan operation using the returned object in
 		// one critical section so a slot cannot be destroyed or reused underneath it.
 		mutable std::mutex timelinesMutex;
+		std::condition_variable timelinesCondition;
 		VulkanRegistry<VulkanHeap> heaps;
 		VulkanRegistry<VulkanQueryPool> queryPools;
+		// Host query-pool reset is externally synchronized by Vulkan, and graph
+		// command lists are recorded concurrently.
+		mutable std::mutex queryResetMutex;
 		VulkanRegistry<VulkanAccelerationStructure> accelerationStructures;
 		VulkanRegistry<VulkanCommandList> commandLists;
 		VulkanRegistry<VulkanQueueState> queues;

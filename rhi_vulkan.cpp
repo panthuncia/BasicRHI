@@ -10,6 +10,10 @@
 #include <string>
 #include <string_view>
 #include <cstddef>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -44,25 +48,96 @@
 
 namespace rhi {
 	namespace {
+		struct VkValidationMessage {
+			VkDebugUtilsMessageSeverityFlagBitsEXT severity{};
+			std::string text;
+		};
+
+		static void VkQueueValidationMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity, const char* message) noexcept {
+			// Validation callbacks execute inside Vulkan entry points and may hold
+			// loader/driver locks. Logging synchronously can invert those locks with
+			// another setup thread which is logging immediately before entering
+			// Vulkan. A process-lifetime drain thread keeps the callback non-blocking
+			// with respect to spdlog and preserves the messages in the renderer log.
+			static std::mutex mutex;
+			static std::condition_variable condition;
+			static std::deque<VkValidationMessage> messages;
+			static std::once_flag startFlag;
+			std::call_once(startFlag, [] {
+				std::thread([] {
+					for (;;) {
+						VkValidationMessage queued;
+						{
+							std::unique_lock lock(mutex);
+							condition.wait(lock, [] { return !messages.empty(); });
+							queued = std::move(messages.front());
+							messages.pop_front();
+						}
+						if ((queued.severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
+							spdlog::error("Vulkan validation: {}", queued.text);
+						} else if ((queued.severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0) {
+							spdlog::warn("Vulkan validation: {}", queued.text);
+						} else {
+							spdlog::debug("Vulkan validation: {}", queued.text);
+						}
+					}
+				}).detach();
+			});
+			try {
+				{
+					std::scoped_lock lock(mutex);
+					messages.push_back({ severity, message ? message : "<no validation message>" });
+				}
+				condition.notify_one();
+			} catch (...) {
+				// A diagnostic callback must never unwind through the Vulkan loader.
+			}
+		}
+
 		static VKAPI_ATTR VkBool32 VKAPI_CALL VkValidationLogCallback(
 			VkDebugUtilsMessageSeverityFlagBitsEXT severity,
 			VkDebugUtilsMessageTypeFlagsEXT,
 			const VkDebugUtilsMessengerCallbackDataEXT* callbackData,
 			void*) noexcept {
-			const char* message = callbackData && callbackData->pMessage ? callbackData->pMessage : "<no validation message>";
-			if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
-				spdlog::error("Vulkan validation: {}", message);
+			std::string diagnostic = callbackData && callbackData->pMessage
+				? callbackData->pMessage
+				: "<no validation message>";
+			if (callbackData) {
+				for (uint32_t i = 0; i < callbackData->objectCount; ++i) {
+					const auto& object = callbackData->pObjects[i];
+					diagnostic += std::format(
+						"\n  object[{}]: type={} handle=0x{:x} name='{}'",
+						i,
+						static_cast<uint32_t>(object.objectType),
+						object.objectHandle,
+						object.pObjectName ? object.pObjectName : "<unnamed>");
+				}
 			}
-			else if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0) {
-				spdlog::warn("Vulkan validation: {}", message);
-			}
-			else {
-				spdlog::debug("Vulkan validation: {}", message);
-			}
+			VkQueueValidationMessage(severity, diagnostic.c_str());
 			return VK_FALSE;
 		}
 		static constexpr uint32_t kVkInvalidQueueFamily = 0xFFFFFFFFu;
 		static void VkDestroyTracyGpuContext(VulkanQueueState& queueState) noexcept;
+
+		static VkResult VkBindBufferMemorySynchronized(VulkanDevice* impl, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset) noexcept {
+			std::scoped_lock lock(impl->deviceMemoryMutex);
+			return vkBindBufferMemory(impl->device, buffer, memory, offset);
+		}
+
+		static VkResult VkBindImageMemorySynchronized(VulkanDevice* impl, VkImage image, VkDeviceMemory memory, VkDeviceSize offset) noexcept {
+			std::scoped_lock lock(impl->deviceMemoryMutex);
+			return vkBindImageMemory(impl->device, image, memory, offset);
+		}
+
+		static VkResult VkMapMemorySynchronized(VulkanDevice* impl, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, void** data) noexcept {
+			std::scoped_lock lock(impl->deviceMemoryMutex);
+			return vkMapMemory(impl->device, memory, offset, size, 0, data);
+		}
+
+		static void VkUnmapMemorySynchronized(VulkanDevice* impl, VkDeviceMemory memory) noexcept {
+			std::scoped_lock lock(impl->deviceMemoryMutex);
+			vkUnmapMemory(impl->device, memory);
+		}
 
 		template <typename... TArgs>
 		constexpr void VkIgnoreUnused(TArgs&&...) noexcept {}
@@ -1013,7 +1088,7 @@ namespace rhi {
 			}
 
 			if (page.mappedData != nullptr && page.memory != VK_NULL_HANDLE) {
-				vkUnmapMemory(impl->device, page.memory);
+				VkUnmapMemorySynchronized(impl, page.memory);
 			}
 			if (page.buffer != VK_NULL_HANDLE) {
 				vkDestroyBuffer(impl->device, page.buffer, nullptr);
@@ -1073,14 +1148,14 @@ namespace rhi {
 				return false;
 			}
 
-			if (vkBindBufferMemory(impl->device, buffer, memory, 0) != VK_SUCCESS) {
+			if (VkBindBufferMemorySynchronized(impl, buffer, memory, 0) != VK_SUCCESS) {
 				vkFreeMemory(impl->device, memory, nullptr);
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return false;
 			}
 
 			void* mappedData = nullptr;
-			if (vkMapMemory(impl->device, memory, 0, capacity64, 0, &mappedData) != VK_SUCCESS || mappedData == nullptr) {
+			if (VkMapMemorySynchronized(impl, memory, 0, capacity64, &mappedData) != VK_SUCCESS || mappedData == nullptr) {
 				vkFreeMemory(impl->device, memory, nullptr);
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return false;
@@ -1090,7 +1165,7 @@ namespace rhi {
 			addressInfo.buffer = buffer;
 			const VkDeviceAddress deviceAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
 			if (deviceAddress == 0) {
-				vkUnmapMemory(impl->device, memory);
+				VkUnmapMemorySynchronized(impl, memory);
 				vkFreeMemory(impl->device, memory, nullptr);
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return false;
@@ -1738,7 +1813,7 @@ namespace rhi {
 			}
 
 			if (heap.mappedData && heap.memory != VK_NULL_HANDLE) {
-				vkUnmapMemory(impl->device, heap.memory);
+				VkUnmapMemorySynchronized(impl, heap.memory);
 			}
 			if (heap.buffer != VK_NULL_HANDLE) {
 				vkDestroyBuffer(impl->device, heap.buffer, nullptr);
@@ -2492,7 +2567,7 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
-			result = vkBindBufferMemory(impl->device, signature.preprocessBuffer, signature.preprocessMemory, 0);
+			result = VkBindBufferMemorySynchronized(impl, signature.preprocessBuffer, signature.preprocessMemory, 0);
 			if (result != VK_SUCCESS) {
 				vkDestroyBuffer(impl->device, signature.preprocessBuffer, nullptr);
 				vkFreeMemory(impl->device, signature.preprocessMemory, nullptr);
@@ -2729,8 +2804,18 @@ namespace rhi {
 			}
 
 			if (resource.mappedData != nullptr && resource.memory != VK_NULL_HANDLE) {
-				vkUnmapMemory(impl->device, resource.memory);
+				std::scoped_lock lock(impl->deviceMemoryMutex);
+				auto mappingIt = impl->hostMemoryMappings.find(resource.memory);
+				if (mappingIt != impl->hostMemoryMappings.end()) {
+					const uint32_t released = (std::min)(resource.mapRefCount, mappingIt->second.refCount);
+					mappingIt->second.refCount -= released;
+					if (mappingIt->second.refCount == 0) {
+						vkUnmapMemory(impl->device, resource.memory);
+						impl->hostMemoryMappings.erase(mappingIt);
+					}
+				}
 				resource.mappedData = nullptr;
+				resource.mapRefCount = 0;
 			}
 
 			if (resource.ownsBuffer && resource.buffer != VK_NULL_HANDLE) {
@@ -2803,7 +2888,8 @@ namespace rhi {
 		}
 
 		static Result VkAcquireNextSwapchainImage(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
-			if (!impl || impl->device == VK_NULL_HANDLE || swapchain.swapchain == VK_NULL_HANDLE || swapchain.acquireFence == VK_NULL_HANDLE) {
+			if (!impl || impl->device == VK_NULL_HANDLE || swapchain.swapchain == VK_NULL_HANDLE ||
+				swapchain.acquireSemaphore == VK_NULL_HANDLE || swapchain.acquireFence == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
@@ -2813,9 +2899,29 @@ namespace rhi {
 			}
 
 			uint32_t imageIndex = 0;
-			result = VkAcquireNextImageKHRHooked(impl->device, swapchain.swapchain, UINT64_MAX, VK_NULL_HANDLE, swapchain.acquireFence, &imageIndex);
+			result = VkAcquireNextImageKHRHooked(
+				impl->device,
+				swapchain.swapchain,
+				UINT64_MAX,
+				swapchain.acquireSemaphore,
+				VK_NULL_HANDLE,
+				&imageIndex);
 			if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
 				return ToRHI(result);
+			}
+
+			const VulkanQueueState* graphicsQueueState = VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
+			if (!graphicsQueueState || graphicsQueueState->queue == VK_NULL_HANDLE) {
+				RHI_FAIL(Result::Failed);
+			}
+			const VkPipelineStageFlags acquireWaitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+			VkSubmitInfo acquireSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+			acquireSubmit.waitSemaphoreCount = 1;
+			acquireSubmit.pWaitSemaphores = &swapchain.acquireSemaphore;
+			acquireSubmit.pWaitDstStageMask = &acquireWaitStage;
+			const VkResult submitResult = vkQueueSubmit(graphicsQueueState->queue, 1, &acquireSubmit, swapchain.acquireFence);
+			if (submitResult != VK_SUCCESS) {
+				return ToRHI(submitResult);
 			}
 
 			const VkResult waitResult = vkWaitForFences(impl->device, 1, &swapchain.acquireFence, VK_TRUE, UINT64_MAX);
@@ -2824,6 +2930,13 @@ namespace rhi {
 			}
 
 			swapchain.currentImageIndex = imageIndex;
+			spdlog::info(
+				"Vulkan swapchain acquire: swapchain=0x{:x} imageIndex={} image=0x{:x}",
+				reinterpret_cast<uint64_t>(swapchain.swapchain),
+				imageIndex,
+				imageIndex < swapchain.images.size()
+					? reinterpret_cast<uint64_t>(swapchain.images[imageIndex])
+					: 0ull);
 			return ToRHI(result);
 		}
 
@@ -2900,6 +3013,11 @@ namespace rhi {
 			swapchain.imageHandles.clear();
 			swapchain.imageHandles.reserve(imageCount);
 			for (uint32_t imageIndex = 0; imageIndex < imageCount; ++imageIndex) {
+				VkSetObjectName(
+					impl,
+					reinterpret_cast<uint64_t>(swapchain.images[imageIndex]),
+					VK_OBJECT_TYPE_IMAGE,
+					std::format("Swapchain Image {}", imageIndex).c_str());
 				VulkanResource resource{};
 				resource.image = swapchain.images[imageIndex];
 				resource.format = swapchain.format;
@@ -3023,6 +3141,19 @@ namespace rhi {
 					swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
 					return ToRHI(result);
 				}
+			}
+			if (swapchain.acquireSemaphore == VK_NULL_HANDLE) {
+				VkSemaphoreCreateInfo semaphoreCreateInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+				result = vkCreateSemaphore(impl->device, &semaphoreCreateInfo, nullptr, &swapchain.acquireSemaphore);
+				if (result != VK_SUCCESS) {
+					VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
+					swapchain.swapchain = oldSwapchain;
+					swapchain.imageHandles = std::move(oldImageHandles);
+					swapchain.images = std::move(oldImages);
+					swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
+					return ToRHI(result);
+				}
+				VkSetObjectName(impl, reinterpret_cast<uint64_t>(swapchain.acquireSemaphore), VK_OBJECT_TYPE_SEMAPHORE, "Swapchain Acquire Semaphore");
 			}
 
 			const Result populateResult = VkPopulateSwapchainImages(impl, swapchain);
@@ -3234,20 +3365,35 @@ namespace rhi {
 			if (!impl) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
-			const std::lock_guard lock(impl->timelinesMutex);
-			VulkanTimeline* timelineState = VkTimelineState(impl, timeline ? timeline->GetHandle() : TimelineHandle{});
-			if (!timelineState || timelineState->semaphore == VK_NULL_HANDLE) {
-				RHI_FAIL(Result::InvalidArgument);
+			const TimelineHandle handle = timeline ? timeline->GetHandle() : TimelineHandle{};
+			VkSemaphore semaphore = VK_NULL_HANDLE;
+			{
+				const std::lock_guard lock(impl->timelinesMutex);
+				VulkanTimeline* timelineState = VkTimelineState(impl, handle);
+				if (!timelineState || timelineState->semaphore == VK_NULL_HANDLE) {
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				semaphore = timelineState->semaphore;
+				++timelineState->activeHostWaits;
 			}
 
 			VkSemaphoreWaitInfo waitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
 			waitInfo.semaphoreCount = 1;
-			waitInfo.pSemaphores = &timelineState->semaphore;
+			waitInfo.pSemaphores = &semaphore;
 			waitInfo.pValues = &value;
 			const uint64_t timeoutNs = timeoutMs == UINT32_MAX
 				? UINT64_MAX
 				: static_cast<uint64_t>(timeoutMs) * 1000000ull;
-			return ToRHI(vkWaitSemaphores(impl->device, &waitInfo, timeoutNs));
+			const VkResult waitResult = vkWaitSemaphores(impl->device, &waitInfo, timeoutNs);
+			{
+				const std::lock_guard lock(impl->timelinesMutex);
+				if (VulkanTimeline* timelineState = VkTimelineState(impl, handle);
+					timelineState && timelineState->activeHostWaits != 0) {
+					--timelineState->activeHostWaits;
+				}
+			}
+			impl->timelinesCondition.notify_all();
+			return ToRHI(waitResult);
 		}
 
 		static void tl_setName(Timeline* timeline, const char* name) noexcept {
@@ -3626,6 +3772,14 @@ namespace rhi {
 			if (!impl || !queueState || impl->device == VK_NULL_HANDLE || queueState->queue == VK_NULL_HANDLE) {
 				return Result::InvalidArgument;
 			}
+			if (queueState->familyIndex >= impl->queueFamilyProperties.size() ||
+				(impl->queueFamilyProperties[queueState->familyIndex].queueFlags &
+					(VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == 0) {
+				// Tracy's Vulkan context bootstrap resets a query pool from its
+				// command buffer. Vulkan prohibits that operation on a transfer-only
+				// command pool, so leave GPU profiling disabled for this queue.
+				return Result::Unsupported;
+			}
 			if (queueState->tracyGpuContext) {
 				if (name) {
 					static_cast<tracy::VkCtx*>(queueState->tracyGpuContext)->Name(
@@ -3710,30 +3864,55 @@ namespace rhi {
 				return;
 			}
 
-			if (resourceState->mappedData == nullptr) {
-				// RHI callers use size==0 to request the remaining resource, matching
-				// the legacy D3D12 path. Vulkan rejects an explicit zero map size.
-				const VkDeviceSize mapSize = (size == 0 || size == ~0ull) ? VK_WHOLE_SIZE : static_cast<VkDeviceSize>(size);
-				void* mappedData = nullptr;
-				if (vkMapMemory(impl->device, resourceState->memory, static_cast<VkDeviceSize>(offset), mapSize, 0, &mappedData) != VK_SUCCESS) {
-					return;
-				}
-				resourceState->mappedData = mappedData;
+			if (size != 0 && size != ~0ull && size > resourceState->bufferSize - offset) {
+				return;
 			}
 
-			*data = resourceState->mappedData;
+			// The same upload buffer may be mapped concurrently by streaming workers.
+			// Protect both the Vulkan call and our mapped/refcount state with the same
+			// lock. Map the complete allocation so every caller's byte offset can be
+			// applied consistently even while another map remains outstanding.
+			std::scoped_lock lock(impl->deviceMemoryMutex);
+			auto [mappingIt, inserted] = impl->hostMemoryMappings.try_emplace(resourceState->memory);
+			auto& mapping = mappingIt->second;
+			if (mapping.base == nullptr) {
+				void* mappedData = nullptr;
+				if (vkMapMemory(impl->device, resourceState->memory, 0, VK_WHOLE_SIZE, 0, &mappedData) != VK_SUCCESS) {
+					if (inserted) impl->hostMemoryMappings.erase(mappingIt);
+					return;
+				}
+				mapping.base = mappedData;
+			}
+			++mapping.refCount;
+			++resourceState->mapRefCount;
+			resourceState->mappedData = static_cast<std::byte*>(mapping.base) + resourceState->memoryOffset;
+			*data = static_cast<std::byte*>(resourceState->mappedData) + offset;
 		}
 
 		static void buf_unmap(Resource* resource, uint64_t writeOffset, uint64_t writeSize) noexcept {
 			VkIgnoreUnused(writeOffset, writeSize);
 			auto* impl = resource ? static_cast<VulkanDevice*>(resource->impl) : nullptr;
 			VulkanResource* resourceState = VkResourceState(impl, resource ? resource->GetHandle() : ResourceHandle{});
-			if (!impl || !resourceState || resourceState->memory == VK_NULL_HANDLE || resourceState->mappedData == nullptr) {
+			if (!impl || !resourceState || resourceState->memory == VK_NULL_HANDLE) {
 				return;
 			}
 
-			vkUnmapMemory(impl->device, resourceState->memory);
-			resourceState->mappedData = nullptr;
+			std::scoped_lock lock(impl->deviceMemoryMutex);
+			if (resourceState->mappedData == nullptr || resourceState->mapRefCount == 0) {
+				return;
+			}
+			auto mappingIt = impl->hostMemoryMappings.find(resourceState->memory);
+			if (mappingIt == impl->hostMemoryMappings.end() || mappingIt->second.refCount == 0) {
+				resourceState->mappedData = nullptr;
+				resourceState->mapRefCount = 0;
+				return;
+			}
+			--resourceState->mapRefCount;
+			if (--mappingIt->second.refCount == 0) {
+				vkUnmapMemory(impl->device, resourceState->memory);
+				impl->hostMemoryMappings.erase(mappingIt);
+			}
+			if (resourceState->mapRefCount == 0) resourceState->mappedData = nullptr;
 		}
 
 		static void buf_setName(Resource* resource, const char* name) noexcept {
@@ -4728,10 +4907,9 @@ namespace rhi {
 			// Host reset is valid independently of the command pool's queue-family
 			// capabilities.  Graph queue assignment may record query work through a
 			// transfer-only family, where vkCmdResetQueryPool is prohibited.
-			if (commandListState->kind == QueueKind::Copy) {
+			{
+				std::scoped_lock lock(impl->queryResetMutex);
 				vkResetQueryPool(impl->device, queryPool, 0, queryInfo.queryCount);
-			} else {
-				vkCmdResetQueryPool(commandListState->commandBuffer, queryPool, 0, queryInfo.queryCount);
 			}
 			vkCmdWriteAccelerationStructuresPropertiesKHR(commandListState->commandBuffer, queryInfo.queryCount, handles.data(), queryInfo.queryType, queryPool, 0);
 			vkCmdCopyQueryPoolResults(commandListState->commandBuffer, queryPool, 0, queryInfo.queryCount, destination->buffer, desc.destinationBuffer.offset, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
@@ -5233,10 +5411,9 @@ namespace rhi {
 			if (commandListState->passActive) {
 				cl_endPass(commandList);
 			}
-			if (commandListState->kind == QueueKind::Copy) {
+			{
+				std::scoped_lock lock(impl->queryResetMutex);
 				vkResetQueryPool(impl->device, queryPoolState->pool, firstQuery, queryCount);
-			} else {
-				vkCmdResetQueryPool(commandListState->commandBuffer, queryPoolState->pool, firstQuery, queryCount);
 			}
 		}
 
@@ -5982,8 +6159,17 @@ namespace rhi {
 				pipelineInfo.pDynamicState = &dynamicState;
 				pipelineInfo.layout = nativeLayout;
 
+				static std::atomic<uint64_t> graphicsPipelineSequence{ 0 };
+				const uint64_t pipelineSequence = graphicsPipelineSequence.fetch_add(1, std::memory_order_relaxed) + 1;
+				spdlog::info("Vulkan graphics pipeline create begin: sequence={} stages={} mesh={} taskEntry='{}' taskBytes={} meshEntry='{}' meshBytes={} pixelEntry='{}' pixelBytes={} colors={} depthFormat={}",
+					pipelineSequence, shaderStages.size(), hasMeshShader,
+					taskShader ? taskShader->entryPoint : std::string{}, taskShader ? taskShader->bytecode.size : 0u,
+					meshShader ? meshShader->entryPoint : std::string{}, meshShader ? meshShader->bytecode.size : 0u,
+					pixelShader ? pixelShader->entryPoint : std::string{}, pixelShader ? pixelShader->bytecode.size : 0u,
+					renderTargets.count, static_cast<uint32_t>(depthFormat));
 				VkPipeline nativePipeline = VK_NULL_HANDLE;
 				VkResult vkResult = vkCreateGraphicsPipelines(impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &nativePipeline);
+				spdlog::info("Vulkan graphics pipeline create end: sequence={} result={}", pipelineSequence, static_cast<int32_t>(vkResult));
 				for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
 				if (vkResult != VK_SUCCESS) {
 					vkDestroyPipelineLayout(impl->device, nativeLayout, nullptr);
@@ -6280,6 +6466,9 @@ namespace rhi {
 				if (swapchainState.acquireFence != VK_NULL_HANDLE) {
 					vkDestroyFence(impl->device, swapchainState.acquireFence, nullptr);
 				}
+				if (swapchainState.acquireSemaphore != VK_NULL_HANDLE) {
+					vkDestroySemaphore(impl->device, swapchainState.acquireSemaphore, nullptr);
+				}
 				if (swapchainState.surface != VK_NULL_HANDLE) {
 					VkDestroySurfaceKHRHooked(impl->instance, swapchainState.surface, nullptr);
 				}
@@ -6314,6 +6503,10 @@ namespace rhi {
 				if (swapchainState->acquireFence != VK_NULL_HANDLE) {
 					vkDestroyFence(impl->device, swapchainState->acquireFence, nullptr);
 					swapchainState->acquireFence = VK_NULL_HANDLE;
+				}
+				if (swapchainState->acquireSemaphore != VK_NULL_HANDLE) {
+					vkDestroySemaphore(impl->device, swapchainState->acquireSemaphore, nullptr);
+					swapchainState->acquireSemaphore = VK_NULL_HANDLE;
 				}
 				if (swapchainState->swapchain != VK_NULL_HANDLE) {
 					VkDestroySwapchainKHRHooked(impl->device, swapchainState->swapchain, nullptr);
@@ -6891,7 +7084,7 @@ namespace rhi {
 					return ToRHI(allocateResult);
 				}
 
-				const VkResult bindResult = vkBindBufferMemory(impl->device, heap.buffer, heap.memory, 0);
+				const VkResult bindResult = VkBindBufferMemorySynchronized(impl, heap.buffer, heap.memory, 0);
 				if (bindResult != VK_SUCCESS) {
 					vkFreeMemory(impl->device, heap.memory, nullptr);
 					vkDestroyBuffer(impl->device, heap.buffer, nullptr);
@@ -6899,7 +7092,7 @@ namespace rhi {
 					return ToRHI(bindResult);
 				}
 
-				const VkResult mapResult = vkMapMemory(impl->device, heap.memory, 0, totalBytes, 0, &heap.mappedData);
+				const VkResult mapResult = VkMapMemorySynchronized(impl, heap.memory, 0, totalBytes, &heap.mappedData);
 				if (mapResult != VK_SUCCESS) {
 					vkFreeMemory(impl->device, heap.memory, nullptr);
 					vkDestroyBuffer(impl->device, heap.buffer, nullptr);
@@ -7500,7 +7693,7 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
-			result = vkBindBufferMemory(impl->device, buffer, memory, 0);
+			result = VkBindBufferMemorySynchronized(impl, buffer, memory, 0);
 			if (result != VK_SUCCESS) {
 				vkFreeMemory(impl->device, memory, nullptr);
 				vkDestroyBuffer(impl->device, buffer, nullptr);
@@ -7617,7 +7810,7 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
-			result = vkBindImageMemory(impl->device, image, memory, 0);
+			result = VkBindImageMemorySynchronized(impl, image, memory, 0);
 			if (result != VK_SUCCESS) {
 				vkFreeMemory(impl->device, memory, nullptr);
 				vkDestroyImage(impl->device, image, nullptr);
@@ -7707,8 +7900,16 @@ namespace rhi {
 		static void d_destroyTimeline(DeviceDeletionContext* context, TimelineHandle handle) noexcept {
 			auto* impl = context ? static_cast<VulkanDevice*>(context->impl) : nullptr;
 			if (!impl) return;
-			const std::lock_guard lock(impl->timelinesMutex);
+			std::unique_lock lock(impl->timelinesMutex);
 			VulkanTimeline* timeline = VkTimelineState(impl, handle);
+			if (!timeline) {
+				return;
+			}
+			impl->timelinesCondition.wait(lock, [&] {
+				VulkanTimeline* current = VkTimelineState(impl, handle);
+				return !current || current->activeHostWaits == 0;
+			});
+			timeline = VkTimelineState(impl, handle);
 			if (!timeline) {
 				return;
 			}
@@ -7903,7 +8104,7 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			result = vkBindImageMemory(impl->device, image, heapState->memory, offset);
+			result = VkBindImageMemorySynchronized(impl, image, heapState->memory, offset);
 			if (result != VK_SUCCESS) {
 				vkDestroyImage(impl->device, image, nullptr);
 				out.Reset();
@@ -7913,6 +8114,7 @@ namespace rhi {
 			VulkanResource resourceState{};
 			resourceState.image = image;
 			resourceState.memory = heapState->memory;
+			resourceState.memoryOffset = offset;
 			resourceState.format = format;
 			resourceState.type = desc.type;
 			resourceState.currentLayout = ResourceLayout::Undefined;
@@ -7972,7 +8174,7 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			result = vkBindBufferMemory(impl->device, buffer, heapState->memory, offset);
+			result = VkBindBufferMemorySynchronized(impl, buffer, heapState->memory, offset);
 			if (result != VK_SUCCESS) {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				out.Reset();
@@ -7983,6 +8185,7 @@ namespace rhi {
 			VulkanResource resourceState{};
 			resourceState.buffer = buffer;
 			resourceState.memory = heapState->memory;
+			resourceState.memoryOffset = offset;
 			resourceState.bufferSize = desc.buffer.sizeBytes;
 			resourceState.type = ResourceType::Buffer;
 			resourceState.hostVisible = (actualFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
@@ -8563,6 +8766,9 @@ namespace rhi {
 			if (device != VK_NULL_HANDLE && slot.obj.acquireFence != VK_NULL_HANDLE) {
 				vkDestroyFence(device, slot.obj.acquireFence, nullptr);
 			}
+			if (device != VK_NULL_HANDLE && slot.obj.acquireSemaphore != VK_NULL_HANDLE) {
+				vkDestroySemaphore(device, slot.obj.acquireSemaphore, nullptr);
+			}
 			if (device != VK_NULL_HANDLE && slot.obj.swapchain != VK_NULL_HANDLE) {
 				VkDestroySwapchainKHRHooked(device, slot.obj.swapchain, nullptr);
 			}
@@ -8677,7 +8883,7 @@ namespace rhi {
 		memoryProperties = {};
 		supportedFeatures = {};
 		queueFamilyProperties.clear();
-		queues = {};
+		queues.clear();
 		queueFamilyNextQueueIndex.clear();
 		queueFamilyFreeQueueIndices.clear();
 		self = {};
@@ -9990,7 +10196,7 @@ namespace rhi {
 			allocation.memoryTypeIndex = memoryTypeIndex;
 			VkDeviceMemory memory = VK_NULL_HANDLE;
 			result = vkAllocateMemory(impl->device, &allocation, nullptr, &memory);
-			if (result == VK_SUCCESS) result = vkBindImageMemory(impl->device, image, memory, 0);
+			if (result == VK_SUCCESS) result = VkBindImageMemorySynchronized(impl, image, memory, 0);
 			if (result != VK_SUCCESS) {
 				if (memory) vkFreeMemory(impl->device, memory, nullptr);
 				vkDestroyImage(impl->device, image, nullptr);
@@ -10113,7 +10319,7 @@ namespace rhi {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return ToRHI(vkResult);
 			}
-			vkResult = vkBindBufferMemory(impl->device, buffer, memory, 0);
+			vkResult = VkBindBufferMemorySynchronized(impl, buffer, memory, 0);
 			if (vkResult != VK_SUCCESS) {
 				vkFreeMemory(impl->device, memory, nullptr);
 				vkDestroyBuffer(impl->device, buffer, nullptr);
