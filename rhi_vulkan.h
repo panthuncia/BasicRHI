@@ -493,6 +493,15 @@ namespace rhi {
 		bool streamlineInitialized = false;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		VulkanRegistry<VulkanDescriptorHeap> descriptorHeaps;
+		// Image-view slots are updated by parallel graph materialization and swept
+		// when resources retire. Registry lookup alone does not protect the nested
+		// per-heap slot arrays or vkCreate/vkDestroyImageView pairs.
+		mutable std::recursive_mutex descriptorViewsMutex;
+		// Pipeline recipes are produced on renderer worker threads.  Keep Vulkan
+		// object creation and the associated layout/descriptor mapping reads in a
+		// single host critical section; several drivers also route these calls
+		// through shared user-mode compiler state.
+		mutable std::mutex pipelineCreationMutex;
 		VulkanRegistry<VulkanResource> resources;
 		// Vulkan requires host access to each VkDeviceMemory object to be
 		// externally synchronized. Resource setup and upload mapping can occur on

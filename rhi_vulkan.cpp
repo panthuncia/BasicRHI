@@ -2901,6 +2901,8 @@ namespace rhi {
 			VkImageAspectFlags aspectMask,
 			VkImageViewType viewType,
 			const TextureSubresourceRange& range) noexcept {
+			if (!impl) return Result::InvalidArgument;
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
 			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
 			VulkanImageViewSlot* viewSlot = VkImageViewSlotState(impl, slot, expectedType);
 			VulkanResource* resource = VkResourceState(impl, resourceHandle);
@@ -2926,6 +2928,11 @@ namespace rhi {
 			viewSlot->format = viewFormat;
 			viewSlot->aspectMask = aspectMask;
 			viewSlot->range = range;
+			if (expectedType == DescriptorHeapType::RTV) {
+				spdlog::debug("Vulkan RTV view create: slot={} resource=({}, {}) image=0x{:x}",
+					slot.index, resourceHandle.index, resourceHandle.generation,
+					reinterpret_cast<uintptr_t>(resource->image));
+			}
 			return Result::Ok;
 		}
 
@@ -2933,16 +2940,21 @@ namespace rhi {
 			if (!impl || impl->device == VK_NULL_HANDLE || !resourceHandle.valid()) {
 				return;
 			}
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
 
 			for (auto& heapSlot : impl->descriptorHeaps.slots) {
 				if (!heapSlot.alive) {
 					continue;
 				}
 
-				for (VulkanImageViewSlot& viewSlot : heapSlot.obj.imageViewSlots) {
+				for (size_t descriptorIndex = 0; descriptorIndex < heapSlot.obj.imageViewSlots.size(); ++descriptorIndex) {
+					VulkanImageViewSlot& viewSlot = heapSlot.obj.imageViewSlots[descriptorIndex];
 					if (viewSlot.resource.index != resourceHandle.index || viewSlot.resource.generation != resourceHandle.generation) {
 						continue;
 					}
+					spdlog::debug("Vulkan descriptor view release: slot={} resource=({}, {}) heapType={}",
+						descriptorIndex, resourceHandle.index, resourceHandle.generation,
+						static_cast<uint32_t>(heapSlot.obj.type));
 
 					VkResetDescriptorSlot(impl, viewSlot);
 				}
@@ -2954,6 +2966,7 @@ namespace rhi {
 				resource = {};
 				return;
 			}
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
 			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
 
 			if (resource.mappedData != nullptr && resource.memory != VK_NULL_HANDLE) {
@@ -4302,10 +4315,19 @@ namespace rhi {
 			commandListState->passColorResources.clear();
 
 			for (const ColorAttachment& color : passInfo.colors) {
+				VulkanDescriptorHeap* descriptorHeap = VkDescriptorHeapState(impl, color.rtv.heap);
 				VulkanImageViewSlot* viewSlot = VkImageViewSlotState(impl, color.rtv, DescriptorHeapType::RTV);
 				VulkanResource* resource = VkResourceState(impl, viewSlot ? viewSlot->resource : ResourceHandle{});
 				if (!viewSlot || viewSlot->view == VK_NULL_HANDLE || !resource) {
-					spdlog::error("Vulkan BeginPass: invalid RTV slot {}", color.rtv.index);
+					spdlog::error("Vulkan BeginPass: invalid RTV slot {} heap=({}, {}) heapValid={} heapType={} slotCount={} viewValid={} resourceHandle=({}, {}) resourceValid={}",
+						color.rtv.index, color.rtv.heap.index, color.rtv.heap.generation,
+						descriptorHeap != nullptr,
+						descriptorHeap ? static_cast<uint32_t>(descriptorHeap->type) : UINT32_MAX,
+						descriptorHeap ? descriptorHeap->imageViewSlots.size() : 0u,
+						viewSlot && viewSlot->view != VK_NULL_HANDLE,
+						viewSlot ? viewSlot->resource.index : 0u,
+						viewSlot ? viewSlot->resource.generation : 0u,
+						resource != nullptr);
 					return;
 				}
 
@@ -5267,23 +5289,33 @@ namespace rhi {
 			if (signatureState->indirectLayout != VK_NULL_HANDLE) {
 				VulkanPipeline* pipelineState = VkPipelineState(impl, commandListState->boundPipeline);
 				if (!impl || !pipelineState || pipelineState->pipeline == VK_NULL_HANDLE || argumentResource->deviceAddress == 0 || !vkCmdExecuteGeneratedCommandsEXT) {
+					commandListState->pendingError = Result::InvalidArgument;
+					spdlog::error("Vulkan ExecuteIndirect DGC rejected invalid pipeline, argument address, or entry point");
 					return;
 				}
 
-				if (signatureState->usesExecutionSet &&
-					VkEnsureGeneratedCommandsExecutionSet(impl, *signatureState, pipelineState->pipeline) != Result::Ok) {
-					return;
+				if (signatureState->usesExecutionSet) {
+					const Result executionSetResult = VkEnsureGeneratedCommandsExecutionSet(impl, *signatureState, pipelineState->pipeline);
+					if (executionSetResult != Result::Ok) {
+						commandListState->pendingError = executionSetResult;
+						spdlog::error("Vulkan ExecuteIndirect failed to materialize its DGC execution set: result={}", ResultName(executionSetResult));
+						return;
+					}
 				}
 				VkDeviceAddress preprocessAddress = 0;
 				VkDeviceSize preprocessSize = 0;
-				if (VkAllocateGeneratedCommandsPreprocessRange(
+				const Result preprocessResult = VkAllocateGeneratedCommandsPreprocessRange(
 					impl,
 					*commandListState,
 					*signatureState,
 					pipelineState->pipeline,
 					maxCommandCount,
 					preprocessAddress,
-					preprocessSize) != Result::Ok) {
+					preprocessSize);
+				if (preprocessResult != Result::Ok) {
+					commandListState->pendingError = preprocessResult;
+					spdlog::error("Vulkan ExecuteIndirect failed to allocate DGC preprocess memory: result={} maxCommands={}",
+						ResultName(preprocessResult), maxCommandCount);
 					return;
 				}
 
@@ -5304,6 +5336,12 @@ namespace rhi {
 				generatedInfo.sequenceCountAddress = countResource && countResource->deviceAddress != 0 ? countResource->deviceAddress + countOffset : 0;
 				generatedInfo.maxDrawCount = maxCommandCount;
 				vkCmdExecuteGeneratedCommandsEXT(commandListState->commandBuffer, VK_FALSE, &generatedInfo);
+				static std::atomic<uint64_t> generatedCommandCallCount{ 0 };
+				const uint64_t call = generatedCommandCallCount.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (call == 1) {
+					spdlog::info("Vulkan ExecuteIndirect DGC active: directPipeline=true maxCommands={} stride={} countBuffer={} preprocessBytes={}",
+						maxCommandCount, stride, countResource && countResource->deviceAddress != 0, preprocessSize);
+				}
 				return;
 			}
 
@@ -5774,6 +5812,20 @@ namespace rhi {
 			if (waitTimeline) {
 				waitSemaphore = waitTimeline->semaphore;
 				waitValue = sync->wait.value;
+				// vkQueuePresentKHR can only wait on a binary semaphore.  Complete the
+				// graph timeline wait on the host before relaying it to the per-image
+				// binary semaphore.  This also gives synchronization validation an
+				// explicit completion point for the swapchain layout transition.  The
+				// relay can move into the final graph submission once Queue::Submit can
+				// carry native binary signals.
+				VkSemaphoreWaitInfo hostWaitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+				hostWaitInfo.semaphoreCount = 1;
+				hostWaitInfo.pSemaphores = &waitSemaphore;
+				hostWaitInfo.pValues = &waitValue;
+				const VkResult hostWaitResult = vkWaitSemaphores(impl->device, &hostWaitInfo, UINT64_MAX);
+				if (hostWaitResult != VK_SUCCESS) {
+					return ToRHI(hostWaitResult);
+				}
 				timelineInfo.waitSemaphoreValueCount = 1;
 				timelineInfo.pWaitSemaphoreValues = &waitValue;
 				timelineInfo.signalSemaphoreValueCount = 1;
@@ -5797,11 +5849,12 @@ namespace rhi {
 			presentInfo.pSwapchains = &swapchainState->swapchain;
 			presentInfo.pImageIndices = &swapchainState->currentImageIndex;
 
-			const VulkanQueueState* graphicsQueueState = VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
-			if (!graphicsQueueState || graphicsQueueState->queue == VK_NULL_HANDLE) {
-				RHI_FAIL(Result::Failed);
-			}
-			const VkResult presentResult = VkQueuePresentKHRHooked(graphicsQueueState->queue, &presentInfo);
+			// Present on the queue which relayed the graph completion timeline into
+			// the binary present semaphore.  Presenting through a different logical
+			// wrapper for the same family obscures the execution chain from sync
+			// validation and is unsafe when the implementation returned distinct
+			// native queues for those wrappers.
+			const VkResult presentResult = VkQueuePresentKHRHooked(signalQueueState->queue, &presentInfo);
 			if (presentResult != VK_SUCCESS && presentResult != VK_SUBOPTIMAL_KHR) {
 				return ToRHI(presentResult);
 			}
@@ -5843,6 +5896,7 @@ namespace rhi {
 			if (!impl || !items || count == 0 || impl->device == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
+			const std::scoped_lock pipelineCreationLock(impl->pipelineCreationMutex);
 
 			const SubobjShader* computeShader = nullptr;
 			const SubobjShader* vertexShader = nullptr;
@@ -6314,9 +6368,12 @@ namespace rhi {
 				rendering.depthAttachmentFormat = depthFormat != Format::Unknown ? ToVkFormat(depthFormat) : VK_FORMAT_UNDEFINED;
 				VkPipelineCreateFlags2CreateInfo createFlags{ VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
 				createFlags.flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
-				if (impl->deviceGeneratedCommandsEnabled) {
-					createFlags.flags |= VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
-				}
+				// ExecuteIndirect supplies the already-bound pipeline through
+				// VkGeneratedCommandsPipelineInfoEXT.  INDIRECT_BINDABLE is required
+				// for pipelines stored in an indirect execution set, not for this
+				// direct-pipeline form.  Applying it to every renderer pipeline makes
+				// drivers retain expensive DGC metadata and has caused unstable mesh
+				// pipeline creation on NVIDIA.
 				createFlags.pNext = &rendering;
 				VkGraphicsPipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
 				pipelineInfo.pNext = &createFlags;
@@ -6401,9 +6458,6 @@ namespace rhi {
 
 			VkPipelineCreateFlags2CreateInfo createFlags{ VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
 			createFlags.flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
-			if (impl->deviceGeneratedCommandsEnabled) {
-				createFlags.flags |= VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
-			}
 			VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
 			pipelineInfo.pNext = &createFlags;
 			pipelineInfo.stage = stageInfo;
@@ -7197,6 +7251,7 @@ namespace rhi {
 				out.Reset();
 				RHI_FAIL(Result::InvalidArgument);
 			}
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
 			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
 
 			VulkanDescriptorHeap heap{};
@@ -7294,8 +7349,12 @@ namespace rhi {
 
 		static void d_destroyDescriptorHeap(DeviceDeletionContext* context, DescriptorHeapHandle handle) noexcept {
 			auto* impl = context ? static_cast<VulkanDevice*>(context->impl) : nullptr;
+			if (!impl) {
+				return;
+			}
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
 			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, handle);
-			if (!impl || !heap) {
+			if (!heap) {
 				return;
 			}
 
@@ -7309,10 +7368,11 @@ namespace rhi {
 
 		static Result d_createShaderResourceView(Device* device, DescriptorSlot slot, const ResourceHandle& resource, const SrvDesc& desc) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
-			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
 			if (!impl) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
+			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
 
 			if (desc.dimension == SrvDim::AccelerationStruct) {
 				VulkanImageViewSlot* descriptorSlot = VkImageViewSlotState(impl, slot, DescriptorHeapType::CbvSrvUav);
@@ -7510,9 +7570,13 @@ namespace rhi {
 
 		static Result d_createUnorderedAccessView(Device* device, DescriptorSlot slot, const ResourceHandle& resource, const UavDesc& desc) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
 			VulkanResource* resourceState = VkResourceState(impl, resource);
 			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
-			if (!impl || !resourceState) {
+			if (!resourceState) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
@@ -7634,8 +7698,12 @@ namespace rhi {
 
 		static Result d_createConstantBufferView(Device* device, DescriptorSlot slot, const ResourceHandle& resource, const CbvDesc& desc) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
 			VulkanResource* resourceState = VkResourceState(impl, resource);
-			if (!impl || !resourceState || resourceState->type != ResourceType::Buffer || desc.byteSize == 0) {
+			if (!resourceState || resourceState->type != ResourceType::Buffer || desc.byteSize == 0) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
@@ -7654,9 +7722,13 @@ namespace rhi {
 
 		static Result d_createSampler(Device* device, DescriptorSlot slot, const SamplerDesc& desc) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
 			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
 			VulkanImageViewSlot* descriptorSlot = VkImageViewSlotState(impl, slot, DescriptorHeapType::Sampler);
-			if (!impl || !descriptorSlot) {
+			if (!descriptorSlot) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
@@ -7705,8 +7777,12 @@ namespace rhi {
 
 		static Result d_createRenderTargetView(Device* device, DescriptorSlot slot, const ResourceHandle& texture, const RtvDesc& desc) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
 			VulkanResource* resource = VkResourceState(impl, texture);
-			if (!impl || !resource) {
+			if (!resource) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
@@ -7717,8 +7793,12 @@ namespace rhi {
 
 		static Result d_createDepthStencilView(Device* device, DescriptorSlot slot, const ResourceHandle& texture, const DsvDesc& desc) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
 			VulkanResource* resource = VkResourceState(impl, texture);
-			if (!impl || !resource) {
+			if (!resource) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 

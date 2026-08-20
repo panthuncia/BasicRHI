@@ -2973,6 +2973,19 @@ namespace rhi {
 			D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
 			ID3D12Resource* pResource = nullptr;
 			ID3D12Resource* pCounterResource = nullptr; // optional, for structured append/consume
+			auto* nativeResource = impl->resources.get(resource);
+			if (!nativeResource || !nativeResource->res) {
+				BreakIfDebugging();
+				return Result::InvalidArgument;
+			}
+			const auto nativeDesc = nativeResource->res->GetDesc();
+			if ((nativeDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+				spdlog::error(
+					"DX12 CreateUnorderedAccessView rejected resource without ALLOW_UNORDERED_ACCESS: handle=({}, {}) dimension={} nativeFlags=0x{:X}",
+					resource.index, resource.generation, static_cast<uint32_t>(dv.dimension),
+					static_cast<uint32_t>(nativeDesc.Flags));
+				return Result::InvalidArgument;
+			}
 
 			switch (dv.dimension)
 			{
@@ -7541,12 +7554,21 @@ namespace rhi {
 						}
 					}
 					else if (p.colors.data[i].loadOp == LoadOp::DontCare) {
-						// DontCare is a promise that the attachment's old contents are not
-						// needed, not a requirement to call DiscardResource.  Explicit
-						// discard is sensitive to the resource's layout at execution time and
-						// is unsafe when independently recorded graph command lists transition
-						// different mips.  The subsequent render-target write provides the
-						// intended invalidation without imposing another layout requirement.
+						// Placed RT/DS resources in shared heaps must be initialized by a
+						// clear, copy, or discard before their first draw. The graph records
+						// the attachment transition in this same command list, so discard the
+						// exact mip after that transition and before binding the attachment.
+						if (auto* resource = l->dev->resources.get(p.colors.data[i].resource);
+							resource && resource->res) {
+							D3D12_DISCARD_REGION region{};
+							const D3D12_DISCARD_REGION* regionPtr = nullptr;
+							if (p.colors.data[i].mipSlice >= 0) {
+								region.FirstSubresource = static_cast<UINT>(p.colors.data[i].mipSlice);
+								region.NumSubresources = 1;
+								regionPtr = &region;
+							}
+							l->cl->DiscardResource(resource->res.Get(), regionPtr);
+						}
 					}
 				}
 				else {
