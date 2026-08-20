@@ -329,6 +329,15 @@ namespace rhi {
 	};
 
 	struct VulkanCommandList {
+		struct GeneratedCommandsPreprocessPage {
+			VkBuffer buffer = VK_NULL_HANDLE;
+			VkDeviceMemory memory = VK_NULL_HANDLE;
+			VkDeviceAddress deviceAddress = 0;
+			VkDeviceSize capacity = 0;
+			VkDeviceSize cursor = 0;
+			uint32_t memoryTypeIndex = UINT32_MAX;
+		};
+
 		struct TracyGpuZoneEvent {
 			void* context = nullptr;
 			uint32_t queryId = 0;
@@ -410,6 +419,10 @@ namespace rhi {
 		std::vector<RecordingTextureState> recordingTextureStates;
 		std::vector<RecordingBufferState> recordingBufferStates;
 		std::vector<EmulatedRootConstantScratchPage> emulatedRootConstantScratchPages;
+		// VK_EXT_device_generated_commands preprocess memory is writable scratch.
+		// Keep unique ranges with the command list so overlapping recorded lists
+		// (and distinct commands in one list) never alias the same scratch bytes.
+		std::vector<GeneratedCommandsPreprocessPage> generatedCommandsPreprocessPages;
 		std::vector<EmulatedRootConstantShadowState> emulatedRootConstantShadowStates;
 		std::vector<VkQueryPool> transientQueryPools;
 		std::vector<TracyGpuOpenZone> tracyGpuZoneStack;
@@ -484,7 +497,11 @@ namespace rhi {
 		// Vulkan requires host access to each VkDeviceMemory object to be
 		// externally synchronized. Resource setup and upload mapping can occur on
 		// parallel graph/setup threads, so serialize memory bind/map operations.
-		mutable std::mutex deviceMemoryMutex;
+		// Vulkan memory-object creation, binding, mapping, and destruction can be
+		// reached concurrently by async backing construction and deferred retirement.
+		// Keep each compound lifetime operation atomic. Recursive locking lets the
+		// compound helpers reuse the synchronized bind/map helpers safely.
+		mutable std::recursive_mutex deviceMemoryMutex;
 		struct HostMemoryMapping {
 			void* base = nullptr;
 			uint32_t refCount = 0;

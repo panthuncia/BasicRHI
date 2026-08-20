@@ -1086,6 +1086,7 @@ namespace rhi {
 				page = {};
 				return;
 			}
+			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
 
 			if (page.mappedData != nullptr && page.memory != VK_NULL_HANDLE) {
 				VkUnmapMemorySynchronized(impl, page.memory);
@@ -1103,6 +1104,7 @@ namespace rhi {
 			if (!impl || impl->device == VK_NULL_HANDLE || !impl->bufferDeviceAddressEnabled || minSize == 0) {
 				return false;
 			}
+			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
 
 			const uint64_t alignment = VkEmulatedRootConstantAlignment(impl);
 			const uint64_t capacity64 = (std::max<uint64_t>)(VkAlignUp(minSize, alignment), 64ull * 1024ull);
@@ -1275,12 +1277,32 @@ namespace rhi {
 		}
 
 		static void* VkDescriptorHeapSlotAddress(VulkanDescriptorHeap* heap, uint32_t index) noexcept {
-			if (!heap || !heap->mappedData || heap->descriptorStride == 0) {
+			if (!heap || !heap->mappedData || heap->descriptorStride == 0 || index >= heap->capacity) {
+				if (heap && index >= heap->capacity) {
+					spdlog::error(
+						"Vulkan descriptor write rejected out-of-range slot: index={} capacity={} type={} stride={} bytes={}",
+						index,
+						heap->capacity,
+						static_cast<uint32_t>(heap->type),
+						heap->descriptorStride,
+						heap->descriptorBytes);
+				}
+				return nullptr;
+			}
+
+			const uint64_t byteOffset = static_cast<uint64_t>(index) * heap->descriptorStride;
+			if (byteOffset > heap->descriptorBytes || heap->descriptorStride > heap->descriptorBytes - byteOffset) {
+				spdlog::error(
+					"Vulkan descriptor write rejected invalid byte range: index={} offset={} stride={} bytes={}",
+					index,
+					byteOffset,
+					heap->descriptorStride,
+					heap->descriptorBytes);
 				return nullptr;
 			}
 
 			auto* base = static_cast<std::byte*>(heap->mappedData);
-			return base + static_cast<size_t>(index * heap->descriptorStride);
+			return base + static_cast<size_t>(byteOffset);
 		}
 
 		static bool VkIsSpirvBytecode(const ShaderBinary& bytecode) noexcept {
@@ -1811,6 +1833,7 @@ namespace rhi {
 				heap.deviceAddress = 0;
 				return;
 			}
+			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
 
 			if (heap.mappedData && heap.memory != VK_NULL_HANDLE) {
 				VkUnmapMemorySynchronized(impl, heap.memory);
@@ -2587,6 +2610,135 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		static void VkDestroyGeneratedCommandsPreprocessPage(
+			VulkanDevice* impl,
+			VulkanCommandList::GeneratedCommandsPreprocessPage& page) noexcept {
+			if (!impl) {
+				page = {};
+				return;
+			}
+			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
+			if (page.buffer != VK_NULL_HANDLE) {
+				vkDestroyBuffer(impl->device, page.buffer, nullptr);
+			}
+			if (page.memory != VK_NULL_HANDLE) {
+				vkFreeMemory(impl->device, page.memory, nullptr);
+			}
+			page = {};
+		}
+
+		static Result VkAllocateGeneratedCommandsPreprocessRange(
+			VulkanDevice* impl,
+			VulkanCommandList& commandListState,
+			const VulkanCommandSignature& signature,
+			VkPipeline pipeline,
+			uint32_t maxSequenceCount,
+			VkDeviceAddress& outAddress,
+			VkDeviceSize& outSize) noexcept {
+			outAddress = 0;
+			outSize = 0;
+			if (!impl || impl->device == VK_NULL_HANDLE || !impl->bufferDeviceAddressEnabled ||
+				signature.indirectLayout == VK_NULL_HANDLE || !vkGetGeneratedCommandsMemoryRequirementsEXT ||
+				maxSequenceCount == 0) {
+				RHI_FAIL(Result::Unsupported);
+			}
+			if ((signature.usesExecutionSet && signature.executionSet == VK_NULL_HANDLE) ||
+				(!signature.usesExecutionSet && pipeline == VK_NULL_HANDLE)) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			VkGeneratedCommandsMemoryRequirementsInfoEXT requirementsInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT };
+			VkGeneratedCommandsPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT };
+			if (!signature.usesExecutionSet) {
+				pipelineInfo.pipeline = pipeline;
+				requirementsInfo.pNext = &pipelineInfo;
+			}
+			requirementsInfo.indirectExecutionSet = signature.usesExecutionSet ? signature.executionSet : VK_NULL_HANDLE;
+			requirementsInfo.indirectCommandsLayout = signature.indirectLayout;
+			requirementsInfo.maxSequenceCount = maxSequenceCount;
+			requirementsInfo.maxDrawCount = maxSequenceCount;
+
+			VkMemoryRequirements2 requirements{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+			vkGetGeneratedCommandsMemoryRequirementsEXT(impl->device, &requirementsInfo, &requirements);
+			const VkDeviceSize rangeSize = requirements.memoryRequirements.size;
+			const VkDeviceSize rangeAlignment = (std::max<VkDeviceSize>)(requirements.memoryRequirements.alignment, 1);
+			if (rangeSize == 0 || requirements.memoryRequirements.memoryTypeBits == 0) {
+				RHI_FAIL(Result::Unsupported);
+			}
+
+			for (auto& page : commandListState.generatedCommandsPreprocessPages) {
+				if (page.memoryTypeIndex >= 32 ||
+					(requirements.memoryRequirements.memoryTypeBits & (1u << page.memoryTypeIndex)) == 0) {
+					continue;
+				}
+				const VkDeviceSize alignedCursor = VkAlignUp(page.cursor, rangeAlignment);
+				if (alignedCursor <= page.capacity && rangeSize <= page.capacity - alignedCursor) {
+					outAddress = page.deviceAddress + alignedCursor;
+					outSize = rangeSize;
+					page.cursor = alignedCursor + rangeSize;
+					return Result::Ok;
+				}
+			}
+
+			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
+			const VkDeviceSize minimumPageSize = 1024ull * 1024ull;
+			const VkDeviceSize pageCapacity = (std::max)(VkAlignUp(rangeSize, rangeAlignment), minimumPageSize);
+			VulkanCommandList::GeneratedCommandsPreprocessPage page{};
+			VkBufferUsageFlags2CreateInfo usage2{ VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO };
+			usage2.usage = VK_BUFFER_USAGE_2_PREPROCESS_BUFFER_BIT_EXT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT;
+			VkBufferCreateInfo bufferInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			bufferInfo.pNext = &usage2;
+			bufferInfo.flags = VkBufferDeviceAddressCreateFlags(impl);
+			bufferInfo.size = pageCapacity;
+			bufferInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+			bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			VkResult result = vkCreateBuffer(impl->device, &bufferInfo, nullptr, &page.buffer);
+			if (result != VK_SUCCESS) {
+				return ToRHI(result);
+			}
+
+			VkMemoryRequirements bufferRequirements{};
+			vkGetBufferMemoryRequirements(impl->device, page.buffer, &bufferRequirements);
+			const uint32_t compatibleMemoryTypes = bufferRequirements.memoryTypeBits & requirements.memoryRequirements.memoryTypeBits;
+			if (!VkFindMemoryTypeIndex(impl->memoryProperties, compatibleMemoryTypes, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, page.memoryTypeIndex)) {
+				vkDestroyBuffer(impl->device, page.buffer, nullptr);
+				RHI_FAIL(Result::OutOfMemory);
+			}
+
+			VkMemoryAllocateFlagsInfo allocateFlags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+			allocateFlags.flags = VkMemoryDeviceAddressAllocateFlags(impl);
+			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+			allocateInfo.pNext = &allocateFlags;
+			allocateInfo.allocationSize = bufferRequirements.size;
+			allocateInfo.memoryTypeIndex = page.memoryTypeIndex;
+			result = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &page.memory);
+			if (result != VK_SUCCESS) {
+				vkDestroyBuffer(impl->device, page.buffer, nullptr);
+				return ToRHI(result);
+			}
+			result = VkBindBufferMemorySynchronized(impl, page.buffer, page.memory, 0);
+			if (result != VK_SUCCESS) {
+				vkDestroyBuffer(impl->device, page.buffer, nullptr);
+				vkFreeMemory(impl->device, page.memory, nullptr);
+				return ToRHI(result);
+			}
+
+			VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+			addressInfo.buffer = page.buffer;
+			page.deviceAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
+			page.capacity = pageCapacity;
+			page.cursor = rangeSize;
+			if (page.deviceAddress == 0) {
+				VkDestroyGeneratedCommandsPreprocessPage(impl, page);
+				RHI_FAIL(Result::Unsupported);
+			}
+
+			outAddress = page.deviceAddress;
+			outSize = rangeSize;
+			commandListState.generatedCommandsPreprocessPages.push_back(std::move(page));
+			return Result::Ok;
+		}
+
 		static VkImageSubresourceRange VkMakeImageSubresourceRange(VulkanResource& resource, const TextureSubresourceRange& range, VkImageAspectFlags aspectMask) noexcept {
 			VkImageSubresourceRange subresourceRange{};
 			subresourceRange.aspectMask = aspectMask;
@@ -2802,9 +2954,9 @@ namespace rhi {
 				resource = {};
 				return;
 			}
+			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
 
 			if (resource.mappedData != nullptr && resource.memory != VK_NULL_HANDLE) {
-				std::scoped_lock lock(impl->deviceMemoryMutex);
 				auto mappingIt = impl->hostMemoryMappings.find(resource.memory);
 				if (mappingIt != impl->hostMemoryMappings.end()) {
 					const uint32_t released = (std::min)(resource.mapRefCount, mappingIt->second.refCount);
@@ -4125,6 +4277,9 @@ namespace rhi {
 			for (auto& page : commandListState->emulatedRootConstantScratchPages) {
 				page.cursor = 0;
 			}
+			for (auto& page : commandListState->generatedCommandsPreprocessPages) {
+				page.cursor = 0;
+			}
 			commandListState->emulatedRootConstantShadowStates.clear();
 			commandListState->passRenderArea = {};
 			commandListState->passColorResources.clear();
@@ -5119,7 +5274,16 @@ namespace rhi {
 					VkEnsureGeneratedCommandsExecutionSet(impl, *signatureState, pipelineState->pipeline) != Result::Ok) {
 					return;
 				}
-				if (VkEnsureGeneratedCommandsPreprocessBuffer(impl, *signatureState, pipelineState->pipeline, maxCommandCount) != Result::Ok) {
+				VkDeviceAddress preprocessAddress = 0;
+				VkDeviceSize preprocessSize = 0;
+				if (VkAllocateGeneratedCommandsPreprocessRange(
+					impl,
+					*commandListState,
+					*signatureState,
+					pipelineState->pipeline,
+					maxCommandCount,
+					preprocessAddress,
+					preprocessSize) != Result::Ok) {
 					return;
 				}
 
@@ -5134,8 +5298,8 @@ namespace rhi {
 				generatedInfo.indirectCommandsLayout = signatureState->indirectLayout;
 				generatedInfo.indirectAddress = argumentResource->deviceAddress + argumentOffset;
 				generatedInfo.indirectAddressSize = static_cast<VkDeviceSize>(stride) * maxCommandCount;
-				generatedInfo.preprocessAddress = signatureState->preprocessAddress;
-				generatedInfo.preprocessSize = signatureState->preprocessSize;
+				generatedInfo.preprocessAddress = preprocessAddress;
+				generatedInfo.preprocessSize = preprocessSize;
 				generatedInfo.maxSequenceCount = maxCommandCount;
 				generatedInfo.sequenceCountAddress = countResource && countResource->deviceAddress != 0 ? countResource->deviceAddress + countOffset : 0;
 				generatedInfo.maxDrawCount = maxCommandCount;
@@ -5598,6 +5762,13 @@ namespace rhi {
 			VkTimelineSemaphoreSubmitInfo timelineInfo{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
 			VkSemaphore waitSemaphore = VK_NULL_HANDLE;
 			uint64_t waitValue = 0;
+			// VkTimelineSemaphoreSubmitInfo value arrays correspond one-for-one
+			// with every semaphore in VkSubmitInfo, including binary semaphores.
+			// The value for a binary semaphore is ignored, but omitting the entry
+			// leaves this mixed timeline-wait/binary-signal submit malformed and
+			// prevents synchronization validation from following the dependency
+			// through to vkQueuePresentKHR.
+			const uint64_t binarySignalValue = 0;
 			VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 			VkSubmitInfo signalPresentInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
 			if (waitTimeline) {
@@ -5605,6 +5776,8 @@ namespace rhi {
 				waitValue = sync->wait.value;
 				timelineInfo.waitSemaphoreValueCount = 1;
 				timelineInfo.pWaitSemaphoreValues = &waitValue;
+				timelineInfo.signalSemaphoreValueCount = 1;
+				timelineInfo.pSignalSemaphoreValues = &binarySignalValue;
 				signalPresentInfo.pNext = &timelineInfo;
 				signalPresentInfo.waitSemaphoreCount = 1;
 				signalPresentInfo.pWaitSemaphores = &waitSemaphore;
@@ -6323,6 +6496,9 @@ namespace rhi {
 			for (auto& page : commandListState->emulatedRootConstantScratchPages) {
 				VkDestroyEmulatedRootConstantScratchPage(impl, page);
 			}
+			for (auto& page : commandListState->generatedCommandsPreprocessPages) {
+				VkDestroyGeneratedCommandsPreprocessPage(impl, page);
+			}
 
 			impl->commandLists.free(commandList->GetHandle());
 			commandList->Reset();
@@ -7021,6 +7197,7 @@ namespace rhi {
 				out.Reset();
 				RHI_FAIL(Result::InvalidArgument);
 			}
+			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
 
 			VulkanDescriptorHeap heap{};
 			heap.type = desc.type;
@@ -7656,6 +7833,7 @@ namespace rhi {
 			if (impl->bufferDeviceAddressEnabled) {
 				createInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 			}
+			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
 			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 			VkBuffer buffer = VK_NULL_HANDLE;
 			VkResult result = vkCreateBuffer(impl->device, &createInfo, nullptr, &buffer);
@@ -7887,6 +8065,7 @@ namespace rhi {
 				const std::lock_guard lock(impl->timelinesMutex);
 				handle = impl->timelines.alloc(VulkanTimeline{ semaphore, initialValue });
 			}
+			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
 			Timeline timeline{ handle };
 			timeline.impl = impl;
 			timeline.vt = &g_vktlvt;
@@ -8735,6 +8914,9 @@ namespace rhi {
 
 			for (auto& page : slot.obj.emulatedRootConstantScratchPages) {
 				VkDestroyEmulatedRootConstantScratchPage(this, page);
+			}
+			for (auto& page : slot.obj.generatedCommandsPreprocessPages) {
+				VkDestroyGeneratedCommandsPreprocessPage(this, page);
 			}
 			VkDestroyCommandListTransientQueryPools(this, slot.obj);
 			slot.obj = VulkanCommandList{};
