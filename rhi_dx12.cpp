@@ -9927,9 +9927,13 @@ namespace rhi {
 			return Result::Ok;
 		}
 
-		Result export_shared_resource(Device device, Resource resource, SharedHandle& out) noexcept
+		static void CloseExternalWin32Handle(void* value) noexcept {
+			if (value) CloseHandle(static_cast<HANDLE>(value));
+		}
+
+		Result export_shared_resource(Device device, Resource resource, ExternalHandle& out) noexcept
 		{
-			out = {};
+			out.Reset();
 			if (!device || device.vt != &g_devvt || resource.impl != device.impl ||
 				(resource.vt != &g_buf_rvt && resource.vt != &g_tex_rvt)) {
 				return Result::InvalidArgument;
@@ -9940,13 +9944,14 @@ namespace rhi {
 			HANDLE handle = nullptr;
 			const HRESULT hr = impl->pNativeDevice->CreateSharedHandle(native->res.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
 			if (FAILED(hr)) return ToRHI(hr);
-			out.value = handle;
+			out = ExternalHandle(handle, ExternalHandleType::D3D12Resource,
+				ExternalHandleImportOwnership::RetainedByCaller, &CloseExternalWin32Handle);
 			return Result::Ok;
 		}
 
-		Result export_shared_heap(Device device, Heap heap, SharedHandle& out) noexcept
+		Result export_shared_heap(Device device, Heap heap, ExternalHandle& out) noexcept
 		{
-			out = {};
+			out.Reset();
 			if (!device || device.vt != &g_devvt || heap.impl != device.impl || heap.vt != &g_hevt) {
 				return Result::InvalidArgument;
 			}
@@ -9956,13 +9961,14 @@ namespace rhi {
 			HANDLE handle = nullptr;
 			const HRESULT hr = impl->pNativeDevice->CreateSharedHandle(native->heap.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
 			if (FAILED(hr)) return ToRHI(hr);
-			out.value = handle;
+			out = ExternalHandle(handle, ExternalHandleType::D3D12Heap,
+				ExternalHandleImportOwnership::RetainedByCaller, &CloseExternalWin32Handle);
 			return Result::Ok;
 		}
 
-		Result export_shared_timeline(Device device, Timeline timeline, SharedHandle& out) noexcept
+		Result export_shared_timeline(Device device, Timeline timeline, ExternalHandle& out) noexcept
 		{
-			out = {};
+			out.Reset();
 			if (!device || device.vt != &g_devvt || timeline.impl != device.impl || timeline.vt != &g_tlvt) {
 				return Result::InvalidArgument;
 			}
@@ -9972,7 +9978,8 @@ namespace rhi {
 			HANDLE handle = nullptr;
 			const HRESULT hr = impl->pNativeDevice->CreateSharedHandle(native->fence.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
 			if (FAILED(hr)) return ToRHI(hr);
-			out.value = handle;
+			out = ExternalHandle(handle, ExternalHandleType::D3D12Fence,
+				ExternalHandleImportOwnership::RetainedByCaller, &CloseExternalWin32Handle);
 			return Result::Ok;
 		}
 	}

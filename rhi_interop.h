@@ -6,6 +6,69 @@
 
 namespace rhi {
 	enum class NativeBackend : uint32_t { Unknown, D3D12, Vulkan };
+	enum class ExternalHandleType : uint8_t {
+		Unknown,
+		D3D12Resource,
+		D3D12Heap,
+		D3D12Fence
+	};
+	enum class ExternalHandleImportOwnership : uint8_t {
+		RetainedByCaller,
+		ConsumedOnSuccessfulImport
+	};
+
+	class ExternalHandle {
+	public:
+		using CloseFunction = void(*)(void*) noexcept;
+
+		ExternalHandle() = default;
+		ExternalHandle(void* value, ExternalHandleType type, ExternalHandleImportOwnership importOwnership, CloseFunction close) noexcept
+			: m_value(value), m_type(type), m_importOwnership(importOwnership), m_close(close) {}
+		~ExternalHandle() { Reset(); }
+		ExternalHandle(const ExternalHandle&) = delete;
+		ExternalHandle& operator=(const ExternalHandle&) = delete;
+		ExternalHandle(ExternalHandle&& other) noexcept { MoveFrom(other); }
+		ExternalHandle& operator=(ExternalHandle&& other) noexcept {
+			if (this != &other) {
+				Reset();
+				MoveFrom(other);
+			}
+			return *this;
+		}
+
+		explicit operator bool() const noexcept { return m_value != nullptr; }
+		void* Get() const noexcept { return m_value; }
+		ExternalHandleType GetType() const noexcept { return m_type; }
+		ExternalHandleImportOwnership GetImportOwnership() const noexcept { return m_importOwnership; }
+		void Reset() noexcept {
+			if (m_value && m_close) m_close(m_value);
+			m_value = nullptr;
+			m_type = ExternalHandleType::Unknown;
+			m_importOwnership = ExternalHandleImportOwnership::RetainedByCaller;
+			m_close = nullptr;
+		}
+		void MarkConsumed() noexcept {
+			m_value = nullptr;
+			m_type = ExternalHandleType::Unknown;
+			m_close = nullptr;
+		}
+
+	private:
+		void MoveFrom(ExternalHandle& other) noexcept {
+			m_value = other.m_value;
+			m_type = other.m_type;
+			m_importOwnership = other.m_importOwnership;
+			m_close = other.m_close;
+			other.m_value = nullptr;
+			other.m_type = ExternalHandleType::Unknown;
+			other.m_close = nullptr;
+		}
+
+		void* m_value = nullptr;
+		ExternalHandleType m_type = ExternalHandleType::Unknown;
+		ExternalHandleImportOwnership m_importOwnership = ExternalHandleImportOwnership::RetainedByCaller;
+		CloseFunction m_close = nullptr;
+	};
 
 	// --- Generic native handle (opaque)
 	struct NativeHandle { void* ptr{}; uint32_t tag{}; uint32_t version{}; };

@@ -10,10 +10,8 @@
 #include <string>
 #include <string_view>
 #include <cstddef>
-#include <condition_variable>
-#include <deque>
 #include <mutex>
-#include <thread>
+#include <utility>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -48,72 +46,66 @@
 
 namespace rhi {
 	namespace {
-		struct VkValidationMessage {
-			VkDebugUtilsMessageSeverityFlagBitsEXT severity{};
-			std::string text;
-		};
+		static constexpr size_t kMaxQueuedValidationMessages = 1024;
 
-		static void VkQueueValidationMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity, const char* message) noexcept {
-			// Validation callbacks execute inside Vulkan entry points and may hold
-			// loader/driver locks. Logging synchronously can invert those locks with
-			// another setup thread which is logging immediately before entering
-			// Vulkan. A process-lifetime drain thread keeps the callback non-blocking
-			// with respect to spdlog and preserves the messages in the renderer log.
-			static std::mutex mutex;
-			static std::condition_variable condition;
-			static std::deque<VkValidationMessage> messages;
-			static std::once_flag startFlag;
-			std::call_once(startFlag, [] {
-				std::thread([] {
-					for (;;) {
-						VkValidationMessage queued;
-						{
-							std::unique_lock lock(mutex);
-							condition.wait(lock, [] { return !messages.empty(); });
-							queued = std::move(messages.front());
-							messages.pop_front();
-						}
-						if ((queued.severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
-							spdlog::error("Vulkan validation: {}", queued.text);
-						} else if ((queued.severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0) {
-							spdlog::warn("Vulkan validation: {}", queued.text);
-						} else {
-							spdlog::debug("Vulkan validation: {}", queued.text);
-						}
-					}
-				}).detach();
-			});
+		static void VkQueueValidationMessage(VulkanDevice* impl, VkDebugUtilsMessageSeverityFlagBitsEXT severity, std::string message) noexcept {
+			if (!impl) return;
 			try {
-				{
-					std::scoped_lock lock(mutex);
-					messages.push_back({ severity, message ? message : "<no validation message>" });
+				std::scoped_lock lock(impl->validationMessagesMutex);
+				if (impl->validationMessages.size() == kMaxQueuedValidationMessages) {
+					impl->validationMessages.pop_front();
+					++impl->droppedValidationMessageCount;
 				}
-				condition.notify_one();
+				impl->validationMessages.push_back({ severity, std::move(message) });
 			} catch (...) {
 				// A diagnostic callback must never unwind through the Vulkan loader.
 			}
+		}
+
+		static void VkDrainValidationMessages(VulkanDevice* impl) noexcept {
+			if (!impl) return;
+			std::deque<VulkanDevice::ValidationMessage> messages;
+			uint64_t dropped = 0;
+			{
+				std::scoped_lock lock(impl->validationMessagesMutex);
+				messages.swap(impl->validationMessages);
+				dropped = std::exchange(impl->droppedValidationMessageCount, 0);
+			}
+			for (const auto& queued : messages) {
+				if ((queued.severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
+					spdlog::error("Vulkan validation: {}", queued.text);
+				} else if ((queued.severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0) {
+					spdlog::warn("Vulkan validation: {}", queued.text);
+				} else {
+					spdlog::debug("Vulkan validation: {}", queued.text);
+				}
+			}
+			if (dropped != 0) spdlog::warn("Vulkan validation: dropped {} queued messages", dropped);
 		}
 
 		static VKAPI_ATTR VkBool32 VKAPI_CALL VkValidationLogCallback(
 			VkDebugUtilsMessageSeverityFlagBitsEXT severity,
 			VkDebugUtilsMessageTypeFlagsEXT,
 			const VkDebugUtilsMessengerCallbackDataEXT* callbackData,
-			void*) noexcept {
-			std::string diagnostic = callbackData && callbackData->pMessage
-				? callbackData->pMessage
-				: "<no validation message>";
-			if (callbackData) {
-				for (uint32_t i = 0; i < callbackData->objectCount; ++i) {
-					const auto& object = callbackData->pObjects[i];
-					diagnostic += std::format(
-						"\n  object[{}]: type={} handle=0x{:x} name='{}'",
-						i,
-						static_cast<uint32_t>(object.objectType),
-						object.objectHandle,
-						object.pObjectName ? object.pObjectName : "<unnamed>");
+			void* userData) noexcept {
+			try {
+				std::string diagnostic = callbackData && callbackData->pMessage
+					? callbackData->pMessage
+					: "<no validation message>";
+				if (callbackData) {
+					for (uint32_t i = 0; i < callbackData->objectCount; ++i) {
+						const auto& object = callbackData->pObjects[i];
+						diagnostic += std::format(
+							"\n  object[{}]: type={} handle=0x{:x} name='{}'",
+							i,
+							static_cast<uint32_t>(object.objectType),
+							object.objectHandle,
+							object.pObjectName ? object.pObjectName : "<unnamed>");
+					}
 				}
+				VkQueueValidationMessage(static_cast<VulkanDevice*>(userData), severity, std::move(diagnostic));
+			} catch (...) {
 			}
-			VkQueueValidationMessage(severity, diagnostic.c_str());
 			return VK_FALSE;
 		}
 		static constexpr uint32_t kVkInvalidQueueFamily = 0xFFFFFFFFu;
@@ -2465,149 +2457,11 @@ namespace rhi {
 				return;
 			}
 
-			if (signature.preprocessBuffer != VK_NULL_HANDLE) {
-				vkDestroyBuffer(impl->device, signature.preprocessBuffer, nullptr);
-			}
-			if (signature.preprocessMemory != VK_NULL_HANDLE) {
-				vkFreeMemory(impl->device, signature.preprocessMemory, nullptr);
-			}
-			if (signature.executionSet != VK_NULL_HANDLE && vkDestroyIndirectExecutionSetEXT) {
-				vkDestroyIndirectExecutionSetEXT(impl->device, signature.executionSet, nullptr);
-			}
 			if (signature.indirectLayout != VK_NULL_HANDLE && vkDestroyIndirectCommandsLayoutEXT) {
 				vkDestroyIndirectCommandsLayoutEXT(impl->device, signature.indirectLayout, nullptr);
 			}
 
 			signature = {};
-		}
-
-		static Result VkEnsureGeneratedCommandsExecutionSet(VulkanDevice* impl, VulkanCommandSignature& signature, VkPipeline pipeline) noexcept {
-			if (!impl || impl->device == VK_NULL_HANDLE || pipeline == VK_NULL_HANDLE || !vkCreateIndirectExecutionSetEXT) {
-				RHI_FAIL(Result::Unsupported);
-			}
-			if (signature.executionSet != VK_NULL_HANDLE) {
-				if (signature.executionSetPipeline != pipeline) {
-					RHI_FAIL(Result::Unsupported);
-				}
-				return Result::Ok;
-			}
-
-			VkIndirectExecutionSetPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_PIPELINE_INFO_EXT };
-			pipelineInfo.initialPipeline = pipeline;
-			pipelineInfo.maxPipelineCount = 1;
-
-			VkIndirectExecutionSetCreateInfoEXT createInfo{ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_CREATE_INFO_EXT };
-			createInfo.type = VK_INDIRECT_EXECUTION_SET_INFO_TYPE_PIPELINES_EXT;
-			createInfo.info.pPipelineInfo = &pipelineInfo;
-
-			const VkResult result = vkCreateIndirectExecutionSetEXT(impl->device, &createInfo, nullptr, &signature.executionSet);
-			if (result != VK_SUCCESS) {
-				return ToRHI(result);
-			}
-			signature.executionSetPipeline = pipeline;
-			return Result::Ok;
-		}
-
-		static Result VkEnsureGeneratedCommandsPreprocessBuffer(VulkanDevice* impl, VulkanCommandSignature& signature, VkPipeline pipeline, uint32_t maxSequenceCount) noexcept {
-			if (!impl || impl->device == VK_NULL_HANDLE || !impl->bufferDeviceAddressEnabled || signature.indirectLayout == VK_NULL_HANDLE || !vkGetGeneratedCommandsMemoryRequirementsEXT) {
-				RHI_FAIL(Result::Unsupported);
-			}
-			if (signature.usesExecutionSet && signature.executionSet == VK_NULL_HANDLE) {
-				RHI_FAIL(Result::Unsupported);
-			}
-			if (!signature.usesExecutionSet && pipeline == VK_NULL_HANDLE) {
-				RHI_FAIL(Result::InvalidArgument);
-			}
-
-			VkGeneratedCommandsMemoryRequirementsInfoEXT requirementsInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT };
-			VkGeneratedCommandsPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT };
-			if (!signature.usesExecutionSet) {
-				pipelineInfo.pipeline = pipeline;
-				requirementsInfo.pNext = &pipelineInfo;
-			}
-			requirementsInfo.indirectExecutionSet = signature.usesExecutionSet ? signature.executionSet : VK_NULL_HANDLE;
-			requirementsInfo.indirectCommandsLayout = signature.indirectLayout;
-			requirementsInfo.maxSequenceCount = maxSequenceCount;
-			requirementsInfo.maxDrawCount = maxSequenceCount;
-
-			VkMemoryRequirements2 requirements{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
-			vkGetGeneratedCommandsMemoryRequirementsEXT(impl->device, &requirementsInfo, &requirements);
-			if (requirements.memoryRequirements.size == 0) {
-				RHI_FAIL(Result::Unsupported);
-			}
-
-			if (signature.preprocessBuffer != VK_NULL_HANDLE &&
-				signature.preprocessSize >= requirements.memoryRequirements.size &&
-				signature.preprocessMaxSequenceCount >= maxSequenceCount) {
-				return Result::Ok;
-			}
-
-			if (signature.preprocessBuffer != VK_NULL_HANDLE) {
-				vkDestroyBuffer(impl->device, signature.preprocessBuffer, nullptr);
-				signature.preprocessBuffer = VK_NULL_HANDLE;
-			}
-			if (signature.preprocessMemory != VK_NULL_HANDLE) {
-				vkFreeMemory(impl->device, signature.preprocessMemory, nullptr);
-				signature.preprocessMemory = VK_NULL_HANDLE;
-			}
-			signature.preprocessAddress = 0;
-			signature.preprocessSize = 0;
-			signature.preprocessMaxSequenceCount = 0;
-
-			VkBufferUsageFlags2CreateInfo usage2{ VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO };
-			usage2.usage = VK_BUFFER_USAGE_2_PREPROCESS_BUFFER_BIT_EXT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT;
-			VkBufferCreateInfo bufferInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-			bufferInfo.pNext = &usage2;
-			bufferInfo.flags = VkBufferDeviceAddressCreateFlags(impl);
-			bufferInfo.size = requirements.memoryRequirements.size;
-			bufferInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-			bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-			VkResult result = vkCreateBuffer(impl->device, &bufferInfo, nullptr, &signature.preprocessBuffer);
-			if (result != VK_SUCCESS) {
-				return ToRHI(result);
-			}
-
-			VkMemoryRequirements bufferRequirements{};
-			vkGetBufferMemoryRequirements(impl->device, signature.preprocessBuffer, &bufferRequirements);
-			uint32_t memoryTypeIndex = 0;
-			if (!VkFindMemoryTypeIndex(impl->memoryProperties, bufferRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, memoryTypeIndex)) {
-				vkDestroyBuffer(impl->device, signature.preprocessBuffer, nullptr);
-				signature.preprocessBuffer = VK_NULL_HANDLE;
-				RHI_FAIL(Result::OutOfMemory);
-			}
-
-			VkMemoryAllocateFlagsInfo allocateFlags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
-			allocateFlags.flags = VkMemoryDeviceAddressAllocateFlags(impl);
-			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-			allocateInfo.pNext = &allocateFlags;
-			allocateInfo.allocationSize = bufferRequirements.size;
-			allocateInfo.memoryTypeIndex = memoryTypeIndex;
-			result = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &signature.preprocessMemory);
-			if (result != VK_SUCCESS) {
-				vkDestroyBuffer(impl->device, signature.preprocessBuffer, nullptr);
-				signature.preprocessBuffer = VK_NULL_HANDLE;
-				return ToRHI(result);
-			}
-
-			result = VkBindBufferMemorySynchronized(impl, signature.preprocessBuffer, signature.preprocessMemory, 0);
-			if (result != VK_SUCCESS) {
-				vkDestroyBuffer(impl->device, signature.preprocessBuffer, nullptr);
-				vkFreeMemory(impl->device, signature.preprocessMemory, nullptr);
-				signature.preprocessBuffer = VK_NULL_HANDLE;
-				signature.preprocessMemory = VK_NULL_HANDLE;
-				return ToRHI(result);
-			}
-
-			VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
-			addressInfo.buffer = signature.preprocessBuffer;
-			signature.preprocessAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
-			signature.preprocessSize = requirements.memoryRequirements.size;
-			signature.preprocessMaxSequenceCount = maxSequenceCount;
-			if (signature.preprocessAddress == 0) {
-				RHI_FAIL(Result::Unsupported);
-			}
-			return Result::Ok;
 		}
 
 		static void VkDestroyGeneratedCommandsPreprocessPage(
@@ -2642,18 +2496,15 @@ namespace rhi {
 				maxSequenceCount == 0) {
 				RHI_FAIL(Result::Unsupported);
 			}
-			if ((signature.usesExecutionSet && signature.executionSet == VK_NULL_HANDLE) ||
-				(!signature.usesExecutionSet && pipeline == VK_NULL_HANDLE)) {
+			if (pipeline == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
 			VkGeneratedCommandsMemoryRequirementsInfoEXT requirementsInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT };
 			VkGeneratedCommandsPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT };
-			if (!signature.usesExecutionSet) {
-				pipelineInfo.pipeline = pipeline;
-				requirementsInfo.pNext = &pipelineInfo;
-			}
-			requirementsInfo.indirectExecutionSet = signature.usesExecutionSet ? signature.executionSet : VK_NULL_HANDLE;
+			pipelineInfo.pipeline = pipeline;
+			requirementsInfo.pNext = &pipelineInfo;
+			requirementsInfo.indirectExecutionSet = VK_NULL_HANDLE;
 			requirementsInfo.indirectCommandsLayout = signature.indirectLayout;
 			requirementsInfo.maxSequenceCount = maxSequenceCount;
 			requirementsInfo.maxDrawCount = maxSequenceCount;
@@ -3901,7 +3752,7 @@ namespace rhi {
 		}
 
 		static void q_checkDebugMessages(Queue* queue) noexcept {
-			VkIgnoreUnused(queue);
+			VkDrainValidationMessages(queue ? static_cast<VulkanDevice*>(queue->impl) : nullptr);
 		}
 
 		static void q_setName(Queue* queue, const char* name) noexcept {
@@ -5294,14 +5145,6 @@ namespace rhi {
 					return;
 				}
 
-				if (signatureState->usesExecutionSet) {
-					const Result executionSetResult = VkEnsureGeneratedCommandsExecutionSet(impl, *signatureState, pipelineState->pipeline);
-					if (executionSetResult != Result::Ok) {
-						commandListState->pendingError = executionSetResult;
-						spdlog::error("Vulkan ExecuteIndirect failed to materialize its DGC execution set: result={}", ResultName(executionSetResult));
-						return;
-					}
-				}
 				VkDeviceAddress preprocessAddress = 0;
 				VkDeviceSize preprocessSize = 0;
 				const Result preprocessResult = VkAllocateGeneratedCommandsPreprocessRange(
@@ -5321,12 +5164,10 @@ namespace rhi {
 
 				VkGeneratedCommandsInfoEXT generatedInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT };
 				VkGeneratedCommandsPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT };
-				if (!signatureState->usesExecutionSet) {
-					pipelineInfo.pipeline = pipelineState->pipeline;
-					generatedInfo.pNext = &pipelineInfo;
-				}
+				pipelineInfo.pipeline = pipelineState->pipeline;
+				generatedInfo.pNext = &pipelineInfo;
 				generatedInfo.shaderStages = pipelineState->bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS;
-				generatedInfo.indirectExecutionSet = signatureState->usesExecutionSet ? signatureState->executionSet : VK_NULL_HANDLE;
+				generatedInfo.indirectExecutionSet = VK_NULL_HANDLE;
 				generatedInfo.indirectCommandsLayout = signatureState->indirectLayout;
 				generatedInfo.indirectAddress = argumentResource->deviceAddress + argumentOffset;
 				generatedInfo.indirectAddressSize = static_cast<VkDeviceSize>(stride) * maxCommandCount;
@@ -5336,12 +5177,6 @@ namespace rhi {
 				generatedInfo.sequenceCountAddress = countResource && countResource->deviceAddress != 0 ? countResource->deviceAddress + countOffset : 0;
 				generatedInfo.maxDrawCount = maxCommandCount;
 				vkCmdExecuteGeneratedCommandsEXT(commandListState->commandBuffer, VK_FALSE, &generatedInfo);
-				static std::atomic<uint64_t> generatedCommandCallCount{ 0 };
-				const uint64_t call = generatedCommandCallCount.fetch_add(1, std::memory_order_relaxed) + 1;
-				if (call == 1) {
-					spdlog::info("Vulkan ExecuteIndirect DGC active: directPipeline=true maxCommands={} stride={} countBuffer={} preprocessBytes={}",
-						maxCommandCount, stride, countResource && countResource->deviceAddress != 0, preprocessSize);
-				}
 				return;
 			}
 
@@ -5896,8 +5731,6 @@ namespace rhi {
 			if (!impl || !items || count == 0 || impl->device == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
-			const std::scoped_lock pipelineCreationLock(impl->pipelineCreationMutex);
-
 			const SubobjShader* computeShader = nullptr;
 			const SubobjShader* vertexShader = nullptr;
 			const SubobjShader* pixelShader = nullptr;
@@ -6389,17 +6222,8 @@ namespace rhi {
 				pipelineInfo.pDynamicState = &dynamicState;
 				pipelineInfo.layout = nativeLayout;
 
-				static std::atomic<uint64_t> graphicsPipelineSequence{ 0 };
-				const uint64_t pipelineSequence = graphicsPipelineSequence.fetch_add(1, std::memory_order_relaxed) + 1;
-				spdlog::info("Vulkan graphics pipeline create begin: sequence={} stages={} mesh={} taskEntry='{}' taskBytes={} meshEntry='{}' meshBytes={} pixelEntry='{}' pixelBytes={} colors={} depthFormat={}",
-					pipelineSequence, shaderStages.size(), hasMeshShader,
-					taskShader ? taskShader->entryPoint : std::string{}, taskShader ? taskShader->bytecode.size : 0u,
-					meshShader ? meshShader->entryPoint : std::string{}, meshShader ? meshShader->bytecode.size : 0u,
-					pixelShader ? pixelShader->entryPoint : std::string{}, pixelShader ? pixelShader->bytecode.size : 0u,
-					renderTargets.count, static_cast<uint32_t>(depthFormat));
 				VkPipeline nativePipeline = VK_NULL_HANDLE;
 				VkResult vkResult = vkCreateGraphicsPipelines(impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &nativePipeline);
-				spdlog::info("Vulkan graphics pipeline create end: sequence={} result={}", pipelineSequence, static_cast<int32_t>(vkResult));
 				for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
 				if (vkResult != VK_SUCCESS) {
 					vkDestroyPipelineLayout(impl->device, nativeLayout, nullptr);
@@ -7226,7 +7050,6 @@ namespace rhi {
 			signature.args.assign(desc.args.data, desc.args.data + desc.args.size);
 			signature.byteStride = desc.byteStride;
 			signature.indirectLayout = indirectLayout;
-			signature.usesExecutionSet = false;
 			const CommandSignatureHandle handle = impl->commandSignatures.alloc(signature);
 			CommandSignature object{ handle };
 			object.impl = impl;
@@ -8860,7 +8683,7 @@ namespace rhi {
 		}
 
 		static void d_checkDebugMessages(Device* device) noexcept {
-			VkIgnoreUnused(device);
+			VkDrainValidationMessages(device ? static_cast<VulkanDevice*>(device->impl) : nullptr);
 		}
 
 		static Result d_getDebugInstrumentationCapabilities(const Device* device, DebugInstrumentationCapabilities& out) noexcept {
@@ -9133,6 +8956,7 @@ namespace rhi {
 		}
 
 		if (instance != VK_NULL_HANDLE && debugMessenger != VK_NULL_HANDLE && vkDestroyDebugUtilsMessengerEXT) {
+			VkDrainValidationMessages(this);
 			vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
 			debugMessenger = VK_NULL_HANDLE;
 		}
@@ -10142,6 +9966,7 @@ namespace rhi {
 				VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
 				VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
 			debugInfo.pfnUserCallback = &VkValidationLogCallback;
+			debugInfo.pUserData = impl.get();
 			if (vkCreateDebugUtilsMessengerEXT(instance, &debugInfo, nullptr, &impl->debugMessenger) != VK_SUCCESS) {
 				spdlog::warn("CreateVulkanDevice: failed to create the validation log messenger.");
 			}
@@ -10408,11 +10233,12 @@ namespace rhi {
 			return support;
 		}
 
-		Result import_d3d12_texture(Device device, void* sharedHandle, const ResourceDesc& desc, ResourcePtr& out) noexcept {
+		Result import_d3d12_texture(Device device, const ExternalHandle& sharedHandle, const ResourceDesc& desc, ResourcePtr& out) noexcept {
 			out.Reset();
 #ifdef _WIN32
 			const ExternalImageSupport support = query_d3d12_texture_support(device, desc);
-			if (!sharedHandle || !support.supported) return sharedHandle ? Result::Unsupported : Result::InvalidArgument;
+			if (!sharedHandle || sharedHandle.GetType() != ExternalHandleType::D3D12Resource || !support.supported)
+				return sharedHandle && sharedHandle.GetType() == ExternalHandleType::D3D12Resource ? Result::Unsupported : Result::InvalidArgument;
 			auto* impl = static_cast<VulkanDevice*>(device.impl);
 			const auto getHandleProperties = reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
 				vkGetDeviceProcAddr(impl->device, "vkGetMemoryWin32HandlePropertiesKHR"));
@@ -10438,7 +10264,7 @@ namespace rhi {
 			VkMemoryRequirements requirements{};
 			vkGetImageMemoryRequirements(impl->device, image, &requirements);
 			VkMemoryWin32HandlePropertiesKHR handleProperties{ VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
-			result = getHandleProperties(impl->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT, sharedHandle, &handleProperties);
+			result = getHandleProperties(impl->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT, sharedHandle.Get(), &handleProperties);
 			uint32_t memoryTypeIndex = 0;
 			if (result != VK_SUCCESS || !VkFindMemoryTypeIndex(impl->memoryProperties,
 				requirements.memoryTypeBits & handleProperties.memoryTypeBits,
@@ -10451,7 +10277,7 @@ namespace rhi {
 			VkImportMemoryWin32HandleInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
 			importInfo.pNext = &dedicated;
 			importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
-			importInfo.handle = static_cast<HANDLE>(sharedHandle);
+			importInfo.handle = static_cast<HANDLE>(sharedHandle.Get());
 			VkMemoryAllocateInfo allocation{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
 			allocation.pNext = &importInfo;
 			allocation.allocationSize = requirements.size;
@@ -10480,17 +10306,18 @@ namespace rhi {
 #endif
 		}
 
-		Result import_d3d12_heap(Device device, void* sharedHandle, const HeapDesc& desc, HeapPtr& out) noexcept {
+		Result import_d3d12_heap(Device device, const ExternalHandle& sharedHandle, const HeapDesc& desc, HeapPtr& out) noexcept {
 			out.Reset();
 #ifdef _WIN32
-			if (!device || device.vt != &g_vkdevvt || !device.impl || !sharedHandle || desc.sizeBytes == 0 ||
+			if (!device || device.vt != &g_vkdevvt || !device.impl || !sharedHandle ||
+				sharedHandle.GetType() != ExternalHandleType::D3D12Heap || desc.sizeBytes == 0 ||
 				desc.memory != HeapType::DeviceLocal) return Result::InvalidArgument;
 			auto* impl = static_cast<VulkanDevice*>(device.impl);
 			const auto getHandleProperties = reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
 				vkGetDeviceProcAddr(impl->device, "vkGetMemoryWin32HandlePropertiesKHR"));
 			if (!impl->externalMemoryWin32Enabled || !getHandleProperties) return Result::Unsupported;
 			VkMemoryWin32HandlePropertiesKHR properties{ VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
-			VkResult result = getHandleProperties(impl->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT, sharedHandle, &properties);
+			VkResult result = getHandleProperties(impl->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT, sharedHandle.Get(), &properties);
 			uint32_t memoryTypeIndex = 0;
 			if (result != VK_SUCCESS || !VkFindMemoryTypeIndex(impl->memoryProperties, properties.memoryTypeBits,
 				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memoryTypeIndex)) {
@@ -10498,7 +10325,7 @@ namespace rhi {
 			}
 			VkImportMemoryWin32HandleInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
 			importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
-			importInfo.handle = static_cast<HANDLE>(sharedHandle);
+			importInfo.handle = static_cast<HANDLE>(sharedHandle.Get());
 			VkMemoryAllocateFlagsInfo flags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
 			if (impl->bufferDeviceAddressEnabled) { flags.flags = VkMemoryDeviceAddressAllocateFlags(impl); importInfo.pNext = &flags; }
 			VkMemoryAllocateInfo allocation{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
@@ -10517,10 +10344,11 @@ namespace rhi {
 #endif
 		}
 
-		Result import_d3d12_buffer(Device device, void* sharedHandle, const ResourceDesc& desc, ResourcePtr& out) noexcept {
+		Result import_d3d12_buffer(Device device, const ExternalHandle& sharedHandle, const ResourceDesc& desc, ResourcePtr& out) noexcept {
 			out.Reset();
 #ifdef _WIN32
 			if (!device || device.vt != &g_vkdevvt || !device.impl || !sharedHandle ||
+				sharedHandle.GetType() != ExternalHandleType::D3D12Resource ||
 				desc.type != ResourceType::Buffer || desc.heapType != HeapType::DeviceLocal || desc.buffer.sizeBytes == 0) {
 				return Result::InvalidArgument;
 			}
@@ -10552,7 +10380,7 @@ namespace rhi {
 			vkGetBufferMemoryRequirements(impl->device, buffer, &requirements);
 			VkMemoryWin32HandlePropertiesKHR handleProperties{ VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
 			vkResult = getHandleProperties(
-				impl->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT, sharedHandle, &handleProperties);
+				impl->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT, sharedHandle.Get(), &handleProperties);
 			if (vkResult != VK_SUCCESS) {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return ToRHI(vkResult);
@@ -10570,7 +10398,7 @@ namespace rhi {
 			VkImportMemoryWin32HandleInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
 			importInfo.pNext = &dedicated;
 			importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
-			importInfo.handle = static_cast<HANDLE>(sharedHandle);
+			importInfo.handle = static_cast<HANDLE>(sharedHandle.Get());
 			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
 			allocateInfo.pNext = &importInfo;
 			allocateInfo.allocationSize = requirements.size;
@@ -10609,11 +10437,12 @@ namespace rhi {
 #endif
 		}
 
-		Result import_d3d12_timeline(Device device, void* sharedHandle, uint64_t initialValue,
+		Result import_d3d12_timeline(Device device, const ExternalHandle& sharedHandle, uint64_t initialValue,
 			const char* debugName, TimelinePtr& out) noexcept {
 			out.Reset();
 #ifdef _WIN32
-			if (!device || device.vt != &g_vkdevvt || !device.impl || !sharedHandle) return Result::InvalidArgument;
+			if (!device || device.vt != &g_vkdevvt || !device.impl || !sharedHandle ||
+				sharedHandle.GetType() != ExternalHandleType::D3D12Fence) return Result::InvalidArgument;
 			auto* impl = static_cast<VulkanDevice*>(device.impl);
 			const auto importSemaphore = reinterpret_cast<PFN_vkImportSemaphoreWin32HandleKHR>(
 				vkGetDeviceProcAddr(impl->device, "vkImportSemaphoreWin32HandleKHR"));
@@ -10631,7 +10460,7 @@ namespace rhi {
 			VkImportSemaphoreWin32HandleInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
 			importInfo.semaphore = semaphore;
 			importInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
-			importInfo.handle = static_cast<HANDLE>(sharedHandle);
+			importInfo.handle = static_cast<HANDLE>(sharedHandle.Get());
 			vkResult = importSemaphore(impl->device, &importInfo);
 			if (vkResult != VK_SUCCESS) {
 				vkDestroySemaphore(impl->device, semaphore, nullptr);

@@ -43,7 +43,7 @@ namespace rhi::vulkan {
     Win32ExternalInteropCapabilities query_win32_external_interop(rhi::Device device) noexcept;
     Result import_d3d12_buffer(
         rhi::Device device,
-        void* sharedHandle,
+        const ExternalHandle& sharedHandle,
         const rhi::ResourceDesc& desc,
         rhi::ResourcePtr& out) noexcept;
 	ExternalImageSupport query_d3d12_texture_support(
@@ -51,17 +51,17 @@ namespace rhi::vulkan {
 		const rhi::ResourceDesc& desc) noexcept;
 	Result import_d3d12_texture(
 		rhi::Device device,
-		void* sharedHandle,
+		const ExternalHandle& sharedHandle,
 		const rhi::ResourceDesc& desc,
 		rhi::ResourcePtr& out) noexcept;
 	Result import_d3d12_heap(
 		rhi::Device device,
-		void* sharedHandle,
+		const ExternalHandle& sharedHandle,
 		const rhi::HeapDesc& desc,
 		rhi::HeapPtr& out) noexcept;
     Result import_d3d12_timeline(
         rhi::Device device,
-        void* sharedHandle,
+        const ExternalHandle& sharedHandle,
         uint64_t initialValue,
         const char* debugName,
         rhi::TimelinePtr& out) noexcept;

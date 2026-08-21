@@ -12,6 +12,9 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -489,6 +492,25 @@ namespace {
 			rhi::Make(subobjLayout),
 			rhi::Make(subobjCompute),
 		};
+		std::atomic_uint32_t concurrentFailures{ 0 };
+		std::vector<std::thread> pipelineThreads;
+		for (uint32_t threadIndex = 0; threadIndex < 8; ++threadIndex) {
+			pipelineThreads.emplace_back([&] {
+				for (uint32_t iteration = 0; iteration < 8; ++iteration) {
+					rhi::PipelinePtr concurrentPipeline;
+					if (device.CreatePipeline(items, static_cast<uint32_t>(std::size(items)), concurrentPipeline) != rhi::Result::Ok ||
+						!concurrentPipeline) {
+						concurrentFailures.fetch_add(1, std::memory_order_relaxed);
+					}
+				}
+			});
+		}
+		for (auto& thread : pipelineThreads) thread.join();
+		if (concurrentFailures.load(std::memory_order_relaxed) != 0) {
+			std::fprintf(stderr, "Concurrent Vulkan pipeline creation failed %u times\n",
+				concurrentFailures.load(std::memory_order_relaxed));
+			return rhi::Result::InvalidArgument;
+		}
 
 		if (Check(device.CreatePipeline(items, static_cast<uint32_t>(std::size(items)), pipeline), "CreatePipeline compute") != rhi::Result::Ok) {
 			return rhi::Result::InvalidArgument;

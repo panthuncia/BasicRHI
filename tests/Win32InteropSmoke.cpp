@@ -102,10 +102,9 @@ int main() {
 		}
 		rhi::ResourcePtr d3Texture, vkTexture;
 		if (!Check(d3d->CreateCommittedResource(textureDesc, d3Texture), "Create shared texture")) return 1;
-		rhi::dx12::SharedHandle textureHandle{};
+		rhi::ExternalHandle textureHandle{};
 		if (!Check(rhi::dx12::export_shared_resource(d3d.Get(), d3Texture.Get(), textureHandle), "Export shared texture")) return 1;
-		const auto textureImport = rhi::vulkan::import_d3d12_texture(vk.Get(), textureHandle.value, textureDesc, vkTexture);
-		CloseHandle(static_cast<HANDLE>(textureHandle.value));
+		const auto textureImport = rhi::vulkan::import_d3d12_texture(vk.Get(), textureHandle, textureDesc, vkTexture);
 		if (!Check(textureImport, "Import shared texture")) return 1;
 	}
 	rhi::ResourceDesc unsupportedTexture{};
@@ -128,10 +127,9 @@ int main() {
 	sharedHeapDesc.debugName = "Interop shared alias heap";
 	rhi::HeapPtr d3Heap, vkHeap;
 	if (!Check(d3d->CreateHeap(sharedHeapDesc, d3Heap), "Create shared heap")) return 1;
-	rhi::dx12::SharedHandle heapHandle{};
+	rhi::ExternalHandle heapHandle{};
 	if (!Check(rhi::dx12::export_shared_heap(d3d.Get(), d3Heap.Get(), heapHandle), "Export shared heap")) return 1;
-	const auto heapImport = rhi::vulkan::import_d3d12_heap(vk.Get(), heapHandle.value, sharedHeapDesc, vkHeap);
-	CloseHandle(static_cast<HANDLE>(heapHandle.value));
+	const auto heapImport = rhi::vulkan::import_d3d12_heap(vk.Get(), heapHandle, sharedHeapDesc, vkHeap);
 	if (!Check(heapImport, "Import shared heap")) return 1;
 	auto aliasDesc = rhi::helpers::ResourceDesc::Buffer(4096, rhi::HeapType::DeviceLocal);
 	rhi::ResourcePtr d3AliasA, d3AliasB, vkAliasA, vkAliasB;
@@ -147,10 +145,9 @@ int main() {
         !Check(d3d->CreateCommittedResource(sharedDesc, d3dB), "Create shared buffer B")) return 1;
 
     for (auto pair : { std::pair{ &d3dA, &vkA }, std::pair{ &d3dB, &vkB } }) {
-        rhi::dx12::SharedHandle handle{};
+        rhi::ExternalHandle handle{};
         if (!Check(rhi::dx12::export_shared_resource(d3d.Get(), pair.first->Get(), handle), "Export shared buffer")) return 1;
-        const auto importResult = rhi::vulkan::import_d3d12_buffer(vk.Get(), handle.value, sharedDesc, *pair.second);
-        CloseHandle(static_cast<HANDLE>(handle.value));
+        const auto importResult = rhi::vulkan::import_d3d12_buffer(vk.Get(), handle, sharedDesc, *pair.second);
         if (!Check(importResult, "Import shared buffer")) return 1;
     }
 
@@ -165,10 +162,9 @@ int main() {
 
     rhi::TimelinePtr d3dBridge, vkBridge, done;
     if (!Check(d3d->CreateTimeline(d3dBridge, 0, "InteropBridge", true), "Create shared fence")) return 1;
-    rhi::dx12::SharedHandle fenceHandle{};
+    rhi::ExternalHandle fenceHandle{};
     if (!Check(rhi::dx12::export_shared_timeline(d3d.Get(), d3dBridge.Get(), fenceHandle), "Export shared fence")) return 1;
-    const auto timelineImport = rhi::vulkan::import_d3d12_timeline(vk.Get(), fenceHandle.value, 0, "InteropBridgeVk", vkBridge);
-    CloseHandle(static_cast<HANDLE>(fenceHandle.value));
+    const auto timelineImport = rhi::vulkan::import_d3d12_timeline(vk.Get(), fenceHandle, 0, "InteropBridgeVk", vkBridge);
     if (!Check(timelineImport, "Import shared fence")) return 1;
     if (!Check(d3d->CreateTimeline(done, 0, "InteropDone"), "Create completion fence")) return 1;
 
@@ -229,10 +225,9 @@ int main() {
     if (!Check(d3d->CreateCommittedResource(transferTextureDesc, d3TextureA), "Create transfer texture A") ||
         !Check(d3d->CreateCommittedResource(transferTextureDesc, d3TextureB), "Create transfer texture B")) return 1;
     for (auto pair : { std::pair{ &d3TextureA, &vkTextureA }, std::pair{ &d3TextureB, &vkTextureB } }) {
-        rhi::dx12::SharedHandle handle{};
+        rhi::ExternalHandle handle{};
         if (!Check(rhi::dx12::export_shared_resource(d3d.Get(), pair.first->Get(), handle), "Export transfer texture")) return 1;
-        const auto import = rhi::vulkan::import_d3d12_texture(vk.Get(), handle.value, transferTextureDesc, *pair.second);
-        CloseHandle(static_cast<HANDLE>(handle.value));
+        const auto import = rhi::vulkan::import_d3d12_texture(vk.Get(), handle, transferTextureDesc, *pair.second);
         if (!Check(import, "Import transfer texture")) return 1;
     }
     rhi::ResourcePtr textureUpload, textureReadback;

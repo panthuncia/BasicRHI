@@ -294,14 +294,6 @@ namespace rhi {
 		std::vector<IndirectArg> args;
 		uint32_t byteStride = 0;
 		VkIndirectCommandsLayoutEXT indirectLayout = VK_NULL_HANDLE;
-		bool usesExecutionSet = false;
-		VkIndirectExecutionSetEXT executionSet = VK_NULL_HANDLE;
-		VkPipeline executionSetPipeline = VK_NULL_HANDLE;
-		VkBuffer preprocessBuffer = VK_NULL_HANDLE;
-		VkDeviceMemory preprocessMemory = VK_NULL_HANDLE;
-		VkDeviceAddress preprocessAddress = 0;
-		VkDeviceSize preprocessSize = 0;
-		uint32_t preprocessMaxSequenceCount = 0;
 	};
 
 	struct VulkanTimeline {
@@ -437,6 +429,13 @@ namespace rhi {
 		Device self{};
 		VkInstance instance = VK_NULL_HANDLE;
 		VkDebugUtilsMessengerEXT debugMessenger = VK_NULL_HANDLE;
+		struct ValidationMessage {
+			VkDebugUtilsMessageSeverityFlagBitsEXT severity{};
+			std::string text;
+		};
+		mutable std::mutex validationMessagesMutex;
+		std::deque<ValidationMessage> validationMessages;
+		uint64_t droppedValidationMessageCount = 0;
 		VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 		VkDevice device = VK_NULL_HANDLE;
 		VkPhysicalDeviceProperties physicalDeviceProperties{};
@@ -497,11 +496,6 @@ namespace rhi {
 		// when resources retire. Registry lookup alone does not protect the nested
 		// per-heap slot arrays or vkCreate/vkDestroyImageView pairs.
 		mutable std::recursive_mutex descriptorViewsMutex;
-		// Pipeline recipes are produced on renderer worker threads.  Keep Vulkan
-		// object creation and the associated layout/descriptor mapping reads in a
-		// single host critical section; several drivers also route these calls
-		// through shared user-mode compiler state.
-		mutable std::mutex pipelineCreationMutex;
 		VulkanRegistry<VulkanResource> resources;
 		// Vulkan requires host access to each VkDeviceMemory object to be
 		// externally synchronized. Resource setup and upload mapping can occur on
