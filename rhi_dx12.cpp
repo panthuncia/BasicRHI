@@ -8020,9 +8020,15 @@ namespace rhi {
 				return ToDX(layout);
 			};
 
-			std::vector<D3D12_TEXTURE_BARRIER> tex;
-			std::vector<D3D12_BUFFER_BARRIER>  buf;
-			std::vector<D3D12_GLOBAL_BARRIER>  glob;
+			// Command recording is non-reentrant on a thread. Reuse translation
+			// storage so parallel recording does not allocate and free several small
+			// vectors for every barrier call through the process heap.
+			static thread_local std::vector<D3D12_TEXTURE_BARRIER> tex;
+			static thread_local std::vector<D3D12_BUFFER_BARRIER>  buf;
+			static thread_local std::vector<D3D12_GLOBAL_BARRIER>  glob;
+			tex.clear();
+			buf.clear();
+			glob.clear();
 
 			tex.reserve(b.textures.size);
 			buf.reserve(b.buffers.size);
@@ -8096,33 +8102,35 @@ namespace rhi {
 				glob.push_back(gb);
 			}
 
-			// Build groups (one per kind if non-empty)
-			std::vector<D3D12_BARRIER_GROUP> groups;
-			groups.reserve(3);
+			// There can be at most one group of each barrier kind. Keep this on the
+			// stack; allocating this fixed-size container for every barrier batch
+			// creates process-heap lock convoys under parallel recording.
+			std::array<D3D12_BARRIER_GROUP, 3> groups{};
+			UINT groupCount = 0;
 			if (!buf.empty()) {
 				D3D12_BARRIER_GROUP g{};
 				g.Type = D3D12_BARRIER_TYPE_BUFFER;
 				g.NumBarriers = (UINT)buf.size();
 				g.pBufferBarriers = buf.data();
-				groups.push_back(g);
+				groups[groupCount++] = g;
 			}
 			if (!tex.empty()) {
 				D3D12_BARRIER_GROUP g{};
 				g.Type = D3D12_BARRIER_TYPE_TEXTURE;
 				g.NumBarriers = (UINT)tex.size();
 				g.pTextureBarriers = tex.data();
-				groups.push_back(g);
+				groups[groupCount++] = g;
 			}
 			if (!glob.empty()) {
 				D3D12_BARRIER_GROUP g{};
 				g.Type = D3D12_BARRIER_TYPE_GLOBAL;
 				g.NumBarriers = (UINT)glob.size();
 				g.pGlobalBarriers = glob.data();
-				groups.push_back(g);
+				groups[groupCount++] = g;
 			}
 
-			if (!groups.empty()) {
-				l->cl->Barrier((UINT)groups.size(), groups.data());
+			if (groupCount != 0) {
+				l->cl->Barrier(groupCount, groups.data());
 			}
 		}
 
@@ -9658,14 +9666,28 @@ namespace rhi {
 
 		}
 
-		// DRED is crash diagnostics, not debug validation. Keep it enabled in
-		// production builds too, and configure it before creating the device.
+		// DRED auto-breadcrumbs instrument command recording inside the D3D12
+		// runtime. Allow profiling to distinguish that instrumentation from the
+		// native driver path without changing the system-wide d3dconfig state.
+		bool enableDred = ci.enableDebug;
+		char* dredEnvironment = nullptr;
+		size_t dredEnvironmentLength = 0;
+		if (_dupenv_s(&dredEnvironment, &dredEnvironmentLength, "SARP_D3D12_DRED") == 0 && dredEnvironment) {
+			enableDred = !(std::strcmp(dredEnvironment, "0") == 0 ||
+				_stricmp(dredEnvironment, "false") == 0 ||
+				_stricmp(dredEnvironment, "off") == 0);
+		}
+		std::free(dredEnvironment);
+
 		ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> dredSettings;
 		if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings)))) {
-			dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-			dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-			dredSettings->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-			spdlog::info("DRED auto-breadcrumbs and page fault reporting enabled.");
+			const auto dredEnablement = enableDred
+				? D3D12_DRED_ENABLEMENT_FORCED_ON
+				: D3D12_DRED_ENABLEMENT_FORCED_OFF;
+			dredSettings->SetAutoBreadcrumbsEnablement(dredEnablement);
+			dredSettings->SetPageFaultEnablement(dredEnablement);
+			dredSettings->SetBreadcrumbContextEnablement(dredEnablement);
+			spdlog::info("DRED auto-breadcrumbs and page fault reporting {}.", enableDred ? "enabled" : "disabled");
 		}
 
 		auto impl = std::make_shared<Dx12Device>();

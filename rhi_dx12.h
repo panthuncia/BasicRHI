@@ -9,6 +9,7 @@
 #include <wrl.h>
 #include <vector>
 #include <mutex>
+#include <shared_mutex>
 #include <cassert>
 #include <spdlog/spdlog.h>
 #include <optional>
@@ -473,7 +474,7 @@ namespace rhi {
 
 		std::deque<Slot<T>> slots;
 		std::vector<uint32_t> freelist;
-		std::mutex mutex;
+		std::shared_mutex mutex;
 
 		HandleT alloc(const T& v) {
 			std::lock_guard lock(mutex);
@@ -499,7 +500,7 @@ namespace rhi {
 		}
 
 		T* get(HandleT h) {
-			std::lock_guard lock(mutex);
+			std::shared_lock lock(mutex);
 			uint32_t i = h.index;
 			if (i >= slots.size()) return nullptr;
 			auto& s = slots[i];
