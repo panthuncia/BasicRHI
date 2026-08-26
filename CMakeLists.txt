@@ -195,12 +195,40 @@ if(_basicrhi_reshape_available)
     if(_basicrhi_fmt_include_dirs)
         target_include_directories(BasicRHI BEFORE PRIVATE ${_basicrhi_fmt_include_dirs})
     endif()
+    if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET AND
+       EXISTS "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include/fmt")
+        # ReShape ships fmt 8 in External/include while the host's spdlog is
+        # configured against vcpkg's fmt. Put the host dependency root first
+        # for BasicRHI translation units that necessarily include both APIs.
+        # Use a dedicated overlay so CMake does not de-duplicate the same vcpkg
+        # include directory later as a SYSTEM dependency and lose the ordering.
+        set(_basicrhi_host_fmt_overlay "${CMAKE_CURRENT_BINARY_DIR}/HostFmtInclude")
+        file(REMOVE_RECURSE "${_basicrhi_host_fmt_overlay}/fmt")
+        file(COPY "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include/fmt"
+            DESTINATION "${_basicrhi_host_fmt_overlay}")
+        target_include_directories(BasicRHI BEFORE PRIVATE
+            "${_basicrhi_host_fmt_overlay}")
+    endif()
 
     target_include_directories(BasicRHI PRIVATE
         ${_basicrhi_reshape_common_include_dirs}
         ${_basicrhi_reshape_dx12_include_dirs}
         ${_basicrhi_reshape_vulkan_include_dirs}
     )
+    set(_basicrhi_reshape_public_include_dirs ${_basicrhi_reshape_common_include_dirs})
+    list(REMOVE_ITEM _basicrhi_reshape_public_include_dirs
+        "${CMAKE_BINARY_DIR}/External/include"
+        "${CMAKE_CURRENT_LIST_DIR}/../GPU-Reshape/ThirdParty/MD5/Include")
+    set(_basicrhi_reshape_build_interface_include_dirs)
+    foreach(_basicrhi_reshape_include_dir IN LISTS
+        _basicrhi_reshape_public_include_dirs
+        _basicrhi_reshape_dx12_include_dirs
+        _basicrhi_reshape_vulkan_include_dirs)
+        list(APPEND _basicrhi_reshape_build_interface_include_dirs
+            "$<BUILD_INTERFACE:${_basicrhi_reshape_include_dir}>")
+    endforeach()
+    target_include_directories(BasicRHI INTERFACE
+        ${_basicrhi_reshape_build_interface_include_dirs})
 
     set(_basicrhi_reshape_schema_targets)
     if(TARGET GRS.Backends.DX12.Layer)
@@ -219,8 +247,13 @@ if(_basicrhi_reshape_available)
         add_dependencies(BasicRHI ${_basicrhi_reshape_schema_targets})
     endif()
 
-    target_link_libraries(BasicRHI PUBLIC
-        $<BUILD_INTERFACE:GRS.Libraries.Backend>
+    # ReShape is an implementation detail of BasicRHI. Keeping this PUBLIC
+    # leaks ReShape's bundled External/include tree (including fmt 8) into all
+    # renderer consumers, which conflicts with the application's fmt/spdlog.
+    # For a static library CMake still carries the private link dependency as a
+    # link-only requirement without propagating its compile usage requirements.
+    target_link_libraries(BasicRHI PRIVATE
+        $<LINK_ONLY:$<BUILD_INTERFACE:GRS.Libraries.Backend>>
     )
 endif()
 

@@ -7083,8 +7083,10 @@ namespace rhi {
 			RHI_FAIL(Result::Unsupported);
 			#endif
 
-			std::lock_guard guard(impl->debugInstrumentation.mutex);
-			impl->debugInstrumentation.state.globalFeatureMask = featureMask;
+			{
+				std::lock_guard guard(impl->debugInstrumentation.mutex);
+				impl->debugInstrumentation.state.globalFeatureMask = featureMask;
+			}
 			Dx12AppendInstrumentationDiagnostic(
 				impl,
 				DebugInstrumentationDiagnosticSeverity::Info,
@@ -7136,11 +7138,13 @@ namespace rhi {
 			RHI_FAIL(Result::Unsupported);
 			#endif
 
-			std::lock_guard guard(impl->debugInstrumentation.mutex);
-			auto& metadata = Dx12GetOrCreatePipelineMetadataUnlocked(impl->debugInstrumentation, pipelineUid);
-			metadata.explicitlyInstrumented = featureMask != 0;
-			metadata.explicitFeatureMask = featureMask;
-			impl->debugInstrumentation.pendingPipelineStatusRequests.insert(pipelineUid);
+			{
+				std::lock_guard guard(impl->debugInstrumentation.mutex);
+				auto& metadata = Dx12GetOrCreatePipelineMetadataUnlocked(impl->debugInstrumentation, pipelineUid);
+				metadata.explicitlyInstrumented = featureMask != 0;
+				metadata.explicitFeatureMask = featureMask;
+				impl->debugInstrumentation.pendingPipelineStatusRequests.insert(pipelineUid);
+			}
 			Dx12AppendInstrumentationDiagnostic(
 				impl,
 				DebugInstrumentationDiagnosticSeverity::Info,
