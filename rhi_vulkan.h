@@ -16,6 +16,7 @@ using namespace volk;
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -69,12 +70,11 @@ namespace rhi {
 
 		std::deque<VulkanSlot<T>> slots;
 		std::vector<uint32_t> freelist;
-		// Graph compilation and command recording can lazily create backend
-		// objects on worker threads.  In particular, concurrent deque growth
-		// corrupts its block map even though references to existing elements are
-		// otherwise stable.  Serialize registry metadata access; callers retain
-		// the normal RHI lifetime responsibility for an object returned by get().
-		mutable std::mutex mutex;
+		// Registry mutations still serialize deque metadata. Readers retain the
+		// normal RHI lifetime responsibility for an object returned by get().
+		// Backend teardown occurs after releasing this lock. Parking blocked readers
+		// avoids priority inversion if a short writer is preempted.
+		mutable std::shared_mutex mutex;
 
 		HandleT alloc(const T& value) {
 			const std::scoped_lock lock(mutex);
@@ -94,24 +94,30 @@ namespace rhi {
 		}
 
 		void free(HandleT handle) {
-			const std::scoped_lock lock(mutex);
-			const uint32_t index = handle.index;
-			if (index >= slots.size()) {
-				return;
-			}
+			T retired{};
+			{
+				const std::scoped_lock lock(mutex);
+				const uint32_t index = handle.index;
+				if (index >= slots.size()) {
+					return;
+				}
 
-			auto& slot = slots[index];
-			if (!slot.alive || slot.generation != handle.generation) {
-				return;
-			}
+				auto& slot = slots[index];
+				if (!slot.alive || slot.generation != handle.generation) {
+					return;
+				}
 
-			slot.alive = false;
-			slot.obj = T{};
-			freelist.push_back(index);
+				slot.alive = false;
+				using std::swap;
+				swap(retired, slot.obj);
+				freelist.push_back(index);
+			}
+			// Vector/string teardown and allocator callbacks stay outside the
+			// registry's exclusive critical section.
 		}
 
 		T* get(HandleT handle) {
-			const std::scoped_lock lock(mutex);
+			const std::shared_lock lock(mutex);
 			const uint32_t index = handle.index;
 			if (index >= slots.size()) {
 				return nullptr;
@@ -126,7 +132,7 @@ namespace rhi {
 		}
 
 		const T* get(HandleT handle) const {
-			const std::scoped_lock lock(mutex);
+			const std::shared_lock lock(mutex);
 			const uint32_t index = handle.index;
 			if (index >= slots.size()) {
 				return nullptr;

@@ -213,6 +213,7 @@ namespace rhi {
 		std::string instrumentationTechniquePath;
 		std::vector<RootCbvScratchPage> rootCbvScratchPages;
 		std::vector<RootCbvShadowState> rootCbvShadowStates;
+		size_t activeRootCbvShadowStateCount = 0;
 		std::vector<TracyGpuOpenZone> tracyGpuZoneStack;
 		std::vector<TracyGpuZoneEvent> tracyGpuZoneEvents;
 		bool tracyGpuZoneEventsSubmitted = false;
@@ -474,6 +475,8 @@ namespace rhi {
 
 		std::deque<Slot<T>> slots;
 		std::vector<uint32_t> freelist;
+		// Destruction is performed after releasing this lock. Use a parking lock so
+		// a preempted writer cannot make all recording workers spin and starve it.
 		std::shared_mutex mutex;
 
 		HandleT alloc(const T& v) {
@@ -489,23 +492,33 @@ namespace rhi {
 		}
 
 		void free(HandleT h) {
-			std::lock_guard lock(mutex);
-			uint32_t i = h.index;
-			if (i >= slots.size()) return;
-			auto& s = slots[i];
-			if (!s.alive || s.generation != h.generation) return;
-			s.alive = false;
-			s.obj = T{};  // force release of previous DX resources
-			freelist.push_back(i);
+			T retired{};
+			{
+				std::lock_guard lock(mutex);
+				uint32_t i = h.index;
+				if (i >= slots.size()) return;
+				auto& s = slots[i];
+				if (!s.alive || s.generation != h.generation) return;
+				s.alive = false;
+				using std::swap;
+				swap(retired, s.obj);
+				freelist.push_back(i);
+			}
+			// COM Release and backend-object teardown can enter the driver. Do it after
+			// releasing the registry so unrelated recording reads never wait on it.
 		}
 
 		T* get(HandleT h) {
-			std::shared_lock lock(mutex);
-			uint32_t i = h.index;
-			if (i >= slots.size()) return nullptr;
-			auto& s = slots[i];
-			if (!s.alive || s.generation != h.generation) return nullptr;
-			return &s.obj;
+			T* result = nullptr;
+			{
+				std::shared_lock lock(mutex);
+				uint32_t i = h.index;
+				if (i < slots.size()) {
+					auto& s = slots[i];
+					if (s.alive && s.generation == h.generation) result = &s.obj;
+				}
+			}
+			return result;
 		}
 
 		void clear() {
@@ -513,6 +526,7 @@ namespace rhi {
 			slots.clear();
 			freelist.clear();
 		}
+
 	};
 
 	struct Dx12Device {

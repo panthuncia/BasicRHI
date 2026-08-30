@@ -2556,13 +2556,17 @@ namespace rhi {
 		CommandList() = default;
 		explicit CommandList(CommandListHandle h) : handle(h) {}
 		void* impl{};
+		// Backends with stable object storage may cache the resolved record here.
+		// This avoids re-entering a global handle registry for every command-list
+		// recording call. The owning ObjectPtr still controls the record lifetime.
+		void* backendState{};
 		const CommandListVTable* vt{};
 		explicit constexpr operator bool() const noexcept {
 			return impl != nullptr && vt != nullptr && vt->abi_version >= RHI_CL_ABI_MIN;
 		}
 		const CommandListHandle& GetHandle() const noexcept { return handle; }
 		constexpr bool IsValid() const noexcept { return static_cast<bool>(*this); }
-		constexpr void Reset() noexcept { impl = nullptr; vt = nullptr; }
+		constexpr void Reset() noexcept { impl = nullptr; backendState = nullptr; vt = nullptr; }
 		void End() noexcept;
 		void Recycle(const CommandAllocator& ca) noexcept;
 		void BeginPass(const PassBeginInfo& p) noexcept;
@@ -2810,12 +2814,14 @@ namespace rhi {
 		CommandAllocator() = default;
 		explicit CommandAllocator(CommandAllocatorHandle handle) : handle(handle) {}
 		void* impl{}; // backend wrap (owns Handle32)
+		// Optional stable backend record cached by the owning backend.
+		void* backendState{};
 		const CommandAllocatorVTable* vt{}; // vtable
 		explicit constexpr operator bool() const noexcept {
 			return impl != nullptr && vt != nullptr && vt->abi_version >= RHI_CA_ABI_MIN;
 		}
 		constexpr bool IsValid() const noexcept { return static_cast<bool>(*this); }
-		constexpr void Reset() noexcept { impl = nullptr; vt = nullptr; } // Naming conflict with vt->reset
+		constexpr void Reset() noexcept { impl = nullptr; backendState = nullptr; vt = nullptr; } // Naming conflict with vt->reset
 		inline void Recycle() noexcept { vt->reset(this); } // GPU-side reset (allocator->Reset)
 		const CommandAllocatorHandle& GetHandle() const noexcept { return handle; }
 

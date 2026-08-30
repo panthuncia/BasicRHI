@@ -67,12 +67,14 @@ namespace rhi::dx12_detail
 
 	[[nodiscard]] inline Dx12Allocator* Alloc(const CommandAllocator* a) noexcept
 	{
+		if (a && a->backendState) return static_cast<Dx12Allocator*>(a->backendState);
 		Dx12Device* dev = Dev(a);
 		return (dev && a) ? dev->allocators.get(a->GetHandle()) : nullptr;
 	}
 
 	[[nodiscard]] inline Dx12CommandList* CL(const CommandList* cl) noexcept
 	{
+		if (cl && cl->backendState) return static_cast<Dx12CommandList*>(cl->backendState);
 		Dx12Device* dev = Dev(cl);
 		return (dev && cl) ? dev->commandLists.get(cl->GetHandle()) : nullptr;
 	}

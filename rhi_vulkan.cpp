@@ -972,6 +972,14 @@ namespace rhi {
 			return impl ? impl->allocators.get(handle) : nullptr;
 		}
 
+		static VulkanCommandAllocator* VkAllocatorState(const CommandAllocator* allocator) noexcept {
+			if (allocator && allocator->backendState) {
+				return static_cast<VulkanCommandAllocator*>(allocator->backendState);
+			}
+			auto* impl = allocator ? static_cast<VulkanDevice*>(allocator->impl) : nullptr;
+			return VkAllocatorState(impl, allocator ? allocator->GetHandle() : CommandAllocatorHandle{});
+		}
+
 		static VulkanPipeline* VkPipelineState(VulkanDevice* impl, PipelineHandle handle) noexcept {
 			return impl ? impl->pipelines.get(handle) : nullptr;
 		}
@@ -1852,6 +1860,9 @@ namespace rhi {
 		}
 
 		static VulkanCommandList* VkCommandListState(CommandList* commandList) noexcept {
+			if (commandList && commandList->backendState) {
+				return static_cast<VulkanCommandList*>(commandList->backendState);
+			}
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			return VkCommandListState(impl, commandList ? commandList->GetHandle() : CommandListHandle{});
 		}
@@ -2792,6 +2803,7 @@ namespace rhi {
 				return;
 			}
 			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
+			const std::shared_lock registryLock(impl->descriptorHeaps.mutex);
 
 			for (auto& heapSlot : impl->descriptorHeaps.slots) {
 				if (!heapSlot.alive) {
@@ -4087,7 +4099,7 @@ namespace rhi {
 		static void cl_reset(CommandList* commandList, const CommandAllocator& allocator) noexcept {
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
-			VulkanCommandAllocator* allocatorState = VkAllocatorState(impl, allocator.GetHandle());
+			VulkanCommandAllocator* allocatorState = VkAllocatorState(&allocator);
 			if (!impl || impl->device == VK_NULL_HANDLE || !commandListState || !allocatorState || allocatorState->pool == VK_NULL_HANDLE) {
 				spdlog::error("Vulkan command list reset received invalid state");
 				return;
@@ -5570,7 +5582,7 @@ namespace rhi {
 
 		static void ca_reset(CommandAllocator* allocator) noexcept {
 			auto* impl = allocator ? static_cast<VulkanDevice*>(allocator->impl) : nullptr;
-			VulkanCommandAllocator* allocatorState = VkAllocatorState(impl, allocator ? allocator->GetHandle() : CommandAllocatorHandle{});
+			VulkanCommandAllocator* allocatorState = VkAllocatorState(allocator);
 			if (!impl || impl->device == VK_NULL_HANDLE || !allocatorState || allocatorState->pool == VK_NULL_HANDLE) {
 				return;
 			}
@@ -6358,7 +6370,7 @@ namespace rhi {
 				return;
 			}
 
-			VulkanCommandList* commandListState = impl->commandLists.get(commandList->GetHandle());
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
 			if (!commandListState) {
 				commandList->Reset();
 				return;
@@ -7658,6 +7670,7 @@ namespace rhi {
 			const CommandAllocatorHandle handle = impl->allocators.alloc(VulkanCommandAllocator{ pool, kind, createInfo.queueFamilyIndex });
 			CommandAllocator allocator{ handle };
 			allocator.impl = impl;
+			allocator.backendState = impl->allocators.get(handle);
 			allocator.vt = &g_vkcalvt;
 			out = MakeCommandAllocatorPtr(device, allocator, impl->selfWeak.lock());
 			return Result::Ok;
@@ -7685,7 +7698,7 @@ namespace rhi {
 
 		static Result d_createCommandList(Device* device, QueueKind kind, CommandAllocator allocator, CommandListPtr& out) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
-			VulkanCommandAllocator* allocatorState = VkAllocatorState(impl, allocator.GetHandle());
+			VulkanCommandAllocator* allocatorState = VkAllocatorState(&allocator);
 			if (!impl || impl->device == VK_NULL_HANDLE || !allocatorState || allocatorState->pool == VK_NULL_HANDLE) {
 				out.Reset();
 				RHI_FAIL(Result::InvalidArgument);
@@ -7713,6 +7726,7 @@ namespace rhi {
 			const CommandListHandle handle = impl->commandLists.alloc(commandListState);
 			CommandList commandList{ handle };
 			commandList.impl = impl;
+			commandList.backendState = impl->commandLists.get(handle);
 			commandList.vt = &g_vkclvt;
 			out = MakeCommandListPtr(device, commandList, impl->selfWeak.lock());
 			return Result::Ok;

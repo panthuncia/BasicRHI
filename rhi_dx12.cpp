@@ -1878,7 +1878,8 @@ namespace rhi {
 		static Dx12CommandList::RootCbvShadowState* Dx12GetRootCbvShadowState(
 			Dx12CommandList* list,
 			const Dx12PipelineLayout::RootConstParam& rc) noexcept {
-			for (auto& state : list->rootCbvShadowStates) {
+			for (size_t index = 0; index < list->activeRootCbvShadowStateCount; ++index) {
+				auto& state = list->rootCbvShadowStates[index];
 				if (state.set == rc.set && state.binding == rc.binding && state.rootIndex == rc.rootIndex) {
 					if (state.values.size() != rc.num32) {
 						state.values.assign(rc.num32, 0u);
@@ -1887,13 +1888,15 @@ namespace rhi {
 				}
 			}
 
-			Dx12CommandList::RootCbvShadowState state{};
+			if (list->activeRootCbvShadowStateCount == list->rootCbvShadowStates.size()) {
+				list->rootCbvShadowStates.emplace_back();
+			}
+			auto& state = list->rootCbvShadowStates[list->activeRootCbvShadowStateCount++];
 			state.set = rc.set;
 			state.binding = rc.binding;
 			state.rootIndex = rc.rootIndex;
 			state.values.assign(rc.num32, 0u);
-			list->rootCbvShadowStates.push_back(std::move(state));
-			return &list->rootCbvShadowStates.back();
+			return &state;
 		}
 
 		static Result d_createPipelineLayout(Device* d, const PipelineLayoutDesc& ld, PipelineLayoutPtr& out) noexcept {
@@ -3433,6 +3436,7 @@ namespace rhi {
 
 			CommandAllocator ret{ h };
 			ret.impl = impl;
+			ret.backendState = impl->allocators.get(h);
 			ret.vt = &g_calvt;
 			out = MakeCommandAllocatorPtr(d, ret, static_cast<Dx12Device*>(d->impl)->selfWeak.lock());
 			return Result::Ok;
@@ -3493,6 +3497,7 @@ namespace rhi {
 
 			CommandList ret{ h };
 			ret.impl = impl;
+			ret.backendState = impl->commandLists.get(h);
 			ret.vt = &g_clvt;
 			out = MakeCommandListPtr(d, ret, static_cast<Dx12Device*>(d->impl)->selfWeak.lock());
 			return Result::Ok;
@@ -7422,14 +7427,21 @@ namespace rhi {
 #endif
 			l->boundLayout = {};
 			l->boundLayoutPtr = nullptr;
-			l->rootCbvShadowStates.clear();
+			l->activeRootCbvShadowStateCount = 0;
 			for (auto& page : l->rootCbvScratchPages) {
 				page.cursor = 0;
 			}
 			l->tracyGpuZoneStack.clear();
 			l->tracyGpuZoneEvents.clear();
 			l->tracyGpuZoneEventsSubmitted = false;
-			l->cl->Reset(a->alloc.Get(), nullptr);
+			const HRESULT resetResult = l->cl->Reset(a->alloc.Get(), nullptr);
+			if (FAILED(resetResult)) {
+				spdlog::error(
+					"D3D12 command list Reset failed for '{}': HRESULT 0x{:08X}",
+					l->debugName,
+					static_cast<unsigned>(resetResult));
+				BreakIfDebugging();
+			}
 		}
 
 		static Result cl_beginTracyGpuZone(CommandList* commandList, const Queue& queue, const char* name) noexcept {
@@ -7642,7 +7654,7 @@ namespace rhi {
 			}
 
 			if (impl->boundLayout.index != layoutH.index || impl->boundLayout.generation != layoutH.generation) {
-				impl->rootCbvShadowStates.clear();
+				impl->activeRootCbvShadowStateCount = 0;
 			}
 			impl->boundLayout = layoutH;
 			impl->boundLayoutPtr = L;
@@ -8980,7 +8992,13 @@ namespace rhi {
 				return;
 			}
 			auto* A = dx12_detail::Alloc(ca);
-			A->alloc->Reset(); // ID3D12CommandAllocator::Reset()
+			const HRESULT resetResult = A->alloc->Reset();
+			if (FAILED(resetResult)) {
+				spdlog::error(
+					"D3D12 command allocator Reset failed: HRESULT 0x{:08X}",
+					static_cast<unsigned>(resetResult));
+				BreakIfDebugging();
+			}
 		}
 
 		// ------------------ QueryPool vtable funcs ----------------
