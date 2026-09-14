@@ -553,6 +553,18 @@ namespace rhi {
 		}
 	}
 
+	static void CALLBACK Dx12DebugMessageCallback(
+		D3D12_MESSAGE_CATEGORY category,
+		D3D12_MESSAGE_SEVERITY severity,
+		D3D12_MESSAGE_ID id,
+		LPCSTR description,
+		void*) noexcept
+	{
+		spdlog::error("D3D12 validation: severity={} category={} id={} {}",
+			static_cast<uint32_t>(severity), static_cast<uint32_t>(category),
+			static_cast<uint32_t>(id), description ? description : "<no description>");
+	}
+
 	static std::string Dx12WideToUtf8(const wchar_t* text) {
 		if (!text) {
 			return {};
@@ -7387,8 +7399,9 @@ namespace rhi {
 			return D3D12CalcSubresource(mip, arraySlice, 0, T.tex.mips, T.tex.arraySize);
 		}
 
-		static void cl_end(CommandList* cl) noexcept {
+		static Result cl_endChecked(CommandList* cl) noexcept {
 			auto* w = dx12_detail::CL(cl);
+			if (!w || !w->cl) return Result::InvalidArgument;
 			while (w && !w->tracyGpuZoneStack.empty()) {
 #if BASICRHI_ENABLE_TRACY_GPU_PROFILING
 				const auto openZone = w->tracyGpuZoneStack.back();
@@ -7409,8 +7422,18 @@ namespace rhi {
 #endif
 				w->tracyGpuZoneStack.pop_back();
 			}
-			w->cl->Close();
+			const auto closeResult = w->cl->Close();
+			if (FAILED(closeResult) && w->dev && w->dev->pNativeDevice) {
+				const auto messageCount = Dx12GetInfoQueueMessageCount(w->dev->pNativeDevice.Get());
+				Dx12LogInfoQueueMessagesSince(w->dev->pNativeDevice.Get(),
+					messageCount > 64 ? messageCount - 64 : 0, 64);
+				spdlog::error("D3D12 command-list Close failed: hr=0x{:08x} type={} name='{}'",
+					static_cast<uint32_t>(closeResult), static_cast<uint32_t>(w->type), w->debugName);
+				spdlog::default_logger()->flush();
+			}
+			return ToRHI(closeResult);
 		}
+		static void cl_end(CommandList* cl) noexcept { (void)cl_endChecked(cl); }
 		static void cl_reset(CommandList* cl, const CommandAllocator& ca) noexcept {
 			auto* l = dx12_detail::CL(cl);
 			auto* a = dx12_detail::Alloc(&ca);
@@ -7663,6 +7686,12 @@ namespace rhi {
 			auto* l = dx12_detail::CL(cl);
 			auto* dev = l->dev;
 			if (auto* P = dev->pipelines.get(psoH)) {
+				if (!P->isRayTracing && !P->pso) {
+					spdlog::error("cl_bindPipeline: pipeline handle {} generation {} has no pipeline state",
+						psoH.index, psoH.generation);
+					BreakIfDebugging();
+					return;
+				}
 #if BUILD_MODE == BUILD_DEBUG
 				l->boundPipeline = P;
 #endif
@@ -7701,11 +7730,16 @@ namespace rhi {
 				#endif
 				return;
 			}
-#if BUILD_TYPE == BUILD_DEBUG
+			// Invalid captured handles are a correctness failure in every build.  The
+			// old BUILD_TYPE guard was also inconsistent with this file's BUILD_MODE
+			// configuration, which made queued-pipeline lifetime failures silent in
+			// RelWithDebInfo.
+			spdlog::error("cl_bindPipeline: invalid pipeline handle {} generation {}",
+				psoH.index, psoH.generation);
+			#if BUILD_MODE == BUILD_DEBUG
 			l->boundPipeline = nullptr;
 			BreakIfDebugging();
-			spdlog::error("cl_bindPipeline: invalid pipeline handle");
-#endif
+			#endif
 		}
 		static void cl_setVB(CommandList* cl, uint32_t startSlot, uint32_t numViews, VertexBufferView* pBufferViews) noexcept {
 			auto* l = dx12_detail::CL(cl);
@@ -7981,6 +8015,18 @@ namespace rhi {
 				if (c && c->res) cntRes = c->res.Get();
 			}
 
+			// D3D12 rejects the entire command list at Close when an indirect
+			// packet describes no complete command.  Empty producer buffers are a
+			// normal result for culled/bootstrapping frames, so make that packet a
+			// no-op at the backend boundary and diagnose genuinely bad offsets.
+			const uint64_t argumentBytes = static_cast<uint64_t>(S->stride) * maxCount;
+			if (argOff > argB->buf.size || argumentBytes > argB->buf.size - argOff) {
+				spdlog::warn(
+					"DX12 ExecuteIndirect skipped undersized argument buffer: handle={} generation={} size={} offset={} stride={} count={}",
+					argBufH.index, argBufH.generation, argB->buf.size, argOff, S->stride, maxCount);
+				return;
+			}
+
 #if BUILD_MODE == BUILD_DEBUG
 			if (l->boundPipeline == nullptr) {
 				BreakIfDebugging();
@@ -8055,25 +8101,16 @@ namespace rhi {
 				const auto& t = b.textures.data[i];
 				auto* T = dev->resources.get(t.texture);
 				if (!T || !T->res) continue;
+				if (T->res->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+					BreakIfDebugging();
+					continue;
+				}
 
-				// D3D12's enhanced DISCARD flag is legal only for a whole-resource
-				// transition from UNDEFINED.  Render-graph "discard previous contents"
-				// is a broader semantic promise and can also occur on a reused backing or
-				// a subresource.  In those cases preserve the real before scopes and emit
-				// an ordinary transition instead of an invalid SYNC_NONE barrier.
-				const auto desc = T->res->GetDesc();
-				const uint32_t mipCount = desc.MipLevels;
-				const uint32_t layerCount = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-					? 1u
-					: static_cast<uint32_t>(desc.DepthOrArraySize);
-				const uint32_t planeCount = D3D12GetFormatPlaneCount(dev->pNativeDevice.Get(), desc.Format);
-				const bool wholeResource =
-					t.range.baseMip == 0 && t.range.mipCount == mipCount
-					&& t.range.baseLayer == 0 && t.range.layerCount == layerCount
-					&& t.range.basePlane == 0 && t.range.planeCount == planeCount;
+				// Enhanced DISCARD applies to the affected subresource range, not only
+				// to a whole texture. Suppressing it for a mip/layer subset leaves an
+				// ordinary barrier whose LayoutBefore is UNDEFINED, which is invalid.
 				const bool nativeDiscard = t.discard
-					&& t.beforeLayout == ResourceLayout::Undefined
-					&& wholeResource;
+					&& t.beforeLayout == ResourceLayout::Undefined;
 
 				D3D12_TEXTURE_BARRIER tb{};
 				tb.SyncBefore = ToDX(nativeDiscard ? ResourceSyncState::None : t.beforeSync);
@@ -8093,6 +8130,22 @@ namespace rhi {
 				const auto& br = b.buffers.data[i];
 				auto* B = dev->resources.get(br.buffer);
 				if (!B || !B->res) continue;
+				const auto bufferDesc = B->res->GetDesc();
+				if (bufferDesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+					BreakIfDebugging();
+					continue;
+				}
+				// UPLOAD and READBACK resources have fixed D3D12 states and must not
+				// participate in transition barriers. Imported resources do not always
+				// carry their heap classification through the render-graph metadata, so
+				// enforce the native API rule at the backend boundary as well.
+				D3D12_HEAP_PROPERTIES heapProperties{};
+				D3D12_HEAP_FLAGS heapFlags{};
+				if (SUCCEEDED(B->res->GetHeapProperties(&heapProperties, &heapFlags))
+					&& (heapProperties.Type == D3D12_HEAP_TYPE_UPLOAD
+						|| heapProperties.Type == D3D12_HEAP_TYPE_READBACK)) {
+					continue;
+				}
 
 				D3D12_BUFFER_BARRIER bb{};
 				// Enhanced buffer barriers have no discard operation.  Retain the
@@ -9310,6 +9363,14 @@ namespace rhi {
 				iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, false);
 				spdlog::info("D3D12 debug layer enabled; break-on-severity disabled so InfoQueue messages can be logged.");
 			}
+			ComPtr<ID3D12InfoQueue1> iq1;
+			if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&iq1)))) {
+				DWORD callbackCookie = 0;
+				if (FAILED(iq1->RegisterMessageCallback(&Dx12DebugMessageCallback,
+					D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &callbackCookie))) {
+					spdlog::warn("D3D12 debug message callback registration failed");
+				}
+			}
 		}
 
 	#if BASICRHI_ENABLE_STREAMLINE
@@ -9589,7 +9650,8 @@ namespace rhi {
 		&cl_setDebugInstrumentationContext,
 		&cl_beginTracyGpuZone,
 		&cl_endTracyGpuZone,
-		5u
+		6u,
+		&cl_endChecked
 	};
 	const SwapchainVTable g_scvt = {
 		&sc_count,
@@ -9772,6 +9834,14 @@ namespace rhi {
 
 		if (!reshapeWrappedDevice) {
 			ComPtr<ID3D12Device> base;
+			// The D3D12 debug layer must be enabled before device creation.  Calling
+			// EnableDebugLayer after D3D12CreateDevice leaves the device's InfoQueue
+			// silent, which hid the validation reason for command-list Close failures.
+			if (ci.enableDebug) {
+				ComPtr<ID3D12Debug> debugController;
+				if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController))))
+					debugController->EnableDebugLayer();
+			}
 			const HRESULT createDeviceHr = D3D12CreateDevice(impl->adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&base));
 			if (FAILED(createDeviceHr)) {
 				spdlog::error(

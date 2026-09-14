@@ -2548,7 +2548,9 @@ namespace rhi {
 		void (*setDebugInstrumentationContext)(CommandList*, const char* passName, const char* techniquePath) noexcept;
 		Result(*beginTracyGpuZone)(CommandList*, const Queue&, const char*) noexcept;
 		void (*endTracyGpuZone)(CommandList*) noexcept;
-		uint32_t abi_version = 5;
+		uint32_t abi_version = 6;
+		// Appended after the version field: older tables remain readable.
+		Result (*endChecked)(CommandList*) noexcept = nullptr;
 	};
 
 	class CommandList {
@@ -2568,6 +2570,8 @@ namespace rhi {
 		constexpr bool IsValid() const noexcept { return static_cast<bool>(*this); }
 		constexpr void Reset() noexcept { impl = nullptr; backendState = nullptr; vt = nullptr; }
 		void End() noexcept;
+		bool SupportsCheckedEnd() const noexcept { return IsValid() && vt->abi_version >= 6 && vt->endChecked; }
+		Result EndChecked() noexcept { return SupportsCheckedEnd() ? vt->endChecked(this) : Result::Unsupported; }
 		void Recycle(const CommandAllocator& ca) noexcept;
 		void BeginPass(const PassBeginInfo& p) noexcept;
 		void EndPass() noexcept;

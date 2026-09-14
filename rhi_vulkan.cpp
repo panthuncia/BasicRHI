@@ -3972,15 +3972,15 @@ namespace rhi {
 
 		static void cl_endPass(CommandList* commandList) noexcept;
 
-		static void cl_end(CommandList* commandList) noexcept {
+		static Result cl_endChecked(CommandList* commandList) noexcept {
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
 			if (!commandListState || commandListState->commandBuffer == VK_NULL_HANDLE || !commandListState->isRecording) {
-				return;
+				return Result::InvalidCall;
 			}
 
 			if (commandListState->pendingError != Result::Ok) {
 				BreakIfDebugging();
-				return;
+				return commandListState->pendingError;
 			}
 
 			if (commandListState->passActive) {
@@ -4006,17 +4006,19 @@ namespace rhi {
 
 			if (commandListState->pendingError != Result::Ok) {
 				BreakIfDebugging();
-				return;
+				return commandListState->pendingError;
 			}
 
 			const VkResult result = vkEndCommandBuffer(commandListState->commandBuffer);
 			if (result != VK_SUCCESS) {
 				spdlog::error("Vulkan command list end failed with VkResult {}", static_cast<int>(result));
-				return;
+				return ToRHI(result);
 			}
 
 			commandListState->isRecording = false;
+			return Result::Ok;
 		}
+		static void cl_end(CommandList* commandList) noexcept { (void)cl_endChecked(commandList); }
 
 		static Result cl_beginTracyGpuZone(CommandList* commandList, const Queue& queue, const char* name) noexcept {
 #if BASICRHI_ENABLE_TRACY_GPU_PROFILING
@@ -9136,7 +9138,8 @@ namespace rhi {
 		&cl_setDebugInstrumentationContext,
 		&cl_beginTracyGpuZone,
 		&cl_endTracyGpuZone,
-		5u
+		6u,
+		&cl_endChecked
 	};
 
 	const SwapchainVTable g_vkscvt = {
