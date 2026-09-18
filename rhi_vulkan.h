@@ -188,6 +188,8 @@ namespace rhi {
 		bool ownsBuffer = false;
 		bool ownsImage = false;
 		bool ownsMemory = false;
+		// VK_SHARING_MODE_CONCURRENT: queue-family ownership barriers are ignored.
+		bool concurrentSharing = false;
 	};
 
 	struct VulkanImageViewSlot {

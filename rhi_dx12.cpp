@@ -8128,6 +8128,10 @@ namespace rhi {
 			// Buffers
 			for (uint32_t i = 0; i < b.buffers.size; ++i) {
 				const auto& br = b.buffers.data[i];
+				// D3D12 buffers have neither layouts nor queue-family ownership: a
+				// cross-queue handoff is COMMON promotion plus the fence the caller
+				// already orders on. Ownership barriers exist for Vulkan only.
+				if (br.queueOwnership != QueueOwnership::None) continue;
 				auto* B = dev->resources.get(br.buffer);
 				if (!B || !B->res) continue;
 				const auto bufferDesc = B->res->GetDesc();

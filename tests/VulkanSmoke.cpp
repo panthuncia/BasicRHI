@@ -2,12 +2,21 @@
 #include "rhi_helpers.h"
 #include "rhi_interop_vulkan.h"
 
+// FidelityFX validation is optional: the smoke still exercises the RHI when
+// the FFX SDK is not part of the build tree.
+#if __has_include("ThirdParty/FFX/ffx_api_loader.h") && __has_include(<FidelityFX/host/ffx_fsr3upscaler.h>)
+#define BASICRHI_SMOKE_HAS_FFX 1
 #include "ThirdParty/FFX/ffx_api_loader.h"
 #include "ThirdParty/FFX/ffx_upscale.h"
 #include "ThirdParty/FFX/host/backends/vk/ffx_vk.h"
 #include "ThirdParty/FFX/vk/ffx_api_vk.h"
+#else
+#define BASICRHI_SMOKE_HAS_FFX 0
+#endif
 
+#if BASICRHI_SMOKE_HAS_FFX
 #include <FidelityFX/host/ffx_fsr3upscaler.h>
+#endif
 
 #include <cstdlib>
 #include <cstdio>
@@ -31,6 +40,7 @@ namespace {
 		return true;
 	}
 
+#if BASICRHI_SMOKE_HAS_FFX
 	bool ValidateFidelityFXVulkanBackend(
 		HMODULE ffxApiModule,
 		VkDevice vkDevice,
@@ -217,6 +227,8 @@ namespace {
 		return true;
 	}
 
+#endif // BASICRHI_SMOKE_HAS_FFX
+
 	rhi::Result Check(rhi::Result result, const char* what) {
 		if (result != rhi::Result::Ok) {
 			std::fprintf(stderr, "%s failed with result %u\n", what, static_cast<unsigned>(result));
@@ -312,6 +324,106 @@ namespace {
 
 		const rhi::CommandList submitLists[] = { commandList };
 		return Check(graphicsQueue.Submit(submitLists, {}), "Queue::Submit clear pass");
+	}
+
+	// Cross-queue ownership: a device-local buffer is written on the copy
+	// queue and read back on the graphics queue, ordered by a timeline. With
+	// QueueSharing::Concurrent the ownership barriers collapse; with Exclusive
+	// they become a VK_SHARING_MODE_EXCLUSIVE release/acquire pair. Both must
+	// read back the written pattern under validation without family errors.
+	rhi::Result ValidateCrossQueueOwnership(rhi::Device& device, rhi::Queue graphicsQueue, rhi::QueueSharing sharing, const char* label) {
+		auto copyQueue = device.GetQueue(rhi::QueueKind::Copy);
+		if (!copyQueue) {
+			std::printf("Cross-queue ownership (%s): no copy queue, skipped\n", label);
+			return rhi::Result::Ok;
+		}
+		constexpr uint64_t kBytes = 256;
+		auto deviceDesc = rhi::helpers::ResourceDesc::Buffer(kBytes, rhi::HeapType::DeviceLocal, {}, "VulkanSmokeOwnershipDevice");
+		deviceDesc.queueSharing = sharing;
+		rhi::ResourcePtr deviceBuffer;
+		if (Check(device.CreateCommittedResource(deviceDesc, deviceBuffer), "CreateCommittedResource ownership device buffer") != rhi::Result::Ok) return rhi::Result::InvalidArgument;
+		rhi::ResourcePtr uploadBuffer;
+		if (Check(device.CreateCommittedResource(rhi::helpers::ResourceDesc::Buffer(kBytes, rhi::HeapType::Upload, {}, "VulkanSmokeOwnershipUpload"), uploadBuffer), "CreateCommittedResource ownership upload") != rhi::Result::Ok) return rhi::Result::InvalidArgument;
+		rhi::ResourcePtr readbackBuffer;
+		if (Check(device.CreateCommittedResource(rhi::helpers::ResourceDesc::Buffer(kBytes, rhi::HeapType::Readback, {}, "VulkanSmokeOwnershipReadback"), readbackBuffer), "CreateCommittedResource ownership readback") != rhi::Result::Ok) return rhi::Result::InvalidArgument;
+
+		std::vector<uint32_t> pattern(kBytes / sizeof(uint32_t));
+		for (size_t i = 0; i < pattern.size(); ++i) pattern[i] = 0xA5000000u ^ static_cast<uint32_t>(i * 2654435761u);
+		void* mapped = nullptr;
+		uploadBuffer->Map(&mapped, 0, kBytes);
+		if (!mapped) { std::fprintf(stderr, "ownership upload map failed\n"); return rhi::Result::InvalidArgument; }
+		std::memcpy(mapped, pattern.data(), kBytes);
+		uploadBuffer->Unmap(0, kBytes);
+
+		rhi::TimelinePtr timeline;
+		if (Check(device.CreateTimeline(timeline, 0, "VulkanSmokeOwnershipTimeline"), "CreateTimeline ownership") != rhi::Result::Ok) return rhi::Result::InvalidArgument;
+
+		// Copy queue: write, then release to the graphics family.
+		rhi::CommandAllocatorPtr copyAllocator;
+		rhi::CommandListPtr copyList;
+		if (Check(device.CreateCommandAllocator(rhi::QueueKind::Copy, copyAllocator), "CreateCommandAllocator copy") != rhi::Result::Ok) return rhi::Result::InvalidArgument;
+		if (Check(device.CreateCommandList(rhi::QueueKind::Copy, copyAllocator.Get(), copyList), "CreateCommandList copy") != rhi::Result::Ok) return rhi::Result::InvalidArgument;
+		{
+			rhi::BufferBarrier toCopyDest{
+				.buffer = deviceBuffer->GetHandle(),
+				.beforeSync = rhi::ResourceSyncState::All,
+				.afterSync = rhi::ResourceSyncState::Copy,
+				.beforeAccess = rhi::ResourceAccessType::Common,
+				.afterAccess = rhi::ResourceAccessType::CopyDest,
+			};
+			copyList->Barriers(rhi::BarrierBatch{ .buffers = { &toCopyDest, 1 } });
+			copyList->CopyBufferRegion(deviceBuffer->GetHandle(), 0, uploadBuffer->GetHandle(), 0, kBytes);
+			rhi::BufferBarrier release{
+				.buffer = deviceBuffer->GetHandle(),
+				.beforeSync = rhi::ResourceSyncState::Copy,
+				.afterSync = rhi::ResourceSyncState::All,
+				.beforeAccess = rhi::ResourceAccessType::CopyDest,
+				.afterAccess = rhi::ResourceAccessType::Common,
+				.queueOwnership = rhi::QueueOwnership::Release,
+				.ownershipPeer = rhi::QueueKind::Graphics,
+			};
+			copyList->Barriers(rhi::BarrierBatch{ .buffers = { &release, 1 } });
+			copyList->End();
+			const rhi::CommandList lists[] = { copyList.Get() };
+			const rhi::TimelinePoint signal{ timeline->GetHandle(), 1 };
+			if (Check(copyQueue.Submit(lists, { .signals = { &signal, 1 } }), "Queue::Submit copy ownership") != rhi::Result::Ok) return rhi::Result::InvalidArgument;
+		}
+
+		// Graphics queue: acquire from the copy family, read back.
+		rhi::CommandAllocatorPtr graphicsAllocator;
+		rhi::CommandListPtr graphicsList;
+		if (Check(device.CreateCommandAllocator(rhi::QueueKind::Graphics, graphicsAllocator), "CreateCommandAllocator graphics ownership") != rhi::Result::Ok) return rhi::Result::InvalidArgument;
+		if (Check(device.CreateCommandList(rhi::QueueKind::Graphics, graphicsAllocator.Get(), graphicsList), "CreateCommandList graphics ownership") != rhi::Result::Ok) return rhi::Result::InvalidArgument;
+		{
+			rhi::BufferBarrier acquire{
+				.buffer = deviceBuffer->GetHandle(),
+				.beforeSync = rhi::ResourceSyncState::All,
+				.afterSync = rhi::ResourceSyncState::Copy,
+				.beforeAccess = rhi::ResourceAccessType::Common,
+				.afterAccess = rhi::ResourceAccessType::CopySource,
+				.queueOwnership = rhi::QueueOwnership::Acquire,
+				.ownershipPeer = rhi::QueueKind::Copy,
+			};
+			graphicsList->Barriers(rhi::BarrierBatch{ .buffers = { &acquire, 1 } });
+			graphicsList->CopyBufferRegion(readbackBuffer->GetHandle(), 0, deviceBuffer->GetHandle(), 0, kBytes);
+			graphicsList->End();
+			const rhi::CommandList lists[] = { graphicsList.Get() };
+			const rhi::TimelinePoint wait{ timeline->GetHandle(), 1 };
+			if (Check(graphicsQueue.Submit(lists, { .waits = { &wait, 1 } }), "Queue::Submit graphics ownership") != rhi::Result::Ok) return rhi::Result::InvalidArgument;
+		}
+		if (Check(device.WaitIdle(), "Device::WaitIdle ownership") != rhi::Result::Ok) return rhi::Result::InvalidArgument;
+
+		void* readback = nullptr;
+		readbackBuffer->Map(&readback, 0, kBytes);
+		if (!readback) { std::fprintf(stderr, "ownership readback map failed\n"); return rhi::Result::InvalidArgument; }
+		const bool match = std::memcmp(readback, pattern.data(), kBytes) == 0;
+		readbackBuffer->Unmap(0, 0);
+		if (!match) {
+			std::fprintf(stderr, "Cross-queue ownership (%s): readback mismatch\n", label);
+			return rhi::Result::InvalidArgument;
+		}
+		std::printf("Cross-queue ownership (%s): ok\n", label);
+		return rhi::Result::Ok;
 	}
 
 	rhi::Result ValidateUploadBuffer(rhi::Device& device) {
@@ -571,9 +683,13 @@ int main() {
 		return 1;
 	}
 
+#if BASICRHI_SMOKE_HAS_FFX
 	if (!ValidateFidelityFXVulkanContext(device.Get())) {
 		return 1;
 	}
+#else
+	std::puts("BasicRHIVulkanSmoke: FidelityFX validation skipped (SDK not in build tree)");
+#endif
 
 	auto graphicsQueue = device->GetQueue(rhi::QueueKind::Graphics);
 	if (!graphicsQueue) {
@@ -582,6 +698,12 @@ int main() {
 	}
 
 	if (ValidateUploadBuffer(device.Get()) != rhi::Result::Ok) {
+		return 1;
+	}
+	if (ValidateCrossQueueOwnership(device.Get(), graphicsQueue, rhi::QueueSharing::Concurrent, "concurrent") != rhi::Result::Ok) {
+		return 1;
+	}
+	if (ValidateCrossQueueOwnership(device.Get(), graphicsQueue, rhi::QueueSharing::Exclusive, "exclusive") != rhi::Result::Ok) {
 		return 1;
 	}
 

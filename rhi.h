@@ -143,6 +143,22 @@ namespace rhi {
 
 	enum class Backend : uint32_t { Null, D3D12, Vulkan };
 	enum class QueueKind : uint32_t { Graphics, Compute, Copy };
+
+	// How a resource may be accessed from queues of different families.
+	// Exclusive: a range/subresource belongs to one queue family at a time and
+	// must be handed over with a Release/Acquire ownership barrier pair
+	// (Vulkan VK_SHARING_MODE_EXCLUSIVE). Concurrent: any family may access it
+	// at any time; ordering is still the caller's job (timelines). D3D12 has no
+	// queue-family ownership; both values behave identically there.
+	enum class QueueSharing : uint8_t { Exclusive, Concurrent };
+
+	// Queue-family ownership transfer carried by a barrier. Release is recorded
+	// on the current owner's queue after its last access, Acquire on the new
+	// owner's queue before its first access; the pair must be ordered by a
+	// timeline. The RHI resolves families: when both sides are the same family,
+	// or the resource is QueueSharing::Concurrent, the fields are ignored and a
+	// barrier whose only purpose is ownership (Common -> Common) is dropped.
+	enum class QueueOwnership : uint8_t { None, Acquire, Release };
 	enum class DebugInstrumentationDiagnosticSeverity : uint32_t { Info, Warning, Error };
 	enum class DebugInstrumentationIssueType : uint32_t { Pipeline, ShaderFile };
 
@@ -1892,6 +1908,7 @@ namespace rhi {
 		ResourceFlags resourceFlags;
 		const char* debugName = nullptr;
 		Span<Format> castableFormats;
+		QueueSharing queueSharing = QueueSharing::Exclusive;
 		union {
 			TextureDesc texture;
 			BufferDesc buffer;
@@ -1928,6 +1945,10 @@ namespace rhi {
 		ResourceLayout       afterLayout{ ResourceLayout::Undefined };
 		bool discard{ false }; // if true, contents before the barrier are undefined (can skip some sync on certain APIs)
 		ExternalOwnership externalOwnership{ ExternalOwnership::None };
+		// Intra-device queue-family ownership (see QueueOwnership). ownershipPeer is
+		// the other family: the new owner for Release, the previous owner for Acquire.
+		QueueOwnership queueOwnership{ QueueOwnership::None };
+		QueueKind ownershipPeer{ QueueKind::Graphics };
 	};
 
 	struct BufferBarrier {
@@ -1941,6 +1962,8 @@ namespace rhi {
 		ResourceAccessType   afterAccess{ ResourceAccessType::None };
 		bool discard{ false };
 		ExternalOwnership externalOwnership{ ExternalOwnership::None };
+		QueueOwnership queueOwnership{ QueueOwnership::None };
+		QueueKind ownershipPeer{ QueueKind::Graphics };
 	};
 
 	struct GlobalBarrier {

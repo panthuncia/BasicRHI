@@ -968,6 +968,68 @@ namespace rhi {
 			return VkQueueStateForHandle(impl, VkPrimaryQueueHandleForKind(impl, kind));
 		}
 
+		// Distinct families of the device's primary graphics/compute/copy queues.
+		// A resource created with QueueSharing::Concurrent lists all of them.
+		static uint32_t VkPrimaryQueueFamilies(VulkanDevice* impl, uint32_t (&out)[3]) noexcept {
+			uint32_t count = 0;
+			for (const QueueKind kind : { QueueKind::Graphics, QueueKind::Compute, QueueKind::Copy }) {
+				const VulkanQueueState* state = VkPrimaryQueueStateForKind(impl, kind);
+				if (!state) continue;
+				bool seen = false;
+				for (uint32_t i = 0; i < count; ++i) seen = seen || out[i] == state->familyIndex;
+				if (!seen) out[count++] = state->familyIndex;
+			}
+			return count;
+		}
+		static void VkApplyBufferSharing(VulkanDevice* impl, const ResourceDesc& desc,
+			VkBufferCreateInfo& createInfo, uint32_t (&families)[3], bool& concurrent) noexcept {
+			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			createInfo.queueFamilyIndexCount = 0;
+			createInfo.pQueueFamilyIndices = nullptr;
+			concurrent = false;
+			if (desc.queueSharing != QueueSharing::Concurrent) return;
+			const uint32_t count = VkPrimaryQueueFamilies(impl, families);
+			if (count < 2) return;
+			createInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
+			createInfo.queueFamilyIndexCount = count;
+			createInfo.pQueueFamilyIndices = families;
+			concurrent = true;
+		}
+		static void VkApplyImageSharing(VulkanDevice* impl, const ResourceDesc& desc,
+			VkImageCreateInfo& createInfo, uint32_t (&families)[3], bool& concurrent) noexcept {
+			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			createInfo.queueFamilyIndexCount = 0;
+			createInfo.pQueueFamilyIndices = nullptr;
+			concurrent = false;
+			if (desc.queueSharing != QueueSharing::Concurrent) return;
+			const uint32_t count = VkPrimaryQueueFamilies(impl, families);
+			if (count < 2) return;
+			createInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
+			createInfo.queueFamilyIndexCount = count;
+			createInfo.pQueueFamilyIndices = families;
+			concurrent = true;
+		}
+		// Resolves an intra-device ownership transfer to (src, dst) families for
+		// the barrier being recorded on `recordingFamily`. Returns false when the
+		// transfer collapses (same family, concurrent resource, unknown peer).
+		static bool VkResolveQueueOwnership(VulkanDevice* impl, QueueOwnership ownership, QueueKind peer,
+			uint32_t recordingFamily, bool concurrentResource, uint32_t& srcFamily, uint32_t& dstFamily) noexcept {
+			srcFamily = VK_QUEUE_FAMILY_IGNORED;
+			dstFamily = VK_QUEUE_FAMILY_IGNORED;
+			if (ownership == QueueOwnership::None || concurrentResource) return false;
+			const VulkanQueueState* peerState = VkPrimaryQueueStateForKind(impl, peer);
+			if (!peerState || recordingFamily == VK_QUEUE_FAMILY_IGNORED) return false;
+			if (peerState->familyIndex == recordingFamily) return false;
+			if (ownership == QueueOwnership::Release) {
+				srcFamily = recordingFamily;
+				dstFamily = peerState->familyIndex;
+			} else {
+				srcFamily = peerState->familyIndex;
+				dstFamily = recordingFamily;
+			}
+			return true;
+		}
+
 		static VulkanCommandAllocator* VkAllocatorState(VulkanDevice* impl, CommandAllocatorHandle handle) noexcept {
 			return impl ? impl->allocators.get(handle) : nullptr;
 		}
@@ -4375,19 +4437,26 @@ namespace rhi {
 				const bool externalRelease = barrier.externalOwnership == TextureBarrier::ExternalOwnership::Release;
 				const VulkanQueueState* recordingQueue = VkPrimaryQueueStateForKind(impl, commandListState->kind);
 				const uint32_t recordingFamily = recordingQueue ? recordingQueue->familyIndex : VK_QUEUE_FAMILY_IGNORED;
-				vkBarrier.srcAccessMask = (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
-				vkBarrier.dstAccessMask = (afterPresent || externalRelease) ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
+				uint32_t ownershipSrcFamily = VK_QUEUE_FAMILY_IGNORED;
+				uint32_t ownershipDstFamily = VK_QUEUE_FAMILY_IGNORED;
+				const bool internalTransfer = !externalAcquire && !externalRelease &&
+					VkResolveQueueOwnership(impl, barrier.queueOwnership, barrier.ownershipPeer, recordingFamily,
+						resource->concurrentSharing, ownershipSrcFamily, ownershipDstFamily);
+				const bool internalAcquire = internalTransfer && barrier.queueOwnership == QueueOwnership::Acquire;
+				const bool internalRelease = internalTransfer && barrier.queueOwnership == QueueOwnership::Release;
+				vkBarrier.srcAccessMask = (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire || internalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
+				vkBarrier.dstAccessMask = (afterPresent || externalRelease || internalRelease) ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
 				vkBarrier.oldLayout = (barrier.discard || firstUseFromUndefined) ? VK_IMAGE_LAYOUT_UNDEFINED : VkToImageLayout(barrier.beforeLayout, aspect);
 				vkBarrier.newLayout = VkToImageLayout(barrier.afterLayout, aspect);
-				vkBarrier.srcQueueFamilyIndex = externalAcquire ? VK_QUEUE_FAMILY_EXTERNAL : (externalRelease ? recordingFamily : VK_QUEUE_FAMILY_IGNORED);
-				vkBarrier.dstQueueFamilyIndex = externalAcquire ? recordingFamily : (externalRelease ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED);
+				vkBarrier.srcQueueFamilyIndex = externalAcquire ? VK_QUEUE_FAMILY_EXTERNAL : (externalRelease ? recordingFamily : ownershipSrcFamily);
+				vkBarrier.dstQueueFamilyIndex = externalAcquire ? recordingFamily : (externalRelease ? VK_QUEUE_FAMILY_EXTERNAL : ownershipDstFamily);
 				vkBarrier.image = resource->image;
 				vkBarrier.subresourceRange = VkMakeImageSubresourceRange(*resource, barrier.range, aspect);
 				imageBarriers.push_back(vkBarrier);
 				const bool beforeTransferClear = (barrier.beforeAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
 				const bool afterTransferClear = (barrier.afterAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
-				srcStages |= (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (VkStageMaskForSync(barrier.beforeSync) | (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
-				dstStages |= (afterPresent || externalRelease) ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : (VkStageMaskForSync(barrier.afterSync) | (afterTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
+				srcStages |= (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire || internalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (VkStageMaskForSync(barrier.beforeSync) | (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
+				dstStages |= (afterPresent || externalRelease || internalRelease) ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : (VkStageMaskForSync(barrier.afterSync) | (afterTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
 				if (impl->validateBarrierTransitions) {
 					recordedBatch.textures.push_back(VulkanCommandList::RecordedTextureBarrier{
 						barrier.texture,
@@ -4412,16 +4481,30 @@ namespace rhi {
 				const bool externalRelease = barrier.externalOwnership == BufferBarrier::ExternalOwnership::Release;
 				const VulkanQueueState* recordingQueue = VkPrimaryQueueStateForKind(impl, commandListState->kind);
 				const uint32_t recordingFamily = recordingQueue ? recordingQueue->familyIndex : VK_QUEUE_FAMILY_IGNORED;
-				vkBarrier.srcAccessMask = (barrier.discard || externalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
-				vkBarrier.dstAccessMask = externalRelease ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
-				vkBarrier.srcQueueFamilyIndex = externalAcquire ? VK_QUEUE_FAMILY_EXTERNAL : (externalRelease ? recordingFamily : VK_QUEUE_FAMILY_IGNORED);
-				vkBarrier.dstQueueFamilyIndex = externalAcquire ? recordingFamily : (externalRelease ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED);
+				uint32_t ownershipSrcFamily = VK_QUEUE_FAMILY_IGNORED;
+				uint32_t ownershipDstFamily = VK_QUEUE_FAMILY_IGNORED;
+				const bool internalTransfer = !externalAcquire && !externalRelease &&
+					VkResolveQueueOwnership(impl, barrier.queueOwnership, barrier.ownershipPeer, recordingFamily,
+						resource->concurrentSharing, ownershipSrcFamily, ownershipDstFamily);
+				const bool internalAcquire = internalTransfer && barrier.queueOwnership == QueueOwnership::Acquire;
+				const bool internalRelease = internalTransfer && barrier.queueOwnership == QueueOwnership::Release;
+				// A barrier whose only purpose was an ownership transfer that collapsed
+				// (same family or concurrent resource) is not needed at all.
+				if (!internalTransfer && barrier.queueOwnership != QueueOwnership::None &&
+					barrier.beforeAccess == ResourceAccessType::Common &&
+					barrier.afterAccess == ResourceAccessType::Common) {
+					continue;
+				}
+				vkBarrier.srcAccessMask = (barrier.discard || externalAcquire || internalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
+				vkBarrier.dstAccessMask = (externalRelease || internalRelease) ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
+				vkBarrier.srcQueueFamilyIndex = externalAcquire ? VK_QUEUE_FAMILY_EXTERNAL : (externalRelease ? recordingFamily : ownershipSrcFamily);
+				vkBarrier.dstQueueFamilyIndex = externalAcquire ? recordingFamily : (externalRelease ? VK_QUEUE_FAMILY_EXTERNAL : ownershipDstFamily);
 				vkBarrier.buffer = resource->buffer;
 				vkBarrier.offset = barrier.offset;
 				vkBarrier.size = barrier.size == ~0ull ? VK_WHOLE_SIZE : barrier.size;
 				bufferBarriers.push_back(vkBarrier);
-				srcStages |= (barrier.discard || externalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VkStageMaskForSync(barrier.beforeSync);
-				dstStages |= externalRelease ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VkStageMaskForSync(barrier.afterSync);
+				srcStages |= (barrier.discard || externalAcquire || internalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VkStageMaskForSync(barrier.beforeSync);
+				dstStages |= (externalRelease || internalRelease) ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VkStageMaskForSync(barrier.afterSync);
 				if (impl->validateBarrierTransitions) {
 					recordedBatch.buffers.push_back(VulkanCommandList::RecordedBufferBarrier{
 						barrier.buffer,
@@ -7753,7 +7836,9 @@ namespace rhi {
 				createInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 			}
 			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
-			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			uint32_t sharingFamilies[3]{};
+			bool concurrentSharing = false;
+			VkApplyBufferSharing(impl, desc, createInfo, sharingFamilies, concurrentSharing);
 			VkBuffer buffer = VK_NULL_HANDLE;
 			VkResult result = vkCreateBuffer(impl->device, &createInfo, nullptr, &buffer);
 			if (result != VK_SUCCESS) {
@@ -7804,6 +7889,7 @@ namespace rhi {
 			resourceState.memory = memory;
 			resourceState.bufferSize = desc.buffer.sizeBytes;
 			resourceState.type = ResourceType::Buffer;
+			resourceState.concurrentSharing = concurrentSharing;
 			resourceState.hostVisible = (actualFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
 			resourceState.ownsBuffer = true;
 			resourceState.ownsMemory = true;
@@ -7871,7 +7957,9 @@ namespace rhi {
 			createInfo.samples = samples;
 			createInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
 			createInfo.usage = VkImageUsageForDesc(desc, format);
-			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			uint32_t sharingFamilies[3]{};
+			bool concurrentSharing = false;
+			VkApplyImageSharing(impl, desc, createInfo, sharingFamilies, concurrentSharing);
 			createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
 			VkImage image = VK_NULL_HANDLE;
@@ -7920,6 +8008,7 @@ namespace rhi {
 			resourceState.memory = memory;
 			resourceState.format = format;
 			resourceState.type = desc.type;
+			resourceState.concurrentSharing = concurrentSharing;
 			resourceState.currentLayout = ResourceLayout::Undefined;
 			resourceState.width = desc.texture.width;
 			resourceState.height = desc.type == ResourceType::Texture1D ? 1u : desc.texture.height;
@@ -8176,7 +8265,9 @@ namespace rhi {
 			createInfo.samples = samples;
 			createInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
 			createInfo.usage = VkImageUsageForDesc(desc, format);
-			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			uint32_t sharingFamilies[3]{};
+			bool concurrentSharing = false;
+			VkApplyImageSharing(impl, desc, createInfo, sharingFamilies, concurrentSharing);
 			createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 			VkExternalMemoryImageCreateInfo externalInfo{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
 			if (heapState->externalD3D12) {
@@ -8215,6 +8306,7 @@ namespace rhi {
 			resourceState.memoryOffset = offset;
 			resourceState.format = format;
 			resourceState.type = desc.type;
+			resourceState.concurrentSharing = concurrentSharing;
 			resourceState.currentLayout = ResourceLayout::Undefined;
 			resourceState.width = desc.texture.width;
 			resourceState.height = desc.type == ResourceType::Texture1D ? 1u : desc.texture.height;
@@ -8248,7 +8340,9 @@ namespace rhi {
 			if (impl->bufferDeviceAddressEnabled) {
 				createInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 			}
-			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			uint32_t sharingFamilies[3]{};
+			bool concurrentSharing = false;
+			VkApplyBufferSharing(impl, desc, createInfo, sharingFamilies, concurrentSharing);
 			VkExternalMemoryBufferCreateInfo externalInfo{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
 			if (heapState->externalD3D12) {
 				externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
@@ -8286,6 +8380,7 @@ namespace rhi {
 			resourceState.memoryOffset = offset;
 			resourceState.bufferSize = desc.buffer.sizeBytes;
 			resourceState.type = ResourceType::Buffer;
+			resourceState.concurrentSharing = concurrentSharing;
 			resourceState.hostVisible = (actualFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
 			resourceState.ownsBuffer = true;
 			resourceState.ownsMemory = false;
