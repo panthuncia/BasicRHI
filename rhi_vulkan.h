@@ -37,6 +37,7 @@ namespace rhi {
 	struct VulkanPipeline;
 	struct VulkanPipelineLayout;
 	struct VulkanCommandSignature;
+	struct VulkanIndirectPipelineSet;
 	struct VulkanTimeline;
 	struct VulkanHeap;
 	struct VulkanQueryPool;
@@ -51,6 +52,7 @@ namespace rhi {
 	template<> struct VulkanHandleFor<VulkanPipeline> { using type = PipelineHandle; };
 	template<> struct VulkanHandleFor<VulkanPipelineLayout> { using type = PipelineLayoutHandle; };
 	template<> struct VulkanHandleFor<VulkanCommandSignature> { using type = CommandSignatureHandle; };
+	template<> struct VulkanHandleFor<VulkanIndirectPipelineSet> { using type = IndirectPipelineSetHandle; };
 	template<> struct VulkanHandleFor<VulkanTimeline> { using type = TimelineHandle; };
 	template<> struct VulkanHandleFor<VulkanHeap> { using type = HeapHandle; };
 	template<> struct VulkanHandleFor<VulkanQueryPool> { using type = QueryPoolHandle; };
@@ -192,6 +194,9 @@ namespace rhi {
 		bool ownsMemory = false;
 		// VK_SHARING_MODE_CONCURRENT: queue-family ownership barriers are ignored.
 		bool concurrentSharing = false;
+		// Simultaneous access (D3D12 RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS, always COMMON): the image stays in
+		// VK_IMAGE_LAYOUT_GENERAL, so views and attachments of it are used in GENERAL.
+		bool generalLayoutOnly = false;
 	};
 
 	struct VulkanImageViewSlot {
@@ -289,6 +294,9 @@ namespace rhi {
 		bool isRayTracingLibrary = false;
 		uint32_t shaderGroupCount = 0;
 		uint32_t rayTracingStackSize = 0;
+		bool indirectBindable = false;       // created with PipelineFlags_IndirectBindable
+		bool dynamicVertexStride = false;    // vertex input strides are dynamic state
+		VkShaderStageFlags shaderStages = 0; // stages the pipeline contains
 	};
 
 	struct VulkanAccelerationStructure {
@@ -304,6 +312,15 @@ namespace rhi {
 		std::vector<IndirectArg> args;
 		uint32_t byteStride = 0;
 		VkIndirectCommandsLayoutEXT indirectLayout = VK_NULL_HANDLE;
+		IndirectPipelineSetHandle pipelineSet{};  // set a PipelineIndex argument selects from
+	};
+
+	struct VulkanIndirectPipelineSet {
+		VkIndirectExecutionSetEXT executionSet = VK_NULL_HANDLE;
+		PipelineHandle initialPipeline{};
+		uint32_t maxPipelineCount = 0;
+		VkShaderStageFlags shaderStages = 0;
+		VkPipelineBindPoint bindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
 	};
 
 	struct VulkanTimeline {
@@ -479,6 +496,7 @@ namespace rhi {
 		bool runtimeDescriptorArrayEnabled = false;
 		bool scalarBlockLayoutEnabled = false;
 		bool descriptorHeapEnabled = false;
+		bool nullDescriptorEnabled = false;  // VK_EXT_robustness2 nullDescriptor: views with no resource
 		bool descriptorHeapCaptureReplayEnabled = false;
 		bool meshShaderEnabled = false;
 		bool taskShaderEnabled = false;
@@ -536,6 +554,7 @@ namespace rhi {
 		VulkanRegistry<VulkanPipeline> pipelines;
 		VulkanRegistry<VulkanPipelineLayout> pipelineLayouts;
 		VulkanRegistry<VulkanCommandSignature> commandSignatures;
+		VulkanRegistry<VulkanIndirectPipelineSet> indirectPipelineSets;
 		VulkanRegistry<VulkanTimeline> timelines;
 		// Timeline completion is polled from retirement/streaming threads while the
 		// render threads submit and deferred deletion can recycle registry slots.
@@ -575,6 +594,7 @@ namespace rhi {
 	extern const WorkGraphVTable g_vkwgvt;
 	extern const PipelineLayoutVTable g_vkplvt;
 	extern const CommandSignatureVTable g_vkcsvt;
+	extern const IndirectPipelineSetVTable g_vkipsvt;
 	extern const DescriptorHeapVTable g_vkdhvt;
 	extern const SamplerVTable g_vksvt;
 	extern const TimelineVTable g_vktlvt;

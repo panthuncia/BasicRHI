@@ -605,6 +605,22 @@ namespace rhi {
 				return VK_FORMAT_BC7_SRGB_BLOCK;
 			case Format::D32_Float:
 				return VK_FORMAT_D32_SFLOAT;
+			case Format::R11G11B10_Float:
+				return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+			case Format::R10G10B10A2_UNorm:
+				return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+			case Format::R10G10B10A2_UInt:
+				return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+			case Format::R24G8_Typeless:
+			case Format::D24_UNorm_S8_UInt:
+			case Format::R24_UNorm_X8_Typeless:
+				return VK_FORMAT_D24_UNORM_S8_UINT;
+			case Format::R32G8X24_Typeless:
+			case Format::D32_Float_S8X24_UInt:
+			case Format::R32_Float_X8X24_Typeless:
+				return VK_FORMAT_D32_SFLOAT_S8_UINT;
+			case Format::D16_UNorm:
+				return VK_FORMAT_D16_UNORM;
 			default:
 				return VK_FORMAT_UNDEFINED;
 			}
@@ -726,6 +742,18 @@ namespace rhi {
 				return Format::BC7_UNorm_sRGB;
 			case VK_FORMAT_D32_SFLOAT:
 				return Format::D32_Float;
+			case VK_FORMAT_D24_UNORM_S8_UINT:
+				return Format::D24_UNorm_S8_UInt;
+			case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+				return Format::R11G11B10_Float;
+			case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+				return Format::R10G10B10A2_UNorm;
+			case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+				return Format::R10G10B10A2_UInt;
+			case VK_FORMAT_D32_SFLOAT_S8_UINT:
+				return Format::D32_Float_S8X24_UInt;
+			case VK_FORMAT_D16_UNORM:
+				return Format::D16_UNorm;
 			default:
 				return Format::Unknown;
 			}
@@ -1039,6 +1067,15 @@ namespace rhi {
 
 		static VulkanCommandSignature* VkCommandSignatureState(VulkanDevice* impl, CommandSignatureHandle handle) noexcept {
 			return impl ? impl->commandSignatures.get(handle) : nullptr;
+		}
+
+		static VulkanIndirectPipelineSet* VkIndirectPipelineSetState(VulkanDevice* impl, IndirectPipelineSetHandle handle) noexcept {
+			return impl ? impl->indirectPipelineSets.get(handle) : nullptr;
+		}
+
+		static bool VkIndirectPipelineSetsSupported(const VulkanDevice* impl) noexcept {
+			return impl && impl->deviceGeneratedCommandsEnabled &&
+			       impl->bufferDeviceAddressEnabled && vkCreateIndirectExecutionSetEXT && vkUpdateIndirectExecutionSetPipelineEXT;
 		}
 
 		static VulkanTimeline* VkTimelineState(VulkanDevice* impl, TimelineHandle handle) noexcept {
@@ -1594,9 +1631,39 @@ namespace rhi {
 			return createInfo;
 		}
 
+		static VkShaderStageFlags VkShaderStageFlagsForRHI(ShaderStage stages) noexcept;
+
+		// The layout a command names for an image: simultaneous-access images are always in GENERAL.
+		static VkImageLayout VkCommandLayout(const VulkanResource& resource, VkImageLayout layout) noexcept {
+			return resource.generalLayoutOnly ? VK_IMAGE_LAYOUT_GENERAL : layout;
+		}
+		// SrvDesc::componentMapping uses D3D12's encoding (D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING): three
+		// bits per output component selecting source R, G, B, A (0-3) or constant 0 / 1 (4 / 5); 0 means identity.
+		static VkComponentMapping VkComponentMappingForRHI(ComponentMapping mapping) noexcept {
+			if (mapping == 0) {
+				return { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
+			}
+			auto component = [&](uint32_t index) {
+				switch ((mapping >> (3 * index)) & 0x7) {
+				case 0: return VK_COMPONENT_SWIZZLE_R;
+				case 1: return VK_COMPONENT_SWIZZLE_G;
+				case 2: return VK_COMPONENT_SWIZZLE_B;
+				case 3: return VK_COMPONENT_SWIZZLE_A;
+				case 4: return VK_COMPONENT_SWIZZLE_ZERO;
+				default: return VK_COMPONENT_SWIZZLE_ONE;
+				}
+			};
+			return { component(0), component(1), component(2), component(3) };
+		}
+
+
+		// The mappings of the layout's ranges visible to `stages` (LayoutBindingRange::visibility), so that
+		// stages can map the same binding differently, as D3D12 root parameter visibility allows.
+		// embeddedSamplers must not be shared between calls: the mappings point into it.
 		static void VkAppendDescriptorHeapMappings(
 			const VulkanDevice* impl,
 			const VulkanPipelineLayout& layout,
+			VkShaderStageFlags stages,
 			std::vector<VkDescriptorSetAndBindingMappingEXT>& mappings,
 			std::vector<VkSamplerCreateInfo>& embeddedSamplers) noexcept {
 			const uint32_t resourceStride = static_cast<uint32_t>(VkDescriptorHeapStride(impl, DescriptorHeapType::CbvSrvUav));
@@ -1654,6 +1721,45 @@ namespace rhi {
 			appendHeapMapping(kCounterDescriptorHeapBinding, kResourceDescriptorHeapMask);
 
 			for (const LayoutBindingRange& range : layout.ranges) {
+				if ((VkShaderStageFlagsForRHI(range.visibility) & stages) == 0) {
+					continue;
+				}
+				if (range.source != LayoutRangeSource::HeapSlot) {
+					// One mapping per binding: each reads its own entry of the record.
+					if (range.addressRootIndex >= layout.pushConstantRanges.size()) {
+						continue;  // rejected at layout creation
+					}
+					const uint32_t pushOffset = layout.pushConstantRanges[range.addressRootIndex].byteOffset + range.addressOffset32 * 4u;
+					for (uint32_t i = 0; i < (std::max)(1u, range.count); ++i) {
+						VkDescriptorSetAndBindingMappingEXT mapping{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT };
+						mapping.descriptorSet = range.set;
+						mapping.firstBinding = range.binding + i;
+						mapping.bindingCount = 1;
+						if (range.source == LayoutRangeSource::IndirectAddress) {
+							mapping.resourceMask = VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT;
+							mapping.source = VK_DESCRIPTOR_MAPPING_SOURCE_INDIRECT_ADDRESS_EXT;
+							mapping.sourceData.indirectAddress.pushOffset = pushOffset;
+							mapping.sourceData.indirectAddress.addressOffset = range.recordOffset + 8u * i;
+						}
+						else {
+							mapping.resourceMask = range.samplers ? kSamplerDescriptorHeapMask : kResourceDescriptorHeapMask;
+							mapping.source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_EXT;
+							auto& indirect = mapping.sourceData.indirectIndex;
+							indirect.heapOffset = 0;
+							indirect.pushOffset = pushOffset;
+							indirect.addressOffset = range.recordOffset + 4u * i;
+							indirect.heapIndexStride = resourceStride;
+							indirect.heapArrayStride = resourceStride;
+							indirect.samplerHeapOffset = 0;
+							indirect.samplerPushOffset = pushOffset;
+							indirect.samplerAddressOffset = range.recordOffset + 4u * i;
+							indirect.samplerHeapIndexStride = samplerStride;
+							indirect.samplerHeapArrayStride = samplerStride;
+						}
+						mappings.push_back(mapping);
+					}
+					continue;
+				}
 				VkDescriptorSetAndBindingMappingEXT mapping{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT };
 				mapping.descriptorSet = range.set;
 				mapping.firstBinding = range.binding;
@@ -1942,6 +2048,7 @@ namespace rhi {
 		static VkImageAspectFlags VkAspectMaskForFormat(VkFormat format) noexcept {
 			switch (format) {
 			case VK_FORMAT_D32_SFLOAT:
+			case VK_FORMAT_D16_UNORM:
 				return VK_IMAGE_ASPECT_DEPTH_BIT;
 			case VK_FORMAT_D24_UNORM_S8_UINT:
 			case VK_FORMAT_D32_SFLOAT_S8_UINT:
@@ -1954,6 +2061,7 @@ namespace rhi {
 		static VkImageAspectFlags VkSampledImageAspectMaskForFormat(VkFormat format) noexcept {
 			switch (format) {
 			case VK_FORMAT_D32_SFLOAT:
+			case VK_FORMAT_D16_UNORM:
 			case VK_FORMAT_D24_UNORM_S8_UINT:
 			case VK_FORMAT_D32_SFLOAT_S8_UINT:
 				return VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -2477,6 +2585,14 @@ namespace rhi {
 				return sizeof(VkDispatchIndirectCommand);
 			case IndirectArgKind::DispatchMesh:
 				return sizeof(VkDrawMeshTasksIndirectCommandEXT);
+			case IndirectArgKind::IndexBuffer:
+				// Read in DXGI mode: { address, size, DXGI_FORMAT }, D3D12_INDEX_BUFFER_VIEW's layout.
+				return sizeof(VkBindIndexBufferIndirectCommandEXT);
+			case IndirectArgKind::VertexBuffer:
+				// { address, size, stride }: D3D12_VERTEX_BUFFER_VIEW's layout.
+				return sizeof(VkBindVertexBufferIndirectCommandEXT);
+			case IndirectArgKind::PipelineIndex:
+				return sizeof(uint32_t);
 			default:
 				return 0;
 			}
@@ -2546,6 +2662,7 @@ namespace rhi {
 			VulkanCommandList& commandListState,
 			const VulkanCommandSignature& signature,
 			VkPipeline pipeline,
+			VkIndirectExecutionSetEXT executionSet,
 			uint32_t maxSequenceCount,
 			VkDeviceAddress& outAddress,
 			VkDeviceSize& outSize) noexcept {
@@ -2556,15 +2673,16 @@ namespace rhi {
 				maxSequenceCount == 0) {
 				RHI_FAIL(Result::Unsupported);
 			}
-			if (pipeline == VK_NULL_HANDLE) {
+			if (pipeline == VK_NULL_HANDLE && executionSet == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
+			// Sized for the pipeline, or for every pipeline the execution set can hold.
 			VkGeneratedCommandsMemoryRequirementsInfoEXT requirementsInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT };
 			VkGeneratedCommandsPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT };
 			pipelineInfo.pipeline = pipeline;
-			requirementsInfo.pNext = &pipelineInfo;
-			requirementsInfo.indirectExecutionSet = VK_NULL_HANDLE;
+			requirementsInfo.pNext = executionSet != VK_NULL_HANDLE ? nullptr : &pipelineInfo;
+			requirementsInfo.indirectExecutionSet = executionSet;
 			requirementsInfo.indirectCommandsLayout = signature.indirectLayout;
 			requirementsInfo.maxSequenceCount = maxSequenceCount;
 			requirementsInfo.maxDrawCount = maxSequenceCount;
@@ -4322,7 +4440,7 @@ namespace rhi {
 
 				VkRenderingAttachmentInfo attachmentInfo{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
 				attachmentInfo.imageView = viewSlot->view;
-				attachmentInfo.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+				attachmentInfo.imageLayout = resource->generalLayoutOnly ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 				attachmentInfo.storeOp = VkStoreOpForAttachment(color.storeOp);
 				switch (color.loadOp) {
 				case LoadOp::Clear:
@@ -4359,7 +4477,8 @@ namespace rhi {
 
 				depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
 				depthAttachment.imageView = viewSlot->view;
-				depthAttachment.imageLayout = passInfo.depth->readOnly ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+				depthAttachment.imageLayout = resource->generalLayoutOnly ? VK_IMAGE_LAYOUT_GENERAL
+					: (passInfo.depth->readOnly ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 				depthAttachment.loadOp = passInfo.depth->depthLoad == LoadOp::Clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : (passInfo.depth->depthLoad == LoadOp::DontCare ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD);
 				depthAttachment.storeOp = VkStoreOpForAttachment(passInfo.depth->depthStore, passInfo.depth->readOnly);
 				depthAttachment.clearValue.depthStencil.depth = passInfo.depth->clear.depthStencil.depth;
@@ -4392,8 +4511,8 @@ namespace rhi {
 			viewport.width = static_cast<float>(passInfo.width);
 			viewport.y = static_cast<float>(passInfo.height);
 			viewport.height = -static_cast<float>(passInfo.height);
-			viewport.minDepth = 0.0f;
-			viewport.maxDepth = 1.0f;
+			viewport.minDepth = passInfo.minDepth;
+			viewport.maxDepth = passInfo.maxDepth;
 			vkCmdSetViewport(commandListState->commandBuffer, 0, 1, &viewport);
 
 			VkRect2D scissor{};
@@ -4662,6 +4781,18 @@ namespace rhi {
 					buffers[i] = resource->buffer;
 					offsets[i] = views[i].offset;
 				}
+			}
+			// Pipelines with dynamic strides take them with the buffers (PipelineFlags_IndirectBindable).
+			const VulkanPipeline* pipelineState = VkPipelineState(impl, commandListState->boundPipeline);
+			if (pipelineState && pipelineState->dynamicVertexStride) {
+				std::vector<VkDeviceSize> sizes(numViews, VK_WHOLE_SIZE);
+				std::vector<VkDeviceSize> strides(numViews, 0);
+				for (uint32_t i = 0; i < numViews; ++i) {
+					sizes[i] = views[i].sizeBytes != 0 ? views[i].sizeBytes : VK_WHOLE_SIZE;
+					strides[i] = views[i].stride;
+				}
+				vkCmdBindVertexBuffers2(commandListState->commandBuffer, startSlot, numViews, buffers.data(), offsets.data(), sizes.data(), strides.data());
+				return;
 			}
 			vkCmdBindVertexBuffers(commandListState->commandBuffer, startSlot, numViews, buffers.data(), offsets.data());
 		}
@@ -5248,7 +5379,7 @@ namespace rhi {
 				cl_endPass(commandList);
 			}
 			VkImageSubresourceRange range = VkMakeImageSubresourceRange(*resource, viewSlot->range, viewSlot->aspectMask);
-			vkCmdClearColorImage(commandListState->commandBuffer, resource->image, VkToImageLayout(ResourceLayout::RenderTargetClear, viewSlot->aspectMask), &value, 1, &range);
+			vkCmdClearColorImage(commandListState->commandBuffer, resource->image, VkCommandLayout(*resource, VkToImageLayout(ResourceLayout::RenderTargetClear, viewSlot->aspectMask)), &value, 1, &range);
 		}
 
 		static void cl_clearDSV_slot(CommandList* commandList, DescriptorSlot slot, bool clearDepth, bool clearStencil, float depth, uint8_t stencil) noexcept {
@@ -5282,7 +5413,7 @@ namespace rhi {
 				cl_endPass(commandList);
 			}
 			if (range.aspectMask != 0) {
-				vkCmdClearDepthStencilImage(commandListState->commandBuffer, resource->image, VkToImageLayout(ResourceLayout::DepthStencilClear, viewSlot->aspectMask), &value, 1, &range);
+				vkCmdClearDepthStencilImage(commandListState->commandBuffer, resource->image, VkCommandLayout(*resource, VkToImageLayout(ResourceLayout::DepthStencilClear, viewSlot->aspectMask)), &value, 1, &range);
 			}
 		}
 
@@ -5303,6 +5434,18 @@ namespace rhi {
 			}
 
 			const uint32_t stride = signatureState->byteStride;
+			VulkanIndirectPipelineSet* pipelineSetState = nullptr;
+			if (signatureState->pipelineSet.valid()) {
+				// The commands select pipelines from the set; start from its initial pipeline, which every
+				// pipeline in the set is compatible with.
+				pipelineSetState = VkIndirectPipelineSetState(impl, signatureState->pipelineSet);
+				if (!pipelineSetState) {
+					commandListState->pendingError = Result::InvalidArgument;
+					spdlog::error("Vulkan ExecuteIndirect: the signature's indirect pipeline set was destroyed");
+					return;
+				}
+				cl_bindPipeline(commandList, pipelineSetState->initialPipeline);
+			}
 			if (signatureState->indirectLayout != VK_NULL_HANDLE) {
 				VulkanPipeline* pipelineState = VkPipelineState(impl, commandListState->boundPipeline);
 				if (!impl || !pipelineState || pipelineState->pipeline == VK_NULL_HANDLE || argumentResource->deviceAddress == 0 || !vkCmdExecuteGeneratedCommandsEXT) {
@@ -5317,7 +5460,8 @@ namespace rhi {
 					impl,
 					*commandListState,
 					*signatureState,
-					pipelineState->pipeline,
+					pipelineSetState ? VK_NULL_HANDLE : pipelineState->pipeline,
+					pipelineSetState ? pipelineSetState->executionSet : VK_NULL_HANDLE,
 					maxCommandCount,
 					preprocessAddress,
 					preprocessSize);
@@ -5331,9 +5475,10 @@ namespace rhi {
 				VkGeneratedCommandsInfoEXT generatedInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT };
 				VkGeneratedCommandsPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT };
 				pipelineInfo.pipeline = pipelineState->pipeline;
-				generatedInfo.pNext = &pipelineInfo;
+				// With an execution set the pipelines come from the set, not from pNext.
+				generatedInfo.pNext = pipelineSetState ? nullptr : &pipelineInfo;
 				generatedInfo.shaderStages = pipelineState->bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS;
-				generatedInfo.indirectExecutionSet = VK_NULL_HANDLE;
+				generatedInfo.indirectExecutionSet = pipelineSetState ? pipelineSetState->executionSet : VK_NULL_HANDLE;
 				generatedInfo.indirectCommandsLayout = signatureState->indirectLayout;
 				generatedInfo.indirectAddress = argumentResource->deviceAddress + argumentOffset;
 				generatedInfo.indirectAddressSize = static_cast<VkDeviceSize>(stride) * maxCommandCount;
@@ -5497,7 +5642,7 @@ namespace rhi {
 			if (!commandListState || !texture || !buffer || !VkBuildBufferImageCopy(*texture, footprint, region)) {
 				return;
 			}
-			vkCmdCopyImageToBuffer(commandListState->commandBuffer, texture->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer->buffer, 1, &region);
+			vkCmdCopyImageToBuffer(commandListState->commandBuffer, texture->image, VkCommandLayout(*texture, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL), buffer->buffer, 1, &region);
 		}
 
 		static void cl_copyBufferToTexture(CommandList* commandList, const BufferTextureCopyFootprint& footprint) noexcept {
@@ -5509,7 +5654,7 @@ namespace rhi {
 			if (!commandListState || !texture || !buffer || !VkBuildBufferImageCopy(*texture, footprint, region)) {
 				return;
 			}
-			vkCmdCopyBufferToImage(commandListState->commandBuffer, buffer->buffer, texture->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+			vkCmdCopyBufferToImage(commandListState->commandBuffer, buffer->buffer, texture->image, VkCommandLayout(*texture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), 1, &region);
 		}
 
 		static void cl_copyTextureRegion(CommandList* commandList, const TextureCopyRegion& dst, const TextureCopyRegion& src) noexcept {
@@ -5534,7 +5679,8 @@ namespace rhi {
 			region.extent.width = src.width ? src.width : VkMipDim(srcTexture->width, src.mip);
 			region.extent.height = src.height ? src.height : VkMipDim(srcTexture->height, src.mip);
 			region.extent.depth = src.depth ? src.depth : (srcTexture->type == ResourceType::Texture3D ? VkMipDim(srcTexture->depthOrLayers, src.mip) : 1u);
-			vkCmdCopyImage(commandListState->commandBuffer, srcTexture->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstTexture->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+			vkCmdCopyImage(commandListState->commandBuffer, srcTexture->image, VkCommandLayout(*srcTexture, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL), dstTexture->image,
+				VkCommandLayout(*dstTexture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), 1, &region);
 		}
 
 		static void cl_copyBufferRegion(CommandList* commandList, ResourceHandle dst, uint64_t dstOffset, ResourceHandle src, uint64_t srcOffset, uint64_t numBytes) noexcept {
@@ -5913,6 +6059,7 @@ namespace rhi {
 			SampleDesc sampleDesc{};
 			FinalizedInputLayout inputLayout{};
 			PrimitiveTopology primitiveTopology = PrimitiveTopology::TriangleList;
+			PipelineFlags pipelineFlags = PipelineFlags_None;
 			bool sawGraphicsState = false;
 
 			for (uint32_t index = 0; index < count; ++index) {
@@ -6014,6 +6161,8 @@ namespace rhi {
 					rayTracingPipeline = static_cast<const SubobjRayTracingPipeline*>(items[index].data);
 					break;
 				case PsoSubobj::Flags:
+					pipelineFlags = static_cast<const SubobjFlags*>(items[index].data)->flags;
+					break;
 				default:
 					break;
 				}
@@ -6042,7 +6191,8 @@ namespace rhi {
 				std::vector<std::string> shaderNames;
 				std::vector<VkDescriptorSetAndBindingMappingEXT> descriptorMappings;
 				std::vector<VkSamplerCreateInfo> embeddedSamplers;
-				VkAppendDescriptorHeapMappings(impl, *layoutState, descriptorMappings, embeddedSamplers);
+				// One list for every stage of the pipeline: ranges visible to any ray tracing stage are mapped.
+				VkAppendDescriptorHeapMappings(impl, *layoutState, VkShaderStageFlagsForRHI(ShaderStage::AllRayTracing), descriptorMappings, embeddedSamplers);
 				VkShaderDescriptorSetAndBindingMappingInfoEXT shaderMappingInfo{ VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT };
 				shaderMappingInfo.mappingCount = static_cast<uint32_t>(descriptorMappings.size());
 				shaderMappingInfo.pMappings = descriptorMappings.empty() ? nullptr : descriptorMappings.data();
@@ -6242,13 +6392,18 @@ namespace rhi {
 
 				std::vector<VkShaderModule> modules;
 				std::vector<VkPipelineShaderStageCreateInfo> shaderStages;
-				std::vector<VkDescriptorSetAndBindingMappingEXT> descriptorMappings;
-				std::vector<VkSamplerCreateInfo> embeddedSamplers;
-				VkAppendDescriptorHeapMappings(impl, *layoutState, descriptorMappings, embeddedSamplers);
-				VkShaderDescriptorSetAndBindingMappingInfoEXT shaderMappingInfo{ VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT };
-				shaderMappingInfo.mappingCount = static_cast<uint32_t>(descriptorMappings.size());
-				shaderMappingInfo.pMappings = descriptorMappings.empty() ? nullptr : descriptorMappings.data();
+				// Each stage gets the mappings of the ranges visible to it.
+				struct StageMappings {
+					std::vector<VkDescriptorSetAndBindingMappingEXT> mappings;
+					std::vector<VkSamplerCreateInfo> embeddedSamplers;
+					VkShaderDescriptorSetAndBindingMappingInfoEXT info{ VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT };
+				};
+				std::array<StageMappings, 3> stageMappings{};  // task, vertex or mesh, pixel
 				auto addShader = [&](const SubobjShader* shader) -> Result {
+					StageMappings& stageMapping = stageMappings[shaderStages.size()];
+					VkAppendDescriptorHeapMappings(impl, *layoutState, VkShaderStageForRHI(shader->stage), stageMapping.mappings, stageMapping.embeddedSamplers);
+					stageMapping.info.mappingCount = static_cast<uint32_t>(stageMapping.mappings.size());
+					stageMapping.info.pMappings = stageMapping.mappings.empty() ? nullptr : stageMapping.mappings.data();
 					VkShaderModuleCreateInfo moduleInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
 					moduleInfo.codeSize = shader->bytecode.size;
 					moduleInfo.pCode = static_cast<const uint32_t*>(shader->bytecode.data);
@@ -6262,7 +6417,7 @@ namespace rhi {
 					stage.stage = VkShaderStageForRHI(shader->stage);
 					stage.module = module;
 					stage.pName = shader->entryPoint.empty() ? "main" : shader->entryPoint.c_str();
-					stage.pNext = shaderMappingInfo.mappingCount != 0 ? &shaderMappingInfo : nullptr;
+					stage.pNext = stageMapping.info.mappingCount != 0 ? &stageMapping.info : nullptr;
 					shaderStages.push_back(stage);
 					return Result::Ok;
 				};
@@ -6347,12 +6502,15 @@ namespace rhi {
 				VkPipelineColorBlendStateCreateInfo colorBlend{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
 				colorBlend.attachmentCount = static_cast<uint32_t>(blendAttachments.size());
 				colorBlend.pAttachments = blendAttachments.empty() ? nullptr : blendAttachments.data();
-				std::array<VkDynamicState, 3> dynamicStates = {
+				std::array<VkDynamicState, 4> dynamicStates = {
 					VK_DYNAMIC_STATE_VIEWPORT,
 					VK_DYNAMIC_STATE_SCISSOR,
 					VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+					VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
 				};
-				uint32_t dynamicStateCount = hasMeshShader ? 2u : static_cast<uint32_t>(dynamicStates.size());
+				// Indirect commands bind vertex buffers with their strides (VertexBuffer argument).
+				const bool dynamicVertexStride = !hasMeshShader && !bindings.empty() && (pipelineFlags & PipelineFlags_IndirectBindable) != 0;
+				uint32_t dynamicStateCount = hasMeshShader ? 2u : (dynamicVertexStride ? 4u : 3u);
 				VkPipelineDynamicStateCreateInfo dynamicState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
 				dynamicState.dynamicStateCount = dynamicStateCount;
 				dynamicState.pDynamicStates = dynamicStates.data();
@@ -6365,6 +6523,10 @@ namespace rhi {
 				rendering.colorAttachmentCount = static_cast<uint32_t>(colorFormats.size());
 				rendering.pColorAttachmentFormats = colorFormats.empty() ? nullptr : colorFormats.data();
 				rendering.depthAttachmentFormat = depthFormat != Format::Unknown ? ToVkFormat(depthFormat) : VK_FORMAT_UNDEFINED;
+				// Depth-stencil formats: BeginPass binds the stencil aspect too, so the pipeline declares it.
+				if ((VkAspectMaskForFormat(rendering.depthAttachmentFormat) & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) {
+					rendering.stencilAttachmentFormat = rendering.depthAttachmentFormat;
+				}
 				VkPipelineCreateFlags2CreateInfo createFlags{ VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
 				createFlags.flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
 				// ExecuteIndirect supplies the already-bound pipeline through
@@ -6372,7 +6534,15 @@ namespace rhi {
 				// for pipelines stored in an indirect execution set, not for this
 				// direct-pipeline form.  Applying it to every renderer pipeline makes
 				// drivers retain expensive DGC metadata and has caused unstable mesh
-				// pipeline creation on NVIDIA.
+				// pipeline creation on NVIDIA.  Only pipelines that ask for it get it.
+				const bool indirectBindable = (pipelineFlags & PipelineFlags_IndirectBindable) != 0;
+				if (indirectBindable) {
+					if (!impl->deviceGeneratedCommandsEnabled) {
+						for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
+						RHI_FAIL(Result::Unsupported);
+					}
+					createFlags.flags |= VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
+				}
 				createFlags.pNext = &rendering;
 				VkGraphicsPipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
 				pipelineInfo.pNext = &createFlags;
@@ -6396,7 +6566,13 @@ namespace rhi {
 					return ToRHI(vkResult);
 				}
 
-				const PipelineHandle handle = impl->pipelines.alloc(VulkanPipeline{ nativePipeline, nativeLayout, VK_PIPELINE_BIND_POINT_GRAPHICS, layoutHandle, false });
+				VulkanPipeline graphicsPipelineState{ nativePipeline, nativeLayout, VK_PIPELINE_BIND_POINT_GRAPHICS, layoutHandle, false };
+				graphicsPipelineState.indirectBindable = indirectBindable;
+				graphicsPipelineState.dynamicVertexStride = dynamicVertexStride;
+				for (const VkPipelineShaderStageCreateInfo& stage : shaderStages) {
+					graphicsPipelineState.shaderStages |= stage.stage;
+				}
+				const PipelineHandle handle = impl->pipelines.alloc(graphicsPipelineState);
 				Pipeline pipelineObject(handle);
 				pipelineObject.impl = impl;
 				pipelineObject.vt = &g_vkpsovt;
@@ -6434,7 +6610,7 @@ namespace rhi {
 
 			std::vector<VkDescriptorSetAndBindingMappingEXT> descriptorMappings;
 			std::vector<VkSamplerCreateInfo> embeddedSamplers;
-			VkAppendDescriptorHeapMappings(impl, *layoutState, descriptorMappings, embeddedSamplers);
+			VkAppendDescriptorHeapMappings(impl, *layoutState, VK_SHADER_STAGE_COMPUTE_BIT, descriptorMappings, embeddedSamplers);
 			VkShaderDescriptorSetAndBindingMappingInfoEXT shaderMappingInfo{ VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT };
 			shaderMappingInfo.mappingCount = static_cast<uint32_t>(descriptorMappings.size());
 			shaderMappingInfo.pMappings = descriptorMappings.empty() ? nullptr : descriptorMappings.data();
@@ -6448,6 +6624,14 @@ namespace rhi {
 
 			VkPipelineCreateFlags2CreateInfo createFlags{ VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
 			createFlags.flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
+			const bool computeIndirectBindable = (pipelineFlags & PipelineFlags_IndirectBindable) != 0;
+			if (computeIndirectBindable) {
+				if (!impl->deviceGeneratedCommandsEnabled) {
+					vkDestroyShaderModule(impl->device, shaderModule, nullptr);
+					RHI_FAIL(Result::Unsupported);
+				}
+				createFlags.flags |= VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
+			}
 			VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
 			pipelineInfo.pNext = &createFlags;
 			pipelineInfo.stage = stageInfo;
@@ -6467,6 +6651,8 @@ namespace rhi {
 				.bindPoint = VK_PIPELINE_BIND_POINT_COMPUTE,
 				.rhiLayout = layoutHandle,
 				.isCompute = true,
+				.indirectBindable = computeIndirectBindable,
+				.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT,
 			});
 
 			Pipeline pipelineObject(handle);
@@ -6791,6 +6977,21 @@ namespace rhi {
 			}
 			layoutState.totalPushDataBytes = pushDataOffset;
 
+			// Indirect ranges: the record address (two dwords) must lie inside a root-constant range.
+			for (const LayoutBindingRange& range : layoutState.ranges) {
+				if (range.source == LayoutRangeSource::HeapSlot) {
+					continue;
+				}
+				const bool validAddress = range.addressRootIndex < layoutState.pushConstants.size() &&
+				                          layoutState.pushConstants[range.addressRootIndex].type == PushConstantRangeType::RootConstants32 &&
+				                          range.addressOffset32 + 2u <= layoutState.pushConstants[range.addressRootIndex].num32BitValues;
+				if (!validAddress || range.count == 0 || (range.source == LayoutRangeSource::IndirectAddress && range.samplers)) {
+					spdlog::error("Vulkan CreatePipelineLayout: indirect range at set {} binding {} needs a record address inside a RootConstants32 range", range.set, range.binding);
+					out.Reset();
+					RHI_FAIL(Result::InvalidArgument);
+				}
+			}
+
 			if (layoutState.totalPushDataBytes > impl->descriptorHeapProperties.maxPushDataSize) {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
@@ -7038,6 +7239,29 @@ namespace rhi {
 					out->meshNodes = false;
 				} break;
 
+				case FeatureInfoStructType::IndirectCommands: {
+					if (header->structSize < sizeof(IndirectCommandsFeatureInfo)) {
+						RHI_FAIL(Result::InvalidArgument);
+					}
+					auto* out = reinterpret_cast<IndirectCommandsFeatureInfo*>(header);
+					const bool generated = impl->deviceGeneratedCommandsEnabled && impl->bufferDeviceAddressEnabled;
+					VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT dgcProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_PROPERTIES_EXT };
+					if (generated) {
+						VkPhysicalDeviceProperties2 properties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+						properties.pNext = &dgcProperties;
+						vkGetPhysicalDeviceProperties2(impl->physicalDevice, &properties);
+					}
+					out->constantArguments = generated;
+					out->indexBufferArguments = generated &&
+						(dgcProperties.supportedIndirectCommandsInputModes & VK_INDIRECT_COMMANDS_INPUT_MODE_DXGI_INDEX_BUFFER_EXT) != 0;
+					constexpr VkShaderStageFlags kGraphicsStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+					out->pipelineSets = generated && VkIndirectPipelineSetsSupported(impl) && dgcProperties.maxIndirectPipelineCount > 0 &&
+						(dgcProperties.supportedIndirectCommandsShaderStagesPipelineBinding & kGraphicsStages) == kGraphicsStages;
+					out->maxPipelineSetCount = out->pipelineSets ? dgcProperties.maxIndirectPipelineCount : 0;
+					out->vertexBufferArguments = generated && (dgcProperties.supportedIndirectCommandsInputModes & VK_INDIRECT_COMMANDS_INPUT_MODE_DXGI_INDEX_BUFFER_EXT) != 0;
+					out->indirectBindings = impl->descriptorHeapEnabled;
+				} break;
+
 				default:
 					break;
 				}
@@ -7102,6 +7326,16 @@ namespace rhi {
 					hasExecutableToken = true;
 					break;
 				case IndirectArgKind::Constant:
+				case IndirectArgKind::IndexBuffer:
+				case IndirectArgKind::VertexBuffer:
+					needsGeneratedCommands = true;
+					break;
+				case IndirectArgKind::PipelineIndex:
+					// The execution set token must come first, and needs the set it indexes.
+					if (runningOffset != 0 || !desc.pipelineSet.valid()) {
+						out.Reset();
+						RHI_FAIL(Result::InvalidArgument);
+					}
 					needsGeneratedCommands = true;
 					break;
 				default:
@@ -7109,6 +7343,14 @@ namespace rhi {
 					RHI_FAIL(Result::Unsupported);
 				}
 				runningOffset += argByteSize;
+			}
+			VulkanIndirectPipelineSet* pipelineSetState = nullptr;
+			if (desc.pipelineSet.valid()) {
+				pipelineSetState = VkIndirectPipelineSetState(impl, desc.pipelineSet);
+				if (!pipelineSetState || desc.args.data[0].kind != IndirectArgKind::PipelineIndex) {
+					out.Reset();
+					RHI_FAIL(Result::InvalidArgument);
+				}
 			}
 			if (!hasExecutableToken) {
 				out.Reset();
@@ -7120,7 +7362,6 @@ namespace rhi {
 				VulkanPipelineLayout* layoutState = VkPipelineLayoutState(impl, layout);
 				if (!layoutState ||
 					!impl->deviceGeneratedCommandsEnabled ||
-					!impl->dynamicGeneratedPipelineLayoutEnabled ||
 					!impl->bufferDeviceAddressEnabled ||
 					!vkCreateIndirectCommandsLayoutEXT) {
 					out.Reset();
@@ -7131,10 +7372,15 @@ namespace rhi {
 				std::vector<VkIndirectCommandsPushConstantTokenEXT> pushTokens;
 				tokens.reserve(desc.args.size);
 				pushTokens.reserve(desc.args.size);
+				VkIndirectCommandsIndexBufferTokenEXT indexBufferToken{ VK_INDIRECT_COMMANDS_INPUT_MODE_DXGI_INDEX_BUFFER_EXT };
+				std::vector<VkIndirectCommandsVertexBufferTokenEXT> vertexBufferTokens;
+				vertexBufferTokens.reserve(desc.args.size);
+				VkIndirectCommandsExecutionSetTokenEXT executionSetToken{ VK_INDIRECT_EXECUTION_SET_INFO_TYPE_PIPELINES_EXT, 0 };
 
 				VkShaderStageFlags executionDomainStages = 0;
 				for (const IndirectArg& arg : desc.args) {
-					if (arg.kind == IndirectArgKind::Constant) {
+					if (arg.kind == IndirectArgKind::Constant || arg.kind == IndirectArgKind::IndexBuffer || arg.kind == IndirectArgKind::VertexBuffer ||
+						arg.kind == IndirectArgKind::PipelineIndex) {
 						continue;
 					}
 
@@ -7178,7 +7424,8 @@ namespace rhi {
 							out.Reset();
 							RHI_FAIL(Result::Unsupported);
 						}
-						pushToken.updateRange.stageFlags = pushStages;
+						// Push data is not per stage: a push data token always names every stage.
+						pushToken.updateRange.stageFlags = VK_SHADER_STAGE_ALL;
 						pushToken.updateRange.offset = pushRange->byteOffset + arg.u.rootConstants.destOffset32 * 4u;
 						pushToken.updateRange.size = arg.u.rootConstants.num32 * 4u;
 						if (pushToken.updateRange.offset + pushToken.updateRange.size > pushRange->byteOffset + pushRange->byteSize) {
@@ -7187,8 +7434,24 @@ namespace rhi {
 						}
 
 						pushTokens.push_back(pushToken);
-						token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_CONSTANT_EXT;
+						// Descriptor-heap pipelines have no pipeline layout; root constants are push data
+						// (cl_pushConstants records vkCmdPushDataEXT), so the token writes push data too.
+						token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_DATA_EXT;
 						token.data.pPushConstant = &pushTokens.back();
+					}
+					else if (arg.kind == IndirectArgKind::IndexBuffer) {
+						token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_INDEX_BUFFER_EXT;
+						token.data.pIndexBuffer = &indexBufferToken;
+					}
+					else if (arg.kind == IndirectArgKind::VertexBuffer) {
+						vertexBufferTokens.push_back({ arg.u.vertexBuffer.slot });
+						token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_VERTEX_BUFFER_EXT;
+						token.data.pVertexBuffer = &vertexBufferTokens.back();
+					}
+					else if (arg.kind == IndirectArgKind::PipelineIndex) {
+						executionSetToken.shaderStages = pipelineSetState->shaderStages;
+						token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_EXECUTION_SET_EXT;
+						token.data.pExecutionSet = &executionSetToken;
 					}
 					else {
 						token.type = VkIndirectCommandsTokenTypeForRHI(arg.kind);
@@ -7202,18 +7465,11 @@ namespace rhi {
 					runningOffset += VkIndirectArgumentByteSize(arg);
 				}
 
+				// No pipeline layout: the pipelines use descriptor heaps and push data (an execution set
+				// token even requires that none is given for such pipelines).
 				const VkShaderStageFlags layoutShaderStages = shaderStages != 0 ? shaderStages : VK_SHADER_STAGE_ALL;
-				VkPushConstantRange pipelineLayoutPushRange{};
-				pipelineLayoutPushRange.stageFlags = layoutShaderStages;
-				pipelineLayoutPushRange.offset = 0;
-				pipelineLayoutPushRange.size = layoutState->totalPushDataBytes;
-				VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-				pipelineLayoutInfo.setLayoutCount = 0;
-				pipelineLayoutInfo.pSetLayouts = nullptr;
-				pipelineLayoutInfo.pushConstantRangeCount = pipelineLayoutPushRange.size != 0 ? 1u : 0u;
-				pipelineLayoutInfo.pPushConstantRanges = pipelineLayoutPushRange.size != 0 ? &pipelineLayoutPushRange : nullptr;
 				VkIndirectCommandsLayoutCreateInfoEXT layoutCreateInfo{ VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_CREATE_INFO_EXT };
-				layoutCreateInfo.pNext = &pipelineLayoutInfo;
+				layoutCreateInfo.pNext = nullptr;
 				layoutCreateInfo.shaderStages = layoutShaderStages;
 				layoutCreateInfo.indirectStride = desc.byteStride;
 				layoutCreateInfo.pipelineLayout = VK_NULL_HANDLE;
@@ -7230,12 +7486,104 @@ namespace rhi {
 			signature.args.assign(desc.args.data, desc.args.data + desc.args.size);
 			signature.byteStride = desc.byteStride;
 			signature.indirectLayout = indirectLayout;
+			signature.pipelineSet = desc.pipelineSet;
 			const CommandSignatureHandle handle = impl->commandSignatures.alloc(signature);
 			CommandSignature object{ handle };
 			object.impl = impl;
 			object.vt = &g_vkcsvt;
 			out = MakeCommandSignaturePtr(device, object, impl->selfWeak.lock());
 			return Result::Ok;
+		}
+
+		static Result d_createIndirectPipelineSet(Device* device, const IndirectPipelineSetDesc& desc, IndirectPipelineSetPtr& out) noexcept {
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			out.Reset();
+			if (!VkIndirectPipelineSetsSupported(impl)) {
+				RHI_FAIL(Result::Unsupported);
+			}
+			VulkanPipeline* initial = VkPipelineState(impl, desc.initialPipeline);
+			if (!initial || initial->pipeline == VK_NULL_HANDLE || !initial->indirectBindable || desc.maxPipelineCount == 0) {
+				spdlog::error("Vulkan CreateIndirectPipelineSet: the initial pipeline must be valid and IndirectBindable, and maxPipelineCount non-zero");
+				RHI_FAIL(Result::InvalidArgument);
+			}
+
+			VkIndirectExecutionSetPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_PIPELINE_INFO_EXT };
+			pipelineInfo.initialPipeline = initial->pipeline;
+			pipelineInfo.maxPipelineCount = desc.maxPipelineCount;
+			VkIndirectExecutionSetCreateInfoEXT createInfo{ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_CREATE_INFO_EXT };
+			createInfo.type = VK_INDIRECT_EXECUTION_SET_INFO_TYPE_PIPELINES_EXT;
+			createInfo.info.pPipelineInfo = &pipelineInfo;
+
+			VulkanIndirectPipelineSet set{};
+			const VkResult result = vkCreateIndirectExecutionSetEXT(impl->device, &createInfo, nullptr, &set.executionSet);
+			if (result != VK_SUCCESS) {
+				spdlog::error("Vulkan CreateIndirectPipelineSet: vkCreateIndirectExecutionSetEXT failed with VkResult {}", static_cast<int>(result));
+				return ToRHI(result);
+			}
+			set.initialPipeline = desc.initialPipeline;
+			set.maxPipelineCount = desc.maxPipelineCount;
+			set.shaderStages = initial->shaderStages;
+			set.bindPoint = initial->bindPoint;
+
+			const IndirectPipelineSetHandle handle = impl->indirectPipelineSets.alloc(set);
+			IndirectPipelineSet object{ handle };
+			object.impl = impl;
+			object.vt = &g_vkipsvt;
+			out = MakeIndirectPipelineSetPtr(device, object, impl->selfWeak.lock());
+			return Result::Ok;
+		}
+
+		static Result d_updateIndirectPipelineSet(Device* device, IndirectPipelineSetHandle handle, uint32_t firstIndex, Span<PipelineHandle> pipelines) noexcept {
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			VulkanIndirectPipelineSet* set = VkIndirectPipelineSetState(impl, handle);
+			if (!set || set->executionSet == VK_NULL_HANDLE || firstIndex > set->maxPipelineCount || pipelines.size > set->maxPipelineCount - firstIndex) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			std::vector<VkWriteIndirectExecutionSetPipelineEXT> writes;
+			writes.reserve(pipelines.size);
+			for (uint32_t i = 0; i < pipelines.size; ++i) {
+				VulkanPipeline* pipeline = VkPipelineState(impl, pipelines.data[i]);
+				if (!pipeline || pipeline->pipeline == VK_NULL_HANDLE || !pipeline->indirectBindable ||
+					pipeline->bindPoint != set->bindPoint || pipeline->shaderStages != set->shaderStages) {
+					spdlog::error("Vulkan UpdateIndirectPipelineSet: pipeline {} is not IndirectBindable or does not match the set's stages", firstIndex + i);
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				VkWriteIndirectExecutionSetPipelineEXT write{ VK_STRUCTURE_TYPE_WRITE_INDIRECT_EXECUTION_SET_PIPELINE_EXT };
+				write.index = firstIndex + i;
+				write.pipeline = pipeline->pipeline;
+				writes.push_back(write);
+			}
+			if (!writes.empty()) {
+				vkUpdateIndirectExecutionSetPipelineEXT(impl->device, set->executionSet, static_cast<uint32_t>(writes.size()), writes.data());
+			}
+			return Result::Ok;
+		}
+
+		static void d_destroyIndirectPipelineSet(DeviceDeletionContext* context, IndirectPipelineSetHandle handle) noexcept {
+			auto* impl = context ? static_cast<VulkanDevice*>(context->impl) : nullptr;
+			if (!impl) {
+				return;
+			}
+			if (VulkanIndirectPipelineSet* set = VkIndirectPipelineSetState(impl, handle)) {
+				if (set->executionSet != VK_NULL_HANDLE && impl->device != VK_NULL_HANDLE && vkDestroyIndirectExecutionSetEXT) {
+					vkDestroyIndirectExecutionSetEXT(impl->device, set->executionSet, nullptr);
+				}
+			}
+			impl->indirectPipelineSets.free(handle);
+		}
+
+		static void d_setNameIndirectPipelineSet(Device* device, IndirectPipelineSetHandle handle, const char* name) noexcept {
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (VulkanIndirectPipelineSet* set = VkIndirectPipelineSetState(impl, handle); set && set->executionSet != VK_NULL_HANDLE) {
+				VkSetObjectName(impl, reinterpret_cast<uint64_t>(set->executionSet), VK_OBJECT_TYPE_INDIRECT_EXECUTION_SET_EXT, name);
+			}
+		}
+
+		static void ips_setName(IndirectPipelineSet* set, const char* name) noexcept {
+			auto* impl = set ? static_cast<VulkanDevice*>(set->impl) : nullptr;
+			if (VulkanIndirectPipelineSet* state = VkIndirectPipelineSetState(impl, set ? set->GetHandle() : IndirectPipelineSetHandle{}); state && state->executionSet != VK_NULL_HANDLE) {
+				VkSetObjectName(impl, reinterpret_cast<uint64_t>(state->executionSet), VK_OBJECT_TYPE_INDIRECT_EXECUTION_SET_EXT, name);
+			}
 		}
 
 		static void d_destroyCommandSignature(DeviceDeletionContext* context, CommandSignatureHandle handle) noexcept {
@@ -7452,6 +7800,28 @@ namespace rhi {
 				return Result::Ok;
 			}
 
+			if (!resource.valid()) {
+				// A null view (D3D12: CreateShaderResourceView without a resource): reads return zero.
+				VulkanImageViewSlot* descriptorSlot = VkImageViewSlotState(impl, slot, DescriptorHeapType::CbvSrvUav);
+				void* slotAddress = heap && heap->buffer != VK_NULL_HANDLE ? VkDescriptorHeapSlotAddress(heap, slot.index) : nullptr;
+				if (!impl->nullDescriptorEnabled || !impl->descriptorHeapEnabled || !descriptorSlot || !slotAddress) {
+					RHI_FAIL(Result::Unsupported);
+				}
+				std::memset(slotAddress, 0, static_cast<size_t>(heap->descriptorStride));
+				VkResourceDescriptorInfoEXT descriptorInfo{ VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT };
+				descriptorInfo.type = desc.dimension != SrvDim::Buffer ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+					: (desc.buffer.kind == BufferViewKind::Typed ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+				VkHostAddressRangeEXT descriptorRange{};
+				descriptorRange.address = slotAddress;
+				descriptorRange.size = static_cast<size_t>(heap->descriptorStride);
+				const VkResult result = vkWriteResourceDescriptorsEXT(impl->device, 1, &descriptorInfo, &descriptorRange);
+				if (result != VK_SUCCESS) {
+					return ToRHI(result);
+				}
+				VkResetDescriptorSlot(impl, *descriptorSlot);
+				return Result::Ok;
+			}
+
 			VulkanResource* resourceState = VkResourceState(impl, resource);
 			if (!resourceState) {
 				RHI_FAIL(Result::InvalidArgument);
@@ -7519,17 +7889,12 @@ namespace rhi {
 				viewCreateInfo.image = resourceState->image;
 				viewCreateInfo.viewType = viewType;
 				viewCreateInfo.format = viewFormat;
-				viewCreateInfo.components = {
-					VK_COMPONENT_SWIZZLE_IDENTITY,
-					VK_COMPONENT_SWIZZLE_IDENTITY,
-					VK_COMPONENT_SWIZZLE_IDENTITY,
-					VK_COMPONENT_SWIZZLE_IDENTITY,
-				};
+				viewCreateInfo.components = VkComponentMappingForRHI(desc.componentMapping);
 				viewCreateInfo.subresourceRange = subresourceRange;
 
 				VkImageDescriptorInfoEXT imageInfo{ VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT };
 				imageInfo.pView = &viewCreateInfo;
-				imageInfo.layout = VkToImageLayout(ResourceLayout::ShaderResource, aspectMask);
+				imageInfo.layout = resourceState->generalLayoutOnly ? VK_IMAGE_LAYOUT_GENERAL : VkToImageLayout(ResourceLayout::ShaderResource, aspectMask);
 
 				VkResourceDescriptorInfoEXT descriptorInfo{ VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT };
 				descriptorInfo.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -9264,6 +9629,10 @@ namespace rhi {
 		&d_setDebugPipelineInstrumentationMask,
 		&d_setDebugSynchronousRecording,
 		&d_setDebugTexelAddressing,
+		&d_createIndirectPipelineSet,
+		&d_updateIndirectPipelineSet,
+		&d_destroyIndirectPipelineSet,
+		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
 		11u
 	};
@@ -9389,6 +9758,11 @@ namespace rhi {
 		1u
 	};
 
+	const IndirectPipelineSetVTable g_vkipsvt = {
+		&ips_setName,
+		1u
+	};
+
 	const DescriptorHeapVTable g_vkdhvt = {
 		&dh_setName,
 		1u
@@ -9418,6 +9792,7 @@ namespace rhi {
 		VkPhysicalDeviceVulkan12Features vulkan12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
 		VkPhysicalDeviceVulkan13Features vulkan13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
 		VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptorHeap{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT };
+		bool nullDescriptor = false;
 		VkPhysicalDeviceMeshShaderFeaturesEXT meshShader{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT };
 		VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT deviceGeneratedCommands{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT };
 		VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR computeShaderDerivatives{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR };
@@ -9463,6 +9838,7 @@ namespace rhi {
 		impl->runtimeDescriptorArrayEnabled = e.vulkan12.runtimeDescriptorArray == VK_TRUE;
 		impl->scalarBlockLayoutEnabled = e.vulkan12.scalarBlockLayout == VK_TRUE;
 		impl->descriptorHeapEnabled = e.descriptorHeap.descriptorHeap == VK_TRUE;
+		impl->nullDescriptorEnabled = e.nullDescriptor;
 		impl->descriptorHeapCaptureReplayEnabled = e.descriptorHeap.descriptorHeapCaptureReplay == VK_TRUE;
 		impl->meshShaderEnabled = e.meshShader.meshShader == VK_TRUE;
 		impl->taskShaderEnabled = e.meshShader.taskShader == VK_TRUE;
@@ -10424,6 +10800,9 @@ namespace rhi {
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: VkCopyFeatureStruct(e.vulkan12, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: VkCopyFeatureStruct(e.vulkan13, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT: VkCopyFeatureStruct(e.descriptorHeap, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT:
+						e.nullDescriptor |= reinterpret_cast<const VkPhysicalDeviceRobustness2FeaturesEXT*>(node)->nullDescriptor == VK_TRUE;
+						break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT: VkCopyFeatureStruct(e.meshShader, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT: VkCopyFeatureStruct(e.deviceGeneratedCommands, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR: VkCopyFeatureStruct(e.computeShaderDerivatives, node); break;
@@ -10640,6 +11019,10 @@ namespace rhi {
 				spdlog::error("import_image: layout {} has no BasicRHI equivalent", static_cast<int>(desc.currentLayout));
 				RHI_FAIL(Result::Unsupported);
 			}
+			if (desc.simultaneousAccess && desc.currentLayout != VK_IMAGE_LAYOUT_GENERAL) {
+				spdlog::error("import_image: a simultaneous-access image must be in VK_IMAGE_LAYOUT_GENERAL");
+				RHI_FAIL(Result::InvalidArgument);
+			}
 			auto* impl = static_cast<VulkanDevice*>(device.impl);
 			const VkImageCreateInfo& ci = desc.createInfo;
 			VulkanResource state{};
@@ -10655,6 +11038,7 @@ namespace rhi {
 			state.imageUsage = ci.usage;
 			state.currentLayout = *layout;
 			state.submittedLayout = *layout;
+			state.generalLayoutOnly = desc.simultaneousAccess;
 			state.concurrentSharing = ci.sharingMode == VK_SHARING_MODE_CONCURRENT;
 			state.ownsImage = false;
 			state.ownsMemory = false;

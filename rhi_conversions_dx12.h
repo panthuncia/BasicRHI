@@ -155,6 +155,13 @@ namespace rhi {
 		case Format::R16G16_SInt: return DXGI_FORMAT_R16G16_SINT;
 		case Format::R32_Typeless: return DXGI_FORMAT_R32_TYPELESS;
 		case Format::D32_Float: return DXGI_FORMAT_D32_FLOAT;
+		case Format::R24G8_Typeless: return DXGI_FORMAT_R24G8_TYPELESS;
+		case Format::D24_UNorm_S8_UInt: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+		case Format::R24_UNorm_X8_Typeless: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+		case Format::R32G8X24_Typeless: return DXGI_FORMAT_R32G8X24_TYPELESS;
+		case Format::D32_Float_S8X24_UInt: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+		case Format::R32_Float_X8X24_Typeless: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+		case Format::D16_UNorm: return DXGI_FORMAT_D16_UNORM;
 		case Format::R32_Float: return DXGI_FORMAT_R32_FLOAT;
 		case Format::R32_UInt: return DXGI_FORMAT_R32_UINT;
 		case Format::R32_SInt: return DXGI_FORMAT_R32_SINT;

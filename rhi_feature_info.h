@@ -11,6 +11,7 @@ enum class FeatureInfoStructType : uint64_t {
     EnhancedBarriers = 7,
 	ResourceAllocation = 8,
 	WorkGraphs = 9,
+	IndirectCommands = 10,
 };
 
 struct FeatureInfoHeader {
@@ -199,4 +200,15 @@ struct WorkGraphFeatureInfo {
 		if (computeNodes) return WorkGraphLevel::ComputeNodes;
         return WorkGraphLevel::None;
     }
+};
+
+struct IndirectCommandsFeatureInfo {
+    FeatureInfoHeader header{ FeatureInfoStructType::IndirectCommands, nullptr, sizeof(IndirectCommandsFeatureInfo), 1 };
+
+    bool constantArguments = false;    // Constant arguments in a command signature
+    bool indexBufferArguments = false; // IndexBuffer arguments (D3D12 index buffer view layout)
+    bool pipelineSets = false;         // IndirectPipelineSet and PipelineIndex arguments
+    uint32_t maxPipelineSetCount = 0;  // largest IndirectPipelineSetDesc::maxPipelineCount
+    bool vertexBufferArguments = false; // VertexBuffer arguments (D3D12 vertex buffer view layout)
+    bool indirectBindings = false;     // LayoutRangeSource::IndirectIndex / IndirectAddress
 };

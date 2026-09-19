@@ -121,6 +121,11 @@ namespace rhi::vulkan {
         VkImage image = VK_NULL_HANDLE;
         VkImageCreateInfo createInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
         VkImageLayout currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        // The host keeps the image in VK_IMAGE_LAYOUT_GENERAL and may use it between BasicRHI's commands
+        // (D3D12's simultaneous-access contract): BasicRHI never moves it out of GENERAL, and its views
+        // and attachments are used in GENERAL. Requires currentLayout GENERAL; pair with barriers whose
+        // layouts are Common (ORG: ExternalTextureResource with commonLayoutOnly).
+        bool simultaneousAccess = false;
         const char* debugName = nullptr;
     };
     Result import_image(rhi::Device device, const ImportedImageDesc& desc, rhi::ResourcePtr& out) noexcept;

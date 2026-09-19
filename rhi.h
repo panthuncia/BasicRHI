@@ -59,6 +59,7 @@ namespace rhi {
 	inline constexpr uint32_t RHI_WORKGRAPH_ABI_MIN = 1;
 	inline constexpr uint32_t RHI_PIPELINELAYOUT_ABI_MIN = 1;
 	inline constexpr uint32_t RHI_COMMANDSIGNATURE_ABI_MIN = 1;
+	inline constexpr uint32_t RHI_INDIRECTPIPELINESET_ABI_MIN = 1;
 	inline constexpr uint32_t RHI_SAMPLER_ABI_MIN = 1;
 	inline constexpr uint32_t RHI_DESCRIPTORHEAP_ABI_MIN = 1;
 	inline constexpr uint32_t RHI_TIMELINE_ABI_MIN = 1;
@@ -95,6 +96,7 @@ namespace rhi {
 		struct HPipeline {};
 		struct HWorkGraph {};
 		struct HCmdSig {};
+		struct HIndirectPipelineSet {};
 		struct HPipelineLayout {};
 		struct HDescHeap {};
 		struct HCmdAlloc {};
@@ -147,6 +149,7 @@ namespace rhi {
 	using PipelineHandle = Handle<detail::HPipeline>;
 	using WorkGraphHandle = Handle<detail::HWorkGraph>;
 	using CommandSignatureHandle = Handle<detail::HCmdSig>;
+	using IndirectPipelineSetHandle = Handle<detail::HIndirectPipelineSet>;
 	using PipelineLayoutHandle = Handle<detail::HPipelineLayout>;
 	using DescriptorHeapHandle = Handle<detail::HDescHeap>;
 	using TimelineHandle = Handle<detail::HTimeline>;
@@ -513,6 +516,11 @@ namespace rhi {
 		B8G8R8A8_Typeless, B8G8R8A8_UNorm, B8G8R8A8_UNorm_sRGB,
 		BC6H_Typeless, BC6H_UF16, BC6H_SF16,
 		BC7_Typeless, BC7_UNorm, BC7_UNorm_sRGB,
+		// Depth-stencil (appended: values above are ABI). The typeless and R*_X* forms name the same
+		// resource for creation and depth-aspect shader reads, as in DXGI.
+		R24G8_Typeless, D24_UNorm_S8_UInt, R24_UNorm_X8_Typeless,
+		R32G8X24_Typeless, D32_Float_S8X24_UInt, R32_Float_X8X24_Typeless,
+		D16_UNorm,
 	};
 
 	constexpr uint32_t FormatByteSize(Format f) noexcept {
@@ -549,6 +557,12 @@ namespace rhi {
 
 		case Format::B8G8R8A8_Typeless: case Format::B8G8R8A8_UNorm:
 		case Format::B8G8R8A8_UNorm_sRGB:                                          return 4;
+
+		case Format::R24G8_Typeless: case Format::D24_UNorm_S8_UInt:
+		case Format::R24_UNorm_X8_Typeless:                                        return 4;
+		case Format::R32G8X24_Typeless: case Format::D32_Float_S8X24_UInt:
+		case Format::R32_Float_X8X24_Typeless:                                     return 8;
+		case Format::D16_UNorm:                                                    return 2;
 
 			// 2 bytes (2 x 8-bit OR single 16-bit)
 		case Format::R8G8_Typeless: case Format::R8G8_UNorm:
@@ -680,6 +694,8 @@ namespace rhi {
 		DispatchRays,  // DXR: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS
 		DispatchMesh,  // Mesh shaders: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH
 		IncrementingConstant, // D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT
+		PipelineIndex,  // uint32 index into CommandSignatureDesc::pipelineSet; must be the first argument.
+		                // Vulkan only (VK_INDIRECT_COMMANDS_TOKEN_TYPE_EXECUTION_SET_EXT); no D3D12 equivalent.
 	};
 
 	struct IndirectArg {
@@ -708,7 +724,30 @@ namespace rhi {
 		All = 0xFFFFFFFFu
 	};
 
-	struct LayoutBindingRange { uint32_t set = 0, binding = 0, count = 1; bool readOnly = true; ShaderStage visibility = ShaderStage::All; };
+	// Where the descriptors of a LayoutBindingRange come from. The Indirect sources read, per binding,
+	// a heap index or a constant buffer address from a record in GPU memory whose device address sits
+	// in push data, so one pushed address can supply every binding of a draw (and an indirect command
+	// stream can change it per command). Vulkan only (VK_EXT_descriptor_heap mappings); D3D12 rejects
+	// them. Supported where IndirectCommandsFeatureInfo::indirectBindings is set.
+	enum class LayoutRangeSource : uint32_t {
+		HeapSlot,         // binding b reads descriptor heap slot b
+		IndirectIndex,    // binding (binding + i) reads the heap slot whose index (uint32) is at record + recordOffset + 4 * i;
+		                  // samplers ranges (samplers = true) index the sampler heap
+		IndirectAddress,  // constant buffer (binding + i) reads the buffer whose device address (uint64) is at record + recordOffset + 8 * i
+	};
+
+	struct LayoutBindingRange {
+		uint32_t set = 0, binding = 0, count = 1;
+		bool readOnly = true;
+		ShaderStage visibility = ShaderStage::All;
+		LayoutRangeSource source = LayoutRangeSource::HeapSlot;
+		// Indirect sources: the record's device address is the uint64 at dword addressOffset32 of push
+		// constant range addressRootIndex (a RootConstants32 range of this layout).
+		uint32_t addressRootIndex = 0;
+		uint32_t addressOffset32 = 0;
+		uint32_t recordOffset = 0;  // bytes
+		bool samplers = false;      // IndirectIndex: the range holds samplers
+	};
 
 	enum class PushConstantRangeType : uint32_t {
 		RootConstants32,
@@ -743,6 +782,18 @@ namespace rhi {
 	struct CommandSignatureDesc {
 		Span<IndirectArg> args;
 		uint32_t byteStride = 0; // sizeof(struct in argument buffer)
+		// Required when args contain PipelineIndex: the set the index selects from. ExecuteIndirect then
+		// binds the set's pipelines itself; the command list's bound pipeline is replaced by the set's
+		// initial pipeline.
+		IndirectPipelineSetHandle pipelineSet{};
+	};
+
+	// A table of pipelines an indirect command stream selects from per command (Vulkan indirect
+	// execution set). Every pipeline must be created with PipelineFlags_IndirectBindable, use the same
+	// pipeline layout and shader stages, and be compatible with the initial pipeline.
+	struct IndirectPipelineSetDesc {
+		PipelineHandle initialPipeline{};  // placed at index 0
+		uint32_t maxPipelineCount = 0;
 	};
 
 	enum class DescriptorHeapType : uint32_t { CbvSrvUav, Sampler, RTV, DSV };
@@ -1736,7 +1787,15 @@ namespace rhi {
 		RayTracingPipelineFlags flags{ RTPipeline_None };
 		bool library{ false };
 	};
-	// struct SubobjFlags { uint64_t mask = 0; }; // optional
+	enum PipelineFlags : uint32_t {
+		PipelineFlags_None = 0,
+		// The pipeline can be placed in an IndirectPipelineSet (Vulkan: VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT).
+		// Only set it where needed: drivers keep extra metadata for such pipelines.
+		PipelineFlags_IndirectBindable = 1u << 0,
+		// Graphics pipelines with vertex input also get dynamic vertex strides (the VertexBuffer indirect
+		// argument sets them): bind their vertex buffers with VertexBufferView::stride set.
+	};
+	struct SubobjFlags { PipelineFlags flags{ PipelineFlags_None }; }; // optional
 
 	struct PipelineStreamItem {
 		PsoSubobj type;
@@ -1756,6 +1815,7 @@ namespace rhi {
 	inline PipelineStreamItem Make(const SubobjInputLayout& x) { return { PsoSubobj::InputLayout, &x, sizeof(x) }; }
 	inline PipelineStreamItem Make(const SubobjPrimitiveTopology& x) { return { PsoSubobj::PrimitiveTopology, &x, sizeof(x) }; }
 	inline PipelineStreamItem Make(const SubobjRayTracingPipeline& x) { return { PsoSubobj::RayTracingPipeline, &x, sizeof(x) }; }
+	inline PipelineStreamItem Make(const SubobjFlags& x) { return { PsoSubobj::Flags, &x, sizeof(x) }; }
 
 	// ---------------- Pass & barriers (minimal) ----------------
 
@@ -1794,8 +1854,9 @@ namespace rhi {
 	struct PassBeginInfo {
 		Span<ColorAttachment> colors{};
 		const DepthAttachment* depth{};
-		uint32_t width = 0, height = 0;
+		uint32_t width = 0, height = 0;  // render area, viewport and scissor (origin 0, 0)
 		const char* debugName = nullptr;
+		float minDepth = 0.0f, maxDepth = 1.0f;  // the viewport's depth range
 	};
 	enum ResourceFlags : uint32_t {
 		RF_None = 0,
@@ -2191,6 +2252,7 @@ namespace rhi {
 	class WorkGraph;    struct WorkGraphVTable;
 	class PipelineLayout; struct PipelineLayoutVTable;
 	class CommandSignature; struct CommandSignatureVTable;
+	class IndirectPipelineSet; struct IndirectPipelineSetVTable;
 	class DescriptorHeap; struct DescriptorHeapVTable;
 	class Sampler;     struct SamplerVTable;
 	class Timeline;    struct TimelineVTable;
@@ -2307,6 +2369,27 @@ namespace rhi {
 		void SetName(const char* n) noexcept { vt->setName(this, n); }
 	private:
 		CommandSignatureHandle handle;
+	};
+
+	struct IndirectPipelineSetVTable {
+		void (*setName)(IndirectPipelineSet*, const char*) noexcept;
+		uint32_t abi_version = 1;
+	};
+	class IndirectPipelineSet {
+	public:
+		IndirectPipelineSet() = default;
+		explicit IndirectPipelineSet(IndirectPipelineSetHandle h) : handle(h) {}
+		void* impl{};
+		const IndirectPipelineSetVTable* vt{};
+		explicit constexpr operator bool() const noexcept {
+			return impl != nullptr && vt != nullptr && vt->abi_version >= RHI_INDIRECTPIPELINESET_ABI_MIN;
+		}
+		constexpr bool IsValid() const noexcept { return static_cast<bool>(*this); }
+		constexpr void Reset() noexcept { impl = nullptr; vt = nullptr; }
+		const IndirectPipelineSetHandle& GetHandle() const noexcept { return handle; }
+		void SetName(const char* n) noexcept { vt->setName(this, n); }
+	private:
+		IndirectPipelineSetHandle handle;
 	};
 
 	struct DescriptorHeapVTable {
@@ -2744,6 +2827,7 @@ namespace rhi {
 	using WorkGraphPtr = ObjectPtr<WorkGraph>;
 	using PipelineLayoutPtr = ObjectPtr<PipelineLayout>;
 	using CommandSignaturePtr = ObjectPtr<CommandSignature>;
+	using IndirectPipelineSetPtr = ObjectPtr<IndirectPipelineSet>;
 	using DescriptorHeapPtr = ObjectPtr<DescriptorHeap>;
 	using TimelinePtr = ObjectPtr<Timeline>;
 	using HeapPtr = ObjectPtr<Heap>;
@@ -2837,8 +2921,16 @@ namespace rhi {
 		Result(*setDebugSynchronousRecording)(Device*, bool) noexcept;
 		Result(*setDebugTexelAddressing)(Device*, bool) noexcept;
 
+		// Indirect pipeline sets (abi 12). Unsupported where FeatureInfo IndirectCommands::pipelineSets is false.
+		Result(*createIndirectPipelineSet)(Device*, const IndirectPipelineSetDesc&, IndirectPipelineSetPtr&) noexcept;
+		// Writes pipelines to [firstIndex, firstIndex + count). An index must not be rewritten while a
+		// submitted command list that uses it may still execute; filling unused indices is always allowed.
+		Result(*updateIndirectPipelineSet)(Device*, IndirectPipelineSetHandle, uint32_t firstIndex, Span<PipelineHandle>) noexcept;
+		void (*destroyIndirectPipelineSet)(DeviceDeletionContext*, IndirectPipelineSetHandle) noexcept;
+		void (*setNameIndirectPipelineSet)(Device*, IndirectPipelineSetHandle, const char*) noexcept;
+
 		void (*destroyDevice)(Device*) noexcept;
-		uint32_t abi_version = 11;
+		uint32_t abi_version = 12;
 	};
 
 
@@ -2852,6 +2944,7 @@ namespace rhi {
 		inline void DestroySwapchain(Swapchain* sc) noexcept { vt->destroySwapchain(this, sc); }
 		inline void DestroyPipelineLayout(PipelineLayoutHandle h) noexcept { vt->destroyPipelineLayout(this, h); }
 		inline void DestroyCommandSignature(CommandSignatureHandle h) noexcept { vt->destroyCommandSignature(this, h); }
+		inline void DestroyIndirectPipelineSet(IndirectPipelineSetHandle h) noexcept { if (vt->destroyIndirectPipelineSet) vt->destroyIndirectPipelineSet(this, h); }
 		inline void DestroyDescriptorHeap(DescriptorHeapHandle h) noexcept { vt->destroyDescriptorHeap(this, h); }
 		inline void DestroyCommandAllocator(CommandAllocator* a) noexcept { vt->destroyCommandAllocator(this, a); }
 		inline void DestroySampler(SamplerHandle h) noexcept { vt->destroySampler(this, h); }
@@ -2919,9 +3012,18 @@ namespace rhi {
 		void DestroyPipelineLayout(PipelineLayoutHandle h) noexcept { deletionContext.DestroyPipelineLayout(h); }
 		Result CreateCommandSignature(const CommandSignatureDesc& d, const PipelineLayoutHandle layout, CommandSignaturePtr& out) noexcept { return vt->createCommandSignature(this, d, layout, out); }
 		void DestroyCommandSignature(CommandSignatureHandle h) noexcept { deletionContext.DestroyCommandSignature(h); }
+		Result CreateIndirectPipelineSet(const IndirectPipelineSetDesc& d, IndirectPipelineSetPtr& out) noexcept {
+			return vt->createIndirectPipelineSet ? vt->createIndirectPipelineSet(this, d, out) : Result::Unsupported;
+		}
+		Result UpdateIndirectPipelineSet(IndirectPipelineSetHandle h, uint32_t firstIndex, Span<PipelineHandle> pipelines) noexcept {
+			return vt->updateIndirectPipelineSet ? vt->updateIndirectPipelineSet(this, h, firstIndex, pipelines) : Result::Unsupported;
+		}
+		void DestroyIndirectPipelineSet(IndirectPipelineSetHandle h) noexcept { deletionContext.DestroyIndirectPipelineSet(h); }
 		Result CreateDescriptorHeap(const DescriptorHeapDesc& d, DescriptorHeapPtr& out) noexcept { return vt->createDescriptorHeap(this, d, out); }
 		void DestroyDescriptorHeap(DescriptorHeapHandle h) noexcept { deletionContext.DestroyDescriptorHeap(h); }
 		Result CreateConstantBufferView(DescriptorSlot s, const ResourceHandle& b, const CbvDesc& d) noexcept { return vt->createConstantBufferView(this, s, b, d); }
+		// An invalid resource writes a null view (reads return zero; textures need a format). Vulkan needs
+		// VK_EXT_robustness2 nullDescriptor and returns Unsupported without it.
 		Result CreateShaderResourceView(DescriptorSlot s, const ResourceHandle& resource, const SrvDesc& d) noexcept { return vt->createShaderResourceView(this, s, resource, d); }
 		Result CreateUnorderedAccessView(DescriptorSlot s, const ResourceHandle& resource, const UavDesc& d) noexcept { return vt->createUnorderedAccessView(this, s, resource, d); }
 		Result CreateSampler(DescriptorSlot s, const SamplerDesc& d) noexcept { return vt->createSampler(this, s, d); }
@@ -3269,6 +3371,14 @@ namespace rhi {
 		return CommandSignaturePtr(
 			*d, h,
 			[](Device& dev, CommandSignature& hh) noexcept { if (dev) dev.DestroyCommandSignature(hh.GetHandle()); },
+			std::move(keepAlive)
+		);
+	}
+
+	inline IndirectPipelineSetPtr MakeIndirectPipelineSetPtr(const Device* d, IndirectPipelineSet h, std::shared_ptr<void> keepAlive = {}) noexcept {
+		return IndirectPipelineSetPtr(
+			*d, h,
+			[](Device& dev, IndirectPipelineSet& hh) noexcept { if (dev) dev.DestroyIndirectPipelineSet(hh.GetHandle()); },
 			std::move(keepAlive)
 		);
 	}

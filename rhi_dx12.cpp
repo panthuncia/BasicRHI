@@ -1913,6 +1913,11 @@ namespace rhi {
 
 		static Result d_createPipelineLayout(Device* d, const PipelineLayoutDesc& ld, PipelineLayoutPtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
+			for (uint32_t i = 0; i < ld.ranges.size; ++i) {
+				if (ld.ranges.data[i].source != LayoutRangeSource::HeapSlot) {
+					RHI_FAIL(Result::Unsupported);  // VK_EXT_descriptor_heap mappings have no D3D12 equivalent
+				}
+			}
 
 			// Root parameters: push constants only (bindless tables omitted for brevity)
 			std::vector<D3D12_ROOT_PARAMETER1> params;
@@ -2552,6 +2557,16 @@ namespace rhi {
 					}
 					
 				} break;
+				case FeatureInfoStructType::IndirectCommands: {
+					if (h->structSize < sizeof(IndirectCommandsFeatureInfo)) return Result::InvalidArgument;
+					auto* out = reinterpret_cast<IndirectCommandsFeatureInfo*>(h);
+					out->constantArguments = true;
+					out->indexBufferArguments = true;
+					out->pipelineSets = false;
+					out->maxPipelineSetCount = 0;
+					out->vertexBufferArguments = true;
+					out->indirectBindings = false;
+				} break;
 				default:
 					// Unknown sType: ignore
 					break;
@@ -2657,6 +2672,16 @@ namespace rhi {
 			const PipelineLayoutHandle layout, CommandSignaturePtr& out) noexcept
 		{
 			auto* impl = static_cast<Dx12Device*>(d->impl);
+
+			// D3D12 has no per-command pipeline switch (IndirectPipelineSet is Vulkan only).
+			if (cd.pipelineSet.valid()) {
+				RHI_FAIL(Result::Unsupported);
+			}
+			for (uint32_t i = 0; i < cd.args.size; ++i) {
+				if (cd.args.data[i].kind == IndirectArgKind::PipelineIndex) {
+					RHI_FAIL(Result::Unsupported);
+				}
+			}
 
 			std::vector<D3D12_INDIRECT_ARGUMENT_DESC> dxArgs(cd.args.size);
 			bool hasRoot = false;
@@ -2807,6 +2832,36 @@ namespace rhi {
 			desc.Shader4ComponentMapping = (dv.componentMapping == 0)
 				? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
 				: dv.componentMapping;
+
+			if (!resource.valid()) {
+				// A null view: reads return zero. D3D12 needs only its dimension and format.
+				switch (dv.dimension) {
+				case SrvDim::Buffer:
+					desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+					desc.Format = dv.buffer.kind == BufferViewKind::Typed ? ToDxgi(dv.formatOverride)
+						: (dv.buffer.kind == BufferViewKind::Raw ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_UNKNOWN);
+					if (dv.buffer.kind == BufferViewKind::Raw) desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+					if (dv.buffer.kind == BufferViewKind::Structured) desc.Buffer.StructureByteStride = (std::max)(dv.buffer.structureByteStride, 4u);
+					break;
+				case SrvDim::Texture1D: desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D; break;
+				case SrvDim::Texture1DArray: desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY; break;
+				case SrvDim::Texture2D: desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; break;
+				case SrvDim::Texture2DArray: desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY; break;
+				case SrvDim::Texture2DMS: desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS; break;
+				case SrvDim::Texture2DMSArray: desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY; break;
+				case SrvDim::Texture3D: desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D; break;
+				case SrvDim::TextureCube: desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE; break;
+				case SrvDim::TextureCubeArray: desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY; break;
+				default:
+					return Result::InvalidArgument;
+				}
+				if (dv.dimension != SrvDim::Buffer) {
+					desc.Format = ToDxgi(dv.formatOverride);
+					if (desc.Format == DXGI_FORMAT_UNKNOWN) return Result::InvalidArgument;
+				}
+				impl->pNativeDevice->CreateShaderResourceView(nullptr, &desc, dst);
+				return Result::Ok;
+			}
 
 			switch (dv.dimension) {
 			case SrvDim::Buffer: {
@@ -3760,6 +3815,17 @@ namespace rhi {
 				P->pso->SetName(w.c_str());
 			}
 		}
+
+		// IndirectPipelineSet is a Vulkan feature (indirect execution sets); D3D12 has no equivalent.
+		static Result d_createIndirectPipelineSet(Device*, const IndirectPipelineSetDesc&, IndirectPipelineSetPtr& out) noexcept {
+			out.Reset();
+			return Result::Unsupported;
+		}
+		static Result d_updateIndirectPipelineSet(Device*, IndirectPipelineSetHandle, uint32_t, Span<PipelineHandle>) noexcept {
+			return Result::Unsupported;
+		}
+		static void d_destroyIndirectPipelineSet(DeviceDeletionContext*, IndirectPipelineSetHandle) noexcept {}
+		static void d_setNameIndirectPipelineSet(Device*, IndirectPipelineSetHandle, const char*) noexcept {}
 
 		static void d_setNameCommandSignature(Device* d, CommandSignatureHandle cs, const char* n) noexcept {
 			if (!n) return;
@@ -7646,7 +7712,7 @@ namespace rhi {
 				BreakIfDebugging();
 				std::abort();
 			}
-			D3D12_VIEWPORT vp{ 0,0,(float)p.width,(float)p.height,0.0f,1.0f };
+			D3D12_VIEWPORT vp{ 0,0,(float)p.width,(float)p.height,p.minDepth,p.maxDepth };
 			D3D12_RECT sc{ 0,0,(LONG)p.width,(LONG)p.height };
 			l->cl->RSSetViewports(1, &vp);
 			l->cl->RSSetScissorRects(1, &sc);
@@ -9591,6 +9657,10 @@ namespace rhi {
 		&d_setDebugPipelineInstrumentationMask,
 		&d_setDebugSynchronousRecording,
 		&d_setDebugTexelAddressing,
+		&d_createIndirectPipelineSet,
+		&d_updateIndirectPipelineSet,
+		&d_destroyIndirectPipelineSet,
+		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
 		11u
 	};

@@ -526,10 +526,9 @@ namespace rhi::ma {
         case Format::R32G32_UInt:
         case Format::R32G32_SInt:
             return 64;
-            //case Format::R32G8X24_Typeless: // TODO
-            //case Format::D32_Float_S8X24_UInt:
-            //case Format::R32_Float_X8X24_Typeless:
-            //case Format::X32_Typeless_G8X24_UInt    :
+        case Format::R32G8X24_Typeless:
+        case Format::D32_Float_S8X24_UInt:
+        case Format::R32_Float_X8X24_Typeless:
             return 64;
         case Format::R10G10B10A2_Typeless:
         case Format::R10G10B10A2_UNorm:
@@ -556,8 +555,12 @@ namespace rhi::ma {
         case Format::R32_UInt:
         case Format::R32_SInt:
             return 32;
-            //case Format::R24G8_Typeless: // TODO
-            //case Format::D24_UNorm_S8_UInt:
+        case Format::R24G8_Typeless:
+        case Format::D24_UNorm_S8_UInt:
+        case Format::R24_UNorm_X8_Typeless:
+            return 32;
+        case Format::D16_UNorm:
+            return 16;
             //case Format::R24_UNorm_X8_Typeless:
             //case Format::X24_Typeless_G8_UInt:
             return 32;
