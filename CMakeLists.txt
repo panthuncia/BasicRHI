@@ -20,6 +20,9 @@ set(BASICRHI_STREAMLINE_HEADERS_DIR "" CACHE PATH "Optional directory containing
 set(BASICRHI_PIX_HEADERS_DIR "" CACHE PATH "Optional directory containing PIX headers")
 
 find_package(spdlog CONFIG REQUIRED)
+# Hosts that link the compiled spdlog library (SPDLOG_COMPILED_LIB) must set this to spdlog::spdlog,
+# otherwise the header-only definitions compiled into BasicRHI collide with theirs at link time.
+set(BASICRHI_SPDLOG_TARGET "spdlog::spdlog_header_only" CACHE STRING "spdlog target linked by BasicRHI")
 find_package(fmt CONFIG REQUIRED)
 if(BASICRHI_ENABLE_D3D12)
     find_package(DirectX-Headers CONFIG REQUIRED)
@@ -334,7 +337,7 @@ PUBLIC
     $<$<BOOL:${BASICRHI_ENABLE_TRACY_GPU_PROFILING}>:Tracy::TracyClient>
 PRIVATE 
     fmt::fmt
-    spdlog::spdlog_header_only
+    ${BASICRHI_SPDLOG_TARGET}
 )
 if(BASICRHI_ENABLE_D3D12)
     target_link_libraries(BasicRHI PUBLIC Microsoft::DirectX-Headers PRIVATE d3d12 dxgi dxguid)
@@ -356,6 +359,19 @@ if(BASICRHI_BUILD_TESTS)
         add_executable(BasicRHIVulkanSmoke tests/VulkanSmoke.cpp)
         set_target_properties(BasicRHIVulkanSmoke PROPERTIES OUTPUT_NAME "BasicRHIVulkanSmoke_v2")
         target_link_libraries(BasicRHIVulkanSmoke PRIVATE BasicRHI::BasicRHI)
+        add_executable(BasicRHIVulkanAdoptionSmoke tests/VulkanAdoptionSmoke.cpp)
+        target_link_libraries(BasicRHIVulkanAdoptionSmoke PRIVATE BasicRHI::BasicRHI)
+        if(_basicrhi_streamline_available AND WIN32)
+            # BasicRHI references the Streamline C API; the smoke test does not load the interposer.
+            target_sources(BasicRHIVulkanAdoptionSmoke PRIVATE tests/StreamlineStubs.cpp)
+            if(TARGET Streamline::headers)
+                target_link_libraries(BasicRHIVulkanAdoptionSmoke PRIVATE Streamline::headers)
+            else()
+                target_include_directories(BasicRHIVulkanAdoptionSmoke PRIVATE "${_basicrhi_streamline_manual_include}")
+            endif()
+        endif()
+        add_test(NAME BasicRHIVulkanAdoptionSmoke COMMAND BasicRHIVulkanAdoptionSmoke)
+        add_test(NAME BasicRHIVulkanAdoptionSmoke.HostSubmit COMMAND BasicRHIVulkanAdoptionSmoke submit)
     endif()
     if(BASICRHI_ENABLE_D3D12 AND WIN32)
         add_executable(BasicRHID3D12AliasingSmoke tests/D3D12AliasingSmoke.cpp)

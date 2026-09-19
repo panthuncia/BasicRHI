@@ -2,7 +2,17 @@
 #pragma once
 #include "rhi.h"
 #include "rhi_interop.h"
+#if BASICRHI_ENABLE_D3D12
 #include "rhi_dx12_headers.h"
+#else
+// D3D12 backend disabled: the native getters below only forward opaque pointers,
+// and every function returns Unsupported (rhi_dx12_stub.cpp).
+struct ID3D12Device; struct IDXGIFactory7; struct IDXGIAdapter4; struct ID3D12CommandQueue;
+struct ID3D12GraphicsCommandList; struct ID3D12CommandAllocator; struct IDXGISwapChain3;
+struct ID3D12Resource; struct ID3D12Heap; struct ID3D12QueryHeap; struct ID3D12PipelineState;
+struct ID3D12RootSignature; struct ID3D12CommandSignature; struct ID3D12DescriptorHeap;
+struct ID3D12Fence; struct ID3D12StateObject;
+#endif
 
 namespace rhi::dx12 {
 
@@ -32,12 +42,17 @@ namespace rhi::dx12 {
         return static_cast<IDXGIAdapter4*>(info.adapter);
     }
     inline uint64_t get_adapter_luid(rhi::Device d) {
+#if !BASICRHI_ENABLE_D3D12
+        (void)d;
+        return 0;
+#else
         auto* adapter = get_adapter(d);
         if (!adapter) return 0;
         DXGI_ADAPTER_DESC3 desc{};
         if (FAILED(adapter->GetDesc3(&desc))) return 0;
         return static_cast<uint64_t>(static_cast<uint32_t>(desc.AdapterLuid.LowPart)) |
             (static_cast<uint64_t>(static_cast<uint32_t>(desc.AdapterLuid.HighPart)) << 32u);
+#endif
     }
     inline ID3D12CommandQueue* get_queue(rhi::Queue q) {
         D3D12QueueInfo info{};

@@ -158,6 +158,8 @@ namespace rhi {
 		uint32_t familyIndex = 0xFFFFFFFFu;
 		uint32_t queueIndex = 0;
 		void* tracyGpuContext = nullptr;
+		// Owned by the host of an adopted device: never idled or reused by BasicRHI.
+		bool external = false;
 	};
 
 	struct VulkanResource {
@@ -498,6 +500,17 @@ namespace rhi {
 		bool partitionedAccelerationStructureEnabled = false;
 		bool validateBarrierTransitions = false;
 		bool streamlineInitialized = false;
+		// AdoptVulkanDevice: the instance and device belong to the host. Every VkQueue
+		// access is bracketed by the host's submission lock, and whole-device waits are
+		// replaced by waits on BasicRHI's own timelines.
+		bool ownsInstance = true;
+		bool ownsDevice = true;
+		// The host destroyed the VkDevice before BasicRHI shut down: skip every vkDestroy*.
+		bool abandoned = false;
+		void* submissionHookUser = nullptr;
+		void (*submissionLock)(void* user, VkQueue queue) = nullptr;
+		void (*submissionUnlock)(void* user, VkQueue queue) = nullptr;
+		VkResult (*submissionSubmit)(void* user, VkQueue queue, const VkSubmitInfo2& submitInfo) = nullptr;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		VulkanRegistry<VulkanDescriptorHeap> descriptorHeaps;
 		// Image-view slots are updated by parallel graph materialization and swept

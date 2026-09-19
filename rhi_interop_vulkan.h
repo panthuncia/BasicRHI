@@ -66,6 +66,80 @@ namespace rhi::vulkan {
         const char* debugName,
         rhi::TimelinePtr& out) noexcept;
 
+    // ---------------------------------------------------------------------------
+    // Adopting a host-created device (e.g. DXVK's). BasicRHI never destroys the
+    // instance/device/queues it adopts, never calls vkDeviceWaitIdle/vkQueueWaitIdle
+    // on them, and brackets every vkQueueSubmit with the host's submission lock.
+
+    // Called around every host access to an adopted VkQueue. DXVK: IDXGIVkInteropDevice
+    // LockSubmissionQueue / ReleaseSubmissionQueue. Both or neither must be set.
+    struct QueueSubmissionHooks {
+        void* user = nullptr;
+        void (*lock)(void* user, VkQueue queue) = nullptr;
+        void (*unlock)(void* user, VkQueue queue) = nullptr;
+        // Optional. When set, queue submissions are handed to the host instead of calling
+        // vkQueueSubmit, so it can order them within its own stream (e.g. DXVK's command
+        // stream). The host must submit batches to `queue` in call order; everything the
+        // submit info points at is only valid during the call. lock/unlock are then not
+        // used for submissions.
+        VkResult (*submit)(void* user, VkQueue queue, const VkSubmitInfo2& submitInfo) = nullptr;
+    };
+
+    struct AdoptedQueue {
+        VkQueue queue = VK_NULL_HANDLE;
+        uint32_t familyIndex = 0;
+        uint32_t queueIndex = 0;
+    };
+
+    struct AdoptedVulkanDeviceInfo {
+        // The loader entry point the host used (it may be an interposer's).
+        PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
+        VkInstance instance = VK_NULL_HANDLE;
+        uint32_t instanceApiVersion = 0;
+        VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+        VkDevice device = VK_NULL_HANDLE;
+        const char* const* enabledDeviceExtensions = nullptr;
+        uint32_t enabledDeviceExtensionCount = 0;
+        // The pNext chain given to vkCreateDevice (VkPhysicalDeviceFeatures2 and/or
+        // Vulkan 1.1-1.3 / extension feature structs). Every capability BasicRHI
+        // reports is derived from it, never assumed.
+        const void* enabledFeatureChain = nullptr;
+        // VkDeviceCreateInfo::pEnabledFeatures, if the host used it instead of Features2.
+        const VkPhysicalDeviceFeatures* enabledCoreFeatures = nullptr;
+        // Indexed by rhi::QueueKind (Graphics, Compute, Copy). queues[0] is required;
+        // unset kinds alias it.
+        AdoptedQueue queues[3]{};
+        QueueSubmissionHooks submissionHooks{};
+        bool validateBarrierTransitions = false;
+    };
+
+    Result AdoptVulkanDevice(const AdoptedVulkanDeviceInfo& info, rhi::DevicePtr& out) noexcept;
+
+    // Non-owning import of a host image. currentLayout is the layout the image is in
+    // when BasicRHI first uses it; the host keeps ownership of image and memory.
+    struct ImportedImageDesc {
+        VkImage image = VK_NULL_HANDLE;
+        VkImageCreateInfo createInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        VkImageLayout currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        const char* debugName = nullptr;
+    };
+    Result import_image(rhi::Device device, const ImportedImageDesc& desc, rhi::ResourcePtr& out) noexcept;
+
+    // Non-owning import of a whole host buffer. Bindless descriptors need
+    // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT in usage.
+    struct ImportedBufferDesc {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize size = 0;
+        VkBufferUsageFlags usage = 0;
+        bool concurrentSharing = false;
+        const char* debugName = nullptr;
+    };
+    Result import_buffer(rhi::Device device, const ImportedBufferDesc& desc, rhi::ResourcePtr& out) noexcept;
+
+    // The host destroyed an adopted VkDevice before BasicRHI was shut down: release
+    // BasicRHI's bookkeeping without touching any Vulkan handle.
+    void abandon_device(rhi::Device device) noexcept;
+
     inline bool spirv_instruction_string_equals(const uint32_t* words, uint32_t wordCount, const char* expected) noexcept {
         const char* bytes = reinterpret_cast<const char*>(words);
         const size_t byteCount = static_cast<size_t>(wordCount) * sizeof(uint32_t);

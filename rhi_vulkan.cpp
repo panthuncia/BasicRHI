@@ -170,12 +170,8 @@ namespace rhi {
 		}
 #endif
 
-#if BASICRHI_ENABLE_STREAMLINE
-		static void VkSlLogMessageCallback(sl::LogType, const char*) {}
-		static HMODULE g_vkSlInterposerModule = nullptr;
-		static PFun_slShutdown* g_vkSlShutdown = nullptr;
-		static PFun_slGetFeatureRequirements* g_vkSlGetFeatureRequirements = nullptr;
-		static PFun_slSetVulkanInfo* g_vkSlSetVulkanInfo = nullptr;
+		// Streamline proxy entry points. Without Streamline they stay null and the hooked
+		// wrappers below fall through to the volk entry points.
 		static PFN_vkGetInstanceProcAddr g_vkSlGetInstanceProcAddr = nullptr;
 		static PFN_vkGetDeviceProcAddr g_vkSlGetDeviceProcAddr = nullptr;
 		static PFN_vkCreateSwapchainKHR g_vkSlCreateSwapchainKHR = nullptr;
@@ -189,14 +185,21 @@ namespace rhi {
 		static PFN_vkBeginCommandBuffer g_vkSlBeginCommandBuffer = nullptr;
 		static PFN_vkCmdBindPipeline g_vkSlCmdBindPipeline = nullptr;
 		static PFN_vkCmdBindDescriptorSets g_vkSlCmdBindDescriptorSets = nullptr;
-		using PFun_slGetPluginFunction = void* (const char* name);
 		using PFun_slHookVkBeginCommandBuffer = void(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* beginInfo);
 		using PFun_slHookVkCmdBindPipeline = void(VkCommandBuffer commandBuffer, VkPipelineBindPoint bindPoint, VkPipeline pipeline);
 		using PFun_slHookVkCmdBindDescriptorSets = void(VkCommandBuffer commandBuffer, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, uint32_t firstSet, uint32_t descriptorSetCount, const VkDescriptorSet* descriptorSets, uint32_t dynamicOffsetCount, const uint32_t* dynamicOffsets);
-		static HMODULE g_vkSlCommonModule = nullptr;
 		static PFun_slHookVkBeginCommandBuffer* g_vkSlCommonBeginCommandBuffer = nullptr;
 		static PFun_slHookVkCmdBindPipeline* g_vkSlCommonCmdBindPipeline = nullptr;
 		static PFun_slHookVkCmdBindDescriptorSets* g_vkSlCommonCmdBindDescriptorSets = nullptr;
+
+#if BASICRHI_ENABLE_STREAMLINE
+		static void VkSlLogMessageCallback(sl::LogType, const char*) {}
+		static HMODULE g_vkSlInterposerModule = nullptr;
+		static PFun_slShutdown* g_vkSlShutdown = nullptr;
+		static PFun_slGetFeatureRequirements* g_vkSlGetFeatureRequirements = nullptr;
+		static PFun_slSetVulkanInfo* g_vkSlSetVulkanInfo = nullptr;
+		using PFun_slGetPluginFunction = void* (const char* name);
+		static HMODULE g_vkSlCommonModule = nullptr;
 		static sl::FeatureRequirements g_vkSlDlssRequirements{};
 		static bool g_vkSlDlssRequirementsValid = false;
 
@@ -341,22 +344,6 @@ namespace rhi {
 			return true;
 		}
 #else
-		static constexpr PFN_vkGetInstanceProcAddr g_vkSlGetInstanceProcAddr = nullptr;
-		static constexpr PFN_vkGetDeviceProcAddr g_vkSlGetDeviceProcAddr = nullptr;
-		static constexpr PFN_vkCreateSwapchainKHR g_vkSlCreateSwapchainKHR = nullptr;
-		static constexpr PFN_vkDestroySwapchainKHR g_vkSlDestroySwapchainKHR = nullptr;
-		static constexpr PFN_vkGetSwapchainImagesKHR g_vkSlGetSwapchainImagesKHR = nullptr;
-		static constexpr PFN_vkAcquireNextImageKHR g_vkSlAcquireNextImageKHR = nullptr;
-		static constexpr PFN_vkQueuePresentKHR g_vkSlQueuePresentKHR = nullptr;
-		static constexpr PFN_vkDeviceWaitIdle g_vkSlDeviceWaitIdle = nullptr;
-		static constexpr PFN_vkCreateWin32SurfaceKHR g_vkSlCreateWin32SurfaceKHR = nullptr;
-		static constexpr PFN_vkDestroySurfaceKHR g_vkSlDestroySurfaceKHR = nullptr;
-		static constexpr PFN_vkBeginCommandBuffer g_vkSlBeginCommandBuffer = nullptr;
-		static constexpr PFN_vkCmdBindPipeline g_vkSlCmdBindPipeline = nullptr;
-		static constexpr PFN_vkCmdBindDescriptorSets g_vkSlCmdBindDescriptorSets = nullptr;
-		static constexpr auto g_vkSlCommonBeginCommandBuffer = nullptr;
-		static constexpr auto g_vkSlCommonCmdBindPipeline = nullptr;
-		static constexpr auto g_vkSlCommonCmdBindDescriptorSets = nullptr;
 		static bool VkInitStreamline() noexcept { return false; }
 		static void VkShutdownStreamline() noexcept {}
 #endif
@@ -3676,6 +3663,45 @@ namespace rhi {
 		}
 #endif
 
+		// Brackets host access to a VkQueue with the adopting host's submission lock
+		// (AdoptVulkanDevice). A no-op for devices BasicRHI created itself.
+		struct VkQueueAccessGuard {
+			VulkanDevice* impl;
+			VkQueue queue;
+			VkQueueAccessGuard(VulkanDevice* device, VkQueue vkQueue) noexcept : impl(device), queue(vkQueue) {
+				if (impl && impl->submissionLock) impl->submissionLock(impl->submissionHookUser, queue);
+			}
+			~VkQueueAccessGuard() {
+				if (impl && impl->submissionUnlock) impl->submissionUnlock(impl->submissionHookUser, queue);
+			}
+			VkQueueAccessGuard(const VkQueueAccessGuard&) = delete;
+			VkQueueAccessGuard& operator=(const VkQueueAccessGuard&) = delete;
+		};
+
+		// Host-waits for everything BasicRHI submitted (its timelines' last signalled
+		// values). Used instead of vkDeviceWaitIdle on adopted devices, whose queues
+		// the host keeps submitting to and whose whole-device wait would need every
+		// queue externally synchronized.
+		static Result VkWaitForSubmittedTimelines(VulkanDevice* impl) noexcept {
+			std::vector<VkSemaphore> semaphores;
+			std::vector<uint64_t> values;
+			{
+				const std::lock_guard lock(impl->timelinesMutex);
+				for (const auto& slot : impl->timelines.slots) {
+					if (slot.alive && slot.obj.semaphore != VK_NULL_HANDLE && slot.obj.lastSubmittedSignalValue != 0) {
+						semaphores.push_back(slot.obj.semaphore);
+						values.push_back(slot.obj.lastSubmittedSignalValue);
+					}
+				}
+			}
+			if (semaphores.empty()) return Result::Ok;
+			VkSemaphoreWaitInfo waitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+			waitInfo.semaphoreCount = static_cast<uint32_t>(semaphores.size());
+			waitInfo.pSemaphores = semaphores.data();
+			waitInfo.pValues = values.data();
+			return ToRHI(vkWaitSemaphores(impl->device, &waitInfo, UINT64_MAX));
+		}
+
 		static Result q_submit(Queue* queue, Span<CommandList> lists, const SubmitDesc& submit) noexcept {
 			auto* impl = queue ? static_cast<VulkanDevice*>(queue->impl) : nullptr;
 			if (!impl || impl->device == VK_NULL_HANDLE) {
@@ -3786,7 +3812,38 @@ namespace rhi {
 			submitInfo.signalSemaphoreCount = static_cast<uint32_t>(signalSemaphores.size());
 			submitInfo.pSignalSemaphores = signalSemaphores.empty() ? nullptr : signalSemaphores.data();
 
-			const Result submitResult = ToRHI(vkQueueSubmit(queueState->queue, 1, &submitInfo, VK_NULL_HANDLE));
+			Result submitResult = Result::Ok;
+			if (impl->submissionSubmit) {
+				// The adopting host orders the batch within its own queue stream.
+				std::vector<VkSemaphoreSubmitInfo> waitInfos(waitSemaphores.size(), { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO });
+				for (size_t index = 0; index < waitInfos.size(); ++index) {
+					waitInfos[index].semaphore = waitSemaphores[index];
+					waitInfos[index].value = waitValues[index];
+					waitInfos[index].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+				}
+				std::vector<VkCommandBufferSubmitInfo> commandBufferInfos(commandBuffers.size(), { VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO });
+				for (size_t index = 0; index < commandBufferInfos.size(); ++index) {
+					commandBufferInfos[index].commandBuffer = commandBuffers[index];
+				}
+				std::vector<VkSemaphoreSubmitInfo> signalInfos(signalSemaphores.size(), { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO });
+				for (size_t index = 0; index < signalInfos.size(); ++index) {
+					signalInfos[index].semaphore = signalSemaphores[index];
+					signalInfos[index].value = signalValues[index];
+					signalInfos[index].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+				}
+				VkSubmitInfo2 submitInfo2{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+				submitInfo2.waitSemaphoreInfoCount = static_cast<uint32_t>(waitInfos.size());
+				submitInfo2.pWaitSemaphoreInfos = waitInfos.empty() ? nullptr : waitInfos.data();
+				submitInfo2.commandBufferInfoCount = static_cast<uint32_t>(commandBufferInfos.size());
+				submitInfo2.pCommandBufferInfos = commandBufferInfos.empty() ? nullptr : commandBufferInfos.data();
+				submitInfo2.signalSemaphoreInfoCount = static_cast<uint32_t>(signalInfos.size());
+				submitInfo2.pSignalSemaphoreInfos = signalInfos.empty() ? nullptr : signalInfos.data();
+				submitResult = ToRHI(impl->submissionSubmit(impl->submissionHookUser, queueState->queue, submitInfo2));
+			}
+			else {
+				const VkQueueAccessGuard queueAccess(impl, queueState->queue);
+				submitResult = ToRHI(vkQueueSubmit(queueState->queue, 1, &submitInfo, VK_NULL_HANDLE));
+			}
 			if (submitResult == Result::Ok) {
 				for (uint32_t index = 0; index < lists.size; ++index) {
 					if (VulkanCommandList* commandListState = VkCommandListState(impl, lists.data[index].GetHandle())) {
@@ -3832,7 +3889,8 @@ namespace rhi {
 		static void q_setName(Queue* queue, const char* name) noexcept {
 			auto* impl = queue ? static_cast<VulkanDevice*>(queue->impl) : nullptr;
 			VulkanQueueState* queueState = VkQueueStateForHandle(impl, queue ? queue->GetQueueHandle() : QueueHandle{});
-			if (queueState) {
+			// Adopted queues belong to the host; renaming them would mislabel the host's own submissions.
+			if (queueState && !queueState->external) {
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(queueState->queue), VK_OBJECT_TYPE_QUEUE, name);
 #if BASICRHI_ENABLE_TRACY_GPU_PROFILING
 				if (queueState->tracyGpuContext && name) {
@@ -3879,6 +3937,10 @@ namespace rhi {
 				return Result::Ok;
 			}
 
+			if (queueState->external) {
+				// Calibration submits to and idles the queue outside the host's lock.
+				return Result::Unsupported;
+			}
 			VkCommandPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
 			poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 			poolInfo.queueFamilyIndex = queueState->familyIndex;
@@ -4521,6 +4583,13 @@ namespace rhi {
 				VkMemoryBarrier vkBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
 				vkBarrier.srcAccessMask = VkAccessMaskForAccess(barrier.beforeAccess);
 				vkBarrier.dstAccessMask = VkAccessMaskForAccess(barrier.afterAccess);
+				if (!impl->accelerationStructureEnabled) {
+					// Access bits of a disabled extension are invalid, even in a catch-all barrier.
+					constexpr VkAccessFlags accelerationStructureAccess =
+						VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+					vkBarrier.srcAccessMask &= ~accelerationStructureAccess;
+					vkBarrier.dstAccessMask &= ~accelerationStructureAccess;
+				}
 				memoryBarriers.push_back(vkBarrier);
 				srcStages |= VkStageMaskForSync(barrier.beforeSync);
 				dstStages |= VkStageMaskForSync(barrier.afterSync);
@@ -6497,6 +6566,11 @@ namespace rhi {
 				out = Queue(kind);
 				RHI_FAIL(Result::InvalidArgument);
 			}
+			if (!impl->ownsDevice) {
+				// The host created every queue of an adopted device; there are none to hand out.
+				out = Queue(kind);
+				return Result::Unsupported;
+			}
 
 			const VulkanQueueState* primaryQueueState = VkPrimaryQueueStateForKind(impl, kind);
 			if (!primaryQueueState || primaryQueueState->familyIndex == kVkInvalidQueueFamily) {
@@ -6558,6 +6632,11 @@ namespace rhi {
 			}
 
 			const VulkanQueueState* queueState = impl->queues.get(handle);
+			if (queueState && queueState->external) {
+				// Host-owned queue: BasicRHI's work on it is covered by its timelines.
+				impl->queues.free(handle);
+				return;
+			}
 			if (queueState && queueState->familyIndex < impl->queueFamilyFreeQueueIndices.size()) {
 				impl->queueFamilyFreeQueueIndices[queueState->familyIndex].push_back(queueState->queueIndex);
 			}
@@ -6575,6 +6654,9 @@ namespace rhi {
 			if (!impl || impl->device == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::Failed);
 			}
+			if (!impl->ownsDevice) {
+				return VkWaitForSubmittedTimelines(impl);
+			}
 
 			return ToRHI(VkDeviceWaitIdleHooked(impl->device));
 		}
@@ -6590,7 +6672,8 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			if (!impl->swapchainExtensionEnabled) {
+			if (!impl->swapchainExtensionEnabled || !impl->ownsDevice) {
+				// Adopted devices present through their host.
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
 			}
@@ -8898,8 +8981,20 @@ namespace rhi {
 	VulkanDevice::~VulkanDevice() = default;
 
 	void VulkanDevice::Shutdown() noexcept {
+		if (abandoned) {
+			// The host destroyed the VkDevice first: every handle below is already gone.
+			for (auto& slot : queues.slots) slot.obj.tracyGpuContext = nullptr;
+			commandLists.clear(); descriptorHeaps.clear(); swapchains.clear(); accelerationStructures.clear();
+			resources.clear(); commandSignatures.clear(); pipelines.clear(); pipelineLayouts.clear();
+			timelines.clear(); heaps.clear(); queryPools.clear(); allocators.clear(); queues.clear();
+			device = VK_NULL_HANDLE;
+			instance = VK_NULL_HANDLE;
+			physicalDevice = VK_NULL_HANDLE;
+			return;
+		}
 		if (device != VK_NULL_HANDLE) {
-			VkDeviceWaitIdleHooked(device);
+			if (ownsDevice) VkDeviceWaitIdleHooked(device);
+			else VkWaitForSubmittedTimelines(this);
 		}
 		for (auto& slot : queues.slots) {
 			if (slot.alive) {
@@ -9062,7 +9157,7 @@ namespace rhi {
 		allocators.clear();
 
 		if (device != VK_NULL_HANDLE) {
-			vkDestroyDevice(device, nullptr);
+			if (ownsDevice) vkDestroyDevice(device, nullptr);
 			device = VK_NULL_HANDLE;
 		}
 
@@ -9072,7 +9167,7 @@ namespace rhi {
 			debugMessenger = VK_NULL_HANDLE;
 		}
 		if (instance != VK_NULL_HANDLE) {
-			vkDestroyInstance(instance, nullptr);
+			if (ownsInstance) vkDestroyInstance(instance, nullptr);
 			instance = VK_NULL_HANDLE;
 		}
 		physicalDevice = VK_NULL_HANDLE;
@@ -9316,6 +9411,84 @@ namespace rhi {
 		1u
 	};
 
+	// The feature set a VkDevice was actually created with. Extension-gated feature
+	// structs are zero unless their extension is enabled, so each impl flag follows
+	// from the struct alone. Shared by CreateVulkanDevice and AdoptVulkanDevice.
+	struct VkEnabledDeviceState {
+		VkPhysicalDeviceVulkan12Features vulkan12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+		VkPhysicalDeviceVulkan13Features vulkan13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+		VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptorHeap{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT };
+		VkPhysicalDeviceMeshShaderFeaturesEXT meshShader{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT };
+		VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT deviceGeneratedCommands{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT };
+		VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR computeShaderDerivatives{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR };
+		VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT shaderImageAtomicInt64{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT };
+		VkPhysicalDeviceShaderSubgroupPartitionedFeaturesEXT shaderSubgroupPartitioned{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT };
+		VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructure{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
+		VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipeline{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
+		VkPhysicalDeviceRayQueryFeaturesKHR rayQuery{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
+#if defined(VK_NV_cluster_acceleration_structure)
+		VkPhysicalDeviceClusterAccelerationStructureFeaturesNV clusterAccelerationStructure{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV };
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+		VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV partitionedAccelerationStructure{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV };
+#endif
+		bool nvShaderSubgroupPartitioned = false;
+		bool pipelineLibrary = false;
+		bool swapchain = false;
+		bool externalMemoryWin32 = false;
+		bool externalSemaphoreWin32 = false;
+	};
+
+	static void VkApplyEnabledDeviceState(VulkanDevice* impl, const VkEnabledDeviceState& e) noexcept {
+		impl->accelerationStructureFeatures = e.accelerationStructure;
+		impl->rayTracingPipelineFeatures = e.rayTracingPipeline;
+		impl->rayQueryFeatures = e.rayQuery;
+		impl->accelerationStructureFeatures.pNext = nullptr;
+		impl->rayTracingPipelineFeatures.pNext = nullptr;
+		impl->rayQueryFeatures.pNext = nullptr;
+#if defined(VK_NV_cluster_acceleration_structure)
+		impl->clusterAccelerationStructureFeatures = e.clusterAccelerationStructure;
+		impl->clusterAccelerationStructureFeatures.pNext = nullptr;
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+		impl->partitionedAccelerationStructureFeatures = e.partitionedAccelerationStructure;
+		impl->partitionedAccelerationStructureFeatures.pNext = nullptr;
+#endif
+		impl->bufferDeviceAddressEnabled = e.vulkan12.bufferDeviceAddress == VK_TRUE;
+		impl->bufferDeviceAddressCaptureReplayEnabled = e.vulkan12.bufferDeviceAddressCaptureReplay == VK_TRUE;
+		impl->timelineSemaphoreEnabled = e.vulkan12.timelineSemaphore == VK_TRUE;
+		impl->externalMemoryWin32Enabled = e.externalMemoryWin32;
+		impl->externalSemaphoreWin32Enabled = e.externalSemaphoreWin32;
+		impl->descriptorIndexingEnabled = e.vulkan12.descriptorIndexing == VK_TRUE;
+		impl->runtimeDescriptorArrayEnabled = e.vulkan12.runtimeDescriptorArray == VK_TRUE;
+		impl->scalarBlockLayoutEnabled = e.vulkan12.scalarBlockLayout == VK_TRUE;
+		impl->descriptorHeapEnabled = e.descriptorHeap.descriptorHeap == VK_TRUE;
+		impl->descriptorHeapCaptureReplayEnabled = e.descriptorHeap.descriptorHeapCaptureReplay == VK_TRUE;
+		impl->meshShaderEnabled = e.meshShader.meshShader == VK_TRUE;
+		impl->taskShaderEnabled = e.meshShader.taskShader == VK_TRUE;
+		impl->meshShaderPipelineStatsEnabled = e.meshShader.meshShaderQueries == VK_TRUE;
+		impl->deviceGeneratedCommandsEnabled = e.deviceGeneratedCommands.deviceGeneratedCommands == VK_TRUE;
+		impl->dynamicGeneratedPipelineLayoutEnabled = e.deviceGeneratedCommands.dynamicGeneratedPipelineLayout == VK_TRUE;
+		impl->dynamicRenderingEnabled = e.vulkan13.dynamicRendering == VK_TRUE;
+		impl->shaderDemoteToHelperInvocationEnabled = e.vulkan13.shaderDemoteToHelperInvocation == VK_TRUE;
+		impl->computeDerivativeGroupQuadsEnabled = e.computeShaderDerivatives.computeDerivativeGroupQuads == VK_TRUE;
+		impl->computeDerivativeGroupLinearEnabled = e.computeShaderDerivatives.computeDerivativeGroupLinear == VK_TRUE;
+		impl->shaderImageInt64AtomicsEnabled = e.shaderImageAtomicInt64.shaderImageInt64Atomics == VK_TRUE;
+		impl->shaderSubgroupPartitionedEnabled = e.shaderSubgroupPartitioned.shaderSubgroupPartitioned == VK_TRUE || e.nvShaderSubgroupPartitioned;
+		impl->deferredHostOperationsEnabled = e.accelerationStructure.accelerationStructure == VK_TRUE;
+		impl->accelerationStructureEnabled = e.accelerationStructure.accelerationStructure == VK_TRUE;
+		impl->rayTracingPipelineEnabled = e.rayTracingPipeline.rayTracingPipeline == VK_TRUE;
+		impl->rayQueryEnabled = e.rayQuery.rayQuery == VK_TRUE;
+		impl->rayTracingPipelineLibraryEnabled = impl->rayTracingPipelineEnabled && e.pipelineLibrary;
+#if defined(VK_NV_cluster_acceleration_structure)
+		impl->clusterAccelerationStructureEnabled = e.clusterAccelerationStructure.clusterAccelerationStructure == VK_TRUE;
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+		impl->partitionedAccelerationStructureEnabled = e.partitionedAccelerationStructure.partitionedAccelerationStructure == VK_TRUE;
+#endif
+		impl->swapchainExtensionEnabled = e.swapchain;
+	}
+
 	rhi::Result CreateVulkanDevice(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer) noexcept {
 		outPtr = {};
 		bool streamlineInitialized = false;
@@ -9379,7 +9552,6 @@ namespace rhi {
 			}
 		}
 
-#if BASICRHI_ENABLE_STREAMLINE
 		auto appendUniqueName = [](std::vector<const char*>& names, const char* name) {
 			if (!name) {
 				return;
@@ -9399,7 +9571,9 @@ namespace rhi {
 				return existing && std::strcmp(existing, name) == 0;
 			}), names.end());
 		};
+		(void)removeName;
 
+#if BASICRHI_ENABLE_STREAMLINE
 		if (streamlineInitialized && g_vkSlDlssRequirementsValid) {
 			for (uint32_t index = 0; index < g_vkSlDlssRequirements.vkNumInstanceExtensions; ++index) {
 				const char* extensionName = g_vkSlDlssRequirements.vkInstanceExtensions[index];
@@ -10091,52 +10265,44 @@ namespace rhi {
 		impl->descriptorHeapProperties = descriptorHeapProperties;
 		impl->meshShaderProperties = meshShaderProperties;
 		impl->computeShaderDerivativesProperties = computeShaderDerivativesProperties;
-		impl->accelerationStructureFeatures = enabledAccelerationStructureFeatures;
-		impl->rayTracingPipelineFeatures = enabledRayTracingPipelineFeatures;
-		impl->rayQueryFeatures = enabledRayQueryFeatures;
 		impl->accelerationStructureProperties = accelerationStructureProperties;
 		impl->rayTracingPipelineProperties = rayTracingPipelineProperties;
 #if defined(VK_NV_cluster_acceleration_structure)
-		impl->clusterAccelerationStructureFeatures = enabledClusterAccelerationStructureFeatures;
 		impl->clusterAccelerationStructureProperties = clusterAccelerationStructureProperties;
 #endif
 #if defined(VK_NV_partitioned_acceleration_structure)
-		impl->partitionedAccelerationStructureFeatures = enabledPartitionedAccelerationStructureFeatures;
 		impl->partitionedAccelerationStructureProperties = partitionedAccelerationStructureProperties;
 #endif
-		impl->bufferDeviceAddressEnabled = enabledVulkan12Features.bufferDeviceAddress == VK_TRUE;
-		impl->bufferDeviceAddressCaptureReplayEnabled = enabledVulkan12Features.bufferDeviceAddressCaptureReplay == VK_TRUE;
-		impl->timelineSemaphoreEnabled = enabledVulkan12Features.timelineSemaphore == VK_TRUE;
-		impl->externalMemoryWin32Enabled = ci.enableExternalInterop && hasExternalMemoryWin32Extension;
-		impl->externalSemaphoreWin32Enabled = ci.enableExternalInterop && hasExternalSemaphoreWin32Extension;
-		impl->descriptorIndexingEnabled = enabledVulkan12Features.descriptorIndexing == VK_TRUE;
-		impl->runtimeDescriptorArrayEnabled = enabledVulkan12Features.runtimeDescriptorArray == VK_TRUE;
-		impl->scalarBlockLayoutEnabled = enabledVulkan12Features.scalarBlockLayout == VK_TRUE;
-		impl->descriptorHeapEnabled = enabledDescriptorHeapFeatures.descriptorHeap == VK_TRUE;
-		impl->descriptorHeapCaptureReplayEnabled = enabledDescriptorHeapFeatures.descriptorHeapCaptureReplay == VK_TRUE;
-		impl->meshShaderEnabled = enabledMeshShaderFeatures.meshShader == VK_TRUE;
-		impl->taskShaderEnabled = enabledMeshShaderFeatures.taskShader == VK_TRUE;
-		impl->meshShaderPipelineStatsEnabled = enabledMeshShaderFeatures.meshShaderQueries == VK_TRUE;
-		impl->deviceGeneratedCommandsEnabled = enabledDeviceGeneratedCommandsFeatures.deviceGeneratedCommands == VK_TRUE;
-		impl->dynamicGeneratedPipelineLayoutEnabled = enabledDeviceGeneratedCommandsFeatures.dynamicGeneratedPipelineLayout == VK_TRUE;
-		impl->dynamicRenderingEnabled = enabledVulkan13Features.dynamicRendering == VK_TRUE;
-		impl->shaderDemoteToHelperInvocationEnabled = enabledVulkan13Features.shaderDemoteToHelperInvocation == VK_TRUE;
-		impl->computeDerivativeGroupQuadsEnabled = enabledComputeShaderDerivativesFeatures.computeDerivativeGroupQuads == VK_TRUE;
-		impl->computeDerivativeGroupLinearEnabled = enabledComputeShaderDerivativesFeatures.computeDerivativeGroupLinear == VK_TRUE;
-		impl->shaderImageInt64AtomicsEnabled = enabledShaderImageAtomicInt64Features.shaderImageInt64Atomics == VK_TRUE;
-		impl->shaderSubgroupPartitionedEnabled = enabledShaderSubgroupPartitionedFeatures.shaderSubgroupPartitioned == VK_TRUE || hasNvShaderSubgroupPartitionedExtension;
-		impl->deferredHostOperationsEnabled = enableAccelerationStructure;
-		impl->accelerationStructureEnabled = enableAccelerationStructure;
-		impl->rayTracingPipelineEnabled = enableRayTracingPipeline;
-		impl->rayQueryEnabled = enableRayQuery;
-		impl->rayTracingPipelineLibraryEnabled = enableRayTracingPipeline && hasPipelineLibraryExtension;
-		impl->clusterAccelerationStructureEnabled = enableClusterAccelerationStructure;
-		impl->partitionedAccelerationStructureEnabled = enablePartitionedAccelerationStructure;
+		{
+			VkEnabledDeviceState enabled{};
+			enabled.vulkan12 = enabledVulkan12Features;
+			enabled.vulkan13 = enabledVulkan13Features;
+			enabled.descriptorHeap = enabledDescriptorHeapFeatures;
+			enabled.meshShader = enabledMeshShaderFeatures;
+			enabled.deviceGeneratedCommands = enabledDeviceGeneratedCommandsFeatures;
+			enabled.computeShaderDerivatives = enabledComputeShaderDerivativesFeatures;
+			enabled.shaderImageAtomicInt64 = enabledShaderImageAtomicInt64Features;
+			enabled.shaderSubgroupPartitioned = enabledShaderSubgroupPartitionedFeatures;
+			enabled.accelerationStructure = enabledAccelerationStructureFeatures;
+			enabled.rayTracingPipeline = enabledRayTracingPipelineFeatures;
+			enabled.rayQuery = enabledRayQueryFeatures;
+#if defined(VK_NV_cluster_acceleration_structure)
+			enabled.clusterAccelerationStructure = enabledClusterAccelerationStructureFeatures;
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+			enabled.partitionedAccelerationStructure = enabledPartitionedAccelerationStructureFeatures;
+#endif
+			enabled.nvShaderSubgroupPartitioned = hasNvShaderSubgroupPartitionedExtension;
+			enabled.pipelineLibrary = hasPipelineLibraryExtension;
+			enabled.swapchain = enableSwapchainExtension;
+			enabled.externalMemoryWin32 = ci.enableExternalInterop && hasExternalMemoryWin32Extension;
+			enabled.externalSemaphoreWin32 = ci.enableExternalInterop && hasExternalSemaphoreWin32Extension;
+			VkApplyEnabledDeviceState(impl.get(), enabled);
+		}
 		impl->validateBarrierTransitions = ci.validateBarrierTransitions;
 		impl->streamlineInitialized = streamlineInitialized;
 		impl->loaderApiVersion = loaderApiVersion;
 		impl->instanceApiVersion = requestedApiVersion;
-		impl->swapchainExtensionEnabled = enableSwapchainExtension;
 		impl->queueFamilyProperties = std::move(queueFamilyProperties);
 #if BASICRHI_ENABLE_RESHAPE
 		impl->reshapeEnvironment = std::move(reshapeEnvironment);
@@ -10233,6 +10399,311 @@ namespace rhi {
 	}
 
 	namespace vulkan {
+		namespace {
+			bool VkNameListContains(const char* const* names, uint32_t count, const char* name) noexcept {
+				for (uint32_t index = 0; index < count; ++index) {
+					if (names && names[index] && std::strcmp(names[index], name) == 0) return true;
+				}
+				return false;
+			}
+
+			template <typename T>
+			void VkCopyFeatureStruct(T& destination, const VkBaseInStructure* source) noexcept {
+				std::memcpy(&destination, source, sizeof(T));
+				destination.pNext = nullptr;
+			}
+
+			// Reconstructs the enabled feature set from the host's vkCreateDevice feature chain.
+			// Accepts the Vulkan 1.2/1.3 aggregate structs and the promoted standalone structs.
+			void VkParseEnabledFeatureChain(const void* chain, VkPhysicalDeviceFeatures& core, VkEnabledDeviceState& e) noexcept {
+				for (auto* node = static_cast<const VkBaseInStructure*>(chain); node; node = node->pNext) {
+					switch (node->sType) {
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+						core = reinterpret_cast<const VkPhysicalDeviceFeatures2*>(node)->features;
+						break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: VkCopyFeatureStruct(e.vulkan12, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: VkCopyFeatureStruct(e.vulkan13, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT: VkCopyFeatureStruct(e.descriptorHeap, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT: VkCopyFeatureStruct(e.meshShader, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT: VkCopyFeatureStruct(e.deviceGeneratedCommands, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR: VkCopyFeatureStruct(e.computeShaderDerivatives, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT: VkCopyFeatureStruct(e.shaderImageAtomicInt64, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT: VkCopyFeatureStruct(e.shaderSubgroupPartitioned, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR: VkCopyFeatureStruct(e.accelerationStructure, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR: VkCopyFeatureStruct(e.rayTracingPipeline, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR: VkCopyFeatureStruct(e.rayQuery, node); break;
+#if defined(VK_NV_cluster_acceleration_structure)
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV: VkCopyFeatureStruct(e.clusterAccelerationStructure, node); break;
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV: VkCopyFeatureStruct(e.partitionedAccelerationStructure, node); break;
+#endif
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
+						e.vulkan12.timelineSemaphore |= reinterpret_cast<const VkPhysicalDeviceTimelineSemaphoreFeatures*>(node)->timelineSemaphore;
+						break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: {
+						const auto* f = reinterpret_cast<const VkPhysicalDeviceBufferDeviceAddressFeatures*>(node);
+						e.vulkan12.bufferDeviceAddress |= f->bufferDeviceAddress;
+						e.vulkan12.bufferDeviceAddressCaptureReplay |= f->bufferDeviceAddressCaptureReplay;
+						break;
+					}
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES: {
+						const auto* f = reinterpret_cast<const VkPhysicalDeviceDescriptorIndexingFeatures*>(node);
+						e.vulkan12.descriptorIndexing = VK_TRUE;
+						e.vulkan12.runtimeDescriptorArray |= f->runtimeDescriptorArray;
+						e.vulkan12.descriptorBindingPartiallyBound |= f->descriptorBindingPartiallyBound;
+						e.vulkan12.shaderUniformBufferArrayNonUniformIndexing |= f->shaderUniformBufferArrayNonUniformIndexing;
+						e.vulkan12.shaderSampledImageArrayNonUniformIndexing |= f->shaderSampledImageArrayNonUniformIndexing;
+						e.vulkan12.shaderStorageBufferArrayNonUniformIndexing |= f->shaderStorageBufferArrayNonUniformIndexing;
+						e.vulkan12.shaderStorageImageArrayNonUniformIndexing |= f->shaderStorageImageArrayNonUniformIndexing;
+						break;
+					}
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES:
+						e.vulkan12.scalarBlockLayout |= reinterpret_cast<const VkPhysicalDeviceScalarBlockLayoutFeatures*>(node)->scalarBlockLayout;
+						break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES:
+						e.vulkan12.hostQueryReset |= reinterpret_cast<const VkPhysicalDeviceHostQueryResetFeatures*>(node)->hostQueryReset;
+						break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES:
+						e.vulkan13.dynamicRendering |= reinterpret_cast<const VkPhysicalDeviceDynamicRenderingFeatures*>(node)->dynamicRendering;
+						break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES:
+						e.vulkan13.shaderDemoteToHelperInvocation |= reinterpret_cast<const VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures*>(node)->shaderDemoteToHelperInvocation;
+						break;
+					default:
+						break;
+					}
+				}
+			}
+
+			std::optional<ResourceLayout> VkFromImageLayout(VkImageLayout layout) noexcept {
+				switch (layout) {
+				case VK_IMAGE_LAYOUT_UNDEFINED: return ResourceLayout::Undefined;
+				case VK_IMAGE_LAYOUT_GENERAL: return ResourceLayout::Common;
+				case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: return ResourceLayout::ShaderResource;
+				case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: return ResourceLayout::RenderTarget;
+				case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: return ResourceLayout::DepthReadWrite;
+				case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: return ResourceLayout::DepthRead;
+				case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return ResourceLayout::CopySource;
+				case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return ResourceLayout::CopyDest;
+				case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: return ResourceLayout::Present;
+				default: return std::nullopt;
+				}
+			}
+		}
+
+		Result AdoptVulkanDevice(const AdoptedVulkanDeviceInfo& info, DevicePtr& out) noexcept {
+			out = {};
+			if (!info.getInstanceProcAddr || info.instance == VK_NULL_HANDLE || info.physicalDevice == VK_NULL_HANDLE ||
+				info.device == VK_NULL_HANDLE || info.queues[0].queue == VK_NULL_HANDLE) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if ((info.submissionHooks.lock == nullptr) != (info.submissionHooks.unlock == nullptr)) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			// volk's dispatch table is process-global: one Vulkan device per process.
+			if (const VkDevice loaded = volkGetLoadedDevice(); loaded != VK_NULL_HANDLE && loaded != info.device) {
+				spdlog::error("AdoptVulkanDevice: another VkDevice already owns the process-wide volk dispatch table.");
+				RHI_FAIL(Result::AlreadyExists);
+			}
+			volkInitializeCustom(info.getInstanceProcAddr);
+			volkLoadInstanceOnly(info.instance);
+			volkLoadDevice(info.device);
+
+			VkPhysicalDeviceFeatures coreFeatures{};
+			VkEnabledDeviceState enabled{};
+			VkParseEnabledFeatureChain(info.enabledFeatureChain, coreFeatures, enabled);
+			if (info.enabledCoreFeatures) coreFeatures = *info.enabledCoreFeatures;
+			// Submissions handed to the host are described with VkSubmitInfo2.
+			if (info.submissionHooks.submit && enabled.vulkan13.synchronization2 != VK_TRUE) {
+				spdlog::error("AdoptVulkanDevice: a host submit hook requires synchronization2 on the adopted device.");
+				RHI_FAIL(Result::Unsupported);
+			}
+			const auto hasExtension = [&](const char* name) {
+				return VkNameListContains(info.enabledDeviceExtensions, info.enabledDeviceExtensionCount, name);
+			};
+			// A feature bit only counts when the extension exposing it was enabled.
+			if (!hasExtension(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME)) enabled.descriptorHeap = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT };
+			if (!hasExtension(VK_EXT_MESH_SHADER_EXTENSION_NAME)) enabled.meshShader = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT };
+			if (!hasExtension(VK_EXT_DEVICE_GENERATED_COMMANDS_EXTENSION_NAME)) enabled.deviceGeneratedCommands = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT };
+			if (!hasExtension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME) && !hasExtension(VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME))
+				enabled.computeShaderDerivatives = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR };
+			if (!hasExtension(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME)) enabled.shaderImageAtomicInt64 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT };
+			if (!hasExtension(VK_EXT_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME)) enabled.shaderSubgroupPartitioned = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT };
+			if (!hasExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) || !hasExtension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME))
+				enabled.accelerationStructure = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
+			if (!hasExtension(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) || enabled.accelerationStructure.accelerationStructure != VK_TRUE)
+				enabled.rayTracingPipeline = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
+			if (!hasExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME) || enabled.accelerationStructure.accelerationStructure != VK_TRUE)
+				enabled.rayQuery = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
+#if defined(VK_NV_cluster_acceleration_structure)
+			if (!hasExtension(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME))
+				enabled.clusterAccelerationStructure = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV };
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+			if (!hasExtension(VK_NV_PARTITIONED_ACCELERATION_STRUCTURE_EXTENSION_NAME))
+				enabled.partitionedAccelerationStructure = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV };
+#endif
+			enabled.nvShaderSubgroupPartitioned = hasExtension(VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
+			enabled.pipelineLibrary = hasExtension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+			enabled.swapchain = false; // presentation stays with the host
+#ifdef _WIN32
+			enabled.externalMemoryWin32 = hasExtension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+			enabled.externalSemaphoreWin32 = hasExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+#endif
+
+			auto impl = std::make_shared<VulkanDevice>();
+			impl->selfWeak = impl;
+			impl->instance = info.instance;
+			impl->physicalDevice = info.physicalDevice;
+			impl->device = info.device;
+			impl->ownsInstance = false;
+			impl->ownsDevice = false;
+			impl->submissionHookUser = info.submissionHooks.user;
+			impl->submissionLock = info.submissionHooks.lock;
+			impl->submissionUnlock = info.submissionHooks.unlock;
+			impl->submissionSubmit = info.submissionHooks.submit;
+			vkGetPhysicalDeviceProperties(info.physicalDevice, &impl->physicalDeviceProperties);
+			vkGetPhysicalDeviceMemoryProperties(info.physicalDevice, &impl->memoryProperties);
+			impl->supportedFeatures = coreFeatures;
+			{
+				VkPhysicalDeviceProperties2 properties2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+				properties2.pNext = &impl->descriptorHeapProperties;
+				impl->descriptorHeapProperties.pNext = &impl->meshShaderProperties;
+				impl->meshShaderProperties.pNext = &impl->computeShaderDerivativesProperties;
+				impl->computeShaderDerivativesProperties.pNext = &impl->accelerationStructureProperties;
+				impl->accelerationStructureProperties.pNext = &impl->rayTracingPipelineProperties;
+				impl->rayTracingPipelineProperties.pNext = nullptr;
+				vkGetPhysicalDeviceProperties2(info.physicalDevice, &properties2);
+				impl->descriptorHeapProperties.pNext = nullptr;
+				impl->meshShaderProperties.pNext = nullptr;
+				impl->computeShaderDerivativesProperties.pNext = nullptr;
+				impl->accelerationStructureProperties.pNext = nullptr;
+			}
+			uint32_t familyCount = 0;
+			vkGetPhysicalDeviceQueueFamilyProperties(info.physicalDevice, &familyCount, nullptr);
+			impl->queueFamilyProperties.resize(familyCount);
+			vkGetPhysicalDeviceQueueFamilyProperties(info.physicalDevice, &familyCount, impl->queueFamilyProperties.data());
+			VkApplyEnabledDeviceState(impl.get(), enabled);
+			impl->validateBarrierTransitions = info.validateBarrierTransitions;
+			impl->loaderApiVersion = volkGetInstanceVersion();
+			impl->instanceApiVersion = info.instanceApiVersion ? info.instanceApiVersion : VK_API_VERSION_1_3;
+			impl->queueFamilyNextQueueIndex.assign(familyCount, 0u);
+			impl->queueFamilyFreeQueueIndices.assign(familyCount, {});
+
+			// Unset kinds alias the graphics queue; kinds sharing a VkQueue share one handle.
+			QueueHandle handles[3]{};
+			for (uint32_t kind = 0; kind < 3; ++kind) {
+				const AdoptedQueue& adopted = info.queues[kind].queue != VK_NULL_HANDLE ? info.queues[kind] : info.queues[0];
+				if (adopted.familyIndex >= familyCount) RHI_FAIL(Result::InvalidArgument);
+				for (uint32_t previous = 0; previous < kind && !handles[kind].valid(); ++previous) {
+					const AdoptedQueue& earlier = info.queues[previous].queue != VK_NULL_HANDLE ? info.queues[previous] : info.queues[0];
+					if (earlier.queue == adopted.queue) handles[kind] = handles[previous];
+				}
+				if (!handles[kind].valid()) {
+					VulkanQueueState state{ adopted.queue, adopted.familyIndex, adopted.queueIndex };
+					state.external = true;
+					handles[kind] = impl->queues.alloc(state);
+				}
+			}
+			impl->gfxHandle = handles[0];
+			impl->compHandle = handles[1];
+			impl->copyHandle = handles[2];
+			impl->self = Device{ impl.get(), &g_vkdevvt };
+
+			spdlog::info(
+				"AdoptVulkanDevice: adopted '{}' queues[gfx={}:{}, compute={}:{}, copy={}:{}] timelineSemaphore={} bufferDeviceAddress={} descriptorHeap={} dynamicRendering={}",
+				impl->physicalDeviceProperties.deviceName,
+				info.queues[0].familyIndex, info.queues[0].queueIndex,
+				info.queues[1].queue ? info.queues[1].familyIndex : info.queues[0].familyIndex,
+				info.queues[1].queue ? info.queues[1].queueIndex : info.queues[0].queueIndex,
+				info.queues[2].queue ? info.queues[2].familyIndex : info.queues[0].familyIndex,
+				info.queues[2].queue ? info.queues[2].queueIndex : info.queues[0].queueIndex,
+				impl->timelineSemaphoreEnabled, impl->bufferDeviceAddressEnabled, impl->descriptorHeapEnabled,
+				impl->dynamicRenderingEnabled);
+			if (!impl->descriptorHeapEnabled || !impl->timelineSemaphoreEnabled) {
+				spdlog::warn("AdoptVulkanDevice: the host did not enable VK_EXT_descriptor_heap and timeline semaphores; pipelines and graph submission will be unsupported.");
+			}
+
+			out = MakeDevicePtr(&impl->self, impl);
+			return Result::Ok;
+		}
+
+		Result import_image(Device device, const ImportedImageDesc& desc, ResourcePtr& out) noexcept {
+			out.Reset();
+			if (!device || device.vt != &g_vkdevvt || !device.impl || desc.image == VK_NULL_HANDLE ||
+				desc.createInfo.sType != VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			const auto layout = VkFromImageLayout(desc.currentLayout);
+			if (!layout) {
+				spdlog::error("import_image: layout {} has no BasicRHI equivalent", static_cast<int>(desc.currentLayout));
+				RHI_FAIL(Result::Unsupported);
+			}
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			const VkImageCreateInfo& ci = desc.createInfo;
+			VulkanResource state{};
+			state.image = desc.image;
+			state.format = ci.format;
+			state.type = ci.imageType == VK_IMAGE_TYPE_3D ? ResourceType::Texture3D
+				: ci.imageType == VK_IMAGE_TYPE_1D ? ResourceType::Texture1D : ResourceType::Texture2D;
+			state.width = ci.extent.width;
+			state.height = ci.extent.height;
+			state.depthOrLayers = static_cast<uint16_t>(ci.imageType == VK_IMAGE_TYPE_3D ? ci.extent.depth : ci.arrayLayers);
+			state.mipLevels = static_cast<uint16_t>(ci.mipLevels);
+			state.imageCreateFlags = ci.flags;
+			state.imageUsage = ci.usage;
+			state.currentLayout = *layout;
+			state.submittedLayout = *layout;
+			state.concurrentSharing = ci.sharingMode == VK_SHARING_MODE_CONCURRENT;
+			state.ownsImage = false;
+			state.ownsMemory = false;
+			const ResourceHandle handle = impl->resources.alloc(state);
+			Resource texture{ handle, true };
+			texture.impl = impl;
+			texture.vt = &g_vktex_rvt;
+			if (desc.debugName) VkSetObjectName(impl, reinterpret_cast<uint64_t>(desc.image), VK_OBJECT_TYPE_IMAGE, desc.debugName);
+			out = MakeTexturePtr(&device, texture, impl->selfWeak.lock());
+			return Result::Ok;
+		}
+
+		Result import_buffer(Device device, const ImportedBufferDesc& desc, ResourcePtr& out) noexcept {
+			out.Reset();
+			if (!device || device.vt != &g_vkdevvt || !device.impl || desc.buffer == VK_NULL_HANDLE || desc.size == 0) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			VulkanResource state{};
+			state.buffer = desc.buffer;
+			state.bufferSize = desc.size;
+			state.type = ResourceType::Buffer;
+			state.currentLayout = ResourceLayout::Common;
+			state.submittedLayout = ResourceLayout::Common;
+			state.concurrentSharing = desc.concurrentSharing;
+			state.ownsBuffer = false;
+			state.ownsMemory = false;
+			// Bindless buffer descriptors are written from the device address.
+			if (impl->bufferDeviceAddressEnabled && (desc.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
+				VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+				addressInfo.buffer = desc.buffer;
+				state.deviceAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
+			}
+			const ResourceHandle handle = impl->resources.alloc(state);
+			Resource buffer{ handle, false };
+			buffer.impl = impl;
+			buffer.vt = &g_vkbuf_rvt;
+			if (desc.debugName) VkSetObjectName(impl, reinterpret_cast<uint64_t>(desc.buffer), VK_OBJECT_TYPE_BUFFER, desc.debugName);
+			out = MakeBufferPtr(&device, buffer, impl->selfWeak.lock());
+			return Result::Ok;
+		}
+
+		void abandon_device(Device device) noexcept {
+			if (!device || device.vt != &g_vkdevvt || !device.impl) return;
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			if (impl->ownsDevice) return; // only an adopted device can be lost underneath BasicRHI
+			impl->abandoned = true;
+		}
+
 		uint64_t get_adapter_luid(Device device) noexcept {
 #ifdef _WIN32
 			if (!device || device.vt != &g_vkdevvt || !device.impl) return 0;

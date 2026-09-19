@@ -3,7 +3,9 @@
 #include <cstddef>
 #include <vector>
 #include <limits>
-#include <directx/d3dcommon.h>
+#ifdef _WIN32
+#include <windows.h> // Win32 scalar types, IsDebuggerPresent; previously reached via d3dcommon.h
+#endif
 #include <optional>
 #include <array>
 #include <unordered_map>
@@ -65,6 +67,23 @@ namespace rhi {
 	inline constexpr uint32_t VULKAN_RESOURCE_DESCRIPTOR_HEAP_BINDING = 1000000;
 	inline constexpr uint32_t VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING = 1000001;
 	inline constexpr uint32_t VULKAN_COUNTER_DESCRIPTOR_HEAP_BINDING = 1000002;
+
+	// The DXC arguments every SPIR-V shader consumed by the Vulkan backend must be compiled with:
+	// DX buffer layout and ResourceDescriptorHeap/SamplerDescriptorHeap mapped onto the
+	// VK_EXT_descriptor_heap bindings above. Runtime compilers append these; build-time
+	// compilation uses BASICRHI_VULKAN_DXC_FLAGS from cmake/BasicRHIShaderFlags.cmake,
+	// which parses the constants from this header.
+	inline void AppendVulkanDxcSpirvArguments(std::vector<std::wstring>& args) {
+		const auto set = std::to_wstring(VULKAN_DESCRIPTOR_HEAP_SET);
+		args.insert(args.end(), {
+			L"-spirv",
+			L"-fvk-use-dx-layout",
+			L"-fspv-target-env=vulkan1.3",
+			L"-fvk-bind-resource-heap", std::to_wstring(VULKAN_RESOURCE_DESCRIPTOR_HEAP_BINDING), set,
+			L"-fvk-bind-sampler-heap", std::to_wstring(VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING), set,
+			L"-fvk-bind-counter-heap", std::to_wstring(VULKAN_COUNTER_DESCRIPTOR_HEAP_BINDING), set,
+		});
+	}
 
 	class Device;
 
@@ -1973,6 +1992,21 @@ namespace rhi {
 		ResourceAccessType   afterAccess{ ResourceAccessType::None };
 	};
 
+	// Orders every prior command/memory write against every later command/access on the
+	// same queue. Barrier scopes extend across submissions, so a host that shares a queue
+	// with another API (e.g. an adopted DXVK queue) can use this at its entry and exit
+	// points instead of per-resource barriers or semaphores.
+	inline GlobalBarrier FullMemoryBarrier() noexcept {
+		const ResourceAccessType writes = static_cast<ResourceAccessType>(
+			ResourceAccessType::RenderTarget | ResourceAccessType::UnorderedAccess | ResourceAccessType::DepthReadWrite
+			| ResourceAccessType::CopyDest | ResourceAccessType::RaytracingAccelerationStructureWrite);
+		const ResourceAccessType all = static_cast<ResourceAccessType>(writes
+			| ResourceAccessType::VertexBuffer | ResourceAccessType::ConstantBuffer | ResourceAccessType::IndexBuffer
+			| ResourceAccessType::DepthRead | ResourceAccessType::ShaderResource | ResourceAccessType::IndirectArgument
+			| ResourceAccessType::CopySource | ResourceAccessType::RaytracingAccelerationStructureRead);
+		return GlobalBarrier{ ResourceSyncState::All, ResourceSyncState::All, writes, all };
+	}
+
 	// Batch to submit in one call
 	struct BarrierBatch {
 		Span<TextureBarrier> textures{};
@@ -3131,7 +3165,10 @@ namespace rhi {
 		DebugInstrumentationCreateInfo instrumentation{};
 	};
 
-	static inline ShaderBinary DXIL(ID3DBlob* blob) {
+	// Accepts any blob exposing GetBufferPointer/GetBufferSize (ID3DBlob, IDxcBlob) without
+	// making rhi.h depend on the D3D headers.
+	template <class Blob>
+	static inline ShaderBinary DXIL(Blob* blob) {
 		return { blob ? blob->GetBufferPointer() : nullptr,
 				 blob ? static_cast<uint32_t>(blob->GetBufferSize()) : 0u };
 	}

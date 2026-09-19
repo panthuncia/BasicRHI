@@ -1,6 +1,9 @@
+#if BASICRHI_ENABLE_D3D12
 #include "rhi_dx12.h"
-#include "rhi_interop.h"
 #include "rhi_dx12_casting.h"
+#endif
+#include "rhi.h"
+#include "rhi_interop.h"
 #if BASICRHI_ENABLE_VULKAN
 #include "rhi_vulkan.h"
 #endif
@@ -22,11 +25,13 @@ namespace rhi {
             }
         }
 
+#if BASICRHI_ENABLE_D3D12
         bool IsDx12Device(const Device& device) noexcept { return device.vt == &g_devvt; }
         bool IsDx12Queue(const Queue& queue) noexcept { return queue.vt == &g_qvt; }
         bool IsDx12CommandList(const CommandList& commandList) noexcept { return commandList.vt == &g_clvt; }
         bool IsDx12Swapchain(const Swapchain& swapchain) noexcept { return swapchain.vt == &g_scvt; }
         bool IsDx12Resource(const Resource& resource) noexcept { return resource.vt == &g_buf_rvt || resource.vt == &g_tex_rvt; }
+#endif
 #if BASICRHI_ENABLE_VULKAN
         bool IsVulkanDevice(const Device& device) noexcept { return device.vt == &g_vkdevvt; }
         bool IsVulkanQueue(const Queue& queue) noexcept { return queue.vt == &g_vkqvt; }
@@ -54,6 +59,7 @@ namespace rhi {
             return true;
         }
 #endif
+#if BASICRHI_ENABLE_D3D12
 
         if (!IsDx12Device(d)) return false;
 
@@ -79,6 +85,9 @@ namespace rhi {
         default:
             return false;
         }
+#else
+        return false;
+#endif
     }
 
     bool QueryNativeQueue(Queue q, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
@@ -97,6 +106,7 @@ namespace rhi {
             return true;
         }
 #endif
+#if BASICRHI_ENABLE_D3D12
         if (!IsDx12Queue(q)) return false;
         if (iid != RHI_IID_D3D12_QUEUE) return false;
         if (outSize < sizeof(D3D12QueueInfo)) return false;
@@ -108,6 +118,9 @@ namespace rhi {
         out->queue = s->pNativeQueue.Get();   // ID3D12CommandQueue*
         out->version = 1;
         return true;
+#else
+        return false;
+#endif
     }
 
     bool QueryNativeCmdList(CommandList cl, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
@@ -125,6 +138,7 @@ namespace rhi {
             return true;
         }
 #endif
+#if BASICRHI_ENABLE_D3D12
         if (!IsDx12CommandList(cl)) return false;
 		const bool requestStreamlineProxy = iid == RHI_IID_D3D12_STREAMLINE_CMD_LIST;
         if (iid != RHI_IID_D3D12_CMD_LIST && !requestStreamlineProxy) return false;
@@ -149,6 +163,9 @@ namespace rhi {
 			: rec->alloc.Get(); // ID3D12CommandAllocator* (may be null if not tracked)
         out->version = 1;
         return true;
+#else
+        return false;
+#endif
     }
 
     bool QueryNativeSwapchain(Swapchain sc, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
@@ -166,6 +183,7 @@ namespace rhi {
             return true;
         }
 #endif
+#if BASICRHI_ENABLE_D3D12
         if (!IsDx12Swapchain(sc)) return false;
         if (iid != RHI_IID_D3D12_SWAPCHAIN) return false;
         if (outSize < sizeof(D3D12SwapchainInfo)) return false;
@@ -177,6 +195,9 @@ namespace rhi {
         out->swapchain = s->pNativeSC.Get(); // IDXGISwapChain3*
         out->version = 1;
         return true;
+#else
+        return false;
+#endif
     }
 
     bool QueryNativeResource(Resource h, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
@@ -202,6 +223,7 @@ namespace rhi {
             return true;
         }
 #endif
+#if BASICRHI_ENABLE_D3D12
         if (!IsDx12Resource(h)) return false;
         if (iid != RHI_IID_D3D12_RESOURCE) return false;
         if (outSize < sizeof(D3D12ResourceInfo)) return false;
@@ -215,6 +237,9 @@ namespace rhi {
         out->resource = resRec->res.Get(); // ID3D12Resource*
         out->version = 1;
         return true;
+#else
+        return false;
+#endif
 	}
 
     bool QueryNativeHeap(Heap h, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
@@ -232,6 +257,7 @@ namespace rhi {
             return true;
         }
 #endif
+#if BASICRHI_ENABLE_D3D12
         if (h.vt != &g_hevt) return false;
         if (iid != RHI_IID_D3D12_HEAP) return false;
         if (outSize < sizeof(D3D12HeapInfo)) return false;
@@ -241,6 +267,9 @@ namespace rhi {
         out->heap = rec->heap.Get(); // ID3D12Heap*
         out->version = 1;
 		return true;
+#else
+        return false;
+#endif
 	}
 
     bool QueryNativeQueryPool(QueryPool qp, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
@@ -258,6 +287,7 @@ namespace rhi {
             return true;
         }
 #endif
+#if BASICRHI_ENABLE_D3D12
         if (qp.vt != &g_qpvt) return false;
 		if (iid != RHI_IID_D3D12_QUERY_POOL) return false;
 		if (outSize < sizeof(D3D12QueryPoolInfo)) return false;
@@ -267,6 +297,9 @@ namespace rhi {
 		out->queryPool = rec->heap.Get(); // ID3D12QueryHeap*
 		out->version = 1;
 		return true;
+#else
+        return false;
+#endif
 	}
 
     bool QueryNativePipeline(Pipeline p, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
@@ -284,6 +317,7 @@ namespace rhi {
             return true;
         }
 #endif
+#if BASICRHI_ENABLE_D3D12
         if (p.vt != &g_psovt) return false;
         if (iid != RHI_IID_D3D12_PIPELINE) return false;
         if (outSize < sizeof(D3D12PipelineInfo)) return false;
@@ -293,6 +327,9 @@ namespace rhi {
         out->pipeline = rec->pso.Get(); // ID3D12PipelineState*
         out->version = 1;
         return true;
+#else
+        return false;
+#endif
 	}
 
     bool QueryNativePipelineLayout(PipelineLayout pl, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
@@ -300,6 +337,7 @@ namespace rhi {
 #if BASICRHI_ENABLE_VULKAN
 		if (pl.vt == &g_vkplvt) return false;
 #endif
+#if BASICRHI_ENABLE_D3D12
 		if (pl.vt != &g_plvt) return false;
         if (iid != RHI_IID_D3D12_PIPELINE_LAYOUT) return false;
         if (outSize < sizeof(D3D12PipelineLayoutInfo)) return false;
@@ -309,6 +347,9 @@ namespace rhi {
         out->layout = rec->root.Get(); // ID3D12RootSignature*
         out->version = 1;
         return true;
+#else
+        return false;
+#endif
     }
 
     bool QueryNativeDescriptorHeap(DescriptorHeap dh, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
@@ -326,6 +367,7 @@ namespace rhi {
             return true;
         }
 #endif
+#if BASICRHI_ENABLE_D3D12
         if (dh.vt != &g_dhvt) return false;
         if (iid != RHI_IID_D3D12_DESCRIPTOR_HEAP) return false;
         if (outSize < sizeof(D3D12DescriptorHeapInfo)) return false;
@@ -335,6 +377,9 @@ namespace rhi {
         out->descHeap = rec->heap.Get(); // ID3D12DescriptorHeap*
         out->version = 1;
         return true;
+#else
+        return false;
+#endif
 	}
 
     bool QueryNativeCommandSignature(CommandSignature cs, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
@@ -342,6 +387,7 @@ namespace rhi {
 #if BASICRHI_ENABLE_VULKAN
 		if (cs.vt == &g_vkcsvt) return false;
 #endif
+#if BASICRHI_ENABLE_D3D12
 		if (cs.vt != &g_csvt) return false;
         if (iid != RHI_IID_D3D12_COMMAND_SIGNATURE) return false;
         if (outSize < sizeof(D3D12CommandSignatureInfo)) return false;
@@ -351,6 +397,9 @@ namespace rhi {
         out->cmdSig = rec->sig.Get(); // ID3D12CommandSignature*
         out->version = 1;
         return true;
+#else
+        return false;
+#endif
     }
 
     bool QueryNativeTimeline(Timeline t, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
@@ -368,6 +417,7 @@ namespace rhi {
             return true;
         }
 #endif
+#if BASICRHI_ENABLE_D3D12
         if (t.vt != &g_tlvt) return false;
         if (iid != RHI_IID_D3D12_TIMELINE) return false;
         if (outSize < sizeof(D3D12TimelineInfo)) return false;
@@ -377,6 +427,9 @@ namespace rhi {
         out->timeline = rec->fence.Get(); // ID3D12Fence*
         out->version = 1;
         return true;
+#else
+        return false;
+#endif
 	}
 
     bool QueryNativeDescriptorSlot(Device device, DescriptorSlot slot, uint32_t iid, void* outStruct, uint32_t outSize) noexcept {
