@@ -103,6 +103,19 @@ find_package(BasicRHI CONFIG REQUIRED)
 target_link_libraries(MyTarget PRIVATE BasicRHI::BasicRHI)
 ```
 
+## Backend-independent conventions
+
+A pipeline or pass description means the same thing on every backend; callers never branch on the API.
+Where the underlying APIs disagree, the backend reconciles it.
+
+- **Clip space is y-up**, as it is in D3D. The Vulkan backend begins each pass with a y-flipped viewport
+  (a negative `VkViewport::height`) rather than asking shaders to invert `SV_Position.y`.
+- **`RasterState::frontCCW` is stated in clip space.** `false`, the default, is D3D's convention, where
+  the clockwise face is the front one; `true` is glTF's, where the counter-clockwise face is. Because the
+  y-flip mirrors the winding Vulkan derives the facing from, the Vulkan backend inverts this flag when it
+  fills `VkPipelineRasterizationStateCreateInfo`. Setting the same `RasterState` therefore culls the same
+  faces on D3D12 and Vulkan.
+
 ## Notes
 
 `BasicRHI` exports package config files under:

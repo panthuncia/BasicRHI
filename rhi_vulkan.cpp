@@ -6468,7 +6468,13 @@ namespace rhi {
 				VkPipelineRasterizationStateCreateInfo raster{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
 				raster.polygonMode = VkPolygonModeForRHI(rasterState.fill);
 				raster.cullMode = VkCullModeForRHI(rasterState.cull);
-				raster.frontFace = rasterState.frontCCW ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+				// RasterState::frontCCW is stated in clip space, the same way D3D12's FrontCounterClockwise
+				// is, so that one pipeline description means the same thing on both backends. Passes render
+				// with a y-flipped viewport (cl_beginPass sets a negative height, to put clip space the right
+				// way up), and mirroring y reverses the sign of the signed area Vulkan derives the facing
+				// from. The mapping is therefore inverted: without this, the same RasterState culls opposite
+				// faces on the two backends.
+				raster.frontFace = rasterState.frontCCW ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
 				raster.lineWidth = 1.0f;
 				raster.depthBiasEnable = (rasterState.depthBias != 0.0f || rasterState.slopeScaledDepthBias != 0.0f) ? VK_TRUE : VK_FALSE;
 				raster.depthBiasConstantFactor = rasterState.depthBias;

@@ -1612,6 +1612,11 @@ namespace rhi {
 	struct RasterState {
 		FillMode fill = FillMode::Solid;
 		CullMode cull = CullMode::Back;
+		// Which winding is the front face, stated in clip space, so that one RasterState means the same
+		// thing on every backend. false (the default) is D3D's convention, where the clockwise face is the
+		// front one; true is glTF's, where the counter-clockwise face is. The Vulkan backend renders with a
+		// y-flipped viewport and inverts this when it fills VkPipelineRasterizationStateCreateInfo; callers
+		// never branch on the backend.
 		bool frontCCW = false;
 		float depthBias = 0;
 		float   depthBiasClamp = 0;
