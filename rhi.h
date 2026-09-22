@@ -2701,6 +2701,11 @@ namespace rhi {
 		uint32_t abi_version = 6;
 		// Appended after the version field: older tables remain readable.
 		Result (*endChecked)(CommandList*) noexcept = nullptr;
+		// abi_version 7: debugger labels (Nsight, RenderDoc, PIX) for backends whose markers need the
+		// backend's own dispatch (Vulkan's VK_EXT_debug_utils). rgba is 0..1; null when unsupported.
+		void (*beginDebugLabel)(CommandList*, const float rgba[4], const char* name) noexcept = nullptr;
+		void (*endDebugLabel)(CommandList*) noexcept = nullptr;
+		void (*insertDebugLabel)(CommandList*, const float rgba[4], const char* name) noexcept = nullptr;
 	};
 
 	class CommandList {
@@ -2721,6 +2726,7 @@ namespace rhi {
 		constexpr void Reset() noexcept { impl = nullptr; backendState = nullptr; vt = nullptr; }
 		void End() noexcept;
 		bool SupportsCheckedEnd() const noexcept { return IsValid() && vt->abi_version >= 6 && vt->endChecked; }
+		bool SupportsDebugLabels() const noexcept { return IsValid() && vt->abi_version >= 7 && vt->beginDebugLabel && vt->endDebugLabel && vt->insertDebugLabel; }
 		Result EndChecked() noexcept { return SupportsCheckedEnd() ? vt->endChecked(this) : Result::Unsupported; }
 		void Recycle(const CommandAllocator& ca) noexcept;
 		void BeginPass(const PassBeginInfo& p) noexcept;

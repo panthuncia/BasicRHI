@@ -100,6 +100,10 @@ namespace rhi::vulkan {
         VkDevice device = VK_NULL_HANDLE;
         const char* const* enabledDeviceExtensions = nullptr;
         uint32_t enabledDeviceExtensionCount = 0;
+        // The instance's enabled extensions. Only VK_EXT_debug_utils is consulted: object names and
+        // debugger labels are issued only when the host enabled it.
+        const char* const* enabledInstanceExtensions = nullptr;
+        uint32_t enabledInstanceExtensionCount = 0;
         // The pNext chain given to vkCreateDevice (VkPhysicalDeviceFeatures2 and/or
         // Vulkan 1.1-1.3 / extension feature structs). Every capability BasicRHI
         // reports is derived from it, never assumed.

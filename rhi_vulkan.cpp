@@ -1403,7 +1403,7 @@ namespace rhi {
 		}
 
 		static void VkSetObjectName(VulkanDevice* impl, uint64_t objectHandle, VkObjectType objectType, const char* name) noexcept {
-			if (!impl || impl->device == VK_NULL_HANDLE || objectHandle == 0 || !name || !*name || !vkSetDebugUtilsObjectNameEXT) {
+			if (!impl || !impl->debugUtilsEnabled || impl->device == VK_NULL_HANDLE || objectHandle == 0 || !name || !*name || !vkSetDebugUtilsObjectNameEXT) {
 				return;
 			}
 
@@ -5883,6 +5883,43 @@ namespace rhi {
 			VkIgnoreUnused(commandList, passName, techniquePath);
 		}
 
+		// Debugger labels (rhi::debug::Begin/End/Marker). Issued only when the instance has
+		// VK_EXT_debug_utils: Nsight and RenderDoc show them as the command buffer's zones.
+		static VkCommandBuffer VkLabelTarget(CommandList* commandList) noexcept {
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			if (!impl || !impl->debugUtilsEnabled)
+				return VK_NULL_HANDLE;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			return commandListState ? commandListState->commandBuffer : VK_NULL_HANDLE;
+		}
+
+		static VkDebugUtilsLabelEXT VkMakeLabel(const float rgba[4], const char* name) noexcept {
+			VkDebugUtilsLabelEXT label{ VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT };
+			label.pLabelName = name ? name : "";
+			for (int i = 0; i < 4; ++i)
+				label.color[i] = rgba ? rgba[i] : 1.0f;
+			return label;
+		}
+
+		static void cl_beginDebugLabel(CommandList* commandList, const float rgba[4], const char* name) noexcept {
+			if (const VkCommandBuffer commandBuffer = VkLabelTarget(commandList); commandBuffer != VK_NULL_HANDLE && vkCmdBeginDebugUtilsLabelEXT) {
+				const VkDebugUtilsLabelEXT label = VkMakeLabel(rgba, name);
+				vkCmdBeginDebugUtilsLabelEXT(commandBuffer, &label);
+			}
+		}
+
+		static void cl_endDebugLabel(CommandList* commandList) noexcept {
+			if (const VkCommandBuffer commandBuffer = VkLabelTarget(commandList); commandBuffer != VK_NULL_HANDLE && vkCmdEndDebugUtilsLabelEXT)
+				vkCmdEndDebugUtilsLabelEXT(commandBuffer);
+		}
+
+		static void cl_insertDebugLabel(CommandList* commandList, const float rgba[4], const char* name) noexcept {
+			if (const VkCommandBuffer commandBuffer = VkLabelTarget(commandList); commandBuffer != VK_NULL_HANDLE && vkCmdInsertDebugUtilsLabelEXT) {
+				const VkDebugUtilsLabelEXT label = VkMakeLabel(rgba, name);
+				vkCmdInsertDebugUtilsLabelEXT(commandBuffer, &label);
+			}
+		}
+
 		static void ca_reset(CommandAllocator* allocator) noexcept {
 			auto* impl = allocator ? static_cast<VulkanDevice*>(allocator->impl) : nullptr;
 			VulkanCommandAllocator* allocatorState = VkAllocatorState(allocator);
@@ -9706,8 +9743,11 @@ namespace rhi {
 		&cl_setDebugInstrumentationContext,
 		&cl_beginTracyGpuZone,
 		&cl_endTracyGpuZone,
-		6u,
-		&cl_endChecked
+		7u,
+		&cl_endChecked,
+		&cl_beginDebugLabel,
+		&cl_endDebugLabel,
+		&cl_insertDebugLabel
 	};
 
 	const SwapchainVTable g_vkscvt = {
@@ -10629,6 +10669,9 @@ namespace rhi {
 		auto impl = std::make_shared<VulkanDevice>();
 		impl->selfWeak = impl;
 		impl->instance = instance;
+		impl->debugUtilsEnabled = std::any_of(enabledExtensions.begin(), enabledExtensions.end(), [](const char* name) {
+			return name && std::strcmp(name, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
+		});
 		if (ci.enableDebug && vkCreateDebugUtilsMessengerEXT) {
 			VkDebugUtilsMessengerCreateInfoEXT debugInfo{ VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
 			debugInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
@@ -10947,6 +10990,7 @@ namespace rhi {
 			impl->device = info.device;
 			impl->ownsInstance = false;
 			impl->ownsDevice = false;
+			impl->debugUtilsEnabled = VkNameListContains(info.enabledInstanceExtensions, info.enabledInstanceExtensionCount, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 			impl->submissionHookUser = info.submissionHooks.user;
 			impl->submissionLock = info.submissionHooks.lock;
 			impl->submissionUnlock = info.submissionHooks.unlock;

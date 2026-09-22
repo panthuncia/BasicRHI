@@ -518,6 +518,9 @@ namespace rhi {
 		bool partitionedAccelerationStructureEnabled = false;
 		bool validateBarrierTransitions = false;
 		bool streamlineInitialized = false;
+		// VK_EXT_debug_utils was enabled on the instance: object names and command buffer labels may
+		// be issued. volk resolves the entry points whether or not it was, so a null check is not enough.
+		bool debugUtilsEnabled = false;
 		// AdoptVulkanDevice: the instance and device belong to the host. Every VkQueue
 		// access is bracketed by the host's submission lock, and whole-device waits are
 		// replaced by waits on BasicRHI's own timelines.

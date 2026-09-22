@@ -7,7 +7,9 @@
 # Also provides:
 #   basicrhi_compile_spirv(OUTPUT <file.spv> SOURCE <file.hlsl> ENTRY <name> PROFILE <cs_6_6>
 #                          [DXC <path>] [DEFINES A=1 B ...] [INCLUDE_DIRS ...] [DEPENDS ...])
-# which adds a custom command producing <file.spv>.
+# which adds a custom command producing <file.spv>. With BASICRHI_SPIRV_DEBUG_INFO=ON the output
+# carries -Zi's OpSource (the HLSL embedded) and OpLine, for Nsight and RenderDoc.
+# (Not -fspv-debug=vulkan: its DebugValues keep dead loads alive, changing a stage's resources.)
 
 include_guard(GLOBAL)
 
@@ -38,6 +40,8 @@ find_program(BASICRHI_DXC_EXECUTABLE dxc
     HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin"
     DOC "DXC used for build-time SPIR-V compilation")
 
+option(BASICRHI_SPIRV_DEBUG_INFO "Embed source-level debug info in build-time SPIR-V" OFF)
+
 function(basicrhi_compile_spirv)
     cmake_parse_arguments(ARG "" "OUTPUT;SOURCE;ENTRY;PROFILE;DXC" "DEFINES;INCLUDE_DIRS;DEPENDS" ${ARGN})
     foreach(_required OUTPUT SOURCE ENTRY PROFILE)
@@ -53,6 +57,9 @@ function(basicrhi_compile_spirv)
         message(FATAL_ERROR "basicrhi_compile_spirv: DXC not found; install the Vulkan SDK or set BASICRHI_DXC_EXECUTABLE")
     endif()
     set(_args -nologo -HV 2021 -E ${ARG_ENTRY} -T ${ARG_PROFILE} ${BASICRHI_VULKAN_DXC_FLAGS} -D BASICRHI_SHADER_API_VULKAN=1)
+    if(BASICRHI_SPIRV_DEBUG_INFO)
+        list(APPEND _args -Zi)
+    endif()
     foreach(_define IN LISTS ARG_DEFINES)
         list(APPEND _args -D ${_define})
     endforeach()

@@ -7,7 +7,8 @@
 
 // Optional feature switches (define them in your build if needed):
 // - RHI_ENABLE_PIX            -> enable PIX markers on D3D12 (requires <pix3.h>)
-// - RHI_ENABLE_VULKAN_MARKERS -> enable VK_EXT_debug_utils markers on Vulkan
+// Vulkan labels (VK_EXT_debug_utils) need no switch: the backend issues them through the command
+// list vtable whenever the instance enabled the extension.
 
 #if !defined(RHI_ENABLE_PIX)
 #  if defined(BASICRHI_ENABLE_PIX) && BASICRHI_ENABLE_PIX
@@ -23,10 +24,6 @@
 #  endif
 #  define PIX_ENABLE_BLOCK_ARGUMENT_COPY 0
 #  include <pix3.h>
-#endif
-
-#if defined(RHI_ENABLE_VULKAN_MARKERS)
-#include <vulkan/vulkan.h>
 #endif
 
 namespace rhi::debug {
@@ -53,8 +50,7 @@ namespace rhi::debug {
         out[3] = ((c >> 24) & 0xFF) * inv; // A
     }
 
-    // Optional one-time init for backends that need function pointers (Vulkan).
-    // D3D12 + PIX requires no init; Vulkan will query vk* proc addrs here.
+    // Kept for callers; no backend needs it (Vulkan labels resolve through the command list).
     bool Init(Device d) noexcept;
     void Shutdown(Device /*d*/) noexcept; // currently a no-op
 
@@ -364,64 +360,9 @@ namespace rhi::debug {
 
     // -------------------- Implementation --------------------
 
-    namespace detail {
-
-#if defined(RHI_ENABLE_VULKAN_MARKERS)
-        // Cached proc addrs; populated by debug::Init(...)
-        inline PFN_vkCmdBeginDebugUtilsLabelEXT  vkCmdBeginDebugUtilsLabelEXT_ = nullptr;
-        inline PFN_vkCmdEndDebugUtilsLabelEXT    vkCmdEndDebugUtilsLabelEXT_ = nullptr;
-        inline PFN_vkCmdInsertDebugUtilsLabelEXT vkCmdInsertDebugUtilsLabelEXT_ = nullptr;
-        inline bool vk_ready_ = false;
-#endif
-
-    } // namespace detail
 
     inline bool Init(Device d) noexcept {
         (void)d;
-#if defined(RHI_ENABLE_VULKAN_MARKERS)
-        // Try to fetch Vulkan proc addrs if we have a Vulkan device behind this RHI device.
-        VulkanDeviceInfo vinfo{};
-        if (QueryNativeDevice(d, RHI_IID_VK_DEVICE, &vinfo, sizeof(vinfo)) && vinfo.instance && vinfo.device) {
-            auto inst = reinterpret_cast<VkInstance>(vinfo.instance);
-            auto dev = reinterpret_cast<VkDevice>(vinfo.device);
-
-            auto vkGetInstanceProcAddr_ = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
-                vkGetInstanceProcAddr);
-            auto vkGetDeviceProcAddr_ = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-                vkGetDeviceProcAddr);
-
-            if (vkGetInstanceProcAddr_ && vkGetDeviceProcAddr_) {
-                detail::vkCmdBeginDebugUtilsLabelEXT_ =
-                    reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(
-                        vkGetInstanceProcAddr_(inst, "vkCmdBeginDebugUtilsLabelEXT"));
-                detail::vkCmdEndDebugUtilsLabelEXT_ =
-                    reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(
-                        vkGetInstanceProcAddr_(inst, "vkCmdEndDebugUtilsLabelEXT"));
-                detail::vkCmdInsertDebugUtilsLabelEXT_ =
-                    reinterpret_cast<PFN_vkCmdInsertDebugUtilsLabelEXT>(
-                        vkGetInstanceProcAddr_(inst, "vkCmdInsertDebugUtilsLabelEXT"));
-
-                // Some loaders require device proc addrs; try those as fallback
-                if (!detail::vkCmdBeginDebugUtilsLabelEXT_)
-                    detail::vkCmdBeginDebugUtilsLabelEXT_ =
-                    reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(
-                        vkGetDeviceProcAddr_(dev, "vkCmdBeginDebugUtilsLabelEXT"));
-                if (!detail::vkCmdEndDebugUtilsLabelEXT_)
-                    detail::vkCmdEndDebugUtilsLabelEXT_ =
-                    reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(
-                        vkGetDeviceProcAddr_(dev, "vkCmdEndDebugUtilsLabelEXT"));
-                if (!detail::vkCmdInsertDebugUtilsLabelEXT_)
-                    detail::vkCmdInsertDebugUtilsLabelEXT_ =
-                    reinterpret_cast<PFN_vkCmdInsertDebugUtilsLabelEXT>(
-                        vkGetDeviceProcAddr_(dev, "vkCmdInsertDebugUtilsLabelEXT"));
-
-                detail::vk_ready_ =
-                    detail::vkCmdBeginDebugUtilsLabelEXT_ &&
-                    detail::vkCmdEndDebugUtilsLabelEXT_ &&
-                    detail::vkCmdInsertDebugUtilsLabelEXT_;
-            }
-        }
-#endif
         return true;
     }
 
@@ -434,18 +375,7 @@ namespace rhi::debug {
 #if RHI_ENABLE_PIX
         if (auto* cl = rhi::dx12::get_cmd_list(cmd)) { PIXBeginEvent(cl, color, name ? name : ""); return; }
 #endif
-#if defined(RHI_ENABLE_VULKAN_MARKERS)
-        if (detail::vk_ready_) {
-            VulkanCmdBufInfo info{};
-            if (QueryNativeCmdList(cmd, RHI_IID_VK_COMMAND_BUFFER, &info, sizeof(info)) && info.commandBuffer) {
-                VkDebugUtilsLabelEXT label{ VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT };
-                label.pLabelName = name ? name : "";
-                float c[4]; toRGBAf(color, c); label.color[0] = c[0]; label.color[1] = c[1]; label.color[2] = c[2]; label.color[3] = c[3];
-                detail::vkCmdBeginDebugUtilsLabelEXT_(reinterpret_cast<VkCommandBuffer>(info.commandBuffer), &label);
-                return;
-            }
-        }
-#endif
+        if (cmd.SupportsDebugLabels()) { float c[4]; toRGBAf(color, c); cmd.vt->beginDebugLabel(&cmd, c, name); return; }
         (void)cmd; (void)color; (void)name; // no-op
     }
 
@@ -453,15 +383,7 @@ namespace rhi::debug {
 #if RHI_ENABLE_PIX
         if (auto* cl = rhi::dx12::get_cmd_list(cmd)) { PIXEndEvent(cl); return; }
 #endif
-#if defined(RHI_ENABLE_VULKAN_MARKERS)
-        if (detail::vk_ready_) {
-            VulkanCmdBufInfo info{};
-            if (QueryNativeCmdList(cmd, RHI_IID_VK_COMMAND_BUFFER, &info, sizeof(info)) && info.commandBuffer) {
-                detail::vkCmdEndDebugUtilsLabelEXT_(reinterpret_cast<VkCommandBuffer>(info.commandBuffer));
-                return;
-            }
-        }
-#endif
+        if (cmd.SupportsDebugLabels()) { cmd.vt->endDebugLabel(&cmd); return; }
         (void)cmd; // no-op
     }
 
@@ -469,18 +391,7 @@ namespace rhi::debug {
 #if RHI_ENABLE_PIX
         if (auto* cl = rhi::dx12::get_cmd_list(cmd)) { PIXSetMarker(cl, color, name ? name : ""); return; }
 #endif
-#if defined(RHI_ENABLE_VULKAN_MARKERS)
-        if (detail::vk_ready_) {
-            VulkanCmdBufInfo info{};
-            if (QueryNativeCmdList(cmd, RHI_IID_VK_COMMAND_BUFFER, &info, sizeof(info)) && info.commandBuffer) {
-                VkDebugUtilsLabelEXT label{ VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT };
-                label.pLabelName = name ? name : "";
-                float c[4]; toRGBAf(color, c); label.color[0] = c[0]; label.color[1] = c[1]; label.color[2] = c[2]; label.color[3] = c[3];
-                detail::vkCmdInsertDebugUtilsLabelEXT_(reinterpret_cast<VkCommandBuffer>(info.commandBuffer), &label);
-                return;
-            }
-        }
-#endif
+        if (cmd.SupportsDebugLabels()) { float c[4]; toRGBAf(color, c); cmd.vt->insertDebugLabel(&cmd, c, name); return; }
         (void)cmd; (void)color; (void)name; // no-op
     }
 
