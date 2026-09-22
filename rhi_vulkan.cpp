@@ -4496,7 +4496,7 @@ namespace rhi {
 			}
 
 			VkRenderingInfo renderingInfo{ VK_STRUCTURE_TYPE_RENDERING_INFO };
-			renderingInfo.renderArea.offset = { 0, 0 };
+			renderingInfo.renderArea.offset = { static_cast<int32_t>(passInfo.x), static_cast<int32_t>(passInfo.y) };
 			renderingInfo.renderArea.extent = { passInfo.width, passInfo.height };
 			commandListState->passRenderArea = renderingInfo.renderArea;
 			renderingInfo.layerCount = 1;
@@ -4508,14 +4508,17 @@ namespace rhi {
 			vkCmdBeginRendering(commandListState->commandBuffer, &renderingInfo);
 
 			VkViewport viewport{};
+			viewport.x = static_cast<float>(passInfo.x);
 			viewport.width = static_cast<float>(passInfo.width);
-			viewport.y = static_cast<float>(passInfo.height);
+			// Flipped: the viewport starts at the bottom of the render area and grows upwards.
+			viewport.y = static_cast<float>(passInfo.y + passInfo.height);
 			viewport.height = -static_cast<float>(passInfo.height);
 			viewport.minDepth = passInfo.minDepth;
 			viewport.maxDepth = passInfo.maxDepth;
 			vkCmdSetViewport(commandListState->commandBuffer, 0, 1, &viewport);
 
 			VkRect2D scissor{};
+			scissor.offset = { static_cast<int32_t>(passInfo.x), static_cast<int32_t>(passInfo.y) };
 			scissor.extent = { passInfo.width, passInfo.height };
 			vkCmdSetScissor(commandListState->commandBuffer, 0, 1, &scissor);
 

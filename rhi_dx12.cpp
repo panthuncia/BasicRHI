@@ -7712,8 +7712,8 @@ namespace rhi {
 				BreakIfDebugging();
 				std::abort();
 			}
-			D3D12_VIEWPORT vp{ 0,0,(float)p.width,(float)p.height,p.minDepth,p.maxDepth };
-			D3D12_RECT sc{ 0,0,(LONG)p.width,(LONG)p.height };
+			D3D12_VIEWPORT vp{ (float)p.x,(float)p.y,(float)p.width,(float)p.height,p.minDepth,p.maxDepth };
+			D3D12_RECT sc{ (LONG)p.x,(LONG)p.y,(LONG)(p.x + p.width),(LONG)(p.y + p.height) };
 			l->cl->RSSetViewports(1, &vp);
 			l->cl->RSSetScissorRects(1, &sc);
 		}

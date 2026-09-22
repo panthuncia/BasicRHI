@@ -1859,7 +1859,12 @@ namespace rhi {
 	struct PassBeginInfo {
 		Span<ColorAttachment> colors{};
 		const DepthAttachment* depth{};
-		uint32_t width = 0, height = 0;  // render area, viewport and scissor (origin 0, 0)
+		uint32_t width = 0, height = 0;  // render area, viewport and scissor extent
+		// Top-left of the render area, viewport and scissor, in pixels. Zero draws over the whole
+		// attachment, which is what a pass that owns its target wants; a pass that writes one rectangle
+		// of a shared target - a shadow map holding two paraboloid hemispheres in one array slice, say -
+		// sets it, and the extent above covers that rectangle alone.
+		uint32_t x = 0, y = 0;
 		const char* debugName = nullptr;
 		float minDepth = 0.0f, maxDepth = 1.0f;  // the viewport's depth range
 	};
