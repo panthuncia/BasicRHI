@@ -2305,6 +2305,20 @@ namespace rhi {
 			}
 		}
 
+		// A custom border color only reaches a sample through border addressing. Without it the color is never
+		// read, so any value is expressible; with it, only the three built-in colors are exactly.
+		static bool VkCustomBorderIsExpressible(const SamplerDesc& desc) noexcept {
+			const bool border = desc.addressU == AddressMode::Border || desc.addressV == AddressMode::Border || desc.addressW == AddressMode::Border;
+			if (!border) {
+				return true;
+			}
+			const float* c = desc.borderColor;
+			const bool transparentBlack = c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f && c[3] == 0.0f;
+			const bool opaqueBlack = c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f && c[3] == 1.0f;
+			const bool opaqueWhite = c[0] == 1.0f && c[1] == 1.0f && c[2] == 1.0f && c[3] == 1.0f;
+			return transparentBlack || opaqueBlack || opaqueWhite;
+		}
+
 		static VkBorderColor VkToBorderColor(const SamplerDesc& desc) noexcept {
 			switch (desc.borderPreset) {
 			case BorderPreset::TransparentBlack:
@@ -6508,13 +6522,12 @@ namespace rhi {
 				VkPipelineRasterizationStateCreateInfo raster{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
 				raster.polygonMode = VkPolygonModeForRHI(rasterState.fill);
 				raster.cullMode = VkCullModeForRHI(rasterState.cull);
-				// RasterState::frontCCW is stated in clip space, the same way D3D12's FrontCounterClockwise
-				// is, so that one pipeline description means the same thing on both backends. Passes render
-				// with a y-flipped viewport (cl_beginPass sets a negative height, to put clip space the right
-				// way up), and mirroring y reverses the sign of the signed area Vulkan derives the facing
-				// from. The mapping is therefore inverted: without this, the same RasterState culls opposite
-				// faces on the two backends.
-				raster.frontFace = rasterState.frontCCW ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+				// RasterState::frontCCW means what D3D12's FrontCounterClockwise means, so that one pipeline
+				// description culls the same faces on both backends. Passes render with a y-flipped viewport
+				// (cl_beginPass sets a negative height), which puts the image the same way up as D3D's; Vulkan
+				// derives the facing from that image, so the D3D flag maps to the VkFrontFace of the same name.
+				// This is DXVK's mapping too, under the same flip (d3d11_rasterizer.cpp, d3d11_context.cpp).
+				raster.frontFace = rasterState.frontCCW ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
 				raster.lineWidth = 1.0f;
 				raster.depthBiasEnable = (rasterState.depthBias != 0.0f || rasterState.slopeScaledDepthBias != 0.0f) ? VK_TRUE : VK_FALSE;
 				raster.depthBiasConstantFactor = rasterState.depthBias;
@@ -8149,7 +8162,9 @@ namespace rhi {
 			if (desc.reduction == ReductionMode::Min || desc.reduction == ReductionMode::Max) {
 				RHI_FAIL(Result::Unsupported);
 			}
-			if (desc.borderPreset == BorderPreset::Custom) {
+			if (desc.borderPreset == BorderPreset::Custom && !VkCustomBorderIsExpressible(desc)) {
+				spdlog::error("CreateSampler: border color ({}, {}, {}, {}) with border addressing needs VK_EXT_custom_border_color, which is not supported",
+					desc.borderColor[0], desc.borderColor[1], desc.borderColor[2], desc.borderColor[3]);
 				RHI_FAIL(Result::Unsupported);
 			}
 

@@ -110,11 +110,12 @@ Where the underlying APIs disagree, the backend reconciles it.
 
 - **Clip space is y-up**, as it is in D3D. The Vulkan backend begins each pass with a y-flipped viewport
   (a negative `VkViewport::height`) rather than asking shaders to invert `SV_Position.y`.
-- **`RasterState::frontCCW` is stated in clip space.** `false`, the default, is D3D's convention, where
-  the clockwise face is the front one; `true` is glTF's, where the counter-clockwise face is. Because the
-  y-flip mirrors the winding Vulkan derives the facing from, the Vulkan backend inverts this flag when it
-  fills `VkPipelineRasterizationStateCreateInfo`. Setting the same `RasterState` therefore culls the same
-  faces on D3D12 and Vulkan.
+- **`RasterState::frontCCW` has D3D's meaning.** It is the winding of a triangle as it lands on the render
+  target, with clip space y-up: `false`, the default, makes the clockwise face the front one (D3D's
+  default), `true` the counter-clockwise one (`FrontCounterClockwise`). The Vulkan backend's y-flipped
+  viewport puts the image the same way up as D3D's, and Vulkan derives the facing from that image, so it
+  maps the flag to the `VkFrontFace` of the same name - which is also DXVK's mapping under the same flip.
+  Setting the same `RasterState` therefore culls the same faces on D3D12 and Vulkan.
 
 ## Notes
 
