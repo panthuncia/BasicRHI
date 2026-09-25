@@ -734,6 +734,8 @@ namespace rhi {
 		IndirectIndex,    // binding (binding + i) reads the heap slot whose index (uint32) is at record + recordOffset + 4 * i;
 		                  // samplers ranges (samplers = true) index the sampler heap
 		IndirectAddress,  // constant buffer (binding + i) reads the buffer whose device address (uint64) is at record + recordOffset + 8 * i
+		PushAddress,      // constant buffer (binding + i) reads the buffer whose device address (uint64) is push data itself: dwords
+		                  // addressOffset32 + 2 * i of push constant range addressRootIndex (no record)
 	};
 
 	struct LayoutBindingRange {
@@ -742,7 +744,7 @@ namespace rhi {
 		ShaderStage visibility = ShaderStage::All;
 		LayoutRangeSource source = LayoutRangeSource::HeapSlot;
 		// Indirect sources: the record's device address is the uint64 at dword addressOffset32 of push
-		// constant range addressRootIndex (a RootConstants32 range of this layout).
+		// constant range addressRootIndex (a RootConstants32 range of this layout). PushAddress: the first buffer's.
 		uint32_t addressRootIndex = 0;
 		uint32_t addressOffset32 = 0;
 		uint32_t recordOffset = 0;  // bytes
@@ -786,6 +788,9 @@ namespace rhi {
 		// binds the set's pipelines itself; the command list's bound pipeline is replaced by the set's
 		// initial pipeline.
 		IndirectPipelineSetHandle pipelineSet{};
+		// The commands may be processed and executed in any order (Vulkan: the layout's UNORDERED_SEQUENCES usage), which
+		// lets the implementation generate them in parallel. Only for streams whose result does not depend on draw order.
+		bool unorderedSequences = false;
 	};
 
 	// A table of pipelines an indirect command stream selects from per command (Vulkan indirect

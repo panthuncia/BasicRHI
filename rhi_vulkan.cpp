@@ -1741,6 +1741,11 @@ namespace rhi {
 							mapping.sourceData.indirectAddress.pushOffset = pushOffset;
 							mapping.sourceData.indirectAddress.addressOffset = range.recordOffset + 8u * i;
 						}
+						else if (range.source == LayoutRangeSource::PushAddress) {
+							mapping.resourceMask = VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT;
+							mapping.source = VK_DESCRIPTOR_MAPPING_SOURCE_PUSH_ADDRESS_EXT;
+							mapping.sourceData.pushAddressOffset = pushOffset + 8u * i;
+						}
 						else {
 							mapping.resourceMask = range.samplers ? kSamplerDescriptorHeapMask : kResourceDescriptorHeapMask;
 							mapping.source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_EXT;
@@ -7041,10 +7046,15 @@ namespace rhi {
 				if (range.source == LayoutRangeSource::HeapSlot) {
 					continue;
 				}
+				// A push address range holds one address per binding in push data, the others one record address.
+				const uint32_t addressWords = range.source == LayoutRangeSource::PushAddress ? 2u * range.count : 2u;
 				const bool validAddress = range.addressRootIndex < layoutState.pushConstants.size() &&
 				                          layoutState.pushConstants[range.addressRootIndex].type == PushConstantRangeType::RootConstants32 &&
-				                          range.addressOffset32 + 2u <= layoutState.pushConstants[range.addressRootIndex].num32BitValues;
-				if (!validAddress || range.count == 0 || (range.source == LayoutRangeSource::IndirectAddress && range.samplers)) {
+				                          range.addressOffset32 + addressWords <= layoutState.pushConstants[range.addressRootIndex].num32BitValues;
+				const bool addressesAligned = range.source != LayoutRangeSource::PushAddress ||
+				                              ((layoutState.pushConstantRanges[range.addressRootIndex].byteOffset + range.addressOffset32 * 4u) % 8u) == 0;
+				if (!validAddress || !addressesAligned || range.count == 0 ||
+					((range.source == LayoutRangeSource::IndirectAddress || range.source == LayoutRangeSource::PushAddress) && range.samplers)) {
 					spdlog::error("Vulkan CreatePipelineLayout: indirect range at set {} binding {} needs a record address inside a RootConstants32 range", range.set, range.binding);
 					out.Reset();
 					RHI_FAIL(Result::InvalidArgument);
@@ -7529,6 +7539,7 @@ namespace rhi {
 				const VkShaderStageFlags layoutShaderStages = shaderStages != 0 ? shaderStages : VK_SHADER_STAGE_ALL;
 				VkIndirectCommandsLayoutCreateInfoEXT layoutCreateInfo{ VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_CREATE_INFO_EXT };
 				layoutCreateInfo.pNext = nullptr;
+				layoutCreateInfo.flags = desc.unorderedSequences ? VK_INDIRECT_COMMANDS_LAYOUT_USAGE_UNORDERED_SEQUENCES_BIT_EXT : 0;
 				layoutCreateInfo.shaderStages = layoutShaderStages;
 				layoutCreateInfo.indirectStride = desc.byteStride;
 				layoutCreateInfo.pipelineLayout = VK_NULL_HANDLE;
