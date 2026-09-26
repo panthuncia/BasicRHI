@@ -791,6 +791,10 @@ namespace rhi {
 		// The commands may be processed and executed in any order (Vulkan: the layout's UNORDERED_SEQUENCES usage), which
 		// lets the implementation generate them in parallel. Only for streams whose result does not depend on draw order.
 		bool unorderedSequences = false;
+		// Every ExecuteIndirect of this signature is preprocessed first, by CommandList::PreprocessIndirect in the same list
+		// (Vulkan: the layout's EXPLICIT_PREPROCESS usage; an execution without its preprocess is an error). No effect on
+		// D3D12, whose driver preprocesses inside ExecuteIndirect.
+		bool explicitPreprocess = false;
 	};
 
 	// A table of pipelines an indirect command stream selects from per command (Vulkan indirect
@@ -2711,6 +2715,11 @@ namespace rhi {
 		void (*beginDebugLabel)(CommandList*, const float rgba[4], const char* name) noexcept = nullptr;
 		void (*endDebugLabel)(CommandList*) noexcept = nullptr;
 		void (*insertDebugLabel)(CommandList*, const float rgba[4], const char* name) noexcept = nullptr;
+		// The explicit preprocess of a later ExecuteIndirect (CommandList::PreprocessIndirect); null where the backend has none.
+		void (*preprocessIndirect)(CommandList*, CommandList& stateSource, CommandSignatureHandle sig,
+			ResourceHandle argumentBuffer, uint64_t argumentOffset,
+			ResourceHandle countBuffer, uint64_t countOffset,
+			uint32_t maxCommandCount) noexcept = nullptr;
 	};
 
 	class CommandList {
@@ -2755,6 +2764,21 @@ namespace rhi {
 			vt->clearDepthStencilViewBySlot(this, s, clearDepth, clearStencil, depth, stencil);
 		}
 		void ExecuteIndirect(CommandSignatureHandle sig,
+			ResourceHandle argBuf, uint64_t argOff,
+			ResourceHandle cntBuf, uint64_t cntOff,
+			uint32_t maxCount) noexcept;
+		/**
+		 * @brief Preprocesses a later ExecuteIndirect of this list - the same signature, buffers, offsets and maxCount -
+		 * outside any pass, so that the execution only runs the generated commands. The signature must have been created
+		 * with explicitPreprocess.
+		 *
+		 * stateSource supplies the state the preprocess is generated for, which the execution must have bound identically:
+		 * a recording list that is never submitted, with the execution's pass begun and its layout, push data and dynamic
+		 * state set. The signature's initial pipeline, and this list's descriptor heaps when stateSource has none, are
+		 * bound on it here. Record every preprocess of a pass before it: their results become visible at this list's next
+		 * BeginPass. The arguments must not change in between. A no-op where the backend has no explicit preprocess (D3D12).
+		 */
+		void PreprocessIndirect(CommandList& stateSource, CommandSignatureHandle sig,
 			ResourceHandle argBuf, uint64_t argOff,
 			ResourceHandle cntBuf, uint64_t cntOff,
 			uint32_t maxCount) noexcept;
@@ -3221,6 +3245,9 @@ namespace rhi {
 	inline void CommandList::ExecuteIndirectRtasOperations(const RayTracingRtasOperationDesc* descs, uint32_t count) noexcept { if (vt->executeIndirectRtasOperations) vt->executeIndirectRtasOperations(this, descs, count); }
 	inline void CommandList::ExecuteIndirect(CommandSignatureHandle sig, ResourceHandle argBuf, uint64_t argOff, ResourceHandle cntBuf, uint64_t cntOff, uint32_t maxCount) noexcept {
 		vt->executeIndirect(this, sig, argBuf, argOff, cntBuf, cntOff, maxCount);
+	}
+	inline void CommandList::PreprocessIndirect(CommandList& state, CommandSignatureHandle sig, ResourceHandle argBuf, uint64_t argOff, ResourceHandle cntBuf, uint64_t cntOff, uint32_t maxCount) noexcept {
+		if (vt->preprocessIndirect) vt->preprocessIndirect(this, state, sig, argBuf, argOff, cntBuf, cntOff, maxCount);
 	}
 	inline void CommandList::SetDescriptorHeaps(DescriptorHeapHandle csu, std::optional<DescriptorHeapHandle> samp) noexcept { vt->setDescriptorHeaps(this, csu, samp); }
 	inline void CommandList::ClearUavUint(const UavClearInfo& i, const UavClearUint& v) noexcept { vt->clearUavUint(this, i, v); }

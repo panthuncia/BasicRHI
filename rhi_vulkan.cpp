@@ -4419,11 +4419,25 @@ namespace rhi {
 			for (auto& page : commandListState->generatedCommandsPreprocessPages) {
 				page.cursor = 0;
 			}
+			commandListState->preprocessedIndirect.clear();
+			commandListState->preprocessBarrierPending = false;
 			commandListState->emulatedRootConstantShadowStates.clear();
 			commandListState->passRenderArea = {};
 			commandListState->passColorResources.clear();
 			commandListState->passDepthResource = {};
 			commandListState->isRecording = true;
+		}
+
+		// The preprocesses recorded so far become visible to the executions that read them (their indirect command reads).
+		static void VkFlushPreprocessBarrier(VulkanCommandList& commandListState) noexcept {
+			if (!commandListState.preprocessBarrierPending)
+				return;
+			VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+			barrier.srcAccessMask = VK_ACCESS_COMMAND_PREPROCESS_WRITE_BIT_EXT;
+			barrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+			vkCmdPipelineBarrier(commandListState.commandBuffer, VK_PIPELINE_STAGE_COMMAND_PREPROCESS_BIT_EXT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1,
+				&barrier, 0, nullptr, 0, nullptr);
+			commandListState.preprocessBarrierPending = false;
 		}
 
 		static void cl_beginPass(CommandList* commandList, const PassBeginInfo& passInfo) noexcept {
@@ -4435,6 +4449,7 @@ namespace rhi {
 			if (commandListState->passActive) {
 				cl_endPass(commandList);
 			}
+			VkFlushPreprocessBarrier(*commandListState);
 
 			std::vector<VkRenderingAttachmentInfo> colorAttachments;
 			colorAttachments.reserve(passInfo.colors.size);
@@ -4594,6 +4609,22 @@ namespace rhi {
 			}
 			VkPipelineStageFlags srcStages = 0;
 			VkPipelineStageFlags dstStages = 0;
+			// With generated commands, indirect arguments are also read by the preprocess, explicit or inside the execution,
+			// in its own stage: a barrier to or from indirect argument reads covers it too.
+			const VulkanQueueState* recordingQueueState = VkPrimaryQueueStateForKind(impl, commandListState->kind);
+			const bool preprocessReads = impl->deviceGeneratedCommandsEnabled && recordingQueueState &&
+				recordingQueueState->familyIndex < impl->queueFamilyProperties.size() &&
+				(impl->queueFamilyProperties[recordingQueueState->familyIndex].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != 0;
+			auto addPreprocessReads = [&](VkAccessFlags srcAccess, VkAccessFlags& dstAccess) {
+				if (!preprocessReads)
+					return;
+				if ((srcAccess & VK_ACCESS_INDIRECT_COMMAND_READ_BIT) != 0)
+					srcStages |= VK_PIPELINE_STAGE_COMMAND_PREPROCESS_BIT_EXT;
+				if ((dstAccess & VK_ACCESS_INDIRECT_COMMAND_READ_BIT) != 0) {
+					dstAccess |= VK_ACCESS_COMMAND_PREPROCESS_READ_BIT_EXT;
+					dstStages |= VK_PIPELINE_STAGE_COMMAND_PREPROCESS_BIT_EXT;
+				}
+			};
 
 			auto getRecordingTextureState = [&](ResourceHandle texture, const VulkanResource& resource) -> VulkanCommandList::RecordingTextureState {
 				for (const auto& state : commandListState->recordingTextureStates) {
@@ -4702,6 +4733,7 @@ namespace rhi {
 				vkBarrier.dstAccessMask = (externalRelease || internalRelease) ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
 				vkBarrier.srcQueueFamilyIndex = externalAcquire ? VK_QUEUE_FAMILY_EXTERNAL : (externalRelease ? recordingFamily : ownershipSrcFamily);
 				vkBarrier.dstQueueFamilyIndex = externalAcquire ? recordingFamily : (externalRelease ? VK_QUEUE_FAMILY_EXTERNAL : ownershipDstFamily);
+				addPreprocessReads(vkBarrier.srcAccessMask, vkBarrier.dstAccessMask);
 				vkBarrier.buffer = resource->buffer;
 				vkBarrier.offset = barrier.offset;
 				vkBarrier.size = barrier.size == ~0ull ? VK_WHOLE_SIZE : barrier.size;
@@ -4731,6 +4763,7 @@ namespace rhi {
 					vkBarrier.srcAccessMask &= ~accelerationStructureAccess;
 					vkBarrier.dstAccessMask &= ~accelerationStructureAccess;
 				}
+				addPreprocessReads(vkBarrier.srcAccessMask, vkBarrier.dstAccessMask);
 				memoryBarriers.push_back(vkBarrier);
 				srcStages |= VkStageMaskForSync(barrier.beforeSync);
 				dstStages |= VkStageMaskForSync(barrier.afterSync);
@@ -5439,6 +5472,110 @@ namespace rhi {
 			}
 		}
 
+		static void cl_setDescriptorHeaps(CommandList* commandList, DescriptorHeapHandle cbvSrvUav, std::optional<DescriptorHeapHandle> sampler) noexcept;
+
+		static bool VkSameHandle(const auto& a, const auto& b) noexcept { return a.index == b.index && a.generation == b.generation; }
+
+		/**
+		 * @brief A generated-commands call's info, identical for its preprocess and its execution: the pipeline (the one
+		 * bound on a_pipelineList, or the execution set's initial one, which is bound on it first, as the execution does), the
+		 * layout, and the argument and count addresses. False, with a_errorList's error set, when the call cannot be made.
+		 */
+		static bool VkGeneratedCommandsCall(VulkanDevice* impl, CommandList* a_pipelineList, VulkanCommandList& a_errorList,
+			const VulkanCommandSignature& signatureState, const VulkanResource& argumentResource, uint64_t argumentOffset,
+			const VulkanResource* countResource, uint64_t countOffset, uint32_t maxCommandCount,
+			VkGeneratedCommandsInfoEXT& info, VkGeneratedCommandsPipelineInfoEXT& pipelineInfo, VkPipeline& pipeline) noexcept {
+			VulkanIndirectPipelineSet* pipelineSetState = nullptr;
+			if (signatureState.pipelineSet.valid()) {
+				// The commands select pipelines from the set; start from its initial pipeline, which every
+				// pipeline in the set is compatible with.
+				pipelineSetState = VkIndirectPipelineSetState(impl, signatureState.pipelineSet);
+				if (!pipelineSetState) {
+					a_errorList.pendingError = Result::InvalidArgument;
+					spdlog::error("Vulkan ExecuteIndirect: the signature's indirect pipeline set was destroyed");
+					return false;
+				}
+				cl_bindPipeline(a_pipelineList, pipelineSetState->initialPipeline);
+			}
+			VulkanCommandList* pipelineListState = VkCommandListState(a_pipelineList);
+			VulkanPipeline* pipelineState = pipelineListState ? VkPipelineState(impl, pipelineListState->boundPipeline) : nullptr;
+			if (!pipelineState || pipelineState->pipeline == VK_NULL_HANDLE || argumentResource.deviceAddress == 0 || !vkCmdExecuteGeneratedCommandsEXT) {
+				a_errorList.pendingError = Result::InvalidArgument;
+				spdlog::error("Vulkan ExecuteIndirect DGC rejected invalid pipeline, argument address, or entry point");
+				return false;
+			}
+			pipeline = pipelineState->pipeline;
+			pipelineInfo = { VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT };
+			pipelineInfo.pipeline = pipelineState->pipeline;
+			info = { VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT };
+			// With an execution set the pipelines come from the set, not from pNext.
+			info.pNext = pipelineSetState ? nullptr : &pipelineInfo;
+			info.shaderStages = pipelineState->bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS;
+			info.indirectExecutionSet = pipelineSetState ? pipelineSetState->executionSet : VK_NULL_HANDLE;
+			info.indirectCommandsLayout = signatureState.indirectLayout;
+			info.indirectAddress = argumentResource.deviceAddress + argumentOffset;
+			info.indirectAddressSize = static_cast<VkDeviceSize>(signatureState.byteStride) * maxCommandCount;
+			info.maxSequenceCount = maxCommandCount;
+			info.sequenceCountAddress = countResource && countResource->deviceAddress != 0 ? countResource->deviceAddress + countOffset : 0;
+			info.maxDrawCount = maxCommandCount;
+			return true;
+		}
+
+		static void cl_preprocessIndirect(CommandList* commandList,
+			CommandList& stateSource,
+			CommandSignatureHandle signature,
+			ResourceHandle argumentBuffer,
+			uint64_t argumentOffset,
+			ResourceHandle countBuffer,
+			uint64_t countOffset,
+			uint32_t maxCommandCount) noexcept {
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			VulkanCommandList* stateListState = VkCommandListState(&stateSource);
+			VulkanCommandSignature* signatureState = VkCommandSignatureState(impl, signature);
+			VulkanResource* argumentResource = VkResourceState(impl, argumentBuffer);
+			VulkanResource* countResource = VkResourceState(impl, countBuffer);
+			if (!commandListState || maxCommandCount == 0)
+				return;
+			if (!stateListState || stateSource.impl != impl || !signatureState || !signatureState->explicitPreprocess || !argumentResource ||
+				argumentResource->buffer == VK_NULL_HANDLE || !vkCmdPreprocessGeneratedCommandsEXT) {
+				commandListState->pendingError = Result::InvalidArgument;
+				spdlog::error("Vulkan PreprocessIndirect: invalid state list, signature without explicitPreprocess, or argument buffer");
+				return;
+			}
+			if (commandListState->passActive || !commandListState->isRecording || !stateListState->isRecording) {
+				commandListState->pendingError = Result::InvalidCall;
+				spdlog::error("Vulkan PreprocessIndirect: must be recorded outside a pass, with both lists recording");
+				return;
+			}
+			// The execution sees this list's descriptor heaps; the state it is generated for must have the same.
+			if (!stateListState->boundCbvSrvUavHeap.valid() && commandListState->boundCbvSrvUavHeap.valid()) {
+				cl_setDescriptorHeaps(&stateSource, commandListState->boundCbvSrvUavHeap,
+					commandListState->boundSamplerHeap.valid() ? std::optional<DescriptorHeapHandle>(commandListState->boundSamplerHeap) : std::nullopt);
+			}
+			VkGeneratedCommandsInfoEXT info{};
+			VkGeneratedCommandsPipelineInfoEXT pipelineInfo{};
+			VkPipeline pipeline = VK_NULL_HANDLE;
+			if (!VkGeneratedCommandsCall(impl, &stateSource, *commandListState, *signatureState, *argumentResource, argumentOffset, countResource, countOffset,
+					maxCommandCount, info, pipelineInfo, pipeline))
+				return;
+			VkDeviceAddress preprocessAddress = 0;
+			VkDeviceSize preprocessSize = 0;
+			const Result preprocessResult = VkAllocateGeneratedCommandsPreprocessRange(impl, *commandListState, *signatureState,
+				info.indirectExecutionSet ? VK_NULL_HANDLE : pipeline, info.indirectExecutionSet, maxCommandCount, preprocessAddress, preprocessSize);
+			if (preprocessResult != Result::Ok) {
+				commandListState->pendingError = preprocessResult;
+				spdlog::error("Vulkan PreprocessIndirect failed to allocate DGC preprocess memory: result={} maxCommands={}", ResultName(preprocessResult), maxCommandCount);
+				return;
+			}
+			info.preprocessAddress = preprocessAddress;
+			info.preprocessSize = preprocessSize;
+			vkCmdPreprocessGeneratedCommandsEXT(commandListState->commandBuffer, &info, stateListState->commandBuffer);
+			commandListState->preprocessBarrierPending = true;
+			commandListState->preprocessedIndirect.push_back({ signature, argumentBuffer, argumentOffset, countBuffer, countOffset, maxCommandCount, pipeline,
+				preprocessAddress, preprocessSize });
+		}
+
 		static void cl_executeIndirect(CommandList* commandList,
 			CommandSignatureHandle signature,
 			ResourceHandle argumentBuffer,
@@ -5456,59 +5593,47 @@ namespace rhi {
 			}
 
 			const uint32_t stride = signatureState->byteStride;
-			VulkanIndirectPipelineSet* pipelineSetState = nullptr;
-			if (signatureState->pipelineSet.valid()) {
-				// The commands select pipelines from the set; start from its initial pipeline, which every
-				// pipeline in the set is compatible with.
-				pipelineSetState = VkIndirectPipelineSetState(impl, signatureState->pipelineSet);
-				if (!pipelineSetState) {
-					commandListState->pendingError = Result::InvalidArgument;
-					spdlog::error("Vulkan ExecuteIndirect: the signature's indirect pipeline set was destroyed");
-					return;
-				}
-				cl_bindPipeline(commandList, pipelineSetState->initialPipeline);
-			}
 			if (signatureState->indirectLayout != VK_NULL_HANDLE) {
-				VulkanPipeline* pipelineState = VkPipelineState(impl, commandListState->boundPipeline);
-				if (!impl || !pipelineState || pipelineState->pipeline == VK_NULL_HANDLE || argumentResource->deviceAddress == 0 || !vkCmdExecuteGeneratedCommandsEXT) {
-					commandListState->pendingError = Result::InvalidArgument;
-					spdlog::error("Vulkan ExecuteIndirect DGC rejected invalid pipeline, argument address, or entry point");
+				VkGeneratedCommandsInfoEXT generatedInfo{};
+				VkGeneratedCommandsPipelineInfoEXT pipelineInfo{};
+				VkPipeline pipeline = VK_NULL_HANDLE;
+				if (!VkGeneratedCommandsCall(impl, commandList, *commandListState, *signatureState, *argumentResource, argumentOffset, countResource, countOffset,
+						maxCommandCount, generatedInfo, pipelineInfo, pipeline))
+					return;
+				if (signatureState->explicitPreprocess) {
+					// Run what this call's PreprocessIndirect generated; each preprocess serves one execution.
+					auto& preprocessed = commandListState->preprocessedIndirect;
+					const auto match = std::find_if(preprocessed.begin(), preprocessed.end(), [&](const VulkanCommandList::PreprocessedIndirect& p) {
+						return VkSameHandle(p.signature, signature) && VkSameHandle(p.argumentBuffer, argumentBuffer) && p.argumentOffset == argumentOffset &&
+						       VkSameHandle(p.countBuffer, countBuffer) && p.countOffset == countOffset && p.maxCommandCount == maxCommandCount &&
+						       p.pipeline == pipeline;
+					});
+					if (match == preprocessed.end()) {
+						commandListState->pendingError = Result::InvalidCall;
+						spdlog::error("Vulkan ExecuteIndirect: the signature needs explicit preprocessing and this call has no PreprocessIndirect");
+						return;
+					}
+					generatedInfo.preprocessAddress = match->preprocessAddress;
+					generatedInfo.preprocessSize = match->preprocessSize;
+					preprocessed.erase(match);
+					if (!commandListState->passActive)
+						VkFlushPreprocessBarrier(*commandListState);
+					vkCmdExecuteGeneratedCommandsEXT(commandListState->commandBuffer, VK_TRUE, &generatedInfo);
 					return;
 				}
 
 				VkDeviceAddress preprocessAddress = 0;
 				VkDeviceSize preprocessSize = 0;
-				const Result preprocessResult = VkAllocateGeneratedCommandsPreprocessRange(
-					impl,
-					*commandListState,
-					*signatureState,
-					pipelineSetState ? VK_NULL_HANDLE : pipelineState->pipeline,
-					pipelineSetState ? pipelineSetState->executionSet : VK_NULL_HANDLE,
-					maxCommandCount,
-					preprocessAddress,
-					preprocessSize);
+				const Result preprocessResult = VkAllocateGeneratedCommandsPreprocessRange(impl, *commandListState, *signatureState,
+					generatedInfo.indirectExecutionSet ? VK_NULL_HANDLE : pipeline, generatedInfo.indirectExecutionSet, maxCommandCount, preprocessAddress, preprocessSize);
 				if (preprocessResult != Result::Ok) {
 					commandListState->pendingError = preprocessResult;
 					spdlog::error("Vulkan ExecuteIndirect failed to allocate DGC preprocess memory: result={} maxCommands={}",
 						ResultName(preprocessResult), maxCommandCount);
 					return;
 				}
-
-				VkGeneratedCommandsInfoEXT generatedInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT };
-				VkGeneratedCommandsPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT };
-				pipelineInfo.pipeline = pipelineState->pipeline;
-				// With an execution set the pipelines come from the set, not from pNext.
-				generatedInfo.pNext = pipelineSetState ? nullptr : &pipelineInfo;
-				generatedInfo.shaderStages = pipelineState->bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS;
-				generatedInfo.indirectExecutionSet = pipelineSetState ? pipelineSetState->executionSet : VK_NULL_HANDLE;
-				generatedInfo.indirectCommandsLayout = signatureState->indirectLayout;
-				generatedInfo.indirectAddress = argumentResource->deviceAddress + argumentOffset;
-				generatedInfo.indirectAddressSize = static_cast<VkDeviceSize>(stride) * maxCommandCount;
 				generatedInfo.preprocessAddress = preprocessAddress;
 				generatedInfo.preprocessSize = preprocessSize;
-				generatedInfo.maxSequenceCount = maxCommandCount;
-				generatedInfo.sequenceCountAddress = countResource && countResource->deviceAddress != 0 ? countResource->deviceAddress + countOffset : 0;
-				generatedInfo.maxDrawCount = maxCommandCount;
 				vkCmdExecuteGeneratedCommandsEXT(commandListState->commandBuffer, VK_FALSE, &generatedInfo);
 				return;
 			}
@@ -7539,7 +7664,8 @@ namespace rhi {
 				const VkShaderStageFlags layoutShaderStages = shaderStages != 0 ? shaderStages : VK_SHADER_STAGE_ALL;
 				VkIndirectCommandsLayoutCreateInfoEXT layoutCreateInfo{ VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_CREATE_INFO_EXT };
 				layoutCreateInfo.pNext = nullptr;
-				layoutCreateInfo.flags = desc.unorderedSequences ? VK_INDIRECT_COMMANDS_LAYOUT_USAGE_UNORDERED_SEQUENCES_BIT_EXT : 0;
+				layoutCreateInfo.flags = (desc.unorderedSequences ? VK_INDIRECT_COMMANDS_LAYOUT_USAGE_UNORDERED_SEQUENCES_BIT_EXT : 0) |
+					(desc.explicitPreprocess ? VK_INDIRECT_COMMANDS_LAYOUT_USAGE_EXPLICIT_PREPROCESS_BIT_EXT : 0);
 				layoutCreateInfo.shaderStages = layoutShaderStages;
 				layoutCreateInfo.indirectStride = desc.byteStride;
 				layoutCreateInfo.pipelineLayout = VK_NULL_HANDLE;
@@ -7557,6 +7683,7 @@ namespace rhi {
 			signature.byteStride = desc.byteStride;
 			signature.indirectLayout = indirectLayout;
 			signature.pipelineSet = desc.pipelineSet;
+			signature.explicitPreprocess = desc.explicitPreprocess && indirectLayout != VK_NULL_HANDLE;
 			const CommandSignatureHandle handle = impl->commandSignatures.alloc(signature);
 			CommandSignature object{ handle };
 			object.impl = impl;
@@ -9773,7 +9900,8 @@ namespace rhi {
 		&cl_endChecked,
 		&cl_beginDebugLabel,
 		&cl_endDebugLabel,
-		&cl_insertDebugLabel
+		&cl_insertDebugLabel,
+		&cl_preprocessIndirect
 	};
 
 	const SwapchainVTable g_vkscvt = {

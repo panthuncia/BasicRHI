@@ -313,6 +313,7 @@ namespace rhi {
 		uint32_t byteStride = 0;
 		VkIndirectCommandsLayoutEXT indirectLayout = VK_NULL_HANDLE;
 		IndirectPipelineSetHandle pipelineSet{};  // set a PipelineIndex argument selects from
+		bool explicitPreprocess = false;  // the layout has EXPLICIT_PREPROCESS: every execution is preprocessed first
 	};
 
 	struct VulkanIndirectPipelineSet {
@@ -442,6 +443,21 @@ namespace rhi {
 		// Keep unique ranges with the command list so overlapping recorded lists
 		// (and distinct commands in one list) never alias the same scratch bytes.
 		std::vector<GeneratedCommandsPreprocessPage> generatedCommandsPreprocessPages;
+		// Explicit preprocesses recorded in this list and not yet executed, each consumed by the one execution it matches.
+		struct PreprocessedIndirect {
+			CommandSignatureHandle signature{};
+			ResourceHandle argumentBuffer{};
+			uint64_t argumentOffset = 0;
+			ResourceHandle countBuffer{};
+			uint64_t countOffset = 0;
+			uint32_t maxCommandCount = 0;
+			VkPipeline pipeline = VK_NULL_HANDLE;
+			VkDeviceAddress preprocessAddress = 0;
+			VkDeviceSize preprocessSize = 0;
+		};
+		std::vector<PreprocessedIndirect> preprocessedIndirect;
+		// A preprocess was recorded since the last barrier making preprocess output visible to executions.
+		bool preprocessBarrierPending = false;
 		std::vector<EmulatedRootConstantShadowState> emulatedRootConstantShadowStates;
 		std::vector<VkQueryPool> transientQueryPools;
 		std::vector<TracyGpuOpenZone> tracyGpuZoneStack;
