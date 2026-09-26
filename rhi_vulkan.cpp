@@ -3950,7 +3950,7 @@ namespace rhi {
 			submitInfo.pSignalSemaphores = signalSemaphores.empty() ? nullptr : signalSemaphores.data();
 
 			Result submitResult = Result::Ok;
-			if (impl->submissionSubmit) {
+			if (impl->submissionSubmit || impl->submissionSubmitResources) {
 				// The adopting host orders the batch within its own queue stream.
 				std::vector<VkSemaphoreSubmitInfo> waitInfos(waitSemaphores.size(), { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO });
 				for (size_t index = 0; index < waitInfos.size(); ++index) {
@@ -3975,7 +3975,21 @@ namespace rhi {
 				submitInfo2.pCommandBufferInfos = commandBufferInfos.empty() ? nullptr : commandBufferInfos.data();
 				submitInfo2.signalSemaphoreInfoCount = static_cast<uint32_t>(signalInfos.size());
 				submitInfo2.pSignalSemaphoreInfos = signalInfos.empty() ? nullptr : signalInfos.data();
-				submitResult = ToRHI(impl->submissionSubmit(impl->submissionHookUser, queueState->queue, submitInfo2));
+				if (impl->submissionSubmitResources) {
+					std::vector<vulkan::CommandBufferResourceAccesses> manifests;
+					manifests.reserve(lists.size);
+					for (const auto& list : lists) {
+						const auto* recorded = VkCommandListState(impl, list.GetHandle());
+						if (!recorded) RHI_FAIL(Result::InvalidArgument);
+						manifests.push_back({recorded->commandBuffer,
+							{recorded->resourceAccesses.data(), static_cast<uint32_t>(recorded->resourceAccesses.size())},
+							recorded->resourceAccessesComplete});
+					}
+					submitResult = ToRHI(impl->submissionSubmitResources(impl->submissionHookUser, queueState->queue, submitInfo2,
+						{manifests.data(), static_cast<uint32_t>(manifests.size())}));
+				} else {
+					submitResult = ToRHI(impl->submissionSubmit(impl->submissionHookUser, queueState->queue, submitInfo2));
+				}
 			}
 			else {
 				const VkQueueAccessGuard queueAccess(impl, queueState->queue);
@@ -4410,6 +4424,8 @@ namespace rhi {
 			commandListState->boundCbvSrvUavHeap = {};
 			commandListState->boundSamplerHeap = {};
 			commandListState->pendingError = Result::Ok;
+			commandListState->resourceAccesses.clear();
+			commandListState->resourceAccessesComplete = false;
 			commandListState->recordedBarrierBatches.clear();
 			commandListState->recordingTextureStates.clear();
 			commandListState->recordingBufferStates.clear();
@@ -4584,9 +4600,9 @@ namespace rhi {
 				cl_endPass(commandList);
 			}
 
-			std::vector<VkImageMemoryBarrier> imageBarriers;
-			std::vector<VkBufferMemoryBarrier> bufferBarriers;
-			std::vector<VkMemoryBarrier> memoryBarriers;
+			std::vector<VkImageMemoryBarrier2> imageBarriers;
+			std::vector<VkBufferMemoryBarrier2> bufferBarriers;
+			std::vector<VkMemoryBarrier2> memoryBarriers;
 			struct TextureStateUpdate {
 				ResourceHandle handle{};
 				VulkanResource* resource = nullptr;
@@ -4607,19 +4623,21 @@ namespace rhi {
 				recordedBatch.textures.reserve(barriers.textures.size);
 				recordedBatch.buffers.reserve(barriers.buffers.size);
 			}
-			VkPipelineStageFlags srcStages = 0;
-			VkPipelineStageFlags dstStages = 0;
+			VkPipelineStageFlags2 srcStages = 0;
+			VkPipelineStageFlags2 dstStages = 0;
 			// With generated commands, indirect arguments are also read by the preprocess, explicit or inside the execution,
 			// in its own stage: a barrier to or from indirect argument reads covers it too.
 			const VulkanQueueState* recordingQueueState = VkPrimaryQueueStateForKind(impl, commandListState->kind);
 			const bool preprocessReads = impl->deviceGeneratedCommandsEnabled && recordingQueueState &&
 				recordingQueueState->familyIndex < impl->queueFamilyProperties.size() &&
 				(impl->queueFamilyProperties[recordingQueueState->familyIndex].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != 0;
-			auto addPreprocessReads = [&](VkAccessFlags srcAccess, VkAccessFlags& dstAccess) {
+			auto addPreprocessReads = [&](VkAccessFlags2& srcAccess, VkAccessFlags2& dstAccess) {
 				if (!preprocessReads)
 					return;
-				if ((srcAccess & VK_ACCESS_INDIRECT_COMMAND_READ_BIT) != 0)
-					srcStages |= VK_PIPELINE_STAGE_COMMAND_PREPROCESS_BIT_EXT;
+				if ((srcAccess & VK_ACCESS_INDIRECT_COMMAND_READ_BIT) != 0) {
+					srcAccess |= VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT;
+					srcStages |= VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT;
+				}
 				if ((dstAccess & VK_ACCESS_INDIRECT_COMMAND_READ_BIT) != 0) {
 					dstAccess |= VK_ACCESS_COMMAND_PREPROCESS_READ_BIT_EXT;
 					dstStages |= VK_PIPELINE_STAGE_COMMAND_PREPROCESS_BIT_EXT;
@@ -4657,6 +4675,7 @@ namespace rhi {
 			};
 
 			for (const TextureBarrier& barrier : barriers.textures) {
+				srcStages = dstStages = 0;
 				VulkanResource* resource = VkResourceState(impl, barrier.texture);
 				if (!resource || resource->image == VK_NULL_HANDLE) {
 					continue;
@@ -4664,7 +4683,7 @@ namespace rhi {
 				const VkImageAspectFlags aspect = VkAspectMaskForFormat(resource->format);
 				const auto recordingState = getRecordingTextureState(barrier.texture, *resource);
 				const bool firstUseFromUndefined = !barrier.discard && recordingState.layout == ResourceLayout::Undefined && barrier.beforeLayout == ResourceLayout::Undefined;
-				VkImageMemoryBarrier vkBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+				VkImageMemoryBarrier2 vkBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
 				const bool beforePresent = barrier.beforeLayout == ResourceLayout::Present;
 				const bool afterPresent = barrier.afterLayout == ResourceLayout::Present;
 				const bool externalAcquire = barrier.externalOwnership == TextureBarrier::ExternalOwnership::Acquire;
@@ -4686,11 +4705,13 @@ namespace rhi {
 				vkBarrier.dstQueueFamilyIndex = externalAcquire ? recordingFamily : (externalRelease ? VK_QUEUE_FAMILY_EXTERNAL : ownershipDstFamily);
 				vkBarrier.image = resource->image;
 				vkBarrier.subresourceRange = VkMakeImageSubresourceRange(*resource, barrier.range, aspect);
-				imageBarriers.push_back(vkBarrier);
 				const bool beforeTransferClear = (barrier.beforeAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
 				const bool afterTransferClear = (barrier.afterAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
 				srcStages |= (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire || internalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (VkStageMaskForSync(barrier.beforeSync) | (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
 				dstStages |= (afterPresent || externalRelease || internalRelease) ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : (VkStageMaskForSync(barrier.afterSync) | (afterTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
+				vkBarrier.srcStageMask = srcStages;
+				vkBarrier.dstStageMask = dstStages;
+				imageBarriers.push_back(vkBarrier);
 				if (impl->validateBarrierTransitions) {
 					recordedBatch.textures.push_back(VulkanCommandList::RecordedTextureBarrier{
 						barrier.texture,
@@ -4706,11 +4727,12 @@ namespace rhi {
 			}
 
 			for (const BufferBarrier& barrier : barriers.buffers) {
+				srcStages = dstStages = 0;
 				VulkanResource* resource = VkResourceState(impl, barrier.buffer);
 				if (!resource || resource->buffer == VK_NULL_HANDLE) {
 					continue;
 				}
-				VkBufferMemoryBarrier vkBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+				VkBufferMemoryBarrier2 vkBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
 				const bool externalAcquire = barrier.externalOwnership == BufferBarrier::ExternalOwnership::Acquire;
 				const bool externalRelease = barrier.externalOwnership == BufferBarrier::ExternalOwnership::Release;
 				const VulkanQueueState* recordingQueue = VkPrimaryQueueStateForKind(impl, commandListState->kind);
@@ -4737,9 +4759,11 @@ namespace rhi {
 				vkBarrier.buffer = resource->buffer;
 				vkBarrier.offset = barrier.offset;
 				vkBarrier.size = barrier.size == ~0ull ? VK_WHOLE_SIZE : barrier.size;
-				bufferBarriers.push_back(vkBarrier);
 				srcStages |= (barrier.discard || externalAcquire || internalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VkStageMaskForSync(barrier.beforeSync);
 				dstStages |= (externalRelease || internalRelease) ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VkStageMaskForSync(barrier.afterSync);
+				vkBarrier.srcStageMask = srcStages;
+				vkBarrier.dstStageMask = dstStages;
+				bufferBarriers.push_back(vkBarrier);
 				if (impl->validateBarrierTransitions) {
 					recordedBatch.buffers.push_back(VulkanCommandList::RecordedBufferBarrier{
 						barrier.buffer,
@@ -4753,7 +4777,8 @@ namespace rhi {
 			}
 
 			for (const GlobalBarrier& barrier : barriers.globals) {
-				VkMemoryBarrier vkBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+				srcStages = dstStages = 0;
+				VkMemoryBarrier2 vkBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
 				vkBarrier.srcAccessMask = VkAccessMaskForAccess(barrier.beforeAccess);
 				vkBarrier.dstAccessMask = VkAccessMaskForAccess(barrier.afterAccess);
 				if (!impl->accelerationStructureEnabled) {
@@ -4764,9 +4789,11 @@ namespace rhi {
 					vkBarrier.dstAccessMask &= ~accelerationStructureAccess;
 				}
 				addPreprocessReads(vkBarrier.srcAccessMask, vkBarrier.dstAccessMask);
-				memoryBarriers.push_back(vkBarrier);
 				srcStages |= VkStageMaskForSync(barrier.beforeSync);
 				dstStages |= VkStageMaskForSync(barrier.afterSync);
+				vkBarrier.srcStageMask = srcStages;
+				vkBarrier.dstStageMask = dstStages;
+				memoryBarriers.push_back(vkBarrier);
 			}
 
 			if (!imageBarriers.empty() || !bufferBarriers.empty() || !memoryBarriers.empty()) {
@@ -4774,15 +4801,63 @@ namespace rhi {
 				const VkQueueFlags queueFlags = barrierQueue && barrierQueue->familyIndex < impl->queueFamilyProperties.size()
 					? impl->queueFamilyProperties[barrierQueue->familyIndex].queueFlags
 					: (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT);
-				srcStages = VkStagesForQueue(srcStages != 0 ? srcStages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queueFlags);
-				dstStages = VkStagesForQueue(dstStages != 0 ? dstStages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queueFlags);
-				vkCmdPipelineBarrier(commandListState->commandBuffer,
-					srcStages,
-					dstStages,
-					0,
-					static_cast<uint32_t>(memoryBarriers.size()), memoryBarriers.empty() ? nullptr : memoryBarriers.data(),
-					static_cast<uint32_t>(bufferBarriers.size()), bufferBarriers.empty() ? nullptr : bufferBarriers.data(),
-					static_cast<uint32_t>(imageBarriers.size()), imageBarriers.empty() ? nullptr : imageBarriers.data());
+				auto filterStages = [&](auto& array) {
+					for (auto& barrier : array) {
+						if (barrier.srcStageMask)
+							barrier.srcStageMask = VkStagesForQueue(static_cast<VkPipelineStageFlags>(barrier.srcStageMask), queueFlags);
+						if (barrier.dstStageMask)
+							barrier.dstStageMask = VkStagesForQueue(static_cast<VkPipelineStageFlags>(barrier.dstStageMask), queueFlags);
+					}
+				};
+				filterStages(imageBarriers);
+				filterStages(bufferBarriers);
+				filterStages(memoryBarriers);
+				if (impl->submissionSubmit || impl->submissionSubmitResources) {
+					// Adopted submit-hook devices require synchronization2 at adoption.
+					VkDependencyInfo dependency{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+					dependency.memoryBarrierCount = static_cast<uint32_t>(memoryBarriers.size());
+					dependency.pMemoryBarriers = memoryBarriers.data();
+					dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(bufferBarriers.size());
+					dependency.pBufferMemoryBarriers = bufferBarriers.data();
+					dependency.imageMemoryBarrierCount = static_cast<uint32_t>(imageBarriers.size());
+					dependency.pImageMemoryBarriers = imageBarriers.data();
+					vkCmdPipelineBarrier2(commandListState->commandBuffer, &dependency);
+				} else {
+					// Devices without the host contract may not enable synchronization2.
+					// Keep their existing barrier semantics; this is not an epoch fallback.
+					std::vector<VkMemoryBarrier> memories;
+					std::vector<VkBufferMemoryBarrier> buffers;
+					std::vector<VkImageMemoryBarrier> images;
+					srcStages = dstStages = 0;
+					auto accumulate = [&](const auto& barrier) {
+						srcStages |= barrier.srcStageMask;
+						dstStages |= barrier.dstStageMask;
+					};
+					for (const auto& barrier : memoryBarriers) {
+						accumulate(barrier);
+						memories.push_back({ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+							static_cast<VkAccessFlags>(barrier.srcAccessMask), static_cast<VkAccessFlags>(barrier.dstAccessMask) });
+					}
+					for (const auto& barrier : bufferBarriers) {
+						accumulate(barrier);
+						buffers.push_back({ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
+							static_cast<VkAccessFlags>(barrier.srcAccessMask), static_cast<VkAccessFlags>(barrier.dstAccessMask),
+							barrier.srcQueueFamilyIndex, barrier.dstQueueFamilyIndex, barrier.buffer, barrier.offset, barrier.size });
+					}
+					for (const auto& barrier : imageBarriers) {
+						accumulate(barrier);
+						images.push_back({ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+							static_cast<VkAccessFlags>(barrier.srcAccessMask), static_cast<VkAccessFlags>(barrier.dstAccessMask),
+							barrier.oldLayout, barrier.newLayout, barrier.srcQueueFamilyIndex, barrier.dstQueueFamilyIndex,
+							barrier.image, barrier.subresourceRange });
+					}
+					vkCmdPipelineBarrier(commandListState->commandBuffer,
+						static_cast<VkPipelineStageFlags>(srcStages ? srcStages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT),
+						static_cast<VkPipelineStageFlags>(dstStages ? dstStages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT), 0,
+						static_cast<uint32_t>(memories.size()), memories.data(),
+						static_cast<uint32_t>(buffers.size()), buffers.data(),
+						static_cast<uint32_t>(images.size()), images.data());
+				}
 			}
 
 			for (const TextureStateUpdate& update : textureUpdates) {
@@ -11100,7 +11175,7 @@ namespace rhi {
 			VkParseEnabledFeatureChain(info.enabledFeatureChain, coreFeatures, enabled);
 			if (info.enabledCoreFeatures) coreFeatures = *info.enabledCoreFeatures;
 			// Submissions handed to the host are described with VkSubmitInfo2.
-			if (info.submissionHooks.submit && enabled.vulkan13.synchronization2 != VK_TRUE) {
+			if ((info.submissionHooks.submit || info.submissionHooks.submitResources) && enabled.vulkan13.synchronization2 != VK_TRUE) {
 				spdlog::error("AdoptVulkanDevice: a host submit hook requires synchronization2 on the adopted device.");
 				RHI_FAIL(Result::Unsupported);
 			}
@@ -11149,6 +11224,7 @@ namespace rhi {
 			impl->submissionLock = info.submissionHooks.lock;
 			impl->submissionUnlock = info.submissionHooks.unlock;
 			impl->submissionSubmit = info.submissionHooks.submit;
+			impl->submissionSubmitResources = info.submissionHooks.submitResources;
 			vkGetPhysicalDeviceProperties(info.physicalDevice, &impl->physicalDeviceProperties);
 			vkGetPhysicalDeviceMemoryProperties(info.physicalDevice, &impl->memoryProperties);
 			impl->supportedFeatures = coreFeatures;
@@ -11256,6 +11332,65 @@ namespace rhi {
 			if (desc.debugName) VkSetObjectName(impl, reinterpret_cast<uint64_t>(desc.image), VK_OBJECT_TYPE_IMAGE, desc.debugName);
 			out = MakeTexturePtr(&device, texture, impl->selfWeak.lock());
 			return Result::Ok;
+		}
+
+		Result set_command_list_resource_accesses(CommandList commands, Span<ResourceAccessDeclaration> declarations) noexcept {
+			if (!commands || commands.vt != &g_vkclvt) return Result::InvalidArgument;
+			auto* impl = commands ? static_cast<VulkanDevice*>(commands.impl) : nullptr;
+			auto* list = VkCommandListState(&commands);
+			if (!impl || !list || !list->isRecording || (declarations.size && !declarations.data))
+				return Result::InvalidArgument;
+			try {
+				std::vector<NativeResourceAccess> resolved;
+				resolved.reserve(declarations.size);
+				for (const auto& declaration : declarations) {
+					const auto* resource = VkResourceState(impl, declaration.resource);
+					if (!resource || declaration.sync == ResourceSyncState::None)
+						return Result::InvalidArgument;
+					NativeResourceAccess access;
+					access.identity = declaration.resource;
+					access.stages = VkStageMaskForSync(declaration.sync);
+					access.access = VkAccessMaskForAccess(declaration.access);
+					access.write = declaration.write;
+					if (!access.access || access.write != AccessTypeIsWriteType(declaration.access))
+						return Result::InvalidArgument;
+					if ((declaration.access & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear
+						| ResourceAccessType::UnorderedAccessClear)) != 0)
+						access.stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+					if (resource->type == ResourceType::Buffer) {
+						if (declaration.offset >= resource->bufferSize)
+							return Result::InvalidArgument;
+						access.buffer = resource->buffer;
+						access.offset = declaration.offset;
+						access.size = declaration.size == UINT64_MAX ? resource->bufferSize - access.offset : declaration.size;
+						if (!access.size || access.size > resource->bufferSize - access.offset)
+							return Result::InvalidArgument;
+						if (impl->deviceGeneratedCommandsEnabled && (access.access & VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT)) {
+							access.stages |= VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT;
+							access.access |= VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT;
+						}
+					} else {
+						if (!resource->image) return Result::InvalidArgument;
+						const auto& range = declaration.range;
+						const uint32_t layers = resource->type == ResourceType::Texture3D ? 1 : resource->depthOrLayers;
+						if (!range.mipCount || range.baseMip >= resource->mipLevels || range.mipCount > resource->mipLevels - range.baseMip
+							|| !range.layerCount || range.baseLayer >= layers || range.layerCount > layers - range.baseLayer)
+							return Result::InvalidArgument;
+						const auto formatAspects = VkAspectMaskForFormat(resource->format);
+						const auto aspects = declaration.aspects ? declaration.aspects : formatAspects;
+						if (aspects & ~formatAspects) return Result::InvalidArgument;
+						access.image = resource->image;
+						access.range = {aspects, range.baseMip, range.mipCount, range.baseLayer, range.layerCount};
+						access.layout = resource->generalLayoutOnly ? VK_IMAGE_LAYOUT_GENERAL : VkToImageLayout(declaration.layout, aspects);
+					}
+					resolved.push_back(access);
+				}
+				list->resourceAccesses = std::move(resolved);
+				list->resourceAccessesComplete = true;
+				return Result::Ok;
+			} catch (...) {
+				return Result::InvalidArgument;
+			}
 		}
 
 		Result import_buffer(Device device, const ImportedBufferDesc& desc, ResourcePtr& out) noexcept {

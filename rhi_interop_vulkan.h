@@ -23,6 +23,44 @@ using namespace volk;
 
 namespace rhi::vulkan {
 
+    struct ResourceAccessDeclaration {
+        rhi::ResourceHandle resource{};
+        uint64_t offset = 0;
+        uint64_t size = UINT64_MAX;
+        rhi::TextureSubresourceRange range{};
+        VkImageAspectFlags aspects = 0;
+        rhi::ResourceSyncState sync = rhi::ResourceSyncState::None;
+        rhi::ResourceAccessType access = rhi::ResourceAccessType::None;
+        rhi::ResourceLayout layout = rhi::ResourceLayout::Undefined;
+        bool write = false;
+    };
+
+    // Concrete accesses attached to an immutable recorded command buffer.
+    // Handles are borrowed; the command-buffer owner retains backing leases.
+    struct NativeResourceAccess {
+        rhi::ResourceHandle identity{};
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        VkDeviceSize size = 0;
+        VkImageSubresourceRange range{};
+        VkPipelineStageFlags2 stages = 0;
+        VkAccessFlags2 access = 0;
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        bool write = false;
+    };
+
+    struct CommandBufferResourceAccesses {
+        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+        rhi::Span<NativeResourceAccess> accesses{};
+        bool complete = false;
+    };
+
+    // Resolves declarations while the recording owner holds backing leases.
+    // A successful empty declaration explicitly describes a resource-free list.
+    Result set_command_list_resource_accesses(rhi::CommandList commands,
+        rhi::Span<ResourceAccessDeclaration> accesses) noexcept;
+
     struct Win32ExternalInteropCapabilities {
         bool memory = false;
         bool timeline = false;
@@ -83,6 +121,10 @@ namespace rhi::vulkan {
         // submit info points at is only valid during the call. lock/unlock are then not
         // used for submissions.
         VkResult (*submit)(void* user, VkQueue queue, const VkSubmitInfo2& submitInfo) = nullptr;
+        // Resource-aware hosts receive one manifest per submitted command buffer,
+        // in identical order. All spans are borrowed only for the callback.
+        VkResult (*submitResources)(void* user, VkQueue queue, const VkSubmitInfo2& submitInfo,
+            rhi::Span<CommandBufferResourceAccesses> resources) = nullptr;
     };
 
     struct AdoptedQueue {

@@ -13,6 +13,15 @@
 #include <vector>
 
 namespace {
+	PFN_vkCmdPipelineBarrier2 originalBarrier2 = nullptr;
+	std::vector<VkBufferMemoryBarrier2> capturedBufferBarriers;
+	uint32_t capturedGlobalBarriers = 0;
+	VKAPI_ATTR void VKAPI_CALL CaptureBarrier2(VkCommandBuffer commands, const VkDependencyInfo* dependency) {
+		capturedGlobalBarriers += dependency->memoryBarrierCount;
+		for (uint32_t i = 0; i < dependency->bufferMemoryBarrierCount; ++i)
+			capturedBufferBarriers.push_back(dependency->pBufferMemoryBarriers[i]);
+		originalBarrier2(commands, dependency);
+	}
 	struct HostDevice {
 		VkInstance instance = VK_NULL_HANDLE;
 		VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -47,6 +56,8 @@ namespace {
 	// Host-side submission hook (the DXVK command-stream model): copies each batch and
 	// submits it later, from the host's own point in its stream.
 	struct DeferredSubmissions {
+		std::vector<rhi::vulkan::NativeResourceAccess> accesses;
+		bool completeAccesses = false;
 		struct Batch {
 			std::vector<VkSemaphoreSubmitInfo> waits;
 			std::vector<VkCommandBufferSubmitInfo> commandBuffers;
@@ -65,6 +76,19 @@ namespace {
 		deferred->pending.push_back(std::move(batch));
 		++deferred->handed;
 		return VK_SUCCESS;
+	}
+
+	VkResult DeferSubmitResources(void* user, VkQueue queue, const VkSubmitInfo2& submit,
+		rhi::Span<rhi::vulkan::CommandBufferResourceAccesses> manifests) {
+		auto& deferred = *static_cast<DeferredSubmissions*>(user);
+		if (manifests.size != submit.commandBufferInfoCount) return VK_ERROR_UNKNOWN;
+		deferred.completeAccesses = true;
+		for (uint32_t i = 0; i < manifests.size; ++i) {
+			if (manifests.data[i].commandBuffer != submit.pCommandBufferInfos[i].commandBuffer) return VK_ERROR_UNKNOWN;
+			deferred.completeAccesses &= manifests.data[i].complete;
+			for (const auto& access : manifests.data[i].accesses) deferred.accesses.push_back(access);
+		}
+		return DeferSubmit(user, queue, submit);
 	}
 
 	VkResult FlushDeferred(DeferredSubmissions& deferred, VkQueue queue) {
@@ -172,7 +196,8 @@ namespace {
 int main(int argc, char** argv) {
 	// "submit": BasicRHI hands submissions to the host (QueueSubmissionHooks::submit)
 	// instead of submitting under the host's lock.
-	const bool hostSubmits = argc > 1 && std::strcmp(argv[1], "submit") == 0;
+	const bool resourceSubmits = argc > 1 && std::strcmp(argv[1], "resources") == 0;
+	const bool hostSubmits = resourceSubmits || (argc > 1 && std::strcmp(argv[1], "submit") == 0);
 	HostDevice host;
 	if (const int created = CreateHostDevice(host); created != 0) {
 		std::printf(created == 77 ? "SKIP: no Vulkan device with VK_EXT_descriptor_heap\n" : "FAIL: host device creation\n");
@@ -223,6 +248,10 @@ int main(int argc, char** argv) {
 			info.submissionHooks = { &deferred, nullptr, nullptr, &DeferSubmit };
 		else
 			info.submissionHooks = { &counters, &Lock, &Unlock };
+		if (resourceSubmits) {
+			info.submissionHooks.submit = nullptr;
+			info.submissionHooks.submitResources = &DeferSubmitResources;
+		}
 		rhi::DevicePtr device;
 		REQUIRE(rhi::vulkan::AdoptVulkanDevice(info, device) == rhi::Result::Ok, "AdoptVulkanDevice");
 		REQUIRE(rhi::vulkan::get_device(device.Get()) == host.device, "adopted device handle");
@@ -260,6 +289,53 @@ int main(int argc, char** argv) {
 		rhi::CommandListPtr list;
 		REQUIRE(device->CreateCommandAllocator(rhi::QueueKind::Graphics, allocator) == rhi::Result::Ok, "allocator");
 		REQUIRE(device->CreateCommandList(rhi::QueueKind::Graphics, allocator.Get(), list) == rhi::Result::Ok, "command list");
+		if (resourceSubmits) {
+			std::array<rhi::vulkan::ResourceAccessDeclaration, 2> accesses{};
+			accesses[0].resource = upload->GetHandle();
+			accesses[0].sync = rhi::ResourceSyncState::Copy;
+			accesses[0].access = rhi::ResourceAccessType::CopySource;
+			accesses[1].resource = imported->GetHandle();
+			accesses[1].offset = kWriteOffset;
+			accesses[1].size = kWriteBytes;
+			accesses[1].sync = rhi::ResourceSyncState::Copy;
+			accesses[1].access = rhi::ResourceAccessType::CopyDest;
+			accesses[1].write = true;
+			REQUIRE(rhi::vulkan::set_command_list_resource_accesses(list.Get(), {accesses.data(), 2}) == rhi::Result::Ok,
+				"attach native access manifest");
+			accesses[1].size = kBufferBytes;
+			REQUIRE(rhi::vulkan::set_command_list_resource_accesses(list.Get(), {accesses.data(), 2}) == rhi::Result::InvalidArgument,
+				"reject invalid buffer range without replacing the valid manifest");
+			accesses[1].size = kWriteBytes;
+			accesses[1].write = false;
+			REQUIRE(rhi::vulkan::set_command_list_resource_accesses(list.Get(), {accesses.data(), 2}) == rhi::Result::InvalidArgument,
+				"reject writes mislabeled as reads");
+		}
+		if (hostSubmits) {
+			std::array<rhi::BufferBarrier, 2> scoped{};
+			for (auto& barrier : scoped) {
+				barrier.buffer = imported->GetHandle();
+				barrier.size = 64;
+				barrier.afterAccess = rhi::ResourceAccessType::ShaderResource;
+			}
+			scoped[0].beforeSync = rhi::ResourceSyncState::Copy;
+			scoped[0].beforeAccess = rhi::ResourceAccessType::CopyDest;
+			scoped[0].afterSync = rhi::ResourceSyncState::VertexShading;
+			scoped[1].offset = 64;
+			scoped[1].beforeSync = rhi::ResourceSyncState::ComputeShading;
+			scoped[1].beforeAccess = rhi::ResourceAccessType::UnorderedAccess;
+			scoped[1].afterSync = rhi::ResourceSyncState::PixelShading;
+			originalBarrier2 = vkCmdPipelineBarrier2;
+			vkCmdPipelineBarrier2 = &CaptureBarrier2;
+			list->Barriers(rhi::BarrierBatch{ .buffers = { scoped.data(), static_cast<uint32_t>(scoped.size()) } });
+			vkCmdPipelineBarrier2 = originalBarrier2;
+			REQUIRE(capturedGlobalBarriers == 0 && capturedBufferBarriers.size() == 2, "resource barriers remain resource scoped");
+			REQUIRE(capturedBufferBarriers[0].srcStageMask == VK_PIPELINE_STAGE_2_TRANSFER_BIT &&
+				capturedBufferBarriers[1].srcStageMask == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, "independent producer stages are not unioned");
+			REQUIRE((capturedBufferBarriers[0].dstStageMask & VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT) == 0 &&
+				capturedBufferBarriers[1].dstStageMask == VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, "independent consumer stages are not unioned");
+			REQUIRE(capturedBufferBarriers[0].offset == 0 && capturedBufferBarriers[1].offset == 64 &&
+				capturedBufferBarriers[0].size == 64 && capturedBufferBarriers[1].size == 64, "byte ranges survive lowering");
+		}
 		auto full = rhi::FullMemoryBarrier();
 		list->Barriers(rhi::BarrierBatch{ .globals = { &full, 1 } });
 		list->CopyBufferRegion(imported->GetHandle(), kWriteOffset, upload->GetHandle(), 0, kWriteBytes);
@@ -270,6 +346,15 @@ int main(int argc, char** argv) {
 		REQUIRE(graphics.Submit(lists, { .signals = { &signal, 1 } }) == rhi::Result::Ok, "submit");
 		if (hostSubmits) {
 			REQUIRE(deferred.handed == 1 && counters.locks == 0, "submission handed to the host, not submitted under its lock");
+			if (resourceSubmits) {
+				REQUIRE(deferred.completeAccesses && deferred.accesses.size() == 2, "complete manifest delivered with its command buffer");
+				REQUIRE(deferred.accesses[0].size == kWriteBytes && !deferred.accesses[0].write, "whole upload range resolved");
+				const auto& output = deferred.accesses[1];
+				REQUIRE(output.buffer == hostBuffer && output.offset == kWriteOffset && output.size == kWriteBytes && output.write,
+					"native backing and output interval preserved");
+				REQUIRE(output.stages == VK_PIPELINE_STAGE_2_TRANSFER_BIT && output.access == VK_ACCESS_2_TRANSFER_WRITE_BIT,
+					"native access scopes preserved");
+			}
 			REQUIRE(timeline->GetCompletedValue() == 0, "nothing ran before the host submitted");
 			REQUIRE(FlushDeferred(deferred, host.queue) == VK_SUCCESS, "host submits the handed batch");
 		} else {
