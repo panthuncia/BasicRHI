@@ -2,7 +2,7 @@
 
 include(CMakeFindDependencyMacro)
 
-if(@BASICRHI_ENABLE_TRACY_GPU_PROFILING@)
+if(@BASICRHI_ENABLE_TRACY_GPU_PROFILING@ OR @BASICRHI_ENABLE_TRACY_CPU_PROFILING@)
     find_dependency(Tracy CONFIG)
 endif()
 

@@ -19,8 +19,12 @@
 
 #include <spdlog/spdlog.h>
 
-#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING || BASICRHI_ENABLE_TRACY_CPU_PROFILING
 #include <tracy/Tracy.hpp>
+#else
+#define ZoneScopedN(name) ((void)0)
+#endif
+#if BASICRHI_ENABLE_TRACY_GPU_PROFILING
 #define TRACY_VK_USE_SYMBOL_TABLE
 #include <tracy/TracyVulkan.hpp>
 #endif
@@ -2685,6 +2689,7 @@ namespace rhi {
 			uint32_t maxSequenceCount,
 			VkDeviceAddress& outAddress,
 			VkDeviceSize& outSize) noexcept {
+			ZoneScopedN("RHI.Vulkan.DGC.AllocatePreprocessRange");
 			outAddress = 0;
 			outSize = 0;
 			if (!impl || impl->device == VK_NULL_HANDLE || !impl->bufferDeviceAddressEnabled ||
@@ -2707,7 +2712,10 @@ namespace rhi {
 			requirementsInfo.maxDrawCount = maxSequenceCount;
 
 			VkMemoryRequirements2 requirements{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
-			vkGetGeneratedCommandsMemoryRequirementsEXT(impl->device, &requirementsInfo, &requirements);
+			{
+				ZoneScopedN("RHI.Vulkan.DGC.MemoryRequirements");
+				vkGetGeneratedCommandsMemoryRequirementsEXT(impl->device, &requirementsInfo, &requirements);
+			}
 			const VkDeviceSize rangeSize = requirements.memoryRequirements.size;
 			const VkDeviceSize rangeAlignment = (std::max<VkDeviceSize>)(requirements.memoryRequirements.alignment, 1);
 			if (rangeSize == 0 || requirements.memoryRequirements.memoryTypeBits == 0) {
@@ -4457,6 +4465,7 @@ namespace rhi {
 		}
 
 		static void cl_beginPass(CommandList* commandList, const PassBeginInfo& passInfo) noexcept {
+			ZoneScopedN("RHI.Vulkan.BeginPass");
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
 			if (!impl || !impl->dynamicRenderingEnabled || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE) {
@@ -4576,6 +4585,7 @@ namespace rhi {
 		}
 
 		static void cl_endPass(CommandList* commandList) noexcept {
+			ZoneScopedN("RHI.Vulkan.EndPass");
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
 			if (!impl || !commandListState || !commandListState->passActive || commandListState->commandBuffer == VK_NULL_HANDLE) {
@@ -4882,6 +4892,7 @@ namespace rhi {
 		}
 
 		static void cl_bindPipeline(CommandList* commandList, PipelineHandle pipeline) noexcept {
+			ZoneScopedN("RHI.Vulkan.BindPipeline");
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
 			if (!impl || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE) {
@@ -5606,6 +5617,7 @@ namespace rhi {
 			uint32_t maxCommandCount) noexcept {
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			ZoneScopedN("RHI.Vulkan.PreprocessIndirect");
 			VulkanCommandList* stateListState = VkCommandListState(&stateSource);
 			VulkanCommandSignature* signatureState = VkCommandSignatureState(impl, signature);
 			VulkanResource* argumentResource = VkResourceState(impl, argumentBuffer);
@@ -5658,6 +5670,7 @@ namespace rhi {
 			ResourceHandle countBuffer,
 			uint64_t countOffset,
 			uint32_t maxCommandCount) noexcept {
+			ZoneScopedN("RHI.Vulkan.ExecuteIndirect");
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
 			VulkanCommandSignature* signatureState = VkCommandSignatureState(impl, signature);
