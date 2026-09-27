@@ -1,7 +1,6 @@
 #pragma once
 
 #include "rhi.h"
-#include "rhi_interop_vulkan.h"
 
 #include "volk.h"
 
@@ -350,8 +349,6 @@ namespace rhi {
 	};
 
 	struct VulkanCommandList {
-		std::vector<vulkan::NativeResourceAccess> resourceAccesses;
-		bool resourceAccessesComplete = false;
 		struct GeneratedCommandsPreprocessPage {
 			VkBuffer buffer = VK_NULL_HANDLE;
 			VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -551,8 +548,6 @@ namespace rhi {
 		void (*submissionLock)(void* user, VkQueue queue) = nullptr;
 		void (*submissionUnlock)(void* user, VkQueue queue) = nullptr;
 		VkResult (*submissionSubmit)(void* user, VkQueue queue, const VkSubmitInfo2& submitInfo) = nullptr;
-		VkResult (*submissionSubmitResources)(void* user, VkQueue queue, const VkSubmitInfo2& submitInfo,
-			Span<vulkan::CommandBufferResourceAccesses> resources) = nullptr;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		VulkanRegistry<VulkanDescriptorHeap> descriptorHeaps;
 		// Image-view slots are updated by parallel graph materialization and swept
