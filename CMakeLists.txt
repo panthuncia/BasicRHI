@@ -12,6 +12,7 @@ option(BASICRHI_ENABLE_PIX "Enable PIX integration in BasicRHI" ON)
 option(BASICRHI_ENABLE_RESHAPE "Enable GPU-Reshape debug instrumentation scaffolding in BasicRHI" OFF)
 option(BASICRHI_ENABLE_DXR2_HEADERS "Enable native DXR 2.0 header-dependent code paths in BasicRHI" OFF)
 option(BASICRHI_ENABLE_TRACY_GPU_PROFILING "Enable Tracy GPU timeline support in BasicRHI" ON)
+option(BASICRHI_ENABLE_TRACY_CPU_PROFILING "Enable Tracy CPU recording zones in BasicRHI" OFF)
 option(BASICRHI_ENABLE_D3D12 "Build the D3D12 backend" ON)
 option(BASICRHI_ENABLE_VULKAN "Build the Vulkan backend" OFF)
 option(BASICRHI_ENABLE_IMGUI "Build ImGui instrumentation widgets" OFF)
@@ -45,12 +46,12 @@ endif()
 if(BASICRHI_ENABLE_IMGUI)
     find_package(imgui CONFIG REQUIRED)
 endif()
-if(BASICRHI_ENABLE_TRACY_GPU_PROFILING)
+if(BASICRHI_ENABLE_TRACY_GPU_PROFILING OR BASICRHI_ENABLE_TRACY_CPU_PROFILING)
     find_package(Tracy REQUIRED CONFIG)
 endif()
 if(COMMAND basicrenderer_use_release_library_for_debug)
     basicrenderer_use_release_library_for_debug(fmt::fmt)
-    if(BASICRHI_ENABLE_TRACY_GPU_PROFILING)
+    if(BASICRHI_ENABLE_TRACY_GPU_PROFILING OR BASICRHI_ENABLE_TRACY_CPU_PROFILING)
         basicrenderer_use_release_library_for_debug(Tracy::TracyClient)
     endif()
 endif()
@@ -334,7 +335,7 @@ install(FILES
 
 target_link_libraries(BasicRHI
 PUBLIC
-    $<$<BOOL:${BASICRHI_ENABLE_TRACY_GPU_PROFILING}>:Tracy::TracyClient>
+    $<$<OR:$<BOOL:${BASICRHI_ENABLE_TRACY_GPU_PROFILING}>,$<BOOL:${BASICRHI_ENABLE_TRACY_CPU_PROFILING}>>:Tracy::TracyClient>
 PRIVATE 
     fmt::fmt
     ${BASICRHI_SPDLOG_TARGET}
@@ -349,6 +350,7 @@ target_compile_definitions(BasicRHI PUBLIC
     BASICRHI_ENABLE_RESHAPE=$<IF:$<BOOL:${_basicrhi_reshape_available}>,1,0>
     BASICRHI_HAS_DXR2_HEADERS=$<IF:$<BOOL:${BASICRHI_ENABLE_DXR2_HEADERS}>,1,0>
     BASICRHI_ENABLE_TRACY_GPU_PROFILING=$<IF:$<BOOL:${BASICRHI_ENABLE_TRACY_GPU_PROFILING}>,1,0>
+    BASICRHI_ENABLE_TRACY_CPU_PROFILING=$<BOOL:${BASICRHI_ENABLE_TRACY_CPU_PROFILING}>
     BASICRHI_ENABLE_D3D12=$<IF:$<BOOL:${BASICRHI_ENABLE_D3D12}>,1,0>
     BASICRHI_ENABLE_VULKAN=$<IF:$<BOOL:${BASICRHI_ENABLE_VULKAN}>,1,0>
 )
