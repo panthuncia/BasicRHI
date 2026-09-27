@@ -139,7 +139,7 @@ add_library(BasicRHI::BasicRHI ALIAS BasicRHI)
 
 if(BASICRHI_ENABLE_IMGUI)
     target_sources(BasicRHI PRIVATE rhi_imgui_widgets.cpp ImGuiColorTextEdit/TextEditor.cpp)
-    target_link_libraries(BasicRHI PRIVATE imgui::imgui)
+    target_link_libraries(BasicRHI PUBLIC imgui::imgui)
 endif()
 
 if(WIN32 AND BASICRHI_ENABLE_VULKAN)
@@ -261,9 +261,23 @@ if(_basicrhi_reshape_available)
 endif()
 
 # Public header(s)
-set(_basicrhi_public_headers "rhi.h;rhi_debug.h")
+set(_basicrhi_public_headers
+    "rhi.h"
+    "rhi_debug.h"
+    "resource_states.h"
+    "rhi_feature_info.h"
+    "rhi_interop.h"
+    "rhi_interop_dx12.h"
+    "rhi_dx12_headers.h"
+    "rhi_colors.h"
+    "rhi_allocator.h"
+    "rhi_helpers.h"
+    "rhi_c.h")
 if(BASICRHI_ENABLE_IMGUI)
     list(APPEND _basicrhi_public_headers "rhi_imgui_widgets.h")
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ImGuiColorTextEdit/"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/BasicRHI/ImGuiColorTextEdit"
+        FILES_MATCHING PATTERN "*.h")
 endif()
 set_target_properties(BasicRHI PROPERTIES PUBLIC_HEADER "${_basicrhi_public_headers}")
 
@@ -319,6 +333,9 @@ write_basic_package_version_file(
     COMPATIBILITY SameMajorVersion
 )
 
+set(BASICRHI_PACKAGE_NEEDS_STREAMLINE ${_basicrhi_streamline_available})
+set(BASICRHI_PACKAGE_NEEDS_PIX ${_basicrhi_pix_available})
+
 configure_package_config_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/BasicRHIConfig.cmake.in"
     "${CMAKE_CURRENT_BINARY_DIR}/BasicRHIConfig.cmake"
@@ -352,7 +369,7 @@ target_compile_definitions(BasicRHI PUBLIC
     BASICRHI_ENABLE_D3D12=$<IF:$<BOOL:${BASICRHI_ENABLE_D3D12}>,1,0>
     BASICRHI_ENABLE_VULKAN=$<IF:$<BOOL:${BASICRHI_ENABLE_VULKAN}>,1,0>
 )
-target_compile_definitions(BasicRHI PRIVATE NOMINMAX)
+target_compile_definitions(BasicRHI PUBLIC NOMINMAX)
 
 if(BASICRHI_BUILD_TESTS)
     if(BASICRHI_ENABLE_VULKAN)
