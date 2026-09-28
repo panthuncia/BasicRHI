@@ -2,6 +2,23 @@
 
 include(CMakeFindDependencyMacro)
 
+find_dependency(fmt CONFIG REQUIRED)
+find_dependency(spdlog CONFIG REQUIRED)
+
+if(@BASICRHI_PACKAGE_NEEDS_STREAMLINE@)
+    find_dependency(StreamlineHeaders CONFIG REQUIRED)
+endif()
+if(@BASICRHI_PACKAGE_NEEDS_PIX@)
+    find_dependency(PixHeaders CONFIG REQUIRED)
+endif()
+
+if(@BASICRHI_ENABLE_D3D12@)
+    find_dependency(DirectX-Headers CONFIG REQUIRED)
+endif()
+if(@BASICRHI_ENABLE_IMGUI@)
+    find_dependency(imgui CONFIG REQUIRED)
+endif()
+
 if(@BASICRHI_ENABLE_TRACY_GPU_PROFILING@ OR @BASICRHI_ENABLE_TRACY_CPU_PROFILING@)
     find_dependency(Tracy CONFIG)
 endif()
