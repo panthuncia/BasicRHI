@@ -9381,6 +9381,94 @@ namespace rhi {
 			}
 			return Result::Ok;
 		}
+		class Dx12CompletionWait final : public CompletionWait {
+			struct Registration {
+				ComPtr<ID3D12Fence> fence;
+				HANDLE event = nullptr;
+				uint64_t value = 0;
+			};
+		public:
+			explicit Dx12CompletionWait(Dx12Device* device) : m_device(device) {
+				m_control = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+			}
+			bool Valid() const noexcept { return m_control != nullptr; }
+			~Dx12CompletionWait() override {
+				// Event registrations cannot be cancelled. Destruction is a teardown
+				// boundary: retain each event until its registered fence has completed.
+				for (auto& registration : m_registrations) if (registration.event) {
+					if (registration.fence->GetCompletedValue() < registration.value)
+						WaitForSingleObject(registration.event, INFINITE);
+					CloseHandle(registration.event);
+				}
+				if (m_control) CloseHandle(m_control);
+			}
+			uint64_t WakeVersion() const noexcept override { return m_version.load(std::memory_order_acquire); }
+			Result Notify() noexcept override {
+				std::lock_guard lock(m_mutex);
+				m_version.fetch_add(1, std::memory_order_release);
+				return SetEvent(m_control) ? Result::Ok : Result::Failed;
+			}
+			Result Wait(Span<TimelinePoint> points, uint64_t observed) noexcept override {
+				if (points.size > MaxTimelines || (points.size && !points.data)) return Result::InvalidArgument;
+				std::array<HANDLE, MaxTimelines + 1> events{};
+				events[0] = m_control;
+				uint32_t eventCount = 1;
+				for (const auto& point : points) {
+					auto* timeline = m_device->timelines.get(point.t);
+					if (!timeline || !timeline->fence || !point.value || point.value == UINT64_MAX) return Result::InvalidArgument;
+					const auto completed = timeline->fence->GetCompletedValue();
+					if (completed == UINT64_MAX) return Result::Failed;
+					if (completed >= point.value) return Result::Ok;
+					Registration* entry = nullptr;
+					for (auto& candidate : m_registrations)
+						if (candidate.fence.Get() == timeline->fence.Get()) { entry = &candidate; break; }
+					if (!entry) {
+						for (auto& candidate : m_registrations) {
+							if (!candidate.fence || candidate.fence->GetCompletedValue() >= candidate.value) {
+								if (candidate.event) CloseHandle(candidate.event);
+								candidate = {};
+								candidate.fence = timeline->fence;
+								entry = &candidate;
+								break;
+							}
+						}
+					}
+					if (!entry) return Result::Failed;
+					if (!entry->event || completed >= entry->value) {
+						if (!entry->event) entry->event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+						if (!entry->event) return Result::Failed;
+						ResetEvent(entry->event);
+						const auto result = entry->fence->SetEventOnCompletion(point.value, entry->event);
+						if (FAILED(result)) return Result::Failed;
+						entry->value = point.value;
+					} else if (point.value < entry->value) return Result::InvalidArgument;
+					// A previous lower value may wake us first; caller rechecks/rearms.
+					events[eventCount++] = entry->event;
+				}
+				{
+					std::lock_guard lock(m_mutex);
+					if (observed != m_version.load(std::memory_order_acquire)) return Result::Ok;
+					ResetEvent(m_control);
+				}
+				const auto result = WaitForMultipleObjects(eventCount, events.data(), FALSE, INFINITE);
+				return result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + eventCount ? Result::Ok : Result::Failed;
+			}
+		private:
+			Dx12Device* m_device;
+			HANDLE m_control = nullptr;
+			std::array<Registration, MaxTimelines> m_registrations;
+			std::atomic<uint64_t> m_version{0};
+			std::mutex m_mutex;
+		};
+		static Result d_createCompletionWait(Device* device, std::unique_ptr<CompletionWait>& out) noexcept {
+			try {
+				auto result = std::make_unique<Dx12CompletionWait>(static_cast<Dx12Device*>(device->impl));
+				if (!result->Valid()) return Result::Failed;
+				out = std::move(result);
+				return Result::Ok;
+			} catch (...) { return Result::Failed; }
+		}
+
 		static void tl_setName(Timeline* tl, const char* n) noexcept {
 			if (!n) {
 				BreakIfDebugging();
@@ -9662,7 +9750,8 @@ namespace rhi {
 		&d_destroyIndirectPipelineSet,
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
-		11u
+		13u,
+		&d_createCompletionWait
 	};
 
 	const QueueVTable g_qvt = {

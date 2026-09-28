@@ -2880,6 +2880,19 @@ namespace rhi {
 
 	struct DeviceDeletionContext;
 
+	// One waiting thread, any number of notifying threads. Timelines and the
+	// device must outlive this object. Wait may return on control wake or GPU
+	// progress; callers recheck all completion conditions after every return.
+	// Per-timeline requested values must not decrease between Wait calls.
+	class CompletionWait {
+	public:
+		static constexpr uint32_t MaxTimelines = 63;
+		virtual ~CompletionWait() = default;
+		virtual uint64_t WakeVersion() const noexcept = 0;
+		virtual Result Notify() noexcept = 0;
+		virtual Result Wait(Span<TimelinePoint> points, uint64_t observedWake) noexcept = 0;
+	};
+
 	struct DeviceVTable {
 		Result(*createPipelineFromStream)(Device*, const PipelineStreamItem*, uint32_t, PipelinePtr&) noexcept;
 		Result(*createWorkGraph)(Device*, const WorkGraphDesc&, WorkGraphPtr&) noexcept;
@@ -2975,7 +2988,8 @@ namespace rhi {
 		void (*setNameIndirectPipelineSet)(Device*, IndirectPipelineSetHandle, const char*) noexcept;
 
 		void (*destroyDevice)(Device*) noexcept;
-		uint32_t abi_version = 12;
+		uint32_t abi_version = 13;
+		Result(*createCompletionWait)(Device*, std::unique_ptr<CompletionWait>&) noexcept = nullptr;
 	};
 
 
@@ -3050,6 +3064,9 @@ namespace rhi {
 		Result CreateQueue(QueueKind k, const char* name, Queue& out) noexcept { return vt->createQueue(this, k, name, out); }
 		void DestroyQueue(QueueHandle h) noexcept { deletionContext.DestroyQueue(h); }
 		Result WaitIdle() noexcept { return vt->deviceWaitIdle(this); }
+		Result CreateCompletionWait(std::unique_ptr<CompletionWait>& out) noexcept {
+			return vt->abi_version >= 13 && vt->createCompletionWait ? vt->createCompletionWait(this, out) : Result::Unsupported;
+		}
 		void FlushDeletionQueue() noexcept { vt->flushDeletionQueue(this); }
 		Result CreateSwapchain(void* hwnd, const uint32_t w, const uint32_t h, const Format fmt, const uint32_t buffers, const bool allowTearing, SwapchainPtr& out) noexcept { return vt->createSwapchain(this, hwnd, w, h, fmt, buffers, allowTearing, out); }
 		void DestroySwapchain(Swapchain* sc) noexcept { deletionContext.DestroySwapchain(sc); }

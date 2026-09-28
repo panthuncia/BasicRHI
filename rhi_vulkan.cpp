@@ -1124,6 +1124,14 @@ namespace rhi {
 		}
 
 		static void VkResetDescriptorSlot(VulkanDevice* impl, VulkanImageViewSlot& slot) noexcept {
+			if (VulkanResource* resource = slot.descriptorResource) {
+				if (slot.previousResourceView)
+					slot.previousResourceView->nextResourceView = slot.nextResourceView;
+				else
+					resource->firstDescriptorView = slot.nextResourceView;
+				if (slot.nextResourceView)
+					slot.nextResourceView->previousResourceView = slot.previousResourceView;
+			}
 			if (impl && impl->device != VK_NULL_HANDLE) {
 				if (slot.view != VK_NULL_HANDLE) {
 					vkDestroyImageView(impl->device, slot.view, nullptr);
@@ -1136,6 +1144,14 @@ namespace rhi {
 				}
 			}
 			slot = {};
+		}
+
+		static void VkLinkDescriptorSlot(VulkanResource& resource, VulkanImageViewSlot& slot) noexcept {
+			slot.descriptorResource = &resource;
+			slot.nextResourceView = resource.firstDescriptorView;
+			if (slot.nextResourceView)
+				slot.nextResourceView->previousResourceView = &slot;
+			resource.firstDescriptorView = &slot;
 		}
 
 		static uint64_t VkAlignUp(uint64_t value, uint64_t alignment) noexcept {
@@ -2420,6 +2436,7 @@ namespace rhi {
 
 			descriptorSlot->kind = cbvDesc ? VulkanImageViewSlot::Kind::ConstantBuffer : VulkanImageViewSlot::Kind::BufferView;
 			descriptorSlot->resource = resourceHandle;
+			VkLinkDescriptorSlot(*resource, *descriptorSlot);
 			descriptorSlot->format = format;
 			descriptorSlot->bufferKind = bufferKind;
 			descriptorSlot->bufferOffset = offsetBytes;
@@ -2981,6 +2998,7 @@ namespace rhi {
 
 			viewSlot->kind = VulkanImageViewSlot::Kind::ImageView;
 			viewSlot->resource = resourceHandle;
+			VkLinkDescriptorSlot(*resource, *viewSlot);
 			viewSlot->format = viewFormat;
 			viewSlot->aspectMask = aspectMask;
 			viewSlot->range = range;
@@ -2993,32 +3011,18 @@ namespace rhi {
 		}
 
 		static void VkReleaseViewsForResource(VulkanDevice* impl, ResourceHandle resourceHandle) noexcept {
+			ZoneScopedN("RHI.Vulkan.ReleaseViewsForResource");
 			if (!impl || impl->device == VK_NULL_HANDLE || !resourceHandle.valid()) {
 				return;
 			}
 			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
-			const std::shared_lock registryLock(impl->descriptorHeaps.mutex);
-
-			for (auto& heapSlot : impl->descriptorHeaps.slots) {
-				if (!heapSlot.alive) {
-					continue;
-				}
-
-				for (size_t descriptorIndex = 0; descriptorIndex < heapSlot.obj.imageViewSlots.size(); ++descriptorIndex) {
-					VulkanImageViewSlot& viewSlot = heapSlot.obj.imageViewSlots[descriptorIndex];
-					if (viewSlot.resource.index != resourceHandle.index || viewSlot.resource.generation != resourceHandle.generation) {
-						continue;
-					}
-					spdlog::debug("Vulkan descriptor view release: slot={} resource=({}, {}) heapType={}",
-						descriptorIndex, resourceHandle.index, resourceHandle.generation,
-						static_cast<uint32_t>(heapSlot.obj.type));
-
-					VkResetDescriptorSlot(impl, viewSlot);
-				}
-			}
+			VulkanResource* resource = VkResourceState(impl, resourceHandle);
+			while (resource && resource->firstDescriptorView)
+				VkResetDescriptorSlot(impl, *resource->firstDescriptorView);
 		}
 
 		static void VkDestroyResource(VulkanDevice* impl, VulkanResource& resource) noexcept {
+			ZoneScopedN("RHI.Vulkan.DestroyResource");
 			if (!impl || impl->device == VK_NULL_HANDLE) {
 				resource = {};
 				return;
@@ -3616,6 +3620,84 @@ namespace rhi {
 			}
 			impl->timelinesCondition.notify_all();
 			return ToRHI(waitResult);
+		}
+
+		class VulkanCompletionWait final : public CompletionWait {
+		public:
+			explicit VulkanCompletionWait(VulkanDevice* device) : m_device(device) {}
+			~VulkanCompletionWait() override { if (m_control) vkDestroySemaphore(m_device->device, m_control, nullptr); }
+			Result Initialize() noexcept {
+				VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+				type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+				VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+				info.pNext = &type;
+				return ToRHI(vkCreateSemaphore(m_device->device, &info, nullptr, &m_control));
+			}
+			uint64_t WakeVersion() const noexcept override { return m_version.load(std::memory_order_acquire); }
+			Result Notify() noexcept override {
+				std::lock_guard lock(m_mutex);
+				const auto version = m_version.fetch_add(1, std::memory_order_release) + 1;
+				if (!m_waiting) return Result::Ok;
+				VkSemaphoreSignalInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+				signal.semaphore = m_control;
+				signal.value = version;
+				return ToRHI(vkSignalSemaphore(m_device->device, &signal));
+			}
+			Result Wait(Span<TimelinePoint> points, uint64_t observed) noexcept override {
+				if (points.size > MaxTimelines || (points.size && !points.data)) return Result::InvalidArgument;
+				std::array<VkSemaphore, MaxTimelines + 1> semaphores{};
+				std::array<uint64_t, MaxTimelines + 1> values{};
+				{
+					std::lock_guard lock(m_device->timelinesMutex);
+					for (size_t i = 0; i < points.size; ++i) {
+						auto* timeline = VkTimelineState(m_device, points[i].t);
+						if (!timeline || !timeline->semaphore || !points[i].value || points[i].value == UINT64_MAX) return Result::InvalidArgument;
+						semaphores[i] = timeline->semaphore;
+						values[i] = points[i].value;
+						for (size_t j = 0; j < i; ++j) if (semaphores[j] == semaphores[i]) return Result::InvalidArgument;
+					}
+					for (size_t i = 0; i < points.size; ++i) ++VkTimelineState(m_device, points[i].t)->activeHostWaits;
+				}
+				Result result = Result::Ok;
+				bool wait = false;
+				{
+					std::lock_guard lock(m_mutex);
+					wait = observed == m_version.load(std::memory_order_acquire);
+					m_waiting = wait;
+				}
+				if (wait) {
+					semaphores[points.size] = m_control;
+					values[points.size] = observed + 1;
+					VkSemaphoreWaitInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+					info.flags = VK_SEMAPHORE_WAIT_ANY_BIT;
+					info.semaphoreCount = points.size + 1;
+					info.pSemaphores = semaphores.data();
+					info.pValues = values.data();
+					result = ToRHI(vkWaitSemaphores(m_device->device, &info, UINT64_MAX));
+					std::lock_guard lock(m_mutex);
+					m_waiting = false;
+				}
+				{
+					std::lock_guard lock(m_device->timelinesMutex);
+					for (size_t i = 0; i < points.size; ++i) --VkTimelineState(m_device, points[i].t)->activeHostWaits;
+				}
+				m_device->timelinesCondition.notify_all();
+				return result;
+			}
+		private:
+			VulkanDevice* m_device;
+			VkSemaphore m_control = VK_NULL_HANDLE;
+			std::atomic<uint64_t> m_version{0};
+			std::mutex m_mutex;
+			bool m_waiting = false;
+		};
+		static Result d_createCompletionWait(Device* device, std::unique_ptr<CompletionWait>& out) noexcept {
+			try {
+				auto result = std::make_unique<VulkanCompletionWait>(static_cast<VulkanDevice*>(device->impl));
+				const auto status = result->Initialize();
+				if (status == Result::Ok) out = std::move(result);
+				return status;
+			} catch (...) { return Result::Failed; }
 		}
 
 		static void tl_setName(Timeline* timeline, const char* name) noexcept {
@@ -4873,9 +4955,22 @@ namespace rhi {
 			vkCmdBindIndexBuffer(commandListState->commandBuffer, resource->buffer, view.offset, VkIndexTypeForFormat(view.format));
 		}
 
+		static void VkDetailedCheckpoint(CommandList* commandList, const char* text) noexcept {
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			if (!impl || !impl->detailedCheckpoints || !impl->setCheckpoint || !impl->registerCheckpoint) return;
+			if (auto* state = VkCommandListState(commandList); state && state->commandBuffer && state->isRecording)
+				if (const void* marker = impl->registerCheckpoint(impl->checkpointUser, text))
+					impl->setCheckpoint(state->commandBuffer, const_cast<void*>(marker));
+		}
+
 		static void cl_draw(CommandList* commandList, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) noexcept {
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
 			if (commandListState && commandListState->isRecording) {
+				if (auto* impl = static_cast<VulkanDevice*>(commandList->impl); impl && impl->detailedCheckpoints) {
+					char marker[160]{};
+					std::snprintf(marker, sizeof(marker), "ORG Draw v=%u i=%u first=%u firstInstance=%u", vertexCount, instanceCount, firstVertex, firstInstance);
+					VkDetailedCheckpoint(commandList, marker);
+				}
 				vkCmdDraw(commandListState->commandBuffer, vertexCount, instanceCount, firstVertex, firstInstance);
 			}
 		}
@@ -4883,6 +4978,11 @@ namespace rhi {
 		static void cl_drawIndexed(CommandList* commandList, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) noexcept {
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
 			if (commandListState && commandListState->isRecording) {
+				if (auto* impl = static_cast<VulkanDevice*>(commandList->impl); impl && impl->detailedCheckpoints) {
+					char marker[160]{};
+					std::snprintf(marker, sizeof(marker), "ORG DrawIndexed n=%u i=%u first=%u base=%d firstInstance=%u", indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+					VkDetailedCheckpoint(commandList, marker);
+				}
 				vkCmdDrawIndexed(commandListState->commandBuffer, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
 			}
 		}
@@ -4899,6 +4999,11 @@ namespace rhi {
 				return;
 			}
 
+			if (impl->detailedCheckpoints) {
+				char marker[160]{};
+				std::snprintf(marker, sizeof(marker), "ORG Dispatch x=%u y=%u z=%u", x, y, z);
+				VkDetailedCheckpoint(commandList, marker);
+			}
 			vkCmdDispatch(commandListState->commandBuffer, x, y, z);
 		}
 
@@ -5424,6 +5529,11 @@ namespace rhi {
 			if (!commandListState || !commandListState->isRecording || !viewSlot || !resource || resource->image == VK_NULL_HANDLE) {
 				return;
 			}
+			if (impl->detailedCheckpoints) {
+				char marker[160]{};
+				std::snprintf(marker, sizeof(marker), "ORG ClearRTV image=%p slot=%u", static_cast<const void*>(resource->image), slot.index);
+				VkDetailedCheckpoint(commandList, marker);
+			}
 			VkClearColorValue value{};
 			std::memcpy(value.float32, clearValue.rgba, sizeof(value.float32));
 			if (commandListState->passActive) {
@@ -5606,6 +5716,15 @@ namespace rhi {
 			}
 
 			const uint32_t stride = signatureState->byteStride;
+			if (impl->detailedCheckpoints) {
+				char marker[160]{};
+				std::snprintf(marker, sizeof(marker), "ORG ExecuteIndirect arg=%p off=%llu bytes=%llu count=%p countOff=%llu max=%u stride=%u",
+					static_cast<const void*>(argumentResource->buffer), static_cast<unsigned long long>(argumentOffset),
+					static_cast<unsigned long long>(argumentResource->bufferSize),
+					static_cast<const void*>(countResource ? countResource->buffer : VK_NULL_HANDLE),
+					static_cast<unsigned long long>(countOffset), maxCommandCount, stride);
+				VkDetailedCheckpoint(commandList, marker);
+			}
 			if (signatureState->indirectLayout != VK_NULL_HANDLE) {
 				VkGeneratedCommandsInfoEXT generatedInfo{};
 				VkGeneratedCommandsPipelineInfoEXT pipelineInfo{};
@@ -5851,6 +5970,23 @@ namespace rhi {
 			if (!commandListState || !dstBuffer || !srcBuffer || numBytes == 0) {
 				return;
 			}
+			// A stale upload target or page must fail command-list validation before
+			// reaching the driver. Subtraction avoids overflow in offset + numBytes.
+			if (!commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE ||
+				!srcBuffer->buffer || !dstBuffer->buffer || srcOffset > srcBuffer->bufferSize ||
+				dstOffset > dstBuffer->bufferSize || numBytes > srcBuffer->bufferSize - srcOffset ||
+				numBytes > dstBuffer->bufferSize - dstOffset) {
+				VkMarkCommandListError(commandListState, Result::InvalidArgument);
+				return;
+			}
+			if (impl->detailedCheckpoints) {
+				char marker[160]{};
+				std::snprintf(marker, sizeof(marker), "ORG CopyBuffer src=%p+%llu dst=%p+%llu bytes=%llu",
+					static_cast<const void*>(srcBuffer->buffer), static_cast<unsigned long long>(srcOffset),
+					static_cast<const void*>(dstBuffer->buffer), static_cast<unsigned long long>(dstOffset),
+					static_cast<unsigned long long>(numBytes));
+				VkDetailedCheckpoint(commandList, marker);
+			}
 			VkBufferCopy region{ srcOffset, dstOffset, numBytes };
 			vkCmdCopyBuffer(commandListState->commandBuffer, srcBuffer->buffer, dstBuffer->buffer, 1, &region);
 		}
@@ -6059,6 +6195,15 @@ namespace rhi {
 		}
 
 		static void cl_beginDebugLabel(CommandList* commandList, const float rgba[4], const char* name) noexcept {
+			if (commandList) {
+				auto* impl = static_cast<VulkanDevice*>(commandList->impl);
+				if (impl && impl->setCheckpoint && impl->registerCheckpoint) {
+					if (auto* state = VkCommandListState(commandList); state && state->commandBuffer) {
+						if (const void* marker = impl->registerCheckpoint(impl->checkpointUser, name))
+							impl->setCheckpoint(state->commandBuffer, const_cast<void*>(marker));
+					}
+				}
+			}
 			if (const VkCommandBuffer commandBuffer = VkLabelTarget(commandList); commandBuffer != VK_NULL_HANDLE && vkCmdBeginDebugUtilsLabelEXT) {
 				const VkDebugUtilsLabelEXT label = VkMakeLabel(rgba, name);
 				vkCmdBeginDebugUtilsLabelEXT(commandBuffer, &label);
@@ -6066,11 +6211,29 @@ namespace rhi {
 		}
 
 		static void cl_endDebugLabel(CommandList* commandList) noexcept {
+			if (commandList) {
+				auto* impl = static_cast<VulkanDevice*>(commandList->impl);
+				if (impl && impl->setCheckpoint && impl->registerCheckpoint) {
+					if (auto* state = VkCommandListState(commandList); state && state->commandBuffer) {
+						if (const void* marker = impl->registerCheckpoint(impl->checkpointUser, "ORG pass end"))
+							impl->setCheckpoint(state->commandBuffer, const_cast<void*>(marker));
+					}
+				}
+			}
 			if (const VkCommandBuffer commandBuffer = VkLabelTarget(commandList); commandBuffer != VK_NULL_HANDLE && vkCmdEndDebugUtilsLabelEXT)
 				vkCmdEndDebugUtilsLabelEXT(commandBuffer);
 		}
 
 		static void cl_insertDebugLabel(CommandList* commandList, const float rgba[4], const char* name) noexcept {
+			if (commandList) {
+				auto* impl = static_cast<VulkanDevice*>(commandList->impl);
+				if (impl && impl->setCheckpoint && impl->registerCheckpoint) {
+					if (auto* state = VkCommandListState(commandList); state && state->commandBuffer) {
+						if (const void* marker = impl->registerCheckpoint(impl->checkpointUser, name))
+							impl->setCheckpoint(state->commandBuffer, const_cast<void*>(marker));
+					}
+				}
+			}
 			if (const VkCommandBuffer commandBuffer = VkLabelTarget(commandList); commandBuffer != VK_NULL_HANDLE && vkCmdInsertDebugUtilsLabelEXT) {
 				const VkDebugUtilsLabelEXT label = VkMakeLabel(rgba, name);
 				vkCmdInsertDebugUtilsLabelEXT(commandBuffer, &label);
@@ -7928,11 +8091,16 @@ namespace rhi {
 		}
 
 		static Result d_createShaderResourceView(Device* device, DescriptorSlot slot, const ResourceHandle& resource, const SrvDesc& desc) noexcept {
+			ZoneScopedN("RHI.Vulkan.CreateSRV");
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
-			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
+			std::unique_lock viewLock(impl->descriptorViewsMutex, std::defer_lock);
+			{
+				ZoneScopedN("RHI.Vulkan.CreateSRV.ViewLock");
+				viewLock.lock();
+			}
 			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
 
 			if (desc.dimension == SrvDim::AccelerationStruct) {
@@ -8114,7 +8282,11 @@ namespace rhi {
 				descriptorRange.address = slotAddress;
 				descriptorRange.size = static_cast<size_t>(heap->descriptorStride);
 
-				const VkResult result = vkWriteResourceDescriptorsEXT(impl->device, 1, &descriptorInfo, &descriptorRange);
+				VkResult result;
+				{
+					ZoneScopedN("RHI.Vulkan.CreateSRV.WriteDescriptor");
+					result = vkWriteResourceDescriptorsEXT(impl->device, 1, &descriptorInfo, &descriptorRange);
+				}
 				if (result != VK_SUCCESS) {
 					return ToRHI(result);
 				}
@@ -8124,12 +8296,17 @@ namespace rhi {
 					RHI_FAIL(Result::InvalidArgument);
 				}
 				VkResetDescriptorSlot(impl, *descriptorSlot);
-				const VkResult viewResult = vkCreateImageView(impl->device, &viewCreateInfo, nullptr, &descriptorSlot->view);
+				VkResult viewResult;
+				{
+					ZoneScopedN("RHI.Vulkan.CreateSRV.CreateImageView");
+					viewResult = vkCreateImageView(impl->device, &viewCreateInfo, nullptr, &descriptorSlot->view);
+				}
 				if (viewResult != VK_SUCCESS) {
 					return ToRHI(viewResult);
 				}
 				descriptorSlot->kind = VulkanImageViewSlot::Kind::ImageView;
 				descriptorSlot->resource = resource;
+				VkLinkDescriptorSlot(*resourceState, *descriptorSlot);
 				descriptorSlot->format = viewFormat;
 				descriptorSlot->aspectMask = aspectMask;
 				descriptorSlot->range = { subresourceRange.baseMipLevel, subresourceRange.levelCount, subresourceRange.baseArrayLayer, subresourceRange.layerCount };
@@ -8258,6 +8435,7 @@ namespace rhi {
 				}
 				descriptorSlot->kind = VulkanImageViewSlot::Kind::ImageView;
 				descriptorSlot->resource = resource;
+				VkLinkDescriptorSlot(*resourceState, *descriptorSlot);
 				descriptorSlot->format = viewFormat;
 				descriptorSlot->aspectMask = aspectMask;
 				descriptorSlot->range = { subresourceRange.baseMipLevel, subresourceRange.levelCount, subresourceRange.baseArrayLayer, subresourceRange.layerCount };
@@ -9846,7 +10024,8 @@ namespace rhi {
 		&d_destroyIndirectPipelineSet,
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
-		11u
+		13u,
+		&d_createCompletionWait
 	};
 
 	const QueueVTable g_vkqvt = {
@@ -11158,6 +11337,14 @@ namespace rhi {
 			impl->ownsInstance = false;
 			impl->ownsDevice = false;
 			impl->debugUtilsEnabled = VkNameListContains(info.enabledInstanceExtensions, info.enabledInstanceExtensionCount, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+			if (VkNameListContains(info.enabledDeviceExtensions, info.enabledDeviceExtensionCount, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)
+				&& info.diagnostics.registerMarker) {
+				auto getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(info.getInstanceProcAddr(info.instance, "vkGetDeviceProcAddr"));
+				impl->setCheckpoint = getDeviceProcAddr ? reinterpret_cast<PFN_vkCmdSetCheckpointNV>(getDeviceProcAddr(info.device, "vkCmdSetCheckpointNV")) : nullptr;
+				impl->checkpointUser = info.diagnostics.user;
+				impl->registerCheckpoint = info.diagnostics.registerMarker;
+				impl->detailedCheckpoints = info.diagnostics.detailedCommands;
+			}
 			impl->submissionHookUser = info.submissionHooks.user;
 			impl->submissionLock = info.submissionHooks.lock;
 			impl->submissionUnlock = info.submissionHooks.unlock;

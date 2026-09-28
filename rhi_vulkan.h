@@ -164,7 +164,11 @@ namespace rhi {
 		bool external = false;
 	};
 
+	struct VulkanImageViewSlot;
 	struct VulkanResource {
+		// Intrusive reverse list of descriptor views. The device's descriptorViewsMutex
+		// protects both this head and the links in VulkanImageViewSlot.
+		VulkanImageViewSlot* firstDescriptorView = nullptr;
 		VkBuffer buffer = VK_NULL_HANDLE;
 		VkImage image = VK_NULL_HANDLE;
 		VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -200,6 +204,9 @@ namespace rhi {
 	};
 
 	struct VulkanImageViewSlot {
+		VulkanResource* descriptorResource = nullptr;
+		VulkanImageViewSlot* previousResourceView = nullptr;
+		VulkanImageViewSlot* nextResourceView = nullptr;
 		enum class Kind : uint8_t {
 			None,
 			ImageView,
@@ -537,6 +544,10 @@ namespace rhi {
 		// VK_EXT_debug_utils was enabled on the instance: object names and command buffer labels may
 		// be issued. volk resolves the entry points whether or not it was, so a null check is not enough.
 		bool debugUtilsEnabled = false;
+		PFN_vkCmdSetCheckpointNV setCheckpoint = nullptr;
+		void* checkpointUser = nullptr;
+		const void* (*registerCheckpoint)(void*, const char*) noexcept = nullptr;
+		bool detailedCheckpoints = false;
 		// AdoptVulkanDevice: the instance and device belong to the host. Every VkQueue
 		// access is bracketed by the host's submission lock, and whole-device waits are
 		// replaced by waits on BasicRHI's own timelines.
@@ -550,9 +561,9 @@ namespace rhi {
 		VkResult (*submissionSubmit)(void* user, VkQueue queue, const VkSubmitInfo2& submitInfo) = nullptr;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		VulkanRegistry<VulkanDescriptorHeap> descriptorHeaps;
-		// Image-view slots are updated by parallel graph materialization and swept
-		// when resources retire. Registry lookup alone does not protect the nested
-		// per-heap slot arrays or vkCreate/vkDestroyImageView pairs.
+		// Image-view slots are updated by parallel graph materialization. The
+		// intrusive resource-to-view lists and vkCreate/vkDestroy pairs are
+		// protected here; retiring a resource never scans descriptor heaps.
 		mutable std::recursive_mutex descriptorViewsMutex;
 		VulkanRegistry<VulkanResource> resources;
 		// Vulkan requires host access to each VkDeviceMemory object to be

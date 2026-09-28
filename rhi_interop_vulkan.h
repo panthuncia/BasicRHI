@@ -92,6 +92,13 @@ namespace rhi::vulkan {
     };
 
     struct AdoptedVulkanDeviceInfo {
+        // Optional, backend-neutral marker registration. The caller owns marker storage
+        // until all submitted command buffers retire; BasicRHI only records opaque IDs.
+        struct Diagnostics {
+            void* user = nullptr;
+            const void* (*registerMarker)(void* user, const char* name) noexcept = nullptr;
+            bool detailedCommands = false;
+        } diagnostics{};
         // The loader entry point the host used (it may be an interposer's).
         PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
         VkInstance instance = VK_NULL_HANDLE;
