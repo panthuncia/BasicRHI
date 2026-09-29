@@ -116,6 +116,14 @@ Where the underlying APIs disagree, the backend reconciles it.
   viewport puts the image the same way up as D3D's, and Vulkan derives the facing from that image, so it
   maps the flag to the `VkFrontFace` of the same name - which is also DXVK's mapping under the same flip.
   Setting the same `RasterState` therefore culls the same faces on D3D12 and Vulkan.
+- **An indirect `Constant` argument may be any size.** On Vulkan it becomes push data tokens of a generated
+  commands layout (`VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_DATA_EXT`), and the backend emits one token per 16 bytes
+  of it (`kMaxPushDataTokenBytes` in `rhi_vulkan.cpp`), each reading its bytes from the argument's own place in
+  the stream. The signature's stream layout and the push data written are what the caller described. The limit
+  is empirical: on NVIDIA (GA102, driver 616.56), a push data token of more than 16 bytes loses the device (DMA
+  page faults with no fault address and usually no active shader, rising with the sequences executed), although
+  neither the extension nor the device's limits state a bound. 12- and 16-byte tokens were healthy, and the same
+  20 bytes as a 16-byte and a 4-byte token were healthy.
 
 ## Notes
 

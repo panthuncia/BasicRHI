@@ -211,4 +211,5 @@ struct IndirectCommandsFeatureInfo {
     uint32_t maxPipelineSetCount = 0;  // largest IndirectPipelineSetDesc::maxPipelineCount
     bool vertexBufferArguments = false; // VertexBuffer arguments (D3D12 vertex buffer view layout)
     bool indirectBindings = false;     // LayoutRangeSource::IndirectIndex / IndirectAddress
+    uint32_t maxSequenceCount = 0;     // largest max count of one ExecuteIndirect (Vulkan maxIndirectSequenceCount)
 };

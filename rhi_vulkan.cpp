@@ -2638,6 +2638,22 @@ namespace rhi {
 			}
 		}
 
+		/**
+		 * The largest push data token a generated commands layout is given. A Constant argument larger than this is split into
+		 * consecutive tokens that together write the same range from the same bytes of the stream.
+		 *
+		 * On NVIDIA (GA102, driver 616.56, VK_EXT_device_generated_commands with VK_EXT_descriptor_heap), a push data token
+		 * of more than 16 bytes loses the device: DMA page faults with no fault address and usually no active shader, rising
+		 * with the number of sequences executed. 12- and 16-byte tokens are fine, and the same 20 bytes as a 16-byte and a
+		 * 4-byte token are fine. Neither the extension nor the device's limits give a bound; this one was found by bisection
+		 * (Community Shaders' Drawcall Limit Fix, whose per-draw push data grew from 12 to 20 bytes).
+		 */
+		static constexpr uint32_t kMaxPushDataTokenBytes = 16;
+
+		static uint32_t VkPushDataTokenChunks(uint32_t bytes) noexcept {
+			return (bytes + kMaxPushDataTokenBytes - 1) / kMaxPushDataTokenBytes;
+		}
+
 		static VkIndirectCommandsTokenTypeEXT VkIndirectCommandsTokenTypeForRHI(IndirectArgKind kind) noexcept {
 			switch (kind) {
 			case IndirectArgKind::Draw:
@@ -7630,6 +7646,7 @@ namespace rhi {
 					out->maxPipelineSetCount = out->pipelineSets ? dgcProperties.maxIndirectPipelineCount : 0;
 					out->vertexBufferArguments = generated && (dgcProperties.supportedIndirectCommandsInputModes & VK_INDIRECT_COMMANDS_INPUT_MODE_DXGI_INDEX_BUFFER_EXT) != 0;
 					out->indirectBindings = impl->descriptorHeapEnabled;
+					out->maxSequenceCount = generated ? dgcProperties.maxIndirectSequenceCount : 0;
 				} break;
 
 				default:
@@ -7738,10 +7755,18 @@ namespace rhi {
 					RHI_FAIL(Result::Unsupported);
 				}
 
+				// A Constant argument becomes one push data token per kMaxPushDataTokenBytes of it (VkPushDataTokenChunks). The
+				// layout tokens point into pushTokens, so it is reserved for every chunk up front and never reallocates.
+				uint32_t pushChunks = 0;
+				for (const IndirectArg& arg : desc.args) {
+					if (arg.kind == IndirectArgKind::Constant) {
+						pushChunks += VkPushDataTokenChunks(arg.u.rootConstants.num32 * 4u);
+					}
+				}
 				std::vector<VkIndirectCommandsLayoutTokenEXT> tokens;
 				std::vector<VkIndirectCommandsPushConstantTokenEXT> pushTokens;
-				tokens.reserve(desc.args.size);
-				pushTokens.reserve(desc.args.size);
+				tokens.reserve(desc.args.size + pushChunks);
+				pushTokens.reserve(pushChunks);
 				VkIndirectCommandsIndexBufferTokenEXT indexBufferToken{ VK_INDIRECT_COMMANDS_INPUT_MODE_DXGI_INDEX_BUFFER_EXT };
 				std::vector<VkIndirectCommandsVertexBufferTokenEXT> vertexBufferTokens;
 				vertexBufferTokens.reserve(desc.args.size);
@@ -7803,11 +7828,27 @@ namespace rhi {
 							RHI_FAIL(Result::Unsupported);
 						}
 
-						pushTokens.push_back(pushToken);
 						// Descriptor-heap pipelines have no pipeline layout; root constants are push data
-						// (cl_pushConstants records vkCmdPushDataEXT), so the token writes push data too.
-						token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_DATA_EXT;
-						token.data.pPushConstant = &pushTokens.back();
+						// (cl_pushConstants records vkCmdPushDataEXT), so the token writes push data too. One token per
+						// chunk (VkPushDataTokenChunks), each reading its bytes from the argument's place in the stream:
+						// the stream layout is the caller's and does not change.
+						const uint32_t argumentBytes = pushToken.updateRange.size;
+						for (uint32_t chunk = 0; chunk < VkPushDataTokenChunks(argumentBytes); ++chunk) {
+							const uint32_t first = chunk * kMaxPushDataTokenBytes;
+							VkIndirectCommandsPushConstantTokenEXT chunkToken = pushToken;
+							chunkToken.updateRange.offset += first;
+							chunkToken.updateRange.size = (std::min)(kMaxPushDataTokenBytes, argumentBytes - first);
+							pushTokens.push_back(chunkToken);
+							VkIndirectCommandsLayoutTokenEXT chunkLayoutToken{ VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT };
+							chunkLayoutToken.offset = runningOffset + first;
+							chunkLayoutToken.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_DATA_EXT;
+							chunkLayoutToken.data.pPushConstant = &pushTokens.back();
+							if (chunk + 1 < VkPushDataTokenChunks(argumentBytes)) {
+								tokens.push_back(chunkLayoutToken);
+							} else {
+								token = chunkLayoutToken;  // the last chunk is appended with the other arguments' tokens below
+							}
+						}
 					}
 					else if (arg.kind == IndirectArgKind::IndexBuffer) {
 						token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_INDEX_BUFFER_EXT;

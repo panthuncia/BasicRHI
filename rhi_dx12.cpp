@@ -2566,6 +2566,7 @@ namespace rhi {
 					out->maxPipelineSetCount = 0;
 					out->vertexBufferArguments = true;
 					out->indirectBindings = false;
+					out->maxSequenceCount = UINT32_MAX;  // ExecuteIndirect's MaxCommandCount has no device limit
 				} break;
 				default:
 					// Unknown sType: ignore
