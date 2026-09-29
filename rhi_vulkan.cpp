@@ -5992,6 +5992,10 @@ namespace rhi {
 				!srcBuffer->buffer || !dstBuffer->buffer || srcOffset > srcBuffer->bufferSize ||
 				dstOffset > dstBuffer->bufferSize || numBytes > srcBuffer->bufferSize - srcOffset ||
 				numBytes > dstBuffer->bufferSize - dstOffset) {
+				// The submit of this list fails with InvalidArgument; this names the copy that made it fail.
+				spdlog::error("Vulkan buffer copy rejected: {} bytes from resource {}:{} (+{} of {}) to resource {}:{} (+{} of {}){}", numBytes, src.index,
+					src.generation, srcOffset, srcBuffer->bufferSize, dst.index, dst.generation, dstOffset, dstBuffer->bufferSize,
+					commandListState->isRecording ? "" : ", the list not recording");
 				VkMarkCommandListError(commandListState, Result::InvalidArgument);
 				return;
 			}
