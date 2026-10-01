@@ -184,7 +184,9 @@ namespace rhi {
 		static PFN_vkAcquireNextImageKHR g_vkSlAcquireNextImageKHR = nullptr;
 		static PFN_vkQueuePresentKHR g_vkSlQueuePresentKHR = nullptr;
 		static PFN_vkDeviceWaitIdle g_vkSlDeviceWaitIdle = nullptr;
+#ifdef _WIN32
 		static PFN_vkCreateWin32SurfaceKHR g_vkSlCreateWin32SurfaceKHR = nullptr;
+#endif
 		static PFN_vkDestroySurfaceKHR g_vkSlDestroySurfaceKHR = nullptr;
 		static PFN_vkBeginCommandBuffer g_vkSlBeginCommandBuffer = nullptr;
 		static PFN_vkCmdBindPipeline g_vkSlCmdBindPipeline = nullptr;
@@ -215,7 +217,9 @@ namespace rhi {
 			g_vkSlAcquireNextImageKHR = nullptr;
 			g_vkSlQueuePresentKHR = nullptr;
 			g_vkSlDeviceWaitIdle = nullptr;
+#ifdef _WIN32
 			g_vkSlCreateWin32SurfaceKHR = nullptr;
+#endif
 			g_vkSlDestroySurfaceKHR = nullptr;
 			g_vkSlBeginCommandBuffer = nullptr;
 			g_vkSlCmdBindPipeline = nullptr;
@@ -416,10 +420,12 @@ namespace rhi {
 			return fn(device);
 		}
 
+#ifdef _WIN32
 		static VkResult VkCreateWin32SurfaceKHRHooked(VkInstance instance, const VkWin32SurfaceCreateInfoKHR* createInfo, const VkAllocationCallbacks* allocator, VkSurfaceKHR* surface) noexcept {
 			const PFN_vkCreateWin32SurfaceKHR fn = g_vkSlCreateWin32SurfaceKHR ? g_vkSlCreateWin32SurfaceKHR : vkCreateWin32SurfaceKHR;
 			return fn(instance, createInfo, allocator, surface);
 		}
+#endif
 
 		static void VkDestroySurfaceKHRHooked(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks* allocator) noexcept {
 			const PFN_vkDestroySurfaceKHR fn = g_vkSlDestroySurfaceKHR ? g_vkSlDestroySurfaceKHR : vkDestroySurfaceKHR;
@@ -1180,7 +1186,7 @@ namespace rhi {
 				return 16u;
 			}
 
-			return (std::max)(16ull, static_cast<uint64_t>(impl->physicalDeviceProperties.limits.minUniformBufferOffsetAlignment));
+			return (std::max)(uint64_t{ 16 }, static_cast<uint64_t>(impl->physicalDeviceProperties.limits.minUniformBufferOffsetAlignment));
 		}
 
 		static VkBufferCreateFlags VkBufferDeviceAddressCreateFlags(const VulkanDevice* impl) noexcept;
@@ -1466,7 +1472,7 @@ namespace rhi {
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::RenderTarget)) != 0) stages |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::ComputeShading)) != 0) stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::Raytracing)) != 0) {
-#ifdef VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+#if defined(VK_KHR_ray_tracing_pipeline) // Vulkan enumerants are not macros; test the extension.
 				stages |= VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
 #else
 				stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -1483,14 +1489,14 @@ namespace rhi {
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::VideoProcess)) != 0) stages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::VideoEncode)) != 0) stages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::BuildRaytracingAccelerationStructure)) != 0) {
-#ifdef VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+#if defined(VK_KHR_acceleration_structure) // Vulkan enumerants are not macros; test the extension.
 				stages |= VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
 #else
 				stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 #endif
 			}
 			if ((bits & static_cast<uint32_t>(ResourceSyncState::CopyRatracingAccelerationStructure)) != 0) {
-#ifdef VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+#if defined(VK_KHR_acceleration_structure) // Vulkan enumerants are not macros; test the extension.
 				stages |= VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
 #else
 				stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -1514,10 +1520,10 @@ namespace rhi {
 			}
 			if ((queueFlags & VK_QUEUE_COMPUTE_BIT) == 0) {
 				stages &= ~VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-#ifdef VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+#if defined(VK_KHR_ray_tracing_pipeline) // Vulkan enumerants are not macros; test the extension.
 				stages &= ~VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
 #endif
-#ifdef VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+#if defined(VK_KHR_acceleration_structure) // Vulkan enumerants are not macros; test the extension.
 				stages &= ~VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
 #endif
 			}
@@ -1591,7 +1597,7 @@ namespace rhi {
 			case ShaderStage::Compute: return VK_SHADER_STAGE_COMPUTE_BIT;
 			case ShaderStage::Mesh: return VK_SHADER_STAGE_MESH_BIT_EXT;
 			case ShaderStage::Task: return VK_SHADER_STAGE_TASK_BIT_EXT;
-#ifdef VK_SHADER_STAGE_RAYGEN_BIT_KHR
+#if defined(VK_KHR_ray_tracing_pipeline) // Vulkan enumerants are not macros; test the extension.
 			case ShaderStage::RayGen: return VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 			case ShaderStage::Miss: return VK_SHADER_STAGE_MISS_BIT_KHR;
 			case ShaderStage::ClosestHit: return VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
@@ -1614,7 +1620,7 @@ namespace rhi {
 			if ((bits & static_cast<uint32_t>(ShaderStage::Compute)) != 0) flags |= VK_SHADER_STAGE_COMPUTE_BIT;
 			if ((bits & static_cast<uint32_t>(ShaderStage::Mesh)) != 0) flags |= VK_SHADER_STAGE_MESH_BIT_EXT;
 			if ((bits & static_cast<uint32_t>(ShaderStage::Task)) != 0) flags |= VK_SHADER_STAGE_TASK_BIT_EXT;
-#ifdef VK_SHADER_STAGE_RAYGEN_BIT_KHR
+#if defined(VK_KHR_ray_tracing_pipeline) // Vulkan enumerants are not macros; test the extension.
 			if ((bits & static_cast<uint32_t>(ShaderStage::RayGen)) != 0) flags |= VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 			if ((bits & static_cast<uint32_t>(ShaderStage::Miss)) != 0) flags |= VK_SHADER_STAGE_MISS_BIT_KHR;
 			if ((bits & static_cast<uint32_t>(ShaderStage::ClosestHit)) != 0) flags |= VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
@@ -2602,7 +2608,7 @@ namespace rhi {
 			if ((bits & static_cast<uint32_t>(ShaderStage::Compute)) != 0) flags |= VK_SHADER_STAGE_COMPUTE_BIT;
 			if ((bits & static_cast<uint32_t>(ShaderStage::Mesh)) != 0) flags |= VK_SHADER_STAGE_MESH_BIT_EXT;
 			if ((bits & static_cast<uint32_t>(ShaderStage::Task)) != 0) flags |= VK_SHADER_STAGE_TASK_BIT_EXT;
-#ifdef VK_SHADER_STAGE_RAYGEN_BIT_KHR
+#if defined(VK_KHR_ray_tracing_pipeline) // Vulkan enumerants are not macros; test the extension.
 			if ((bits & static_cast<uint32_t>(ShaderStage::RayGen)) != 0) flags |= VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 			if ((bits & static_cast<uint32_t>(ShaderStage::Miss)) != 0) flags |= VK_SHADER_STAGE_MISS_BIT_KHR;
 			if ((bits & static_cast<uint32_t>(ShaderStage::ClosestHit)) != 0) flags |= VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
@@ -2879,7 +2885,7 @@ namespace rhi {
 			case ResourceLayout::ResolveSource:
 				return VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 			case ResourceLayout::ShadingRateSource:
-#ifdef VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR
+#if defined(VK_KHR_fragment_shading_rate) // Vulkan enumerants are not macros; test the extension.
 				return VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
 #else
 				return VK_IMAGE_LAYOUT_GENERAL;
@@ -2924,7 +2930,7 @@ namespace rhi {
 				stageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
 				accessMask = VK_ACCESS_TRANSFER_READ_BIT;
 				break;
-#ifdef VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR
+#if defined(VK_KHR_fragment_shading_rate) // Vulkan enumerants are not macros; test the extension.
 			case VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR:
 				stageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 				accessMask = VK_ACCESS_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR;
@@ -6553,6 +6559,7 @@ namespace rhi {
 				if (!impl->rayTracingPipelineEnabled || sawGraphicsState || computeShader ||
 					(rayTracingPipeline->shaderGroups.size == 0 && rayTracingPipeline->libraries.size == 0) ||
 					(rayTracingPipeline->shaderGroups.size != 0 && rayTracingPipeline->shaders.size == 0)) {
+					spdlog::error("Vulkan ray tracing pipeline: unsupported device or incomplete description");
 					RHI_FAIL(Result::Unsupported);
 				}
 				if (usesLibraries && !impl->rayTracingPipelineLibraryEnabled) {
@@ -6563,6 +6570,7 @@ namespace rhi {
 					layoutState = VkPipelineLayoutState(impl, layoutHandle);
 				}
 				if (!layoutState || !layoutState->usesDescriptorHeap || !impl->descriptorHeapEnabled) {
+					spdlog::error("Vulkan ray tracing pipeline: needs a descriptor-heap pipeline layout");
 					RHI_FAIL(Result::Unsupported);
 				}
 
@@ -6584,10 +6592,12 @@ namespace rhi {
 					const VkShaderStageFlagBits stage = VkShaderStageForRHI(shader.stage);
 					if (stage != VK_SHADER_STAGE_RAYGEN_BIT_KHR && stage != VK_SHADER_STAGE_MISS_BIT_KHR && stage != VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR &&
 						stage != VK_SHADER_STAGE_ANY_HIT_BIT_KHR && stage != VK_SHADER_STAGE_INTERSECTION_BIT_KHR && stage != VK_SHADER_STAGE_CALLABLE_BIT_KHR) {
+						spdlog::error("Vulkan ray tracing pipeline: shader '{}' has a non-ray-tracing stage", shader.entryPoint);
 						for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
 						RHI_FAIL(Result::InvalidArgument);
 					}
 					if (!VkIsSpirvBytecode(shader.bytecode)) {
+						spdlog::error("Vulkan ray tracing pipeline: shader '{}' is not SPIR-V", shader.entryPoint);
 						for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
 						RHI_FAIL(Result::Unsupported);
 					}
@@ -6598,6 +6608,7 @@ namespace rhi {
 					VkShaderModule module = VK_NULL_HANDLE;
 					VkResult moduleResult = vkCreateShaderModule(impl->device, &moduleInfo, nullptr, &module);
 					if (moduleResult != VK_SUCCESS) {
+						spdlog::error("Vulkan ray tracing pipeline: vkCreateShaderModule for '{}' failed ({})", shader.entryPoint, static_cast<int>(moduleResult));
 						for (VkShaderModule existingModule : modules) vkDestroyShaderModule(impl->device, existingModule, nullptr);
 						return ToRHI(moduleResult);
 					}
@@ -6636,6 +6647,7 @@ namespace rhi {
 						group.generalShader = findShader(groupDesc.generalShader ? groupDesc.generalShader : groupDesc.name,
 							VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR);
 						if (group.generalShader == VK_SHADER_UNUSED_KHR) {
+						spdlog::error("Vulkan ray tracing pipeline: group '{}' names no raygen, miss or callable shader", groupDesc.name ? groupDesc.name : "");
 							for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
 							RHI_FAIL(Result::InvalidArgument);
 						}
@@ -6645,6 +6657,7 @@ namespace rhi {
 						group.closestHitShader = findShader(groupDesc.closestHitShader, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
 						group.anyHitShader = findShader(groupDesc.anyHitShader, VK_SHADER_STAGE_ANY_HIT_BIT_KHR);
 						if (group.closestHitShader == VK_SHADER_UNUSED_KHR && group.anyHitShader == VK_SHADER_UNUSED_KHR) {
+						spdlog::error("Vulkan ray tracing pipeline: hit group '{}' names no closest-hit or any-hit shader", groupDesc.name ? groupDesc.name : "");
 							for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
 							RHI_FAIL(Result::InvalidArgument);
 						}
@@ -6655,6 +6668,7 @@ namespace rhi {
 						group.anyHitShader = findShader(groupDesc.anyHitShader, VK_SHADER_STAGE_ANY_HIT_BIT_KHR);
 						group.intersectionShader = findShader(groupDesc.intersectionShader, VK_SHADER_STAGE_INTERSECTION_BIT_KHR);
 						if (group.intersectionShader == VK_SHADER_UNUSED_KHR) {
+						spdlog::error("Vulkan ray tracing pipeline: procedural hit group '{}' names no intersection shader", groupDesc.name ? groupDesc.name : "");
 							for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
 							RHI_FAIL(Result::InvalidArgument);
 						}
@@ -6727,6 +6741,7 @@ namespace rhi {
 				VkResult pipelineResult = vkCreateRayTracingPipelinesKHR(impl->device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &nativePipeline);
 				for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
 				if (pipelineResult != VK_SUCCESS) {
+					spdlog::error("Vulkan ray tracing pipeline: vkCreateRayTracingPipelinesKHR failed ({})", static_cast<int>(pipelineResult));
 					return ToRHI(pipelineResult);
 				}
 
@@ -7473,7 +7488,9 @@ namespace rhi {
 					}
 
 					auto* out = reinterpret_cast<ShaderFeatureInfo*>(header);
-					out->maxShaderModel = ShaderModel::Unknown;
+					// DXC's SPIR-V covers SM 6.0 on every Vulkan 1.3 device; SM 6.6's dynamic resources
+					// (ResourceDescriptorHeap / SamplerDescriptorHeap) need VK_EXT_descriptor_heap.
+					out->maxShaderModel = impl->descriptorHeapEnabled ? ShaderModel::SM_6_6 : ShaderModel::SM_6_0;
 					out->unifiedResourceHeaps = impl->descriptorHeapEnabled;
 					out->unboundedDescriptorTables = impl->descriptorHeapEnabled;
 					out->waveOps = false;

@@ -5,7 +5,11 @@
 #pragma once
 #include <utility>     // std::move
 #include <type_traits> // std::is_trivially_copyable_v
+#ifdef _WIN32
 #include <dxgi1_6.h>
+#else
+#include <directx/dxgiformat.h> // DirectX-Headers' portable DXGI_FORMAT
+#endif
 #include <string>
 #include <stdexcept>
 

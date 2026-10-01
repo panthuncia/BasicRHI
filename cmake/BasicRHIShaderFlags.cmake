@@ -1,8 +1,8 @@
-# Build-time counterpart of rhi::AppendVulkanDxcSpirvArguments (rhi.h).
+# Build-time counterpart of rhi::AppendVulkanDxcSpirvArguments (rhi_shader_abi.h).
 #
 # Sets BASICRHI_VULKAN_DXC_FLAGS to the DXC arguments every SPIR-V shader consumed by
 # BasicRHI's Vulkan backend must be compiled with. The descriptor-heap bindings are read
-# from rhi.h so the header stays the single source of truth.
+# from rhi_shader_abi.h so the header stays the single source of truth.
 #
 # Also provides:
 #   basicrhi_compile_spirv(OUTPUT <file.spv> SOURCE <file.hlsl> ENTRY <name> PROFILE <cs_6_6>
@@ -13,7 +13,7 @@
 
 include_guard(GLOBAL)
 
-set(_basicrhi_rhi_header "${CMAKE_CURRENT_LIST_DIR}/../rhi.h")
+set(_basicrhi_rhi_header "${CMAKE_CURRENT_LIST_DIR}/../rhi_shader_abi.h")
 file(STRINGS "${_basicrhi_rhi_header}" _basicrhi_heap_lines REGEX "VULKAN_[A-Z_]*(HEAP_SET|HEAP_BINDING) = [0-9]+;")
 foreach(_line IN LISTS _basicrhi_heap_lines)
     if(_line MATCHES "(VULKAN_[A-Z_]+) = ([0-9]+);")

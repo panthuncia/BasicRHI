@@ -241,6 +241,7 @@ namespace rhi {
 		case HeapType::DeviceLocal:    return D3D12_HEAP_TYPE_DEFAULT;
 		case HeapType::HostVisibleCoherent: return D3D12_HEAP_TYPE_UPLOAD;
 		case HeapType::HostVisibleCached: return D3D12_HEAP_TYPE_READBACK;
+		case HeapType::HostVisibleDeviceLocal: return D3D12_HEAP_TYPE_GPU_UPLOAD;
 		default: return D3D12_HEAP_TYPE_CUSTOM;
 		}
 	}

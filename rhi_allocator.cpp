@@ -26,7 +26,10 @@
 #include "rhi_allocator.h"
 #include "rhi_allocator_config.h"
 
+#ifdef _WIN32
 #include <combaseapi.h>
+#endif
+#include <cstring>
 #include <mutex>
 #include <algorithm>
 #include <utility>
@@ -1244,10 +1247,15 @@ namespace rhi::ma {
 
 
     inline std::wstring s2ws(const std::string& s) {
+#ifdef _WIN32
         int buffSize = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
         std::wstring ws(buffSize, 0);
         MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), ws.data(), buffSize);
         return ws;
+#else
+        // Only feeds D3D12MA_DEBUG_LOG; byte-wise widening is enough for allocation names.
+        return std::wstring(s.begin(), s.end());
+#endif
     }
 
 #ifndef _D3D12MA_JSON_WRITER_UTF8
@@ -6056,7 +6064,7 @@ Synchronized internally with a mutex.
         //ZeroMemory(&m_D3D12Options, sizeof(m_D3D12Options));
         //ZeroMemory(&m_D3D12Architecture, sizeof(m_D3D12Architecture));
 
-        ZeroMemory(m_BlockVectors, sizeof(m_BlockVectors));
+        std::memset(m_BlockVectors, 0, sizeof(m_BlockVectors));
 
         for (UINT i = 0; i < STANDARD_HEAP_TYPE_COUNT; ++i)
         {
@@ -7790,7 +7798,7 @@ Synchronized internally with a mutex.
             {
                 Free(pAllocations[allocIndex]);
             }
-            ZeroMemory(pAllocations, sizeof(Allocation*) * allocationCount);
+            std::memset(pAllocations, 0, sizeof(Allocation*) * allocationCount);
         }
 
         return hr;

@@ -25,7 +25,9 @@ find_package(spdlog CONFIG REQUIRED)
 # otherwise the header-only definitions compiled into BasicRHI collide with theirs at link time.
 set(BASICRHI_SPDLOG_TARGET "spdlog::spdlog_header_only" CACHE STRING "spdlog target linked by BasicRHI")
 find_package(fmt CONFIG REQUIRED)
-if(BASICRHI_ENABLE_D3D12)
+# D3D12 types also back the shared allocator and format helpers; off Windows, DirectX-Headers
+# supplies them (and its WSL adapter the Win32 scalar types).
+if(BASICRHI_ENABLE_D3D12 OR NOT WIN32)
     find_package(DirectX-Headers CONFIG REQUIRED)
 endif()
 if(BASICRHI_ENABLE_VULKAN)
@@ -125,7 +127,7 @@ add_library(BasicRHI STATIC
     "rhi_allocator.h" 
     "rhi_allocator.cpp" "rhi_feature_info.h" "rhi_dx12_casting.h")
 
-target_compile_options(BasicRHI PRIVATE $<$<NOT:$<CXX_COMPILER_ID:Clang>>:/WX>)
+target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/WX>)
 target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
 target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:Clang>:
     -Wno-error=switch
@@ -273,6 +275,7 @@ set(_basicrhi_public_headers
     "rhi_colors.h"
     "rhi_allocator.h"
     "rhi_helpers.h"
+    "rhi_shader_abi.h"
     "rhi_c.h")
 if(BASICRHI_ENABLE_IMGUI)
     list(APPEND _basicrhi_public_headers "rhi_imgui_widgets.h")
@@ -359,6 +362,8 @@ PRIVATE
 )
 if(BASICRHI_ENABLE_D3D12)
     target_link_libraries(BasicRHI PUBLIC Microsoft::DirectX-Headers PRIVATE d3d12 dxgi dxguid)
+elseif(NOT WIN32)
+    target_link_libraries(BasicRHI PUBLIC Microsoft::DirectX-Headers)
 endif()
 
 target_compile_definitions(BasicRHI PUBLIC

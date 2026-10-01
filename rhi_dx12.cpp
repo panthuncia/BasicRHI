@@ -2330,12 +2330,12 @@ namespace rhi {
 			const bool hasMeshShaders =
 				(opt7.MeshShaderTier == D3D12_MESH_SHADER_TIER_1);
 
+			// Tiers are ordered; drivers report newer tiers (e.g. 1.2) that include everything below.
 			const bool hasRayTracingPipeline =
-				(opt5.RaytracingTier == D3D12_RAYTRACING_TIER_1_0) ||
-				(opt5.RaytracingTier == D3D12_RAYTRACING_TIER_1_1);
+				(opt5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0);
 
 			const bool hasRayTracing11 =
-				(opt5.RaytracingTier == D3D12_RAYTRACING_TIER_1_1);
+				(opt5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1);
 
 			bool hasRayTracing20 = false;
 #if BASICRHI_HAS_DXR2_HEADERS && defined(D3D12_RAYTRACING_TIER_2_0)

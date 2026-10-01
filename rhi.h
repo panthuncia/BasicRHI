@@ -5,6 +5,8 @@
 #include <limits>
 #ifdef _WIN32
 #include <windows.h> // Win32 scalar types, IsDebuggerPresent; previously reached via d3dcommon.h
+#else
+#include <wsl/winadapter.h> // DirectX-Headers' portable Win32 scalar types (UINT, BOOL, ...)
 #endif
 #include <optional>
 #include <array>
@@ -15,6 +17,7 @@
 #include <cstring>
 
 #include "resource_states.h"
+#include "rhi_shader_abi.h"
 #include "rhi_feature_info.h"
 
 #ifndef BASICRHI_HAS_DXR2_HEADERS
@@ -40,9 +43,11 @@ namespace rhi {
 	inline void BreakIfDebugging() {
 #if BUILD_TYPE == BUILD_DEBUG
 		CaptureAbnormalExitDiagnostics();
+#ifdef _WIN32
 		if (IsDebuggerPresent()) {
 			__debugbreak();
 		}
+#endif
 #endif
 	}
 #define RHI_FAIL(x) do { rhi::BreakIfDebugging(); return (x); } while(0)
@@ -64,27 +69,6 @@ namespace rhi {
 	inline constexpr uint32_t RHI_DESCRIPTORHEAP_ABI_MIN = 1;
 	inline constexpr uint32_t RHI_TIMELINE_ABI_MIN = 1;
 	inline constexpr uint32_t RHI_ACCELERATION_STRUCTURE_ABI_MIN = 1;
-	inline constexpr uint32_t VULKAN_DESCRIPTOR_HEAP_SET = 0;
-	inline constexpr uint32_t VULKAN_RESOURCE_DESCRIPTOR_HEAP_BINDING = 1000000;
-	inline constexpr uint32_t VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING = 1000001;
-	inline constexpr uint32_t VULKAN_COUNTER_DESCRIPTOR_HEAP_BINDING = 1000002;
-
-	// The DXC arguments every SPIR-V shader consumed by the Vulkan backend must be compiled with:
-	// DX buffer layout and ResourceDescriptorHeap/SamplerDescriptorHeap mapped onto the
-	// VK_EXT_descriptor_heap bindings above. Runtime compilers append these; build-time
-	// compilation uses BASICRHI_VULKAN_DXC_FLAGS from cmake/BasicRHIShaderFlags.cmake,
-	// which parses the constants from this header.
-	inline void AppendVulkanDxcSpirvArguments(std::vector<std::wstring>& args) {
-		const auto set = std::to_wstring(VULKAN_DESCRIPTOR_HEAP_SET);
-		args.insert(args.end(), {
-			L"-spirv",
-			L"-fvk-use-dx-layout",
-			L"-fspv-target-env=vulkan1.3",
-			L"-fvk-bind-resource-heap", std::to_wstring(VULKAN_RESOURCE_DESCRIPTOR_HEAP_BINDING), set,
-			L"-fvk-bind-sampler-heap", std::to_wstring(VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING), set,
-			L"-fvk-bind-counter-heap", std::to_wstring(VULKAN_COUNTER_DESCRIPTOR_HEAP_BINDING), set,
-		});
-	}
 
 	class Device;
 
