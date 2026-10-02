@@ -1530,6 +1530,38 @@ namespace rhi {
 			return stages != 0 ? stages : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 		}
 
+		// The access bits a barrier recorded on a queue of these flags may name: those of the stages VkStagesForQueue leaves
+		// it. A catch-all access (a full barrier) recorded on a compute or transfer queue keeps only its own kinds.
+		static VkAccessFlags VkAccessForQueue(VkAccessFlags access, VkQueueFlags queueFlags) noexcept {
+			if ((queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) {
+				access &= ~(VK_ACCESS_INDEX_READ_BIT |
+					VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+					VK_ACCESS_INPUT_ATTACHMENT_READ_BIT |
+					VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+					VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+					VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+					VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+#if defined(VK_KHR_fragment_shading_rate) // Vulkan enumerants are not macros; test the extension.
+				access &= ~VK_ACCESS_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR;
+#endif
+#if defined(VK_EXT_blend_operation_advanced)
+				access &= ~VK_ACCESS_COLOR_ATTACHMENT_READ_NONCOHERENT_BIT_EXT;
+#endif
+#if defined(VK_EXT_transform_feedback)
+				access &= ~(VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT | VK_ACCESS_TRANSFORM_FEEDBACK_COUNTER_READ_BIT_EXT |
+					VK_ACCESS_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT);
+#endif
+#if defined(VK_EXT_fragment_density_map)
+				access &= ~VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT;
+#endif
+			}
+			if ((queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == 0) {
+				access &= VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT |
+					VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+			}
+			return access;
+		}
+
 		static VkAccessFlags VkAccessMaskForAccess(ResourceAccessType access) noexcept {
 			const uint32_t bits = static_cast<uint32_t>(access);
 			if (bits == 0 || access == ResourceAccessType::Common) {
@@ -4890,6 +4922,13 @@ namespace rhi {
 					: (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT);
 				srcStages = VkStagesForQueue(srcStages != 0 ? srcStages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queueFlags);
 				dstStages = VkStagesForQueue(dstStages != 0 ? dstStages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queueFlags);
+				const auto clip = [&](auto& a_barrier) {
+					a_barrier.srcAccessMask = VkAccessForQueue(a_barrier.srcAccessMask, queueFlags);
+					a_barrier.dstAccessMask = VkAccessForQueue(a_barrier.dstAccessMask, queueFlags);
+				};
+				for (auto& barrier : memoryBarriers) clip(barrier);
+				for (auto& barrier : bufferBarriers) clip(barrier);
+				for (auto& barrier : imageBarriers) clip(barrier);
 				vkCmdPipelineBarrier(commandListState->commandBuffer,
 					srcStages,
 					dstStages,
