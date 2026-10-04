@@ -551,6 +551,11 @@ namespace rhi {
 				return VK_FORMAT_B8G8R8A8_UNORM;
 			case Format::B8G8R8A8_UNorm_sRGB:
 				return VK_FORMAT_B8G8R8A8_SRGB;
+			// No X format in Vulkan: the A8 one, its views swizzling alpha to one (VkSrvComponentMapping).
+			case Format::B8G8R8X8_UNorm:
+				return VK_FORMAT_B8G8R8A8_UNORM;
+			case Format::B8G8R8X8_UNorm_sRGB:
+				return VK_FORMAT_B8G8R8A8_SRGB;
 			case Format::R32_Typeless:
 				return VK_FORMAT_D32_SFLOAT;
 			case Format::R32_Float:
@@ -1712,6 +1717,15 @@ namespace rhi {
 				}
 			};
 			return { component(0), component(1), component(2), component(3) };
+		}
+
+		// A shader resource view's swizzle: its mapping, with alpha one for a format whose fourth byte is unused (B8G8R8X8, viewed
+		// as B8G8R8A8), as DXGI samples it. a_viewed is the view's format, or the resource's when the view names none.
+		static VkComponentMapping VkSrvComponentMapping(ComponentMapping mapping, Format a_viewed) noexcept {
+			VkComponentMapping components = VkComponentMappingForRHI(mapping);
+			if (a_viewed == Format::B8G8R8X8_UNorm || a_viewed == Format::B8G8R8X8_UNorm_sRGB || a_viewed == Format::B8G8R8X8_Typeless)
+				components.a = VK_COMPONENT_SWIZZLE_ONE;
+			return components;
 		}
 
 
@@ -3027,7 +3041,8 @@ namespace rhi {
 			VkFormat viewFormat,
 			VkImageAspectFlags aspectMask,
 			VkImageViewType viewType,
-			const TextureSubresourceRange& range) noexcept {
+			const TextureSubresourceRange& range,
+			VkComponentMapping components = {}) noexcept {
 			if (!impl) return Result::InvalidArgument;
 			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
 			VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, slot.heap);
@@ -3043,6 +3058,7 @@ namespace rhi {
 			createInfo.image = resource->image;
 			createInfo.viewType = viewType;
 			createInfo.format = viewFormat;
+			createInfo.components = components;
 			createInfo.subresourceRange = VkMakeImageSubresourceRange(*resource, range, aspectMask);
 
 			const VkResult result = vkCreateImageView(impl->device, &createInfo, nullptr, &viewSlot->view);
@@ -8368,7 +8384,7 @@ namespace rhi {
 				viewCreateInfo.image = resourceState->image;
 				viewCreateInfo.viewType = viewType;
 				viewCreateInfo.format = viewFormat;
-				viewCreateInfo.components = VkComponentMappingForRHI(desc.componentMapping);
+				viewCreateInfo.components = VkSrvComponentMapping(desc.componentMapping, desc.formatOverride);
 				viewCreateInfo.subresourceRange = subresourceRange;
 
 				VkImageDescriptorInfoEXT imageInfo{ VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT };
@@ -8421,7 +8437,8 @@ namespace rhi {
 				viewFormat,
 				aspectMask,
 				viewType,
-				{ subresourceRange.baseMipLevel, subresourceRange.levelCount, subresourceRange.baseArrayLayer, subresourceRange.layerCount });
+				{ subresourceRange.baseMipLevel, subresourceRange.levelCount, subresourceRange.baseArrayLayer, subresourceRange.layerCount },
+				VkSrvComponentMapping(desc.componentMapping, desc.formatOverride));
 		}
 
 		static Result d_createUnorderedAccessView(Device* device, DescriptorSlot slot, const ResourceHandle& resource, const UavDesc& desc) noexcept {

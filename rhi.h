@@ -505,6 +505,9 @@ namespace rhi {
 		R24G8_Typeless, D24_UNorm_S8_UInt, R24_UNorm_X8_Typeless,
 		R32G8X24_Typeless, D32_Float_S8X24_UInt, R32_Float_X8X24_Typeless,
 		D16_UNorm,
+		// Four bytes whose fourth is unused (appended): sampled with alpha one, as in DXGI. The Vulkan backend views them as
+		// B8G8R8A8 with the alpha swizzled to one.
+		B8G8R8X8_Typeless, B8G8R8X8_UNorm, B8G8R8X8_UNorm_sRGB,
 	};
 
 	constexpr uint32_t FormatByteSize(Format f) noexcept {
@@ -541,6 +544,8 @@ namespace rhi {
 
 		case Format::B8G8R8A8_Typeless: case Format::B8G8R8A8_UNorm:
 		case Format::B8G8R8A8_UNorm_sRGB:                                          return 4;
+		case Format::B8G8R8X8_Typeless: case Format::B8G8R8X8_UNorm:
+		case Format::B8G8R8X8_UNorm_sRGB:                                          return 4;
 
 		case Format::R24G8_Typeless: case Format::D24_UNorm_S8_UInt:
 		case Format::R24_UNorm_X8_Typeless:                                        return 4;
