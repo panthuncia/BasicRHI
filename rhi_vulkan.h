@@ -162,6 +162,8 @@ namespace rhi {
 		void* tracyGpuContext = nullptr;
 		// Owned by the host of an adopted device: never idled or reused by BasicRHI.
 		bool external = false;
+		// One of the host's spare queues (AdoptedVulkanDeviceInfo::spareQueues): offered again when destroyed.
+		bool spare = false;
 	};
 
 	struct VulkanImageViewSlot;
@@ -560,6 +562,11 @@ namespace rhi {
 		void (*submissionUnlock)(void* user, VkQueue queue) = nullptr;
 		VkResult (*submissionSubmit)(void* user, VkQueue queue, const VkSubmitInfo2& submitInfo) = nullptr;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
+		// AdoptVulkanDevice's spare queues (AdoptedVulkanDeviceInfo::spareQueues) not handed out, and the families of all of
+		// them, which Concurrent resources share with besides the primary queues'.
+		std::mutex spareQueuesMutex;
+		std::vector<VulkanQueueState> spareQueues;
+		std::vector<uint32_t> spareQueueFamilies;
 		VulkanRegistry<VulkanDescriptorHeap> descriptorHeaps;
 		// Image-view slots are updated by parallel graph materialization. The
 		// intrusive resource-to-view lists and vkCreate/vkDestroy pairs are

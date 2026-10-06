@@ -1000,19 +1000,25 @@ namespace rhi {
 
 		// Distinct families of the device's primary graphics/compute/copy queues.
 		// A resource created with QueueSharing::Concurrent lists all of them.
-		static uint32_t VkPrimaryQueueFamilies(VulkanDevice* impl, uint32_t (&out)[3]) noexcept {
+		// The families a Concurrent resource is shared with: the primary queues', and an adopted device's spare queues'.
+		static constexpr uint32_t kVkMaxSharingFamilies = 8;
+		static uint32_t VkPrimaryQueueFamilies(VulkanDevice* impl, uint32_t (&out)[kVkMaxSharingFamilies]) noexcept {
 			uint32_t count = 0;
+			auto add = [&](uint32_t a_family) {
+				bool seen = false;
+				for (uint32_t i = 0; i < count; ++i) seen = seen || out[i] == a_family;
+				if (!seen && count < kVkMaxSharingFamilies) out[count++] = a_family;
+			};
 			for (const QueueKind kind : { QueueKind::Graphics, QueueKind::Compute, QueueKind::Copy }) {
 				const VulkanQueueState* state = VkPrimaryQueueStateForKind(impl, kind);
 				if (!state) continue;
-				bool seen = false;
-				for (uint32_t i = 0; i < count; ++i) seen = seen || out[i] == state->familyIndex;
-				if (!seen) out[count++] = state->familyIndex;
+				add(state->familyIndex);
 			}
+			for (const uint32_t family : impl->spareQueueFamilies) add(family);
 			return count;
 		}
 		static void VkApplyBufferSharing(VulkanDevice* impl, const ResourceDesc& desc,
-			VkBufferCreateInfo& createInfo, uint32_t (&families)[3], bool& concurrent) noexcept {
+			VkBufferCreateInfo& createInfo, uint32_t (&families)[kVkMaxSharingFamilies], bool& concurrent) noexcept {
 			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 			createInfo.queueFamilyIndexCount = 0;
 			createInfo.pQueueFamilyIndices = nullptr;
@@ -1026,7 +1032,7 @@ namespace rhi {
 			concurrent = true;
 		}
 		static void VkApplyImageSharing(VulkanDevice* impl, const ResourceDesc& desc,
-			VkImageCreateInfo& createInfo, uint32_t (&families)[3], bool& concurrent) noexcept {
+			VkImageCreateInfo& createInfo, uint32_t (&families)[kVkMaxSharingFamilies], bool& concurrent) noexcept {
 			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 			createInfo.queueFamilyIndexCount = 0;
 			createInfo.pQueueFamilyIndices = nullptr;
@@ -7210,9 +7216,33 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 			if (!impl->ownsDevice) {
-				// The host created every queue of an adopted device; there are none to hand out.
-				out = Queue(kind);
-				return Result::Unsupported;
+				// The host created every queue of an adopted device: a spare one it offered, whose family supports the kind.
+				const VkQueueFlags wanted = kind == QueueKind::Graphics ? VK_QUEUE_GRAPHICS_BIT
+					: kind == QueueKind::Compute ? VK_QUEUE_COMPUTE_BIT
+					: (VK_QUEUE_TRANSFER_BIT | VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT);
+				VulkanQueueState taken{};
+				{
+					std::lock_guard lock(impl->spareQueuesMutex);
+					for (auto it = impl->spareQueues.begin(); it != impl->spareQueues.end(); ++it) {
+						if (it->familyIndex < impl->queueFamilyProperties.size() &&
+							(impl->queueFamilyProperties[it->familyIndex].queueFlags & wanted) != 0) {
+							taken = *it;
+							impl->spareQueues.erase(it);
+							break;
+						}
+					}
+				}
+				if (taken.queue == VK_NULL_HANDLE) {
+					out = Queue(kind);
+					return Result::Unsupported;
+				}
+				out = Queue{ kind, impl->queues.alloc(taken) };
+				out.vt = &g_vkqvt;
+				out.impl = impl;
+				if (name) {
+					q_setName(&out, name);
+				}
+				return Result::Ok;
 			}
 
 			const VulkanQueueState* primaryQueueState = VkPrimaryQueueStateForKind(impl, kind);
@@ -7276,7 +7306,13 @@ namespace rhi {
 
 			const VulkanQueueState* queueState = impl->queues.get(handle);
 			if (queueState && queueState->external) {
-				// Host-owned queue: BasicRHI's work on it is covered by its timelines.
+				// Host-owned queue: BasicRHI's work on it is covered by its timelines. A spare one is offered again.
+				if (queueState->spare) {
+					std::lock_guard lock(impl->spareQueuesMutex);
+					VulkanQueueState state = *queueState;
+					state.tracyGpuContext = nullptr;
+					impl->spareQueues.push_back(state);
+				}
 				impl->queues.free(handle);
 				return;
 			}
@@ -8794,7 +8830,7 @@ namespace rhi {
 				createInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 			}
 			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
-			uint32_t sharingFamilies[3]{};
+			uint32_t sharingFamilies[kVkMaxSharingFamilies]{};
 			bool concurrentSharing = false;
 			VkApplyBufferSharing(impl, desc, createInfo, sharingFamilies, concurrentSharing);
 			VkBuffer buffer = VK_NULL_HANDLE;
@@ -8915,7 +8951,7 @@ namespace rhi {
 			createInfo.samples = samples;
 			createInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
 			createInfo.usage = VkImageUsageForDesc(desc, format);
-			uint32_t sharingFamilies[3]{};
+			uint32_t sharingFamilies[kVkMaxSharingFamilies]{};
 			bool concurrentSharing = false;
 			VkApplyImageSharing(impl, desc, createInfo, sharingFamilies, concurrentSharing);
 			createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -9223,7 +9259,7 @@ namespace rhi {
 			createInfo.samples = samples;
 			createInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
 			createInfo.usage = VkImageUsageForDesc(desc, format);
-			uint32_t sharingFamilies[3]{};
+			uint32_t sharingFamilies[kVkMaxSharingFamilies]{};
 			bool concurrentSharing = false;
 			VkApplyImageSharing(impl, desc, createInfo, sharingFamilies, concurrentSharing);
 			createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -9298,7 +9334,7 @@ namespace rhi {
 			if (impl->bufferDeviceAddressEnabled) {
 				createInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 			}
-			uint32_t sharingFamilies[3]{};
+			uint32_t sharingFamilies[kVkMaxSharingFamilies]{};
 			bool concurrentSharing = false;
 			VkApplyBufferSharing(impl, desc, createInfo, sharingFamilies, concurrentSharing);
 			VkExternalMemoryBufferCreateInfo externalInfo{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
@@ -11496,6 +11532,16 @@ namespace rhi {
 			impl->instanceApiVersion = info.instanceApiVersion ? info.instanceApiVersion : VK_API_VERSION_1_3;
 			impl->queueFamilyNextQueueIndex.assign(familyCount, 0u);
 			impl->queueFamilyFreeQueueIndices.assign(familyCount, {});
+			for (uint32_t i = 0; i < info.spareQueueCount && info.spareQueues; ++i) {
+				const AdoptedQueue& spare = info.spareQueues[i];
+				if (spare.queue == VK_NULL_HANDLE || spare.familyIndex >= familyCount) RHI_FAIL(Result::InvalidArgument);
+				VulkanQueueState state{ spare.queue, spare.familyIndex, spare.queueIndex };
+				state.external = true;
+				state.spare = true;
+				impl->spareQueues.push_back(state);
+				if (std::find(impl->spareQueueFamilies.begin(), impl->spareQueueFamilies.end(), spare.familyIndex) == impl->spareQueueFamilies.end())
+					impl->spareQueueFamilies.push_back(spare.familyIndex);
+			}
 
 			// Unset kinds alias the graphics queue; kinds sharing a VkQueue share one handle.
 			QueueHandle handles[3]{};

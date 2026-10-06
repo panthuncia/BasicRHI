@@ -120,6 +120,11 @@ namespace rhi::vulkan {
         // Indexed by rhi::QueueKind (Graphics, Compute, Copy). queues[0] is required;
         // unset kinds alias it.
         AdoptedQueue queues[3]{};
+        // Queues the host created and never uses itself: Device::CreateQueue hands them out (one whose
+        // family supports the kind, each once; a destroyed one is handed out again). Their families join
+        // every Concurrent resource's sharing list. Submissions to them go through submissionHooks too.
+        const AdoptedQueue* spareQueues = nullptr;
+        uint32_t spareQueueCount = 0;
         QueueSubmissionHooks submissionHooks{};
         bool validateBarrierTransitions = false;
     };
