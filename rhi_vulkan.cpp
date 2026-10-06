@@ -2113,8 +2113,10 @@ namespace rhi {
 		}
 
 		static Result VkBeginCommandRecording(VkCommandBuffer commandBuffer) noexcept {
+			// Not ONE_TIME_SUBMIT: a recorded list may be submitted again once its previous submission has completed (as on
+			// D3D12, where a closed list can always be resubmitted): OpenRenderGraph keeps an epoch's recordings and resubmits
+			// them while what they were recorded for holds. Never simultaneously: a list is in at most one submission at a time.
 			VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-			beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 			const VkResult result = VkBeginCommandBufferHooked(commandBuffer, &beginInfo);
 			if (result != VK_SUCCESS) {
 				RHI_FAIL(ToRHI(result));
