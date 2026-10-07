@@ -4043,6 +4043,13 @@ namespace rhi {
 					spdlog::error("Vulkan queue submit rejected a command list that is still recording");
 					RHI_FAIL(Result::InvalidArgument);
 				}
+				// A command buffer runs only on a queue of the family its pool was made for (Device::CreateCommandAllocator(Queue)).
+				if (const VulkanCommandAllocator* allocatorState = VkAllocatorState(impl, commandListState->allocatorHandle);
+					allocatorState && allocatorState->familyIndex != queueState->familyIndex) {
+					spdlog::error("Vulkan queue submit rejected a command list allocated for queue family {} on a queue of family {}", allocatorState->familyIndex,
+						queueState->familyIndex);
+					RHI_FAIL(Result::InvalidArgument);
+				}
 #if BASICRHI_ENABLE_TRACY_GPU_PROFILING
 				if (!commandListState->tracyGpuZoneEvents.empty() &&
 					commandListState->tracyGpuZoneEvents.front().context != queueState->tracyGpuContext) {
@@ -8722,14 +8729,27 @@ namespace rhi {
 			return VkCreateImageViewSlot(impl, slot, DescriptorHeapType::DSV, texture, viewFormat, aspectMask, viewType, desc.range);
 		}
 
+		static Result VkCreateCommandAllocator(Device* device, VulkanDevice* impl, QueueKind kind, const VulkanQueueState* queueState, CommandAllocatorPtr& out) noexcept;
+
 		static Result d_createCommandAllocator(Device* device, QueueKind kind, CommandAllocatorPtr& out) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || impl->device == VK_NULL_HANDLE) {
 				out.Reset();
 				RHI_FAIL(Result::InvalidArgument);
 			}
+			return VkCreateCommandAllocator(device, impl, kind, VkPrimaryQueueStateForKind(impl, kind), out);
+		}
 
-			const VulkanQueueState* queueState = VkPrimaryQueueStateForKind(impl, kind);
+		static Result d_createCommandAllocatorForQueue(Device* device, const Queue& queue, CommandAllocatorPtr& out) noexcept {
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl || impl->device == VK_NULL_HANDLE || !queue) {
+				out.Reset();
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			return VkCreateCommandAllocator(device, impl, queue.GetKind(), VkQueueStateForHandle(impl, queue.GetQueueHandle()), out);
+		}
+
+		static Result VkCreateCommandAllocator(Device* device, VulkanDevice* impl, QueueKind kind, const VulkanQueueState* queueState, CommandAllocatorPtr& out) noexcept {
 			if (!queueState || queueState->familyIndex == kVkInvalidQueueFamily) {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
@@ -10181,7 +10201,8 @@ namespace rhi {
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
 		13u,
-		&d_createCompletionWait
+		&d_createCompletionWait,
+		&d_createCommandAllocatorForQueue
 	};
 
 	const QueueVTable g_vkqvt = {

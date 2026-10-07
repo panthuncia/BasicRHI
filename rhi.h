@@ -2979,6 +2979,10 @@ namespace rhi {
 		void (*destroyDevice)(Device*) noexcept;
 		uint32_t abi_version = 13;
 		Result(*createCompletionWait)(Device*, std::unique_ptr<CompletionWait>&) noexcept = nullptr;
+		// A command allocator for exactly this queue's family. A queue CreateQueue hands out need not be of its kind's primary queue's
+		// family (an adopted device's spare queue: Vulkan's transfer family beside a graphics-family copy queue), and a command list
+		// is submitted only to a queue of the family its allocator was made for.
+		Result(*createCommandAllocatorForQueue)(Device*, const Queue&, CommandAllocatorPtr&) noexcept = nullptr;
 	};
 
 
@@ -3081,6 +3085,10 @@ namespace rhi {
 		Result CreateRenderTargetView(DescriptorSlot s, const ResourceHandle& resource, const RtvDesc& d) noexcept { return vt->createRenderTargetView(this, s, resource, d); }
 		Result CreateDepthStencilView(DescriptorSlot s, const ResourceHandle& resource, const DsvDesc& d) noexcept { return vt->createDepthStencilView(this, s, resource, d); }
 		Result CreateCommandAllocator(const QueueKind q, CommandAllocatorPtr& out) noexcept { return vt->createCommandAllocator(this, q, out); }
+		/** @brief A command allocator for the lists submitted to this queue (its family, which its kind's primary queue may not share). */
+		Result CreateCommandAllocator(const Queue& q, CommandAllocatorPtr& out) noexcept {
+			return vt->createCommandAllocatorForQueue ? vt->createCommandAllocatorForQueue(this, q, out) : vt->createCommandAllocator(this, q.GetKind(), out);
+		}
 		void DestroyCommandAllocator(CommandAllocator* a) noexcept { deletionContext.DestroyCommandAllocator(a); }
 		Result CreateCommittedResource(const ResourceDesc& d, ResourcePtr& out) noexcept { return vt->createCommittedResource(this, d, out); }
 		void DestroySampler(SamplerHandle h) noexcept { deletionContext.DestroySampler(h); }

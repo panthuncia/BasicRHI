@@ -3473,6 +3473,9 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		static Result d_createCommandAllocator(Device* d, QueueKind q, CommandAllocatorPtr& out) noexcept;
+		// D3D12 allocators are per command list type, which every queue of a kind shares.
+		static Result d_createCommandAllocatorForQueue(Device* d, const Queue& q, CommandAllocatorPtr& out) noexcept { return d_createCommandAllocator(d, q.GetKind(), out); }
 		static Result d_createCommandAllocator(Device* d, QueueKind q, CommandAllocatorPtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 			ID3D12Device* createDevice = impl->steamlineInitialized ? impl->pSLProxyDevice.Get() : impl->pNativeDevice.Get();
@@ -9752,7 +9755,8 @@ namespace rhi {
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
 		13u,
-		&d_createCompletionWait
+		&d_createCompletionWait,
+		&d_createCommandAllocatorForQueue
 	};
 
 	const QueueVTable g_qvt = {
