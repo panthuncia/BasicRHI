@@ -2773,6 +2773,34 @@ namespace rhi {
 			page = {};
 		}
 
+		// At the list's reset (its buffer not pending): its preprocess pages go back to the device's pool; pages the pool has held
+		// for kPreprocessPoolIdleResets resets are freed, outside the pool's lock.
+		static void VkReturnGeneratedCommandsPreprocessPages(VulkanDevice* impl, VulkanCommandList& commandListState) noexcept {
+			auto& pages = commandListState.generatedCommandsPreprocessPages;
+			std::vector<VulkanCommandList::GeneratedCommandsPreprocessPage> idle;
+			{
+				std::scoped_lock poolLock(impl->preprocessPoolMutex);
+				const uint64_t now = ++impl->preprocessPoolResets;
+				for (auto& page : pages) {
+					page.cursor = 0;
+					impl->preprocessPool.push_back({ page, now });
+				}
+				auto& pool = impl->preprocessPool;
+				for (size_t i = 0; i < pool.size();) {
+					if (now - pool[i].returnedAt > VulkanDevice::kPreprocessPoolIdleResets) {
+						idle.push_back(pool[i].page);
+						pool[i] = pool.back();
+						pool.pop_back();
+					} else {
+						++i;
+					}
+				}
+			}
+			pages.clear();
+			for (auto& page : idle)
+				VkDestroyGeneratedCommandsPreprocessPage(impl, page);
+		}
+
 		static Result VkAllocateGeneratedCommandsPreprocessRange(
 			VulkanDevice* impl,
 			VulkanCommandList& commandListState,
@@ -2825,6 +2853,30 @@ namespace rhi {
 					outAddress = page.deviceAddress + alignedCursor;
 					outSize = rangeSize;
 					page.cursor = alignedCursor + rangeSize;
+					return Result::Ok;
+				}
+			}
+
+			// A page another list gave back at its reset: the smallest that holds the range (it starts at offset 0, so any
+			// alignment fits).
+			{
+				std::scoped_lock poolLock(impl->preprocessPoolMutex);
+				auto& pool = impl->preprocessPool;
+				auto best = pool.end();
+				for (auto it = pool.begin(); it != pool.end(); ++it) {
+					const auto& page = it->page;
+					if (page.memoryTypeIndex < 32 && (requirements.memoryRequirements.memoryTypeBits & (1u << page.memoryTypeIndex)) != 0 &&
+						page.deviceAddress % rangeAlignment == 0 && page.capacity >= rangeSize && (best == pool.end() || page.capacity < best->page.capacity))
+						best = it;
+				}
+				if (best != pool.end()) {
+					auto page = best->page;
+					*best = pool.back();
+					pool.pop_back();
+					outAddress = page.deviceAddress;
+					outSize = rangeSize;
+					page.cursor = rangeSize;
+					commandListState.generatedCommandsPreprocessPages.push_back(page);
 					return Result::Ok;
 				}
 			}
@@ -4591,9 +4643,7 @@ namespace rhi {
 			for (auto& page : commandListState->emulatedRootConstantScratchPages) {
 				page.cursor = 0;
 			}
-			for (auto& page : commandListState->generatedCommandsPreprocessPages) {
-				page.cursor = 0;
-			}
+			VkReturnGeneratedCommandsPreprocessPages(impl, *commandListState);
 			commandListState->preprocessedIndirect.clear();
 			commandListState->preprocessBarrierPending = false;
 			commandListState->emulatedRootConstantShadowStates.clear();
@@ -9915,7 +9965,7 @@ namespace rhi {
 		if (abandoned) {
 			// The host destroyed the VkDevice first: every handle below is already gone.
 			for (auto& slot : queues.slots) slot.obj.tracyGpuContext = nullptr;
-			commandLists.clear(); descriptorHeaps.clear(); swapchains.clear(); accelerationStructures.clear();
+			commandLists.clear(); preprocessPool.clear(); descriptorHeaps.clear(); swapchains.clear(); accelerationStructures.clear();
 			resources.clear(); commandSignatures.clear(); pipelines.clear(); pipelineLayouts.clear();
 			timelines.clear(); heaps.clear(); queryPools.clear(); allocators.clear(); queues.clear();
 			device = VK_NULL_HANDLE;
@@ -9963,6 +10013,9 @@ namespace rhi {
 			slot.alive = false;
 		}
 		commandLists.clear();
+		for (auto& pooled : preprocessPool)
+			VkDestroyGeneratedCommandsPreprocessPage(this, pooled.page);
+		preprocessPool.clear();
 
 		for (auto& slot : descriptorHeaps.slots) {
 			if (!slot.alive) {

@@ -451,6 +451,7 @@ namespace rhi {
 		// VK_EXT_device_generated_commands preprocess memory is writable scratch.
 		// Keep unique ranges with the command list so overlapping recorded lists
 		// (and distinct commands in one list) never alias the same scratch bytes.
+		// Held until the list's reset, which gives them back to the device's pool (VulkanDevice::preprocessPool).
 		std::vector<GeneratedCommandsPreprocessPage> generatedCommandsPreprocessPages;
 		// Explicit preprocesses recorded in this list and not yet executed, each consumed by the one execution it matches.
 		struct PreprocessedIndirect {
@@ -581,6 +582,18 @@ namespace rhi {
 		// Keep each compound lifetime operation atomic. Recursive locking lets the
 		// compound helpers reuse the synchronized bind/map helpers safely.
 		mutable std::recursive_mutex deviceMemoryMutex;
+		// VK_EXT_device_generated_commands preprocess pages no command list holds. A list gives its pages back at its reset (its
+		// buffer is not pending then, so the GPU is done with them) and takes ranges from them before allocating, so the memory
+		// is what the lists not yet reset hold, not every page a pooled list ever needed. A page left here for
+		// kPreprocessPoolIdleResets resets (a size the lists outgrew) is freed.
+		static constexpr uint64_t kPreprocessPoolIdleResets = 4096;
+		struct PooledPreprocessPage {
+			VulkanCommandList::GeneratedCommandsPreprocessPage page;
+			uint64_t returnedAt = 0;  // preprocessPoolResets when it came back
+		};
+		std::mutex preprocessPoolMutex;
+		std::vector<PooledPreprocessPage> preprocessPool;
+		uint64_t preprocessPoolResets = 0;
 		struct HostMemoryMapping {
 			void* base = nullptr;
 			uint32_t refCount = 0;
