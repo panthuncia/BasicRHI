@@ -3500,4 +3500,13 @@ namespace rhi {
 	rhi::Result CreateD3D12Device(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer = false) noexcept; // implemented in rhi_dx12.cpp
 	rhi::Result CreateVulkanDevice(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer = false) noexcept; // implemented in rhi_vulkan.cpp
 
+	namespace vulkan {
+		/**
+		 * The calling thread's label for the graphics pipelines it creates next (null clears it). With DXVK_PIPELINE_STATS set and
+		 * VK_KHR_pipeline_executable_properties enabled, each graphics pipeline captures its statistics (registers, spills) and logs
+		 * them under this label. Implemented in rhi_vulkan.cpp.
+		 */
+		void set_pipeline_statistics_label(const char* label) noexcept;
+	}
+
 }

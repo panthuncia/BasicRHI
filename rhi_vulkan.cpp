@@ -2,7 +2,10 @@
 #include "rhi_interop_vulkan.h"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cmath>
+#include <format>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -12,6 +15,7 @@
 #include <cstddef>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -50,6 +54,96 @@
 
 namespace rhi {
 	namespace {
+		thread_local const char* t_pipelineStatisticsLabel = nullptr;
+
+		// Capture tools list shaders by entry point and primary source file (Nsight Graphics shows "main - <hash>" for every module, and
+		// every DCLF Lighting permutation's file is Lighting.hlsl), so a labelled pipeline's modules get the label as both: the entry point
+		// (and the entry function's OpName) and the primary OpSource file name. Empty when the module has no single entry point.
+		std::vector<uint32_t> SpirvWithCaptureNames(const uint32_t* code, size_t dwords, const std::string& entryName, const std::string& fileName) {
+			auto stringWords = [](const char* str) { return uint32_t((std::strlen(str) + 4u) / 4u); };
+			auto appendString = [](std::vector<uint32_t>& out, const std::string& str) {
+				size_t base = out.size();
+				out.resize(base + (str.size() + 4u) / 4u, 0u);
+				std::memcpy(&out[base], str.data(), str.size());
+			};
+			if (dwords < 5u) return {};
+			uint32_t entryFunction = 0u, entryPoints = 0u, fileId = 0u;
+			for (size_t i = 5u; i < dwords;) {
+				uint32_t op = code[i] & 0xffffu, count = code[i] >> 16u;
+				if (!count || i + count > dwords) return {};
+				if (op == 15u && count > 3u) { entryFunction = code[i + 2u]; ++entryPoints; }  // OpEntryPoint
+				if (op == 3u && count > 3u && !fileId) fileId = code[i + 3u];                  // OpSource lang version file
+				i += count;
+			}
+			if (entryPoints != 1u) return {};
+			std::vector<uint32_t> out(code, code + 5u);
+			out.reserve(dwords + 64u);
+			for (size_t i = 5u; i < dwords;) {
+				uint32_t op = code[i] & 0xffffu, count = code[i] >> 16u;
+				size_t start = out.size();
+				if (op == 15u && count > 3u) {
+					uint32_t nameEnd = std::min(count, 3u + stringWords(reinterpret_cast<const char*>(&code[i + 3u])));
+					out.insert(out.end(), { 0u, code[i + 1u], code[i + 2u] });
+					appendString(out, entryName);
+					out.insert(out.end(), &code[i + nameEnd], &code[i + count]);
+				} else if (op == 5u && count > 2u && code[i + 1u] == entryFunction) {  // OpName
+					out.insert(out.end(), { 0u, code[i + 1u] });
+					appendString(out, entryName);
+				} else if (op == 7u && count > 2u && fileId && code[i + 1u] == fileId) {  // OpString
+					out.insert(out.end(), { 0u, code[i + 1u] });
+					appendString(out, fileName);
+				} else {
+					out.insert(out.end(), &code[i], &code[i + count]);
+					i += count;
+					continue;
+				}
+				out[start] = uint32_t((out.size() - start) << 16u) | op;
+				i += count;
+			}
+			return out;
+		}
+
+		bool PipelineStatisticsRequested() noexcept {
+			static const bool requested = [] { const char* value = std::getenv("DXVK_PIPELINE_STATS"); return value && *value; }();
+			return requested && vkGetPipelineExecutablePropertiesKHR && vkGetPipelineExecutableStatisticsKHR;
+		}
+
+		// One line per executable of a_pipeline: its name and every statistic the driver reports.
+		void LogPipelineStatistics(VkDevice device, VkPipeline pipeline) noexcept {
+			try {
+				VkPipelineInfoKHR info{ VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR };
+				info.pipeline = pipeline;
+				uint32_t count = 0;
+				if (vkGetPipelineExecutablePropertiesKHR(device, &info, &count, nullptr) != VK_SUCCESS || !count) return;
+				std::vector<VkPipelineExecutablePropertiesKHR> executables(count, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR });
+				if (vkGetPipelineExecutablePropertiesKHR(device, &info, &count, executables.data()) != VK_SUCCESS) return;
+				for (uint32_t e = 0; e < count; ++e) {
+					VkPipelineExecutableInfoKHR executable{ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR };
+					executable.pipeline = pipeline;
+					executable.executableIndex = e;
+					uint32_t statCount = 0;
+					if (vkGetPipelineExecutableStatisticsKHR(device, &executable, &statCount, nullptr) != VK_SUCCESS) continue;
+					std::vector<VkPipelineExecutableStatisticKHR> stats(statCount, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR });
+					if (vkGetPipelineExecutableStatisticsKHR(device, &executable, &statCount, stats.data()) != VK_SUCCESS) continue;
+					std::string line;
+					for (const auto& stat : stats) {
+						line += " ";
+						line += stat.name;
+						line += "=";
+						switch (stat.format) {
+						case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: line += stat.value.b32 ? "true" : "false"; break;
+						case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: line += std::to_string(stat.value.i64); break;
+						case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: line += std::to_string(stat.value.u64); break;
+						case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR: line += std::to_string(stat.value.f64); break;
+						default: line += "?"; break;
+						}
+						line += ";";
+					}
+					spdlog::info("PipelineStats: {} | {}:{}", t_pipelineStatisticsLabel ? t_pipelineStatisticsLabel : "(unlabelled)", executables[e].name, line);
+				}
+			} catch (...) {
+			}
+		}
 		static constexpr size_t kMaxQueuedValidationMessages = 1024;
 
 		static void VkQueueValidationMessage(VulkanDevice* impl, VkDebugUtilsMessageSeverityFlagBitsEXT severity, std::string message) noexcept {
@@ -2595,7 +2689,7 @@ namespace rhi {
 			case HeapType::HostCached:
 				return VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 			case HeapType::GPUUpload:
-				return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+				return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 			case HeapType::Custom:
 			default:
 				return 0;
@@ -2613,7 +2707,8 @@ namespace rhi {
 			case HeapType::HostCached:
 				return VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 			case HeapType::GPUUpload:
-				return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+				// Coherent, as D3D12's GPU_UPLOAD: the host writes through the mapping with no flush.
+				return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 			case HeapType::Custom:
 			default:
 				return 0;
@@ -6914,14 +7009,31 @@ namespace rhi {
 					VkShaderDescriptorSetAndBindingMappingInfoEXT info{ VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT };
 				};
 				std::array<StageMappings, 3> stageMappings{};  // task, vertex or mesh, pixel
+				std::array<std::string, 3> entryNames{};
 				auto addShader = [&](const SubobjShader* shader) -> Result {
 					StageMappings& stageMapping = stageMappings[shaderStages.size()];
+					std::string& entryName = entryNames[shaderStages.size()];
 					VkAppendDescriptorHeapMappings(impl, *layoutState, VkShaderStageForRHI(shader->stage), stageMapping.mappings, stageMapping.embeddedSamplers);
 					stageMapping.info.mappingCount = static_cast<uint32_t>(stageMapping.mappings.size());
 					stageMapping.info.pMappings = stageMapping.mappings.empty() ? nullptr : stageMapping.mappings.data();
 					VkShaderModuleCreateInfo moduleInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
 					moduleInfo.codeSize = shader->bytecode.size;
 					moduleInfo.pCode = static_cast<const uint32_t*>(shader->bytecode.data);
+					std::vector<uint32_t> namedCode;
+					if (t_pipelineStatisticsLabel && impl->debugUtilsEnabled) {
+						VkShaderStageFlagBits vkStage = VkShaderStageForRHI(shader->stage);
+						const char* stageName = vkStage == VK_SHADER_STAGE_FRAGMENT_BIT ? "ps" : vkStage == VK_SHADER_STAGE_VERTEX_BIT ? "vs"
+							: vkStage == VK_SHADER_STAGE_MESH_BIT_EXT ? "ms" : "ts";
+						std::string label = std::format("{} {}", stageName, t_pipelineStatisticsLabel);
+						std::string identifier = label;
+						for (char& c : identifier) c = std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
+						namedCode = SpirvWithCaptureNames(moduleInfo.pCode, moduleInfo.codeSize / sizeof(uint32_t), identifier, label);
+						if (!namedCode.empty()) {
+							entryName = std::move(identifier);
+							moduleInfo.codeSize = namedCode.size() * sizeof(uint32_t);
+							moduleInfo.pCode = namedCode.data();
+						}
+					}
 					VkShaderModule module = VK_NULL_HANDLE;
 					VkResult result = vkCreateShaderModule(impl->device, &moduleInfo, nullptr, &module);
 					if (result != VK_SUCCESS) {
@@ -6931,7 +7043,7 @@ namespace rhi {
 					VkPipelineShaderStageCreateInfo stage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
 					stage.stage = VkShaderStageForRHI(shader->stage);
 					stage.module = module;
-					stage.pName = shader->entryPoint.empty() ? "main" : shader->entryPoint.c_str();
+					stage.pName = !entryName.empty() ? entryName.c_str() : shader->entryPoint.empty() ? "main" : shader->entryPoint.c_str();
 					stage.pNext = stageMapping.info.mappingCount != 0 ? &stageMapping.info : nullptr;
 					shaderStages.push_back(stage);
 					return Result::Ok;
@@ -7063,6 +7175,8 @@ namespace rhi {
 					}
 					createFlags.flags |= VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
 				}
+				const bool captureStatistics = PipelineStatisticsRequested();
+				if (captureStatistics) createFlags.flags |= VK_PIPELINE_CREATE_2_CAPTURE_STATISTICS_BIT_KHR;
 				createFlags.pNext = &rendering;
 				VkGraphicsPipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
 				pipelineInfo.pNext = &createFlags;
@@ -7079,13 +7193,26 @@ namespace rhi {
 				pipelineInfo.layout = nativeLayout;
 
 				VkPipeline nativePipeline = VK_NULL_HANDLE;
+				// A labelled pipeline (set_pipeline_statistics_label) and its stages carry the label for debuggers (Nsight Graphics, RenderDoc):
+				// the modules before the pipeline is created, which is when a capture tool records its stages.
+				if (t_pipelineStatisticsLabel) {
+					static std::atomic<bool> reported{ false };
+					if (!reported.exchange(true))
+						spdlog::info("BasicRHI: labelled pipelines are named for capture tools: {} (debug utils {}, vkSetDebugUtilsObjectNameEXT {})",
+							impl->debugUtilsEnabled && vkSetDebugUtilsObjectNameEXT ? "yes" : "no", impl->debugUtilsEnabled, vkSetDebugUtilsObjectNameEXT != nullptr);
+				}
+				if (t_pipelineStatisticsLabel)
+					for (VkShaderModule module : modules) VkSetObjectName(impl, reinterpret_cast<uint64_t>(module), VK_OBJECT_TYPE_SHADER_MODULE, t_pipelineStatisticsLabel);
 				VkResult vkResult = vkCreateGraphicsPipelines(impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &nativePipeline);
+				if (vkResult == VK_SUCCESS && t_pipelineStatisticsLabel)
+					VkSetObjectName(impl, reinterpret_cast<uint64_t>(nativePipeline), VK_OBJECT_TYPE_PIPELINE, t_pipelineStatisticsLabel);
 				for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
 				if (vkResult != VK_SUCCESS) {
 					vkDestroyPipelineLayout(impl->device, nativeLayout, nullptr);
 					return ToRHI(vkResult);
 				}
 
+				if (captureStatistics) LogPipelineStatistics(impl->device, nativePipeline);
 				VulkanPipeline graphicsPipelineState{ nativePipeline, nativeLayout, VK_PIPELINE_BIND_POINT_GRAPHICS, layoutHandle, false };
 				graphicsPipelineState.indirectBindable = indirectBindable;
 				graphicsPipelineState.dynamicVertexStride = dynamicVertexStride;
@@ -7781,7 +7908,7 @@ namespace rhi {
 					}
 
 					auto* out = reinterpret_cast<ResourceAllocationFeatureInfo*>(header);
-					out->gpuUploadHeapSupported = hostVisibleDeviceLocal;
+					out->gpuUploadHeapSupported = hostCoherentDeviceLocal;
 					out->tightAlignmentSupported = false;
 					out->createNotZeroedHeapSupported = false;
 				} break;
@@ -12101,3 +12228,7 @@ namespace rhi {
 	}
 
 } // namespace rhi
+
+namespace rhi::vulkan {
+	void set_pipeline_statistics_label(const char* label) noexcept { t_pipelineStatisticsLabel = label; }
+}
