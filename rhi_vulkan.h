@@ -441,6 +441,9 @@ namespace rhi {
 		PipelineHandle boundPipeline{};
 		DescriptorHeapHandle boundCbvSrvUavHeap{};
 		DescriptorHeapHandle boundSamplerHeap{};
+		// Diagnostics (DiagnosticDedupeHeapBinds): the heaps the list's last bind emitted; cleared where the binding may be lost.
+		DescriptorHeapHandle emittedCbvSrvUavHeap{};
+		DescriptorHeapHandle emittedSamplerHeap{};
 		VkRect2D passRenderArea{};
 		std::vector<ResourceHandle> passColorResources;
 		ResourceHandle passDepthResource{};

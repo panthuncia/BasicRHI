@@ -4731,6 +4731,8 @@ namespace rhi {
 			commandListState->boundPipeline = {};
 			commandListState->boundCbvSrvUavHeap = {};
 			commandListState->boundSamplerHeap = {};
+			commandListState->emittedCbvSrvUavHeap = {};
+			commandListState->emittedSamplerHeap = {};
 			commandListState->pendingError = Result::Ok;
 			commandListState->recordedBarrierBatches.clear();
 			commandListState->recordingTextureStates.clear();
@@ -5075,6 +5077,8 @@ namespace rhi {
 			}
 
 			for (const GlobalBarrier& barrier : barriers.globals) {
+				if (rhi::DiagnosticSkipGlobalBarriers().load(std::memory_order_relaxed))
+					break;
 				VkMemoryBarrier vkBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
 				vkBarrier.srcAccessMask = VkAccessMaskForAccess(barrier.beforeAccess);
 				vkBarrier.dstAccessMask = VkAccessMaskForAccess(barrier.afterAccess);
@@ -5988,6 +5992,7 @@ namespace rhi {
 					if (!commandListState->passActive)
 						VkFlushPreprocessBarrier(*commandListState);
 					vkCmdExecuteGeneratedCommandsEXT(commandListState->commandBuffer, VK_TRUE, &generatedInfo);
+					commandListState->emittedCbvSrvUavHeap = commandListState->emittedSamplerHeap = {};
 					return;
 				}
 
@@ -6004,6 +6009,7 @@ namespace rhi {
 				generatedInfo.preprocessAddress = preprocessAddress;
 				generatedInfo.preprocessSize = preprocessSize;
 				vkCmdExecuteGeneratedCommandsEXT(commandListState->commandBuffer, VK_FALSE, &generatedInfo);
+				commandListState->emittedCbvSrvUavHeap = commandListState->emittedSamplerHeap = {};
 				return;
 			}
 
@@ -6063,7 +6069,12 @@ namespace rhi {
 			if (VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, cbvSrvUav);
 				heap && heap->type == DescriptorHeapType::CbvSrvUav && heap->shaderVisible) {
 				commandListState->boundCbvSrvUavHeap = cbvSrvUav;
-				if (impl->descriptorHeapEnabled && heap->buffer != VK_NULL_HANDLE && heap->deviceAddress != 0) {
+				const bool emitted = commandListState->emittedCbvSrvUavHeap.index == cbvSrvUav.index
+					&& commandListState->emittedCbvSrvUavHeap.generation == cbvSrvUav.generation && commandListState->emittedCbvSrvUavHeap.valid();
+				if (emitted && rhi::DiagnosticDedupeHeapBinds().load(std::memory_order_relaxed)) {
+				}
+				else if (impl->descriptorHeapEnabled && heap->buffer != VK_NULL_HANDLE && heap->deviceAddress != 0) {
+					commandListState->emittedCbvSrvUavHeap = cbvSrvUav;
 					VkBindHeapInfoEXT bindInfo{ VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT };
 					bindInfo.heapRange.address = heap->deviceAddress;
 					bindInfo.heapRange.size = heap->descriptorBytes + heap->reservedRangeSize;
@@ -6080,7 +6091,12 @@ namespace rhi {
 				if (VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, sampler.value());
 					heap && heap->type == DescriptorHeapType::Sampler && heap->shaderVisible) {
 					commandListState->boundSamplerHeap = sampler.value();
-					if (impl->descriptorHeapEnabled && heap->buffer != VK_NULL_HANDLE && heap->deviceAddress != 0) {
+					const bool emitted = commandListState->emittedSamplerHeap.index == sampler->index
+						&& commandListState->emittedSamplerHeap.generation == sampler->generation && commandListState->emittedSamplerHeap.valid();
+					if (emitted && rhi::DiagnosticDedupeHeapBinds().load(std::memory_order_relaxed)) {
+					}
+					else if (impl->descriptorHeapEnabled && heap->buffer != VK_NULL_HANDLE && heap->deviceAddress != 0) {
+						commandListState->emittedSamplerHeap = sampler.value();
 						VkBindHeapInfoEXT bindInfo{ VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT };
 						bindInfo.heapRange.address = heap->deviceAddress;
 						bindInfo.heapRange.size = heap->descriptorBytes + heap->reservedRangeSize;

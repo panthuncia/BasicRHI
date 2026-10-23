@@ -15,6 +15,7 @@
 #include <utility> // C++23: std::to_underlying
 #include <string>
 #include <cstring>
+#include <atomic>
 
 #include "resource_states.h"
 #include "rhi_shader_abi.h"
@@ -3507,6 +3508,19 @@ namespace rhi {
 		 * them under this label. Implemented in rhi_vulkan.cpp.
 		 */
 		void set_pipeline_statistics_label(const char* label) noexcept;
+	}
+
+	// Diagnostics: while set, a command list's descriptor heap bind of the heaps its last bind emitted emits nothing (Vulkan; recordings
+	// made while set). Timing only.
+	inline std::atomic<bool>& DiagnosticDedupeHeapBinds() {
+		static std::atomic<bool> dedupe{ false };
+		return dedupe;
+	}
+
+	// Diagnostics: while set, command lists record no global (memory) barrier (Vulkan). Unsafe: timing runs whose lists access nothing only.
+	inline std::atomic<bool>& DiagnosticSkipGlobalBarriers() {
+		static std::atomic<bool> skip{ false };
+		return skip;
 	}
 
 }
