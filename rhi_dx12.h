@@ -166,6 +166,9 @@ namespace rhi {
 		// proxy is retained so the object created through the hooked device remains alive.
 		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc;
 		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> slProxyAlloc;
+		// The bundle allocator for the secondaries recorded from this allocator (Device::CreateSecondaryCommandList): made with
+		// the first of them, reset with alloc.
+		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> bundleAlloc;
 		D3D12_COMMAND_LIST_TYPE type{};
 		Dx12Device* dev = nullptr;
 	};
@@ -204,6 +207,10 @@ namespace rhi {
 		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> slProxyCl;
 		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc;
 		D3D12_COMMAND_LIST_TYPE type{};
+		// A secondary, recorded as a bundle (D3D12_COMMAND_LIST_TYPE_BUNDLE) from its allocator's bundleAlloc.
+		bool bundle = false;
+		// A command a bundle cannot hold was refused; End reports it.
+		Result pendingError = Result::Ok;
 		PipelineLayoutHandle boundLayout{};
 		Dx12PipelineLayout* boundLayoutPtr = nullptr;
 		Dx12Device* dev = nullptr;

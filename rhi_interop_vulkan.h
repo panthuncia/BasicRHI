@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -91,6 +92,35 @@ namespace rhi::vulkan {
         uint32_t queueIndex = 0;
     };
 
+    // The binding models BasicRHI's Vulkan backend can run on. The model is fixed for a device: an adopted device uses the one
+    // whose features the host enabled (descriptorHeap; or descriptorBuffer + mutableDescriptorType), and a host that records
+    // BasicRHI work into its own command buffers must use the same model itself.
+    enum BindingModelBits : uint32_t {
+        BindingModel_DescriptorHeap = 1u << 0,    // VK_EXT_descriptor_heap
+        BindingModel_DescriptorBuffer = 1u << 1,  // VK_EXT_descriptor_buffer + VK_EXT_mutable_descriptor_type, shaders lowered
+    };
+
+    // What the client will create on the device, for the descriptor-buffer model's limit checks.
+    struct BindingRequirements {
+        // The shader-visible heap capacities the client wants (preferred) and can live with (min): a model is supported with
+        // min(preferred, the device's limit) when that reaches min, and that capacity is reported per model.
+        DescriptorHeapCapacities heapCapacities{};
+        // What the host itself takes from the device's shared budgets (DXVK: its 2048-sampler pool and its descriptor
+        // buffers), so that the two together fit.
+        uint32_t hostSamplerObjects = 0;
+        VkDeviceSize hostResourceDescriptorBufferBytes = 0;
+        VkDeviceSize hostSamplerDescriptorBufferBytes = 0;
+    };
+
+    struct BindingModelReport {
+        uint32_t supportedModels = 0;  // BindingModelBits
+        // The capacities each supported model would set the device up with (0 for an unsupported model).
+        uint32_t heapModelResources = 0, heapModelSamplers = 0;
+        uint32_t bufferModelResources = 0, bufferModelSamplers = 0;
+        // One line per check, required against the device's value, for the log.
+        std::vector<std::string> checks;
+    };
+
     struct AdoptedVulkanDeviceInfo {
         // Optional, backend-neutral marker registration. The caller owns marker storage
         // until all submitted command buffers retire; BasicRHI only records opaque IDs.
@@ -127,9 +157,21 @@ namespace rhi::vulkan {
         uint32_t spareQueueCount = 0;
         QueueSubmissionHooks submissionHooks{};
         bool validateBarrierTransitions = false;
+        // What the host passed EvaluateBindingModels for this device (heap capacities, its own sampler objects and descriptor
+        // buffer bytes): adoption sets the device up the same way the evaluation said it would.
+        BindingRequirements bindingRequirements{};
     };
 
     Result AdoptVulkanDevice(const AdoptedVulkanDeviceInfo& info, rhi::DevicePtr& out) noexcept;
+
+    // Which binding models a physical device supports for BasicRHI, from instance-level queries only, so that a host can ask
+    // before it creates its device. BASICRHI_VK_LIMITS=base clamps every limit to the Vulkan base-spec minimum (to exercise the
+    // fallbacks).
+    BindingModelReport EvaluateBindingModels(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance instance,
+        VkPhysicalDevice physicalDevice, const BindingRequirements& requirements) noexcept;
+
+    // The binding model a Vulkan device runs on (one BindingModelBits value), 0 for a device of another backend.
+    uint32_t GetBindingModel(rhi::Device device) noexcept;
 
     // Non-owning import of a host image. currentLayout is the layout the image is in
     // when BasicRHI first uses it; the host keeps ownership of image and memory.
@@ -156,6 +198,14 @@ namespace rhi::vulkan {
         const char* debugName = nullptr;
     };
     Result import_buffer(rhi::Device device, const ImportedBufferDesc& desc, rhi::ResourcePtr& out) noexcept;
+
+    // Non-owning wrap of a VkCommandBuffer recorded by the host (an adopted device's), already begun: every recording call
+    // works on it, starting with nothing bound (no heaps, layout, pipeline or pass), and records on one thread at a time. End
+    // and Recycle are no-ops (End closes only a pass this wrapper began), the RHI never submits it, and destroying the
+    // wrapper leaves the VkCommandBuffer alone. Barriers recorded through it are not reflected in BasicRHI's resource layout
+    // tracking. GPU scratch its recording allocates - generated-commands preprocess memory, emulated root constants, transient
+    // query pools - lives with the wrapper: keep it until the host's submission of the buffer completes if any was used.
+    CommandListPtr AdoptCommandBuffer(Device& device, VkCommandBuffer commandBuffer, QueueKind kind) noexcept;
 
     // The host destroyed an adopted VkDevice before BasicRHI was shut down: release
     // BasicRHI's bookkeeping without touching any Vulkan handle.

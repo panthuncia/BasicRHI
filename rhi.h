@@ -1855,6 +1855,9 @@ namespace rhi {
 		ResourceHandle resource{};  // Required for LoadOp::DontCare (DiscardResource)
 	};
 
+	/** @brief Where a pass's draws are recorded (PassBeginInfo::contents). */
+	enum class PassContents : uint8_t { Inline, SecondaryLists };
+
 	struct PassBeginInfo {
 		Span<ColorAttachment> colors{};
 		const DepthAttachment* depth{};
@@ -1866,6 +1869,41 @@ namespace rhi {
 		uint32_t x = 0, y = 0;
 		const char* debugName = nullptr;
 		float minDepth = 0.0f, maxDepth = 1.0f;  // the viewport's depth range
+		// SecondaryLists: the pass's draws come from secondary lists (CommandList::ExecuteCommands), and ExecuteCommands is the
+		// only command valid on this list until EndPass. The viewport and scissor are not set here: each secondary sets its own
+		// (SecondaryInheritance). Vulkan: VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT. Ignored on D3D12, whose bundles
+		// mix freely with inline commands.
+		PassContents contents = PassContents::Inline;
+	};
+
+	/**
+	 * @brief What a secondary list (Device::CreateSecondaryCommandList) is recorded for: the pass it will be executed in.
+	 *
+	 * Nothing is inherited from the list that executes it: heaps, layout, pipeline, push data, index buffer and topology are
+	 * bound inside the secondary. BeginSecondary sets the viewport (flipped, as BeginPass does) and scissor from the rectangle
+	 * here, since dynamic state is not inherited either. The formats and sample count must match the executing pass's.
+	 *
+	 * D3D12 records a secondary as a bundle: it inherits the executing list's render targets, viewport and scissor (a bundle
+	 * cannot set them, so the rectangle here is unused there), and its SetDescriptorHeaps must name the heaps the executing list
+	 * has bound.
+	 */
+	struct SecondaryInheritance {
+		Span<const Format> colorFormats{};
+		Format depthFormat = Format::Unknown;    // Unknown: no depth attachment
+		Format stencilFormat = Format::Unknown;  // Unknown: no stencil attachment
+		uint32_t sampleCount = 1;
+		// The render area, viewport and scissor the secondary sets itself.
+		uint32_t x = 0, y = 0, width = 0, height = 0;
+		float minDepth = 0.0f, maxDepth = 1.0f;
+		// The recording may be pending in several executions at once (replayed by several frames in flight).
+		// Vulkan: VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT. D3D12 bundles always may.
+		bool simultaneousUse = false;
+		// False: recorded for execution outside any pass, not inside one - copies, barriers and dispatches are valid in it, draws
+		// are not, and every field above but simultaneousUse is unused. Vulkan only (no RENDER_PASS_CONTINUE, no rendering
+		// inheritance, no viewport or scissor); D3D12 bundles can hold neither copies nor barriers, so BeginSecondary returns
+		// Unsupported there.
+		bool insideRendering = true;
+		const char* debugName = nullptr;
 	};
 	enum ResourceFlags : uint32_t {
 		RF_None = 0,
@@ -2710,6 +2748,9 @@ namespace rhi {
 			ResourceHandle argumentBuffer, uint64_t argumentOffset,
 			ResourceHandle countBuffer, uint64_t countOffset,
 			uint32_t maxCommandCount) noexcept = nullptr;
+		// abi_version 8: secondary lists (Device::CreateSecondaryCommandList); null where the backend has none.
+		Result (*beginSecondary)(CommandList*, const SecondaryInheritance&) noexcept = nullptr;
+		void (*executeCommands)(CommandList*, Span<CommandList* const>) noexcept = nullptr;
 	};
 
 	class CommandList {
@@ -2731,6 +2772,7 @@ namespace rhi {
 		void End() noexcept;
 		bool SupportsCheckedEnd() const noexcept { return IsValid() && vt->abi_version >= 6 && vt->endChecked; }
 		bool SupportsDebugLabels() const noexcept { return IsValid() && vt->abi_version >= 7 && vt->beginDebugLabel && vt->endDebugLabel && vt->insertDebugLabel; }
+		bool SupportsSecondaryLists() const noexcept { return IsValid() && vt->abi_version >= 8 && vt->beginSecondary && vt->executeCommands; }
 		Result EndChecked() noexcept { return SupportsCheckedEnd() ? vt->endChecked(this) : Result::Unsupported; }
 		void Recycle(const CommandAllocator& ca) noexcept;
 		void BeginPass(const PassBeginInfo& p) noexcept;
@@ -2773,6 +2815,25 @@ namespace rhi {
 			ResourceHandle cntBuf, uint64_t cntOff,
 			uint32_t maxCount) noexcept;
 		void SetDescriptorHeaps(DescriptorHeapHandle cbvSrvUav, std::optional<DescriptorHeapHandle> sampler) noexcept;
+		/**
+		 * @brief Begins recording a secondary list (Device::CreateSecondaryCommandList) for the pass `inheritance` describes.
+		 * Call it after Recycle(allocator), on every use including the first; End() ends it as usual. Inside a secondary that
+		 * continues a pass only pass-scoped commands are valid (binds, push data, draws, ExecuteIndirect): a barrier, clear,
+		 * copy, query reset or resolve, BeginPass or EndPass fails the list, which End then reports. One recorded without
+		 * insideRendering takes the commands valid outside a pass instead.
+		 */
+		Result BeginSecondary(const SecondaryInheritance& inheritance) noexcept {
+			return SupportsSecondaryLists() ? vt->beginSecondary(this, inheritance) : Result::Unsupported;
+		}
+		/**
+		 * @brief Executes ended secondary lists, in order: inside a pass begun with PassContents::SecondaryLists (Vulkan; on
+		 * D3D12 inside any pass, as ExecuteBundle), or outside any pass for those recorded without insideRendering. Everything the
+		 * executing list had bound - pipeline, heaps, push data, dynamic state - is undefined afterwards: rebind before recording
+		 * further work on it. A secondary cannot execute secondaries.
+		 */
+		void ExecuteCommands(Span<CommandList* const> lists) noexcept {
+			if (SupportsSecondaryLists()) vt->executeCommands(this, lists);
+		}
 		void ClearUavUint(const UavClearInfo& u, const UavClearUint& v) noexcept;
 		void ClearUavFloat(const UavClearInfo& u, const UavClearFloat& v) noexcept;
 		void CopyTextureToBuffer(const BufferTextureCopyFootprint& r) noexcept;
@@ -2984,6 +3045,8 @@ namespace rhi {
 		// family (an adopted device's spare queue: Vulkan's transfer family beside a graphics-family copy queue), and a command list
 		// is submitted only to a queue of the family its allocator was made for.
 		Result(*createCommandAllocatorForQueue)(Device*, const Queue&, CommandAllocatorPtr&) noexcept = nullptr;
+		// abi_version 14: secondary command lists (CommandList::BeginSecondary). Null where the backend has none.
+		Result(*createSecondaryCommandList)(Device*, QueueKind, CommandAllocator, CommandListPtr&) noexcept = nullptr;
 	};
 
 
@@ -3053,6 +3116,15 @@ namespace rhi {
 			return vt->createWorkGraph ? vt->createWorkGraph(this, d, out) : Result::Unsupported;
 		}
 		Result CreateCommandList(QueueKind q, CommandAllocator alloc, CommandListPtr& out) noexcept { return vt->createCommandList(this, q, alloc, out); }
+		/**
+		 * @brief A secondary command list, recorded from `alloc` and executed inside another list's pass (CommandList::
+		 * ExecuteCommands), never submitted. It is not recording when created: Recycle(alloc), then BeginSecondary. Recording
+		 * is externally synchronized per allocator, so give each recording thread its own allocator. D3D12: a bundle, from a
+		 * bundle allocator kept beside `alloc` (whose Recycle resets both).
+		 */
+		Result CreateSecondaryCommandList(QueueKind q, CommandAllocator alloc, CommandListPtr& out) noexcept {
+			return vt->abi_version >= 14 && vt->createSecondaryCommandList ? vt->createSecondaryCommandList(this, q, alloc, out) : Result::Unsupported;
+		}
 		void DestroyCommandList(CommandList* cl) noexcept { deletionContext.DestroyCommandList(cl); }
 		Queue GetQueue(QueueKind q) noexcept { return vt->getQueue(this, q); }
 		Result CreateQueue(QueueKind k, const char* name, Queue& out) noexcept { return vt->createQueue(this, k, name, out); }
@@ -3309,9 +3381,21 @@ namespace rhi {
 		vt->dispatchWorkGraph(this, desc);
 	}
 
+	// Shader-visible descriptor heap capacities. The device is set up for min(preferred, what it supports); a device that
+	// cannot reach the minimum does not support bindless and creation fails. The capacities a device was set up with are
+	// reported in ShaderFeatureInfo (maxShaderVisibleResourceDescriptors / maxShaderVisibleSamplerDescriptors), and a
+	// shader-visible heap larger than them cannot be created.
+	struct DescriptorHeapCapacities {
+		uint32_t preferredResources = 1000000;  // D3D12 resource binding tier 2
+		uint32_t minResources = 65536;
+		uint32_t preferredSamplers = 2048;      // D3D12's sampler heap limit
+		uint32_t minSamplers = 256;
+	};
+
 	struct DeviceCreateInfo {
 		Backend backend = Backend::D3D12;
 		uint32_t framesInFlight = 3;
+		DescriptorHeapCapacities descriptorHeapCapacities{};
 		bool enableDebug = true;
 		bool validateBarrierTransitions = false;
 		// Enables the platform external-memory and external-timeline capabilities used

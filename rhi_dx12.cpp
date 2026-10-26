@@ -2425,6 +2425,12 @@ namespace rhi {
 					out->atomicInt64OnGroupShared = atomicInt64GroupShared;
 					out->atomicInt64OnTypedResource = atomicInt64Typed;
 					out->atomicInt64OnDescriptorHeapResources = atomicInt64OnDescriptorHeapResources;
+					if (h->structVersion >= 2) {
+						// D3D12's shader-visible heap limits: 1,000,000 CBV/SRV/UAV descriptors on every resource binding tier (tier 3 allows more, the
+						// preferred capacity is this) and D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE samplers.
+						out->maxShaderVisibleResourceDescriptors = 1000000u;
+						out->maxShaderVisibleSamplerDescriptors = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+					}
 				} break;
 
 				case FeatureInfoStructType::MeshShaders: {
@@ -3574,6 +3580,55 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// A bundle, from the allocator's bundle allocator (made here with its first secondary: an allocator is recorded from by
+		// one thread at a time). Created closed: Recycle, then BeginSecondary.
+		static Result d_createSecondaryCommandList(Device* d, QueueKind q, CommandAllocator ca, CommandListPtr& out) noexcept {
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			auto* A = dx12_detail::Alloc(&ca);
+			if (!impl || !impl->pNativeDevice || !A || A->type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+				out.Reset();
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (!A->bundleAlloc) {
+				if (const auto hr = impl->pNativeDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&A->bundleAlloc)); FAILED(hr)) {
+					spdlog::error("DX12 create bundle allocator failed hr=0x{:08X}", static_cast<unsigned>(hr));
+					out.Reset();
+					RHI_FAIL(ToRHI(hr));
+				}
+			}
+			ComPtr<ID3D12GraphicsCommandList> created;
+			if (const auto hr = impl->pNativeDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, A->bundleAlloc.Get(), nullptr, IID_PPV_ARGS(&created)); FAILED(hr)) {
+				spdlog::error("DX12 create bundle failed queue={} hr=0x{:08X}", static_cast<int>(q), static_cast<unsigned>(hr));
+				out.Reset();
+				RHI_FAIL(ToRHI(hr));
+			}
+			Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList10> cl;
+			if (const auto hr = created.As(&cl); FAILED(hr)) {
+				spdlog::error("DX12 create bundle As(ID3D12GraphicsCommandList10) failed hr=0x{:08X}", static_cast<unsigned>(hr));
+				out.Reset();
+				RHI_FAIL(ToRHI(hr));
+			}
+			if (const auto hr = cl->Close(); FAILED(hr)) {
+				out.Reset();
+				RHI_FAIL(ToRHI(hr));
+			}
+
+			Dx12CommandList rec(cl, A->bundleAlloc, D3D12_COMMAND_LIST_TYPE_BUNDLE, impl);
+			rec.bundle = true;
+			if (!Dx12EnsureRootCbvScratchPage(impl, rec, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT)) {
+				spdlog::error("DX12 create bundle EnsureRootCbvScratchPage failed");
+				out.Reset();
+				RHI_FAIL(Result::Failed);
+			}
+			const auto h = impl->commandLists.alloc(rec);
+			CommandList ret{ h };
+			ret.impl = impl;
+			ret.backendState = impl->commandLists.get(h);
+			ret.vt = &g_clvt;
+			out = MakeCommandListPtr(d, ret, impl->selfWeak.lock());
+			return Result::Ok;
+		}
+
 		static Result d_createCommittedBuffer(Device* d, const ResourceDesc& bd, ResourcePtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 			if (!impl || !impl->pNativeDevice || bd.buffer.sizeBytes == 0) {
@@ -4650,6 +4705,12 @@ namespace rhi {
 			auto* dev = qs->dev;
 			if (!dev) {
 				RHI_FAIL(Result::InvalidArgument);
+			}
+			for (auto& list : lists) {
+				if (auto* listState = dx12_detail::CL(&list); !listState || listState->bundle) {
+					spdlog::error("D3D12 queue submit rejected a {} command list", listState ? "secondary" : "null");
+					RHI_FAIL(Result::InvalidArgument);
+				}
 			}
 #if BASICRHI_ENABLE_TRACY_GPU_PROFILING
 			for (auto& list : lists) {
@@ -7469,6 +7530,21 @@ namespace rhi {
 			return D3D12CalcSubresource(mip, arraySlice, 0, T.tex.mips, T.tex.arraySize);
 		}
 
+		// Bundles cannot hold barriers, clears, copies, queries, render-target, viewport or scissor changes: such a command is
+		// not recorded and the bundle fails (End reports it).
+		static bool DxRejectInBundle(CommandList* cl, const char* command) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->bundle) {
+				return false;
+			}
+			spdlog::error("D3D12: {} was recorded into a bundle (a secondary list)", command);
+			if (l->pendingError == Result::Ok) {
+				l->pendingError = Result::InvalidCall;
+			}
+			BreakIfDebugging();
+			return true;
+		}
+
 		static Result cl_endChecked(CommandList* cl) noexcept {
 			auto* w = dx12_detail::CL(cl);
 			if (!w || !w->cl) return Result::InvalidArgument;
@@ -7501,6 +7577,9 @@ namespace rhi {
 					static_cast<uint32_t>(closeResult), static_cast<uint32_t>(w->type), w->debugName);
 				spdlog::default_logger()->flush();
 			}
+			if (SUCCEEDED(closeResult) && w->pendingError != Result::Ok) {
+				return w->pendingError;
+			}
 			return ToRHI(closeResult);
 		}
 		static void cl_end(CommandList* cl) noexcept { (void)cl_endChecked(cl); }
@@ -7527,7 +7606,15 @@ namespace rhi {
 			l->tracyGpuZoneStack.clear();
 			l->tracyGpuZoneEvents.clear();
 			l->tracyGpuZoneEventsSubmitted = false;
-			const HRESULT resetResult = l->cl->Reset(a->alloc.Get(), nullptr);
+			l->pendingError = Result::Ok;
+			ID3D12CommandAllocator* resetAllocator = l->bundle ? a->bundleAlloc.Get() : a->alloc.Get();
+			if (!resetAllocator) {
+				spdlog::error("D3D12 command list Reset for '{}': the allocator has no bundle allocator (not the one the secondary was made from)", l->debugName);
+				l->pendingError = Result::InvalidArgument;
+				BreakIfDebugging();
+				return;
+			}
+			const HRESULT resetResult = l->cl->Reset(resetAllocator, nullptr);
 			if (FAILED(resetResult)) {
 				spdlog::error(
 					"D3D12 command list Reset failed for '{}': HRESULT 0x{:08X}",
@@ -7544,7 +7631,7 @@ namespace rhi {
 			if (!listState || !listState->cl || !queueState || !queueState->tracyGpuContext || !name) {
 				return Result::InvalidArgument;
 			}
-			if (listState->dev != queueState->dev || listState->type != queueState->pNativeQueue->GetDesc().Type) {
+			if (listState->dev != queueState->dev || listState->type != queueState->pNativeQueue->GetDesc().Type || listState->bundle) {
 				return Result::InvalidArgument;
 			}
 #ifdef TRACY_ON_DEMAND
@@ -7639,6 +7726,9 @@ namespace rhi {
 		}
 
 		static void cl_beginPass(CommandList* cl, const PassBeginInfo& p) noexcept {
+			if (DxRejectInBundle(cl, "BeginPass")) {
+				return;
+			}
 			auto* l = dx12_detail::CL(cl);
 			if (!l) {
 				BreakIfDebugging();
@@ -7734,6 +7824,7 @@ namespace rhi {
 
 			switch (impl->type) {
 			case D3D12_COMMAND_LIST_TYPE_DIRECT:
+			case D3D12_COMMAND_LIST_TYPE_BUNDLE:  // a secondary binds its own, as on Vulkan
 				impl->cl->SetGraphicsRootSignature(L->root.Get());
 				impl->cl->SetComputeRootSignature(L->root.Get());
 				break;
@@ -7849,6 +7940,9 @@ namespace rhi {
 		}
 
 		static void cl_buildAccelerationStructures(CommandList* cl, const AccelerationStructureBuildDesc* descs, uint32_t count) noexcept {
+			if (DxRejectInBundle(cl, "an acceleration structure operation")) {
+				return;
+			}
 			auto* list = dx12_detail::CL(cl);
 			if (!list || !list->cl || (!descs && count != 0)) {
 				BreakIfDebugging();
@@ -7885,6 +7979,9 @@ namespace rhi {
 		}
 
 		static void cl_copyAccelerationStructure(CommandList* cl, const AccelerationStructureCopyDesc& desc) noexcept {
+			if (DxRejectInBundle(cl, "an acceleration structure operation")) {
+				return;
+			}
 			auto* list = dx12_detail::CL(cl);
 			if (!list || !list->cl) {
 				BreakIfDebugging();
@@ -7918,6 +8015,9 @@ namespace rhi {
 		}
 
 		static void cl_writeAccelerationStructureProperties(CommandList* cl, const AccelerationStructurePropertiesDesc& desc) noexcept {
+			if (DxRejectInBundle(cl, "an acceleration structure operation")) {
+				return;
+			}
 			auto* list = dx12_detail::CL(cl);
 			if (!list || !list->cl || desc.accelerationStructures.size == 0) {
 				BreakIfDebugging();
@@ -8012,6 +8112,9 @@ namespace rhi {
 		}
 
 		static void cl_clearRTV_slot(CommandList* c, DescriptorSlot s, const rhi::ClearValue& cv) noexcept {
+			if (DxRejectInBundle(c, "a clear")) {
+				return;
+			}
 			auto* impl = dx12_detail::CL(c);
 			if (!impl) {
 				BreakIfDebugging();
@@ -8031,6 +8134,9 @@ namespace rhi {
 			bool clearDepth, bool clearStencil,
 			float depth, uint8_t stencil) noexcept
 		{
+			if (DxRejectInBundle(c, "a clear")) {
+				return;
+			}
 			auto* impl = dx12_detail::CL(c);
 			if (!impl) {
 				BreakIfDebugging();
@@ -8129,6 +8235,9 @@ namespace rhi {
 		}
 
 		static void cl_barrier(CommandList* cl, const BarrierBatch& b) noexcept {
+			if (DxRejectInBundle(cl, "a barrier")) {
+				return;
+			}
 			if (!cl || !cl->impl) {
 				BreakIfDebugging();
 				return;
@@ -8281,6 +8390,9 @@ namespace rhi {
 			const UavClearInfo& u,
 			const UavClearUint& v) noexcept
 		{
+			if (DxRejectInBundle(cl, "a clear")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!rec || !impl) {
@@ -8322,6 +8434,9 @@ namespace rhi {
 			const UavClearInfo& u,
 			const UavClearFloat& v) noexcept
 		{
+			if (DxRejectInBundle(cl, "a clear")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!rec || !impl) {
@@ -8359,6 +8474,9 @@ namespace rhi {
 
 		// texture -> buffer
 		static void cl_copyTextureToBuffer(rhi::CommandList* cl, const rhi::BufferTextureCopyFootprint& r) noexcept {
+			if (DxRejectInBundle(cl, "a copy")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!rec || !impl) {
@@ -8395,6 +8513,9 @@ namespace rhi {
 
 		// buffer -> texture (symmetric)
 		static void cl_copyBufferToTexture(rhi::CommandList* cl, const rhi::BufferTextureCopyFootprint& r) noexcept {
+			if (DxRejectInBundle(cl, "a copy")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!rec || !impl) {
@@ -8433,6 +8554,9 @@ namespace rhi {
 			const TextureCopyRegion& dst,
 			const TextureCopyRegion& src) noexcept
 		{
+			if (DxRejectInBundle(cl, "a copy")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!rec || !impl) {
@@ -8491,6 +8615,9 @@ namespace rhi {
 			ResourceHandle src, uint64_t srcOffset,
 			uint64_t numBytes) noexcept
 		{
+			if (DxRejectInBundle(cl, "a copy")) {
+				return;
+			}
 			if (!cl || !cl->IsValid() || numBytes == 0) {
 				BreakIfDebugging();
 				return;
@@ -8546,6 +8673,9 @@ namespace rhi {
 		}
 
 		static void cl_writeTimestamp(CommandList* cl, QueryPoolHandle pool, uint32_t index, Stage /*ignored*/) noexcept {
+			if (DxRejectInBundle(cl, "a query")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!impl) {
@@ -8563,6 +8693,9 @@ namespace rhi {
 		}
 
 		static void cl_beginQuery(CommandList* cl, QueryPoolHandle pool, uint32_t index) noexcept {
+			if (DxRejectInBundle(cl, "a query")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!impl) {
@@ -8588,6 +8721,9 @@ namespace rhi {
 		}
 
 		static void cl_endQuery(CommandList* cl, QueryPoolHandle pool, uint32_t index) noexcept {
+			if (DxRejectInBundle(cl, "a query")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!impl) {
@@ -8620,6 +8756,9 @@ namespace rhi {
 			uint32_t firstQuery, uint32_t queryCount,
 			ResourceHandle dst, uint64_t dstOffset) noexcept
 		{
+			if (DxRejectInBundle(cl, "a query")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!impl) {
@@ -8742,6 +8881,9 @@ namespace rhi {
 		}
 
 		static void cl_setWorkGraph(CommandList* cl, const WorkGraphHandle& h, const ResourceHandle& backingMemory, bool resetBackingMemory) noexcept {
+			if (DxRejectInBundle(cl, "a work graph")) {
+				return;
+			}
 			auto* l = dx12_detail::CL(cl);
 			if (!l) {
 				BreakIfDebugging();
@@ -8767,6 +8909,9 @@ namespace rhi {
 		}
 
 		static void cl_dispatchWorkGraph(CommandList* cl, const WorkGraphDispatchDesc& desc) noexcept {
+			if (DxRejectInBundle(cl, "a work graph")) {
+				return;
+			}
 			auto* l = dx12_detail::CL(cl);
 			if (!l) {
 				BreakIfDebugging();
@@ -9125,6 +9270,51 @@ namespace rhi {
 					"D3D12 command allocator Reset failed: HRESULT 0x{:08X}",
 					static_cast<unsigned>(resetResult));
 				BreakIfDebugging();
+			}
+			if (A->bundleAlloc) {
+				if (const HRESULT bundleResult = A->bundleAlloc->Reset(); FAILED(bundleResult)) {
+					spdlog::error("D3D12 bundle allocator Reset failed: HRESULT 0x{:08X}", static_cast<unsigned>(bundleResult));
+					BreakIfDebugging();
+				}
+			}
+		}
+
+		// A secondary is a bundle: it inherits the executing list's render targets, viewport and scissor, so there is nothing to
+		// begin beyond the Reset that opened it. A bundle can hold neither copies nor barriers: a secondary outside rendering is unsupported.
+		static Result cl_beginSecondary(CommandList* cl, const SecondaryInheritance& inheritance) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl || !l->bundle) {
+				RHI_FAIL(Result::InvalidCall);
+			}
+			if (!inheritance.insideRendering) {
+				RHI_FAIL(Result::Unsupported);
+			}
+			if (l->pendingError != Result::Ok) {
+				return l->pendingError;  // Recycle failed
+			}
+			if (inheritance.debugName) {
+				cl_setName(cl, inheritance.debugName);
+			}
+			return Result::Ok;
+		}
+
+		static void cl_executeCommands(CommandList* cl, Span<CommandList* const> lists) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl) {
+				BreakIfDebugging();
+				return;
+			}
+			if (DxRejectInBundle(cl, "ExecuteCommands")) {
+				return;
+			}
+			for (uint32_t index = 0; index < lists.size; ++index) {
+				auto* bundle = lists.data[index] ? dx12_detail::CL(lists.data[index]) : nullptr;
+				if (!bundle || !bundle->bundle || !bundle->cl || bundle->pendingError != Result::Ok) {
+					spdlog::error("D3D12 ExecuteCommands: list {} of {} is not a valid secondary", index, lists.size);
+					BreakIfDebugging();
+					return;
+				}
+				l->cl->ExecuteBundle(bundle->cl.Get());
 			}
 		}
 
@@ -9754,9 +9944,10 @@ namespace rhi {
 		&d_destroyIndirectPipelineSet,
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
-		13u,
+		14u,
 		&d_createCompletionWait,
-		&d_createCommandAllocatorForQueue
+		&d_createCommandAllocatorForQueue,
+		&d_createSecondaryCommandList
 	};
 
 	const QueueVTable g_qvt = {
@@ -9818,8 +10009,14 @@ namespace rhi {
 		&cl_setDebugInstrumentationContext,
 		&cl_beginTracyGpuZone,
 		&cl_endTracyGpuZone,
-		6u,
-		&cl_endChecked
+		8u,
+		&cl_endChecked,
+		nullptr,  // beginDebugLabel: PIX markers go through the native list
+		nullptr,  // endDebugLabel
+		nullptr,  // insertDebugLabel
+		nullptr,  // preprocessIndirect: the driver preprocesses inside ExecuteIndirect
+		&cl_beginSecondary,
+		&cl_executeCommands
 	};
 	const SwapchainVTable g_scvt = {
 		&sc_count,

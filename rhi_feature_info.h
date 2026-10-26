@@ -59,7 +59,7 @@ struct ArchitectureFeatureInfo {
 };
 
 struct ShaderFeatureInfo {
-    FeatureInfoHeader header{ FeatureInfoStructType::Features, nullptr, sizeof(ShaderFeatureInfo), 1 };
+    FeatureInfoHeader header{ FeatureInfoStructType::Features, nullptr, sizeof(ShaderFeatureInfo), 2 };
 
     // "How modern is the shader compiler/runtime path?"
     ShaderModel maxShaderModel = ShaderModel::Unknown;
@@ -76,6 +76,11 @@ struct ShaderFeatureInfo {
     bool atomicInt64OnGroupShared = false;
     bool atomicInt64OnTypedResource = false;
     bool atomicInt64OnDescriptorHeapResources = false;
+
+    // (structVersion 2) The largest shader-visible descriptor heaps the device was set up for (DescriptorHeapCapacities):
+    // creating a larger one fails. 0: not reported (size heaps at DescriptorHeapCapacities' preferred values).
+    uint32_t maxShaderVisibleResourceDescriptors = 0;
+    uint32_t maxShaderVisibleSamplerDescriptors = 0;
 };
 
 struct MeshShaderFeatureInfo {
@@ -203,7 +208,7 @@ struct WorkGraphFeatureInfo {
 };
 
 struct IndirectCommandsFeatureInfo {
-    FeatureInfoHeader header{ FeatureInfoStructType::IndirectCommands, nullptr, sizeof(IndirectCommandsFeatureInfo), 1 };
+    FeatureInfoHeader header{ FeatureInfoStructType::IndirectCommands, nullptr, sizeof(IndirectCommandsFeatureInfo), 2 };
 
     bool constantArguments = false;    // Constant arguments in a command signature
     bool indexBufferArguments = false; // IndexBuffer arguments (D3D12 index buffer view layout)
@@ -212,4 +217,9 @@ struct IndirectCommandsFeatureInfo {
     bool vertexBufferArguments = false; // VertexBuffer arguments (D3D12 vertex buffer view layout)
     bool indirectBindings = false;     // LayoutRangeSource::IndirectIndex / IndirectAddress
     uint32_t maxSequenceCount = 0;     // largest max count of one ExecuteIndirect (Vulkan maxIndirectSequenceCount)
+    // (structVersion 2) Bytes of a layout's root constants, counted from its first range in declaration order, that Constant
+    // arguments may write. Vulkan's descriptor-buffer model pushes only that much (base-spec push constants) and keeps the rest
+    // of a larger layout's constants in memory, so a command signature whose Constant argument reaches past it is refused.
+    // 0: no limit beyond the layout's own.
+    uint32_t constantArgumentBytes = 0;
 };

@@ -13,6 +13,7 @@ using namespace volk;
 
 #include <array>
 #include <condition_variable>
+#include <cstddef>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -250,6 +251,12 @@ namespace rhi {
 		uint64_t descriptorBytes = 0;
 		uint64_t reservedRangeOffset = 0;
 		uint64_t reservedRangeSize = 0;
+		// Descriptor-buffer model: element 0's byte offset (the universal set layout's binding offset), the buffer's usage
+		// (vkCmdBindDescriptorBuffersEXT names it), and a CPU-only heap's descriptors, kept in host memory (mappedData points
+		// into it) rather than in a descriptor buffer.
+		uint64_t descriptorBaseOffset = 0;
+		VkBufferUsageFlags descriptorBufferUsage = 0;
+		std::vector<std::byte> hostDescriptors;
 		std::vector<VulkanImageViewSlot> imageViewSlots;
 	};
 
@@ -291,6 +298,14 @@ namespace rhi {
 		std::vector<VulkanPushConstantRange> pushConstantRanges;
 		uint32_t totalPushDataBytes = 0;
 		bool usesDescriptorHeap = false;
+		// Descriptor-buffer model (VulkanBindingModel::DescriptorBuffer): push data bytes [0, pushedBytes) are push constants of
+		// the universal pipeline layout, the rest are spilled to memory whose address is the push constant at
+		// spillAddressOffset (0xFFFFFFFF: nothing spilled); and the sampler heap element of each static sampler's first
+		// element (the static-sampler tail, VulkanDevice::descriptorBuffer).
+		bool usesDescriptorBuffer = false;
+		uint32_t pushedBytes = 0;
+		uint32_t spillAddressOffset = 0xFFFFFFFFu;
+		std::vector<uint32_t> staticSamplerElements;
 	};
 
 	struct VulkanPipeline {
@@ -436,6 +451,13 @@ namespace rhi {
 		QueueKind kind = QueueKind::Graphics;
 		Result pendingError = Result::Ok;
 		bool isRecording = false;
+		// A secondary (VK_COMMAND_BUFFER_LEVEL_SECONDARY, Device::CreateSecondaryCommandList).
+		bool secondary = false;
+		// This recording of a secondary continues the executing primary's rendering (BeginSecondary with insideRendering):
+		// passActive is set by BeginSecondary and the rendering is never ended here. Cleared by Recycle.
+		bool continuesRendering = false;
+		// A foreign VkCommandBuffer wrapped by AdoptCommandBuffer: begun, ended, reset, submitted and freed by its owner.
+		bool adopted = false;
 		bool passActive = false;
 		PipelineLayoutHandle boundLayout{};
 		PipelineHandle boundPipeline{};
@@ -467,15 +489,88 @@ namespace rhi {
 			VkPipeline pipeline = VK_NULL_HANDLE;
 			VkDeviceAddress preprocessAddress = 0;
 			VkDeviceSize preprocessSize = 0;
+			// Descriptor-buffer model: the universal layout's whole push constant range (VulkanDescriptorBufferModel::
+			// kPushConstantBytes) as the preprocess saw it - the pushed prefix and the spill address, whose scratch is this list's
+			// - pushed again, unchanged, before the execution (VUID-vkCmdExecuteGeneratedCommandsEXT-isPreprocessed-11048).
+			std::array<uint8_t, 128> pushConstants{};
+			bool pushConstantsRecorded = false;
 		};
 		std::vector<PreprocessedIndirect> preprocessedIndirect;
 		// A preprocess was recorded since the last barrier making preprocess output visible to executions.
 		bool preprocessBarrierPending = false;
 		std::vector<EmulatedRootConstantShadowState> emulatedRootConstantShadowStates;
+		// Descriptor-buffer model: the bound layout's push data image as last written (PushConstants). Its pushed prefix is
+		// recorded as push constants when written; pushedDataDirty asks for it again (after ExecuteCommands or generated
+		// commands left push constants undefined). Its spilled rest is uploaded to emulated-root-constant scratch and its
+		// address pushed before the next draw, dispatch, trace or ExecuteIndirect when spilledDataDirty. Descriptor-heap model:
+		// the push data as written, pushed again when pushedDataDirty (after generated commands left it undefined).
+		std::vector<uint8_t> pushDataShadow;
+		bool pushedDataDirty = false;
+		bool spilledDataDirty = false;
 		std::vector<VkQueryPool> transientQueryPools;
 		std::vector<TracyGpuOpenZone> tracyGpuZoneStack;
 		std::vector<TracyGpuZoneEvent> tracyGpuZoneEvents;
 		bool tracyGpuZoneEventsSubmitted = false;
+	};
+
+	// How shaders reach descriptor heaps; fixed for a device (rhi_interop_vulkan.h BindingModelBits).
+	enum class VulkanBindingModel : uint8_t {
+		None,              // neither: pipelines and pipeline layouts are unsupported
+		DescriptorHeap,    // VK_EXT_descriptor_heap: heaps are bound as they are, shaders keep DXC's bindings (set/binding mappings)
+		DescriptorBuffer,  // VK_EXT_descriptor_buffer + VK_EXT_mutable_descriptor_type: one universal pipeline layout, shaders lowered
+	};
+
+	// The descriptor-buffer model's device state (VulkanBindingModel::DescriptorBuffer), set up once the VkDevice exists.
+	struct VulkanDescriptorBufferModel {
+		// Static samplers follow the caller's samplers, at elements [samplerCapacity, samplerCapacity + staticSamplerCapacity) of
+		// every shader-visible sampler heap, so that a lowered shader's constant element is the same whichever sampler heap is
+		// bound.
+		static constexpr uint32_t kMaxStaticSamplers = 256;
+		// The universal pipeline layout: set 0 the resource heap (one MUTABLE_EXT variable-count binding), set 1 the sampler
+		// heap (one SAMPLER variable-count binding), push constants [0, kPushConstantBytes) for every stage.
+		static constexpr uint32_t kPushConstantBytes = 128;
+		// A layout whose push data exceeds kPushConstantBytes pushes the ranges within kPushedPrefixBytes and spills the rest;
+		// the spill image's address is the push constant at kSpillAddressOffset.
+		static constexpr uint32_t kPushedPrefixBytes = 120;
+		static constexpr uint32_t kSpillAddressOffset = 120;
+		VkDescriptorSetLayout resourceSetLayout = VK_NULL_HANDLE;
+		VkDescriptorSetLayout samplerSetLayout = VK_NULL_HANDLE;
+		VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+		// The resource heap's mutable type list includes uniform buffers (else CBVs are written as storage buffers) and
+		// acceleration structures.
+		bool uniformBuffers = false;
+		bool accelerationStructures = false;
+		uint32_t resourceCapacity = 0;        // descriptors of set 0: the largest shader-visible resource heap (the chosen capacity)
+		uint32_t samplerCapacity = 0;         // the largest shader-visible sampler heap's caller samplers (the chosen capacity)
+		uint32_t staticSamplerCapacity = 0;   // the static-sampler tail past samplerCapacity
+		uint64_t resourceStride = 0;          // bytes between consecutive elements (vkGetDescriptorSetLayoutSizeEXT)
+		uint64_t samplerStride = 0;
+		uint64_t resourceBindingOffset = 0;   // vkGetDescriptorSetLayoutBindingOffsetEXT of binding 0
+		uint64_t samplerBindingOffset = 0;
+		// vkGetDescriptorEXT data sizes, robust ones where robustBufferAccess is enabled.
+		size_t samplerSize = 0, sampledImageSize = 0, storageImageSize = 0, uniformTexelSize = 0, storageTexelSize = 0;
+		size_t uniformBufferSize = 0, storageBufferSize = 0, accelerationStructureSize = 0;
+		// Distinct VkSamplers BasicRHI may create: maxSamplerAllocationCount less the host's (AdoptedVulkanDeviceInfo::
+		// hostSamplerObjects).
+		uint32_t samplerBudget = 0;
+		// One VkSampler per distinct sampler description, shared by every slot (and static sampler) that describes it.
+		struct CachedSampler {
+			VkSampler sampler = VK_NULL_HANDLE;
+			uint32_t references = 0;
+		};
+		std::mutex samplerCacheMutex;
+		std::unordered_map<std::string, CachedSampler> samplerCache;
+		std::unordered_map<VkSampler, std::string> samplerCacheKeys;
+		// Static samplers registered by pipeline layouts (deduplicated), each at tail elements [element, element + count) of
+		// every shader-visible sampler heap. Guarded by the device's descriptorViewsMutex.
+		struct StaticSampler {
+			std::string key;
+			uint32_t count = 0;
+			uint32_t element = 0;
+			VkSampler sampler = VK_NULL_HANDLE;
+		};
+		std::vector<StaticSampler> staticSamplers;
+		uint32_t staticSamplersUsed = 0;
 	};
 
 	struct VulkanDevice {
@@ -498,6 +593,7 @@ namespace rhi {
 		VkPhysicalDeviceMemoryProperties memoryProperties{};
 		VkPhysicalDeviceFeatures supportedFeatures{};
 		VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptorHeapProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT };
+		VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptorBufferProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT };
 		VkPhysicalDeviceMeshShaderPropertiesEXT meshShaderProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT };
 		VkPhysicalDeviceComputeShaderDerivativesPropertiesKHR computeShaderDerivativesProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_PROPERTIES_KHR };
 		VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
@@ -525,6 +621,15 @@ namespace rhi {
 		bool runtimeDescriptorArrayEnabled = false;
 		bool scalarBlockLayoutEnabled = false;
 		bool descriptorHeapEnabled = false;
+		bool descriptorBufferEnabled = false;          // VK_EXT_descriptor_buffer descriptorBuffer
+		bool mutableDescriptorTypeEnabled = false;     // VK_EXT_mutable_descriptor_type (or the VALVE alias)
+		bool variableDescriptorCountEnabled = false;   // descriptorBindingVariableDescriptorCount
+		VulkanBindingModel bindingModel = VulkanBindingModel::None;
+		// The shader-visible heap capacities the device was set up with (min(DescriptorHeapCapacities preferred, the device's
+		// limit) for its binding model; ShaderFeatureInfo reports them). Larger shader-visible heaps fail creation.
+		uint32_t shaderVisibleResourceCapacity = 0;
+		uint32_t shaderVisibleSamplerCapacity = 0;
+		VulkanDescriptorBufferModel descriptorBuffer;
 		bool nullDescriptorEnabled = false;  // VK_EXT_robustness2 nullDescriptor: views with no resource
 		bool descriptorHeapCaptureReplayEnabled = false;
 		bool meshShaderEnabled = false;

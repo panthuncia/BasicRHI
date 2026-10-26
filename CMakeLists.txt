@@ -292,7 +292,24 @@ else()
     target_sources(BasicRHI PRIVATE rhi_dx12_stub.cpp)
 endif()
 if(BASICRHI_ENABLE_VULKAN)
-    target_sources(BasicRHI PRIVATE rhi_vulkan.cpp)
+    target_sources(BasicRHI PRIVATE rhi_vulkan.cpp rhi_vulkan_spirv_lowering.cpp)
+    # The descriptor-buffer binding model lowers shaders with a SPIRV-Tools optimizer pass (rhi_vulkan_spirv_lowering.h), which
+    # needs SPIRV-Tools' internal IR (source/opt): neither the Vulkan SDK nor vcpkg ships it, so SPIRV-Tools and SPIRV-Headers
+    # are submodules pinned to the Vulkan SDK 1.4.357 release (SPIRV-Tools v2026.3, SPIRV-Headers at its DEPS commit).
+    if(NOT TARGET SPIRV-Tools-opt)
+        set(SPIRV-Headers_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SPIRV-Headers")
+        set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+        set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
+        set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
+        set(SPIRV_TOOLS_BUILD_STATIC ON CACHE BOOL "" FORCE)
+        set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
+        add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/third_party/SPIRV-Tools" "${CMAKE_CURRENT_BINARY_DIR}/_deps/SPIRV-Tools" EXCLUDE_FROM_ALL)
+    endif()
+    set(BASICRHI_SPIRV_TOOLS_INTERNAL_INCLUDE_DIRS
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SPIRV-Tools"
+        "${CMAKE_CURRENT_BINARY_DIR}/_deps/SPIRV-Tools")
+    set_source_files_properties(rhi_vulkan_spirv_lowering.cpp PROPERTIES INCLUDE_DIRECTORIES "${BASICRHI_SPIRV_TOOLS_INTERNAL_INCLUDE_DIRS}")
+    target_link_libraries(BasicRHI PRIVATE $<BUILD_INTERFACE:SPIRV-Tools-opt>)
     # volk owns Vulkan dispatch. Linking vulkan-1 as well can resolve volk's
     # function-pointer globals to loader import thunks in a mixed DX12/Vulkan
     # executable, making volkInitialize write through an invalid address.
@@ -396,6 +413,20 @@ if(BASICRHI_BUILD_TESTS)
         endif()
         add_test(NAME BasicRHIVulkanAdoptionSmoke COMMAND BasicRHIVulkanAdoptionSmoke)
         add_test(NAME BasicRHIVulkanAdoptionSmoke.HostSubmit COMMAND BasicRHIVulkanAdoptionSmoke submit)
+        # Both binding models on one GPU (BASICRHI_VK_BINDING forces the model of a device BasicRHI creates).
+        add_test(NAME BasicRHIVulkanSmoke.DescriptorHeap COMMAND BasicRHIVulkanSmoke)
+        set_tests_properties(BasicRHIVulkanSmoke.DescriptorHeap PROPERTIES ENVIRONMENT "BASICRHI_VK_BINDING=heap")
+        add_test(NAME BasicRHIVulkanSmoke.DescriptorBuffer COMMAND BasicRHIVulkanSmoke)
+        set_tests_properties(BasicRHIVulkanSmoke.DescriptorBuffer PROPERTIES ENVIRONMENT "BASICRHI_VK_BINDING=buffer")
+
+        # The descriptor-buffer lowering on HLSL fixtures (tests/lowering: compiled with the shader ABI's DXC flags, lowered,
+        # validated). No GPU needed.
+        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BasicRHIShaderFlags.cmake")
+        add_executable(BasicRHISpirvLoweringTests tests/SpirvLoweringTests.cpp)
+        target_link_libraries(BasicRHISpirvLoweringTests PRIVATE BasicRHI::BasicRHI SPIRV-Tools-opt)
+        target_include_directories(BasicRHISpirvLoweringTests PRIVATE ${BASICRHI_SPIRV_TOOLS_INTERNAL_INCLUDE_DIRS})
+        add_subdirectory(tests/lowering)
+        add_test(NAME BasicRHISpirvLoweringTests COMMAND BasicRHISpirvLoweringTests)
     endif()
     if(BASICRHI_ENABLE_D3D12 AND WIN32)
         add_executable(BasicRHID3D12AliasingSmoke tests/D3D12AliasingSmoke.cpp)
