@@ -7,12 +7,13 @@
 //   Heap, StaticSampler at heap element 0 (the shader ABI's heap bindings): re-decorated to the universal layout's heap binding.
 //     DXC's aliased typed runtime arrays stay aliased: they are valid against a MUTABLE_EXT binding.
 //   Heap, StaticSampler at element e != 0, HeapIndirect: every use becomes an access chain into a typed alias of the heap binding
-//     (one alias variable per descriptor type), at e plus the variable's own array index. HeapIndirect's e is a uint32 loaded per
-//     use through a PhysicalStorageBuffer pointer at the record address (push data) + recordOffset + 4i.
+//     (one alias variable per descriptor type), at e plus the variable's own array index. HeapIndirect's e is a uint32 loaded once per
+//     function, in its entry block, through a PhysicalStorageBuffer pointer at the record address (push data) + recordOffset + 4i.
 //   PushData inside the pushed prefix: a member of the one push constant block (see BuildPushBlock); access chains get the member
 //     index prepended and are retyped Uniform -> PushConstant.
 //   PushData past the pushed prefix (spilled), BufferIndirectAddress, BufferPushAddress: the uniform block becomes a
-//     PhysicalStorageBuffer pointer to the same Block type, bitcast from a uvec2 address recomputed at each use; access chains
+//     PhysicalStorageBuffer pointer to the same Block type, bitcast from a uvec2 address recomputed at each use (a
+//     BufferIndirectAddress's read from the record once per function, in its entry block, as HeapIndirect's index is); access chains
 //     and loads are retyped through a worklist and every load carries Aligned (see Walk).
 // Address arithmetic stays 32-bit (uvec2 + OpIAddCarry), so no Int64 capability is needed.
 
@@ -27,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -249,6 +251,8 @@ namespace rhi::vulkan_binding {
 			std::map<std::pair<uint32_t, uint32_t>, uint32_t> pointerTypes;
 			std::map<uint32_t, uint32_t> uintConstants;
 			std::map<std::vector<uint32_t>, uint32_t> heapAliases;
+			// RecordValue's: by function, type, push offset and record offset.
+			std::map<std::tuple<opt::Function*, uint32_t, uint32_t, uint32_t>, uint32_t> recordValues;
 
 			static IRContext::Analysis Preserved() { return IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping; }
 
@@ -1069,6 +1073,34 @@ namespace rhi::vulkan_binding {
 				return Builder(a_where).AddLoad(a_type, pointer, a_alignment)->result_id();
 			}
 
+			// Where a value read once per invocation goes: a_where's function's entry block, past its variables. Every use in the
+			// function is dominated by it (after InlineExhaustive, every use is in the entry point).
+			Instruction* EntryInsertionPoint(Instruction* a_where) {
+				opt::BasicBlock& entry = *context()->get_instr_block(a_where)->GetParent()->begin();
+				auto it = entry.begin();
+				while (it != entry.end() && (it->opcode() == spv::Op::OpVariable || it->opcode() == spv::Op::OpLine || it->opcode() == spv::Op::OpNoLine)) {
+					++it;
+				}
+				return &*it;
+			}
+
+			// A record's a_type value (uint: a heap index; uvec2: a block's address) at the record address in push data at a_pushOffset
+			// plus a_offset, loaded once per function in its entry block. The record is the frame's, the same for every invocation of a
+			// draw: per use, the load and its address arithmetic were repeated at each descriptor and block access (hundreds in a
+			// Lighting pixel stage), which the driver cannot merge (the pointer's memory may be written, for all it knows).
+			uint32_t RecordValue(Instruction* a_where, uint32_t a_type, uint32_t a_pushOffset, uint32_t a_offset) {
+				opt::Function* function = context()->get_instr_block(a_where)->GetParent();
+				const auto key = std::tuple{ function, a_type, a_pushOffset, a_offset };
+				if (const auto found = recordValues.find(key); found != recordValues.end()) {
+					return found->second;
+				}
+				Instruction* at = EntryInsertionPoint(a_where);
+				const uint32_t address = AddressPlus(at, ReadPushAddress(at, a_pushOffset), a_offset);
+				const uint32_t value = LoadPhysical(at, a_type, address, AlignmentAt(target.recordAlignment, a_offset));
+				recordValues.emplace(key, value);
+				return value;
+			}
+
 			uint32_t ReadSpillAddress(Instruction* a_where) {
 				const uint32_t low = ReadPushDword(a_where, target.spillAddressOffset);
 				const uint32_t high = ReadPushDword(a_where, target.spillAddressOffset + 4);
@@ -1151,12 +1183,9 @@ namespace rhi::vulkan_binding {
 					return UintConstant(mapping.heapElement + a_resource.index);
 				case BindingSource::StaticSampler:
 					return UintConstant(target.staticSamplerElements[mapping.staticSampler] + a_resource.index);
-				case BindingSource::HeapIndirect: {
-					const uint32_t offset = mapping.recordOffset + 4 * a_resource.index;
-					const uint32_t address = AddressPlus(a_where, ReadPushAddress(a_where, mapping.pushOffset), offset);
+				case BindingSource::HeapIndirect:
 					// The record base is recordAlignment-aligned; its index entries at least 4 (recordOffset + 4i).
-					return LoadPhysical(a_where, Uint(), address, AlignmentAt(target.recordAlignment, offset));
-				}
+					return RecordValue(a_where, Uint(), mapping.pushOffset, mapping.recordOffset + 4 * a_resource.index);
 				default:
 					Fail(a_resource.description, ": not a descriptor mapping");
 				}
@@ -1427,9 +1456,7 @@ namespace rhi::vulkan_binding {
 					break;
 				case BindingSource::BufferIndirectAddress:
 					address = [this, &mapping, &a_resource](Instruction* a_where) {
-						const uint32_t offset = mapping.recordOffset + 8 * a_resource.index;
-						const uint32_t entryAddress = AddressPlus(a_where, ReadPushAddress(a_where, mapping.pushOffset), offset);
-						return LoadPhysical(a_where, Uvec2(), entryAddress, AlignmentAt(target.recordAlignment, offset));
+						return RecordValue(a_where, Uvec2(), mapping.pushOffset, mapping.recordOffset + 8 * a_resource.index);
 					};
 					break;
 				default: {

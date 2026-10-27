@@ -7360,6 +7360,23 @@ namespace rhi {
 					};
 					dump(fileStem + ".in.spv", input);
 					if (loweredOk) dump(fileStem + ".lowered.spv", lowered);
+					// The plan and target the module was lowered with, for an offline lowering (tools that call LowerForDescriptorBuffer):
+					// "target" pushedBytes spillAddressOffset pushConstantBytes recordAlignment uniformBlockAlignment spillAlignment, then
+					// "plan" pushDataBytes, "mapping" set firstBinding bindingCount resourceMask source heapElement pushOffset recordOffset
+					// pushDataBytes staticSampler per mapping, and "staticSamplers" with each element.
+					if (std::FILE* file = std::fopen((fileStem + ".plan.txt").c_str(), "wb")) {
+						std::fprintf(file, "stage %u\nentry %s\ntarget %u %u %u %u %u %u\nplan %u\n", static_cast<uint32_t>(stage), std::string(entryPoint).c_str(),
+							target.pushedBytes, target.spillAddressOffset, target.pushConstantBytes, target.recordAlignment, target.uniformBlockAlignment,
+							target.spillAlignment, plan.pushDataBytes);
+						for (const auto& m : plan.mappings)
+							std::fprintf(file, "mapping %u %u %u %u %u %u %u %u %u %u\n", m.set, m.firstBinding, m.bindingCount, static_cast<uint32_t>(m.resourceMask),
+								static_cast<uint32_t>(m.source), m.heapElement, m.pushOffset, m.recordOffset, m.pushDataBytes, m.staticSampler);
+						std::fprintf(file, "staticSamplers");
+						for (const uint32_t element : target.staticSamplerElements)
+							std::fprintf(file, " %u", element);
+						std::fprintf(file, "\n");
+						std::fclose(file);
+					}
 				}
 				if (!loweredOk) {
 					spdlog::error("Vulkan descriptor-buffer model: lowering stage 0x{:x} of pipeline '{}' failed: {}", static_cast<uint32_t>(stage), name, error);
