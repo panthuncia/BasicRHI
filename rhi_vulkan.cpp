@@ -1197,6 +1197,24 @@ namespace rhi {
 			       impl->bufferDeviceAddressEnabled && vkCreateIndirectExecutionSetEXT && vkUpdateIndirectExecutionSetPipelineEXT;
 		}
 
+		// Chains a_flags into a_info: VkPipelineCreateFlags2CreateInfo with maintenance5, else a_flags' bits in the legacy flags (every bit
+		// BasicRHI sets below bit 32 has the same value there) and a_flags' chain in its place. False for a bit past 32 without maintenance5
+		// (the descriptor heap's: heaps need maintenance5 anyway).
+		template <class Info>
+		static bool VkChainPipelineCreateFlags(const VulkanDevice* impl, VkPipelineCreateFlags2CreateInfo& a_flags, Info& a_info) noexcept {
+			if (impl->maintenance5Enabled) {
+				a_info.pNext = &a_flags;
+				return true;
+			}
+			if ((a_flags.flags >> 32) != 0) {
+				spdlog::error("Vulkan pipeline creation: create flags {:#x} need VK_KHR_maintenance5", static_cast<uint64_t>(a_flags.flags));
+				return false;
+			}
+			a_info.flags |= static_cast<VkPipelineCreateFlags>(a_flags.flags);
+			a_info.pNext = a_flags.pNext;
+			return true;
+		}
+
 		static VulkanTimeline* VkTimelineState(VulkanDevice* impl, TimelineHandle handle) noexcept {
 			return impl ? impl->timelines.get(handle) : nullptr;
 		}
@@ -7720,7 +7738,10 @@ namespace rhi {
 				}
 
 				VkRayTracingPipelineCreateInfoKHR pipelineInfo{ VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR };
-				pipelineInfo.pNext = &createFlags;
+				if (!VkChainPipelineCreateFlags(impl, createFlags, pipelineInfo)) {
+					for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
+					RHI_FAIL(Result::Unsupported);
+				}
 				pipelineInfo.stageCount = static_cast<uint32_t>(shaderStages.size());
 				pipelineInfo.pStages = shaderStages.data();
 				pipelineInfo.groupCount = static_cast<uint32_t>(groups.size());
@@ -7966,7 +7987,10 @@ namespace rhi {
 				if (captureStatistics) createFlags.flags |= VK_PIPELINE_CREATE_2_CAPTURE_STATISTICS_BIT_KHR;
 				createFlags.pNext = &rendering;
 				VkGraphicsPipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-				pipelineInfo.pNext = &createFlags;
+				if (!VkChainPipelineCreateFlags(impl, createFlags, pipelineInfo)) {
+					for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
+					RHI_FAIL(Result::Unsupported);
+				}
 				pipelineInfo.stageCount = static_cast<uint32_t>(shaderStages.size());
 				pipelineInfo.pStages = shaderStages.data();
 				pipelineInfo.pVertexInputState = hasMeshShader ? nullptr : &vertexInput;
@@ -8078,7 +8102,10 @@ namespace rhi {
 				createFlags.flags |= VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
 			}
 			VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-			pipelineInfo.pNext = &createFlags;
+			if (!VkChainPipelineCreateFlags(impl, createFlags, pipelineInfo)) {
+				vkDestroyShaderModule(impl->device, shaderModule, nullptr);
+				RHI_FAIL(Result::Unsupported);
+			}
 			pipelineInfo.stage = stageInfo;
 			pipelineInfo.layout = bufferModel ? impl->descriptorBuffer.pipelineLayout : nativeLayout;
 
@@ -11777,9 +11804,11 @@ namespace rhi {
 		bool swapchain = false;
 		bool externalMemoryWin32 = false;
 		bool externalSemaphoreWin32 = false;
+		bool maintenance5 = false;  // VK_KHR_maintenance5 enabled
 	};
 
 	static void VkApplyEnabledDeviceState(VulkanDevice* impl, const VkEnabledDeviceState& e) noexcept {
+		impl->maintenance5Enabled = e.maintenance5;
 		impl->accelerationStructureFeatures = e.accelerationStructure;
 		impl->rayTracingPipelineFeatures = e.rayTracingPipeline;
 		impl->rayQueryFeatures = e.rayQuery;
@@ -11980,7 +12009,6 @@ namespace rhi {
 			bool bufferSupported = true;
 			feature(bufferSupported, kBuffer, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME, hasBuffer);
 			feature(bufferSupported, kBuffer, "VK_EXT_mutable_descriptor_type (or VK_VALVE_mutable_descriptor_type)", hasMutable);
-			feature(bufferSupported, kBuffer, "VK_KHR_maintenance5 (pipeline create flags 2)", hasMaintenance5);
 			feature(bufferSupported, kBuffer, "descriptorBuffer", bufferFeatures.descriptorBuffer == VK_TRUE);
 			feature(bufferSupported, kBuffer, "mutableDescriptorType", mutableFeatures.mutableDescriptorType == VK_TRUE);
 			feature(bufferSupported, kBuffer, "bufferDeviceAddress", features12.bufferDeviceAddress == VK_TRUE);
@@ -13168,6 +13196,8 @@ namespace rhi {
 			enabled.swapchain = enableSwapchainExtension;
 			enabled.externalMemoryWin32 = ci.enableExternalInterop && hasExternalMemoryWin32Extension;
 			enabled.externalSemaphoreWin32 = ci.enableExternalInterop && hasExternalSemaphoreWin32Extension;
+			enabled.maintenance5 = std::any_of(enabledDeviceExtensions.begin(), enabledDeviceExtensions.end(),
+				[](const char* a_name) { return std::strcmp(a_name, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0; });
 			VkApplyEnabledDeviceState(impl.get(), enabled);
 		}
 		impl->validateBarrierTransitions = ci.validateBarrierTransitions;
@@ -13450,6 +13480,7 @@ namespace rhi {
 #ifdef _WIN32
 			enabled.externalMemoryWin32 = hasExtension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
 			enabled.externalSemaphoreWin32 = hasExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+			enabled.maintenance5 = hasExtension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 #endif
 
 			auto impl = std::make_shared<VulkanDevice>();

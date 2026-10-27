@@ -638,6 +638,9 @@ namespace rhi {
 		bool deviceGeneratedCommandsEnabled = false;
 		bool dynamicGeneratedPipelineLayoutEnabled = false;
 		bool dynamicRenderingEnabled = false;
+		// VK_KHR_maintenance5: pipeline create flags go in VkPipelineCreateFlags2CreateInfo; without it (AMD's legacy Polaris driver)
+		// in the legacy flags (VkChainPipelineCreateFlags).
+		bool maintenance5Enabled = false;
 		bool shaderDemoteToHelperInvocationEnabled = false;
 		bool computeDerivativeGroupQuadsEnabled = false;
 		bool computeDerivativeGroupLinearEnabled = false;
