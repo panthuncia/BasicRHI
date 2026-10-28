@@ -151,6 +151,15 @@ Where the underlying APIs disagree, the backend reconciles it.
 - **Descriptor-buffer diagnostics.** `BASICRHI_VK_VALIDATE_LOWERING=1` validates every lowered module with
   SPIRV-Tools' validator. `BASICRHI_VK_DUMP_LOWERED=<dir>` writes each stage's input and lowered SPIR-V. The lowering
   strips NonSemantic debug info, so Nsight source-level shader debugging needs the heap model.
+- **The driver's compiled shaders.** With `BASICRHI_VK_DUMP_ISA=<dir>`, every graphics, compute and ray tracing pipeline
+  is created with `VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR`. Each one's internal representations
+  (`VK_KHR_pipeline_executable_properties`) go to `<dir>/<n>_<kind>_<label>.txt`, numbered in creation order. On AMD these
+  include the final ISA. Use it when the SPIR-V is right but the GPU does something else: that is what the driver compiled.
+  `DXVK_PIPELINE_STATS=1` logs each graphics pipeline's statistics instead (registers, spills).
+  - Either switch makes a device BasicRHI creates enable `pipelineExecutableInfo`. An adopted device needs its host to
+    enable it: DXVK does for either switch, and without it nothing is captured.
+  - Find a shader by a literal it uses, as its constants appear in the ISA. The label is the thread's
+    `rhi::vulkan::set_pipeline_statistics_label`, else a compute shader's entry point.
 
 ## Notes
 

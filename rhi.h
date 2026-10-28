@@ -3589,7 +3589,8 @@ namespace rhi {
 		/**
 		 * The calling thread's label for the graphics pipelines it creates next (null clears it). With DXVK_PIPELINE_STATS set and
 		 * VK_KHR_pipeline_executable_properties enabled, each graphics pipeline captures its statistics (registers, spills) and logs
-		 * them under this label. Implemented in rhi_vulkan.cpp.
+		 * them under this label; with BASICRHI_VK_DUMP_ISA=<dir>, every pipeline's internal representations (the driver's ISA) are
+		 * written under it (README, "The driver's compiled shaders"). Implemented in rhi_vulkan.cpp.
 		 */
 		void set_pipeline_statistics_label(const char* label) noexcept;
 	}

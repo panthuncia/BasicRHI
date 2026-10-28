@@ -107,9 +107,87 @@ namespace rhi {
 			return out;
 		}
 
-		bool PipelineStatisticsRequested() noexcept {
+		// The driver's view of the pipelines BasicRHI creates (VK_KHR_pipeline_executable_properties), for debugging: DXVK_PIPELINE_STATS
+		// logs each graphics pipeline's statistics (LogPipelineStatistics); BASICRHI_VK_DUMP_ISA=<dir> writes each pipeline's internal
+		// representations (DumpPipelineInternalRepresentations). Either one has a device BasicRHI creates enable pipelineExecutableInfo; an
+		// adopted device has it only if its host enabled it (DXVK does for either switch).
+		bool PipelineStatisticsSwitch() noexcept {
 			static const bool requested = [] { const char* value = std::getenv("DXVK_PIPELINE_STATS"); return value && *value; }();
-			return requested && vkGetPipelineExecutablePropertiesKHR && vkGetPipelineExecutableStatisticsKHR;
+			return requested;
+		}
+
+		const std::string& IsaDumpDirectory() noexcept {
+			static const std::string directory = [] { const char* value = std::getenv("BASICRHI_VK_DUMP_ISA"); return std::string(value ? value : ""); }();
+			return directory;
+		}
+
+		bool PipelineExecutableDebugRequested() noexcept { return PipelineStatisticsSwitch() || !IsaDumpDirectory().empty(); }
+
+		bool PipelineStatisticsRequested(const VulkanDevice* impl) noexcept {
+			return PipelineStatisticsSwitch() && impl->pipelineExecutableInfoEnabled && vkGetPipelineExecutablePropertiesKHR && vkGetPipelineExecutableStatisticsKHR;
+		}
+
+		bool IsaDumpRequested(const VulkanDevice* impl) noexcept {
+			return !IsaDumpDirectory().empty() && impl->pipelineExecutableInfoEnabled && vkGetPipelineExecutablePropertiesKHR &&
+			       vkGetPipelineExecutableInternalRepresentationsKHR;
+		}
+
+		/**
+		 * Every executable of a_pipeline (created with VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR) into one file,
+		 * <BASICRHI_VK_DUMP_ISA>/<n>_<a_kind>_<a_label>.txt: per executable its name and stages, then each internal representation the
+		 * driver reports (text ones written out: AMD's include the final ISA; a binary one by its size). Pipelines are numbered in creation
+		 * order across the process; a shader is found by a literal it uses (its constants appear in the ISA).
+		 */
+		void DumpPipelineInternalRepresentations(VkDevice device, VkPipeline pipeline, std::string_view a_kind, const char* a_label) noexcept {
+			try {
+				const std::string& directory = IsaDumpDirectory();
+				static std::atomic<uint32_t> dumpIndex{ 0 };
+				const char* label = a_label && *a_label ? a_label : (t_pipelineStatisticsLabel ? t_pipelineStatisticsLabel : "unlabelled");
+				std::string stem = std::format("{:05}_{}_{}", dumpIndex.fetch_add(1, std::memory_order_relaxed), a_kind, label);
+				for (char& c : stem)
+					if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') c = '_';
+				VkPipelineInfoKHR info{ VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR };
+				info.pipeline = pipeline;
+				uint32_t count = 0;
+				if (vkGetPipelineExecutablePropertiesKHR(device, &info, &count, nullptr) != VK_SUCCESS || !count) return;
+				std::vector<VkPipelineExecutablePropertiesKHR> executables(count, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR });
+				if (vkGetPipelineExecutablePropertiesKHR(device, &info, &count, executables.data()) != VK_SUCCESS) return;
+				std::FILE* file = std::fopen(std::format("{}/{}.txt", directory, stem).c_str(), "wb");
+				if (!file) {
+					static std::atomic<bool> reported{ false };
+					if (!reported.exchange(true)) spdlog::warn("BASICRHI_VK_DUMP_ISA: cannot write into {}", directory);
+					return;
+				}
+				std::fprintf(file, "pipeline %s (%.*s)\n", label, static_cast<int>(a_kind.size()), a_kind.data());
+				for (uint32_t e = 0; e < count; ++e) {
+					std::fprintf(file, "\n######## executable %u: %s (stages 0x%x, subgroup size %u): %s\n", e, executables[e].name,
+						static_cast<uint32_t>(executables[e].stages), executables[e].subgroupSize, executables[e].description);
+					VkPipelineExecutableInfoKHR executable{ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR };
+					executable.pipeline = pipeline;
+					executable.executableIndex = e;
+					uint32_t representationCount = 0;
+					if (vkGetPipelineExecutableInternalRepresentationsKHR(device, &executable, &representationCount, nullptr) != VK_SUCCESS) continue;
+					std::vector<VkPipelineExecutableInternalRepresentationKHR> representations(representationCount,
+						{ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR });
+					if (vkGetPipelineExecutableInternalRepresentationsKHR(device, &executable, &representationCount, representations.data()) != VK_SUCCESS) continue;
+					std::vector<std::vector<char>> data(representationCount);
+					for (uint32_t r = 0; r < representationCount; ++r) {
+						data[r].resize(representations[r].dataSize);
+						representations[r].pData = data[r].data();
+					}
+					if (vkGetPipelineExecutableInternalRepresentationsKHR(device, &executable, &representationCount, representations.data()) != VK_SUCCESS) continue;
+					for (uint32_t r = 0; r < representationCount; ++r) {
+						std::fprintf(file, "\n==== %s: %s\n", representations[r].name, representations[r].description);
+						if (representations[r].isText)
+							std::fwrite(data[r].data(), 1, strnlen(data[r].data(), data[r].size()), file);
+						else
+							std::fprintf(file, "(binary, %zu bytes)", data[r].size());
+						std::fputc('\n', file);
+					}
+				}
+				std::fclose(file);
+			} catch (...) {
+			}
 		}
 
 		// One line per executable of a_pipeline: its name and every statistic the driver reports.
@@ -7751,6 +7829,8 @@ namespace rhi {
 					createFlags.pNext = &libraryInfo;
 				}
 
+				const bool dumpIsa = IsaDumpRequested(impl);
+				if (dumpIsa) createFlags.flags |= VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
 				VkRayTracingPipelineCreateInfoKHR pipelineInfo{ VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR };
 				if (!VkChainPipelineCreateFlags(impl, createFlags, pipelineInfo)) {
 					for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
@@ -7771,6 +7851,7 @@ namespace rhi {
 					spdlog::error("Vulkan ray tracing pipeline: vkCreateRayTracingPipelinesKHR failed ({})", static_cast<int>(pipelineResult));
 					return ToRHI(pipelineResult);
 				}
+				if (dumpIsa) DumpPipelineInternalRepresentations(impl->device, nativePipeline, "raytracing", nullptr);
 
 				const PipelineHandle handle = impl->pipelines.alloc(VulkanPipeline{
 					.pipeline = nativePipeline,
@@ -7997,8 +8078,10 @@ namespace rhi {
 					}
 					createFlags.flags |= VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
 				}
-				const bool captureStatistics = PipelineStatisticsRequested();
+				const bool captureStatistics = PipelineStatisticsRequested(impl);
 				if (captureStatistics) createFlags.flags |= VK_PIPELINE_CREATE_2_CAPTURE_STATISTICS_BIT_KHR;
+				const bool dumpIsa = IsaDumpRequested(impl);
+				if (dumpIsa) createFlags.flags |= VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
 				createFlags.pNext = &rendering;
 				VkGraphicsPipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
 				if (!VkChainPipelineCreateFlags(impl, createFlags, pipelineInfo)) {
@@ -8038,6 +8121,7 @@ namespace rhi {
 				}
 
 				if (captureStatistics) LogPipelineStatistics(impl->device, nativePipeline);
+				if (dumpIsa) DumpPipelineInternalRepresentations(impl->device, nativePipeline, "graphics", nullptr);
 				VulkanPipeline graphicsPipelineState{ nativePipeline, nativeLayout, VK_PIPELINE_BIND_POINT_GRAPHICS, layoutHandle, false };
 				graphicsPipelineState.indirectBindable = indirectBindable;
 				graphicsPipelineState.dynamicVertexStride = dynamicVertexStride;
@@ -8115,6 +8199,8 @@ namespace rhi {
 				}
 				createFlags.flags |= VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
 			}
+			const bool dumpIsa = IsaDumpRequested(impl);
+			if (dumpIsa) createFlags.flags |= VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
 			VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
 			if (!VkChainPipelineCreateFlags(impl, createFlags, pipelineInfo)) {
 				vkDestroyShaderModule(impl->device, shaderModule, nullptr);
@@ -8130,6 +8216,7 @@ namespace rhi {
 				spdlog::error("Vulkan compute pipeline creation: vkCreateComputePipelines failed with VkResult {}", static_cast<int>(vkResult));
 				return ToRHI(vkResult);
 			}
+			if (dumpIsa) DumpPipelineInternalRepresentations(impl->device, nativePipeline, "compute", t_pipelineStatisticsLabel ? t_pipelineStatisticsLabel : entryPoint);
 
 			const PipelineHandle handle = impl->pipelines.alloc(VulkanPipeline{
 				.pipeline = nativePipeline,
@@ -11822,10 +11909,12 @@ namespace rhi {
 		bool externalMemoryWin32 = false;
 		bool externalSemaphoreWin32 = false;
 		bool maintenance5 = false;  // VK_KHR_maintenance5 enabled
+		VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipelineExecutableProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
 	};
 
 	static void VkApplyEnabledDeviceState(VulkanDevice* impl, const VkEnabledDeviceState& e) noexcept {
 		impl->maintenance5Enabled = e.maintenance5;
+		impl->pipelineExecutableInfoEnabled = e.pipelineExecutableProperties.pipelineExecutableInfo == VK_TRUE;
 		impl->accelerationStructureFeatures = e.accelerationStructure;
 		impl->rayTracingPipelineFeatures = e.rayTracingPipeline;
 		impl->rayQueryFeatures = e.rayQuery;
@@ -12536,8 +12625,10 @@ namespace rhi {
 		supportedDescriptorHeapFeatures.pNext = &supportedMeshShaderFeatures;
 		supportedMeshShaderFeatures.pNext = &supportedDeviceGeneratedCommandsFeatures;
 		supportedDeviceGeneratedCommandsFeatures.pNext = &supportedComputeShaderDerivativesFeatures;
+		VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR supportedPipelineExecutableFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
 		supportedComputeShaderDerivativesFeatures.pNext = &supportedShaderImageAtomicInt64Features;
-		supportedShaderImageAtomicInt64Features.pNext = &supportedShaderSubgroupPartitionedFeatures;
+		supportedShaderImageAtomicInt64Features.pNext = &supportedPipelineExecutableFeatures;
+		supportedPipelineExecutableFeatures.pNext = &supportedShaderSubgroupPartitionedFeatures;
 		supportedShaderSubgroupPartitionedFeatures.pNext = &supportedAccelerationStructureFeatures;
 		supportedAccelerationStructureFeatures.pNext = &supportedRayTracingPipelineFeatures;
 		supportedRayTracingPipelineFeatures.pNext = &supportedRayQueryFeatures;
@@ -12859,8 +12950,10 @@ namespace rhi {
 		enabledDescriptorHeapFeatures.pNext = &enabledMeshShaderFeatures;
 		enabledMeshShaderFeatures.pNext = &enabledDeviceGeneratedCommandsFeatures;
 		enabledDeviceGeneratedCommandsFeatures.pNext = &enabledComputeShaderDerivativesFeatures;
+		VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR enabledPipelineExecutableFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
 		enabledComputeShaderDerivativesFeatures.pNext = &enabledShaderImageAtomicInt64Features;
-		enabledShaderImageAtomicInt64Features.pNext = &enabledShaderSubgroupPartitionedFeatures;
+		enabledShaderImageAtomicInt64Features.pNext = &enabledPipelineExecutableFeatures;
+		enabledPipelineExecutableFeatures.pNext = &enabledShaderSubgroupPartitionedFeatures;
 		enabledShaderSubgroupPartitionedFeatures.pNext = &enabledAccelerationStructureFeatures;
 		enabledAccelerationStructureFeatures.pNext = &enabledRayTracingPipelineFeatures;
 		enabledRayTracingPipelineFeatures.pNext = &enabledRayQueryFeatures;
@@ -13000,6 +13093,12 @@ namespace rhi {
 		if (hasShaderImageAtomicInt64Extension && supportedShaderImageAtomicInt64Features.shaderImageInt64Atomics == VK_TRUE) {
 			enabledDeviceExtensions.push_back(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 			enabledShaderImageAtomicInt64Features.shaderImageInt64Atomics = VK_TRUE;
+		}
+		// Only on request (DXVK_PIPELINE_STATS, BASICRHI_VK_DUMP_ISA): a driver may keep more per pipeline with it enabled.
+		if (PipelineExecutableDebugRequested() && VkHasDeviceExtension(physicalDevice, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) &&
+			supportedPipelineExecutableFeatures.pipelineExecutableInfo == VK_TRUE) {
+			enabledDeviceExtensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+			enabledPipelineExecutableFeatures.pipelineExecutableInfo = VK_TRUE;
 		}
 		if (hasShaderSubgroupPartitionedExtension && supportedShaderSubgroupPartitionedFeatures.shaderSubgroupPartitioned == VK_TRUE) {
 			enabledDeviceExtensions.push_back(VK_EXT_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
@@ -13199,6 +13298,7 @@ namespace rhi {
 			enabled.deviceGeneratedCommands = enabledDeviceGeneratedCommandsFeatures;
 			enabled.computeShaderDerivatives = enabledComputeShaderDerivativesFeatures;
 			enabled.shaderImageAtomicInt64 = enabledShaderImageAtomicInt64Features;
+			enabled.pipelineExecutableProperties = enabledPipelineExecutableFeatures;
 			enabled.shaderSubgroupPartitioned = enabledShaderSubgroupPartitionedFeatures;
 			enabled.accelerationStructure = enabledAccelerationStructureFeatures;
 			enabled.rayTracingPipeline = enabledRayTracingPipelineFeatures;
@@ -13370,6 +13470,7 @@ namespace rhi {
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT: VkCopyFeatureStruct(e.deviceGeneratedCommands, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR: VkCopyFeatureStruct(e.computeShaderDerivatives, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT: VkCopyFeatureStruct(e.shaderImageAtomicInt64, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR: VkCopyFeatureStruct(e.pipelineExecutableProperties, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT: VkCopyFeatureStruct(e.shaderSubgroupPartitioned, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR: VkCopyFeatureStruct(e.accelerationStructure, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR: VkCopyFeatureStruct(e.rayTracingPipeline, node); break;
@@ -13477,6 +13578,8 @@ namespace rhi {
 			if (!hasExtension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME) && !hasExtension(VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME))
 				enabled.computeShaderDerivatives = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR };
 			if (!hasExtension(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME)) enabled.shaderImageAtomicInt64 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT };
+			if (!hasExtension(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME))
+				enabled.pipelineExecutableProperties = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
 			if (!hasExtension(VK_EXT_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME)) enabled.shaderSubgroupPartitioned = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT };
 			if (!hasExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) || !hasExtension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME))
 				enabled.accelerationStructure = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };

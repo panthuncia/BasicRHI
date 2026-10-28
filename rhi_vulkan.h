@@ -643,6 +643,8 @@ namespace rhi {
 		// VK_KHR_maintenance5: pipeline create flags go in VkPipelineCreateFlags2CreateInfo; without it (AMD's legacy Polaris driver)
 		// in the legacy flags (VkChainPipelineCreateFlags).
 		bool maintenance5Enabled = false;
+		// VK_KHR_pipeline_executable_properties' pipelineExecutableInfo: the debugging switches' (DXVK_PIPELINE_STATS, BASICRHI_VK_DUMP_ISA).
+		bool pipelineExecutableInfoEnabled = false;
 		bool shaderDemoteToHelperInvocationEnabled = false;
 		bool computeDerivativeGroupQuadsEnabled = false;
 		bool computeDerivativeGroupLinearEnabled = false;
