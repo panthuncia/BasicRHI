@@ -589,6 +589,8 @@ namespace rhi {
 		uint64_t droppedValidationMessageCount = 0;
 		VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 		VkDevice device = VK_NULL_HANDLE;
+		// VK_FORMAT_D24_UNORM_S8_UINT is no depth attachment here (AMD): the D24 family is D32_SFLOAT_S8_UINT, as DXVK maps it.
+		bool d24Fallback = false;
 		VkPhysicalDeviceProperties physicalDeviceProperties{};
 		VkPhysicalDeviceMemoryProperties memoryProperties{};
 		VkPhysicalDeviceFeatures supportedFeatures{};

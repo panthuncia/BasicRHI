@@ -739,6 +739,20 @@ namespace rhi {
 			}
 		}
 
+		// Whether VK_FORMAT_D24_UNORM_S8_UINT is no depth attachment on the device (AMD's), so that the D24 family is D32_SFLOAT_S8_UINT
+		// there, as DXVK maps it (VulkanDevice::d24Fallback).
+		static bool VkD24Fallback(VkPhysicalDevice physicalDevice) noexcept {
+			VkFormatProperties properties{};
+			vkGetPhysicalDeviceFormatProperties(physicalDevice, VK_FORMAT_D24_UNORM_S8_UINT, &properties);
+			return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0;
+		}
+
+		// The device's format for an image, view or attachment: the D24 family as D32_SFLOAT_S8_UINT where D24S8 is no attachment.
+		static VkFormat ToVkFormat(const VulkanDevice* impl, Format format) noexcept {
+			const VkFormat converted = ToVkFormat(format);
+			return impl && impl->d24Fallback && converted == VK_FORMAT_D24_UNORM_S8_UINT ? VK_FORMAT_D32_SFLOAT_S8_UINT : converted;
+		}
+
 		static Format FromVkFormat(VkFormat format) noexcept {
 			switch (format) {
 			case VK_FORMAT_R32G32B32A32_UINT:
@@ -7083,13 +7097,13 @@ namespace rhi {
 			std::vector<VkFormat> colorFormats;
 			colorFormats.reserve(inheritance.colorFormats.size);
 			for (const Format format : inheritance.colorFormats) {
-				colorFormats.push_back(format == Format::Unknown ? VK_FORMAT_UNDEFINED : ToVkFormat(format));
+				colorFormats.push_back(format == Format::Unknown ? VK_FORMAT_UNDEFINED : ToVkFormat(impl, format));
 			}
 			VkCommandBufferInheritanceRenderingInfo renderingInheritance{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO };
 			renderingInheritance.colorAttachmentCount = static_cast<uint32_t>(colorFormats.size());
 			renderingInheritance.pColorAttachmentFormats = colorFormats.empty() ? nullptr : colorFormats.data();
-			renderingInheritance.depthAttachmentFormat = inheritance.depthFormat == Format::Unknown ? VK_FORMAT_UNDEFINED : ToVkFormat(inheritance.depthFormat);
-			renderingInheritance.stencilAttachmentFormat = inheritance.stencilFormat == Format::Unknown ? VK_FORMAT_UNDEFINED : ToVkFormat(inheritance.stencilFormat);
+			renderingInheritance.depthAttachmentFormat = inheritance.depthFormat == Format::Unknown ? VK_FORMAT_UNDEFINED : ToVkFormat(impl, inheritance.depthFormat);
+			renderingInheritance.stencilAttachmentFormat = inheritance.stencilFormat == Format::Unknown ? VK_FORMAT_UNDEFINED : ToVkFormat(impl, inheritance.stencilFormat);
 			renderingInheritance.rasterizationSamples = VkSampleCountForDesc(inheritance.sampleCount);
 			VkCommandBufferInheritanceInfo inheritanceInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO };
 			const bool continuesRendering = inheritance.insideRendering;
@@ -7957,12 +7971,12 @@ namespace rhi {
 				std::vector<VkFormat> colorFormats;
 				colorFormats.reserve(renderTargets.count);
 				for (uint32_t i = 0; i < renderTargets.count; ++i) {
-					colorFormats.push_back(ToVkFormat(renderTargets.formats[i]));
+					colorFormats.push_back(ToVkFormat(impl, renderTargets.formats[i]));
 				}
 				VkPipelineRenderingCreateInfo rendering{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
 				rendering.colorAttachmentCount = static_cast<uint32_t>(colorFormats.size());
 				rendering.pColorAttachmentFormats = colorFormats.empty() ? nullptr : colorFormats.data();
-				rendering.depthAttachmentFormat = depthFormat != Format::Unknown ? ToVkFormat(depthFormat) : VK_FORMAT_UNDEFINED;
+				rendering.depthAttachmentFormat = depthFormat != Format::Unknown ? ToVkFormat(impl, depthFormat) : VK_FORMAT_UNDEFINED;
 				// Depth-stencil formats: BeginPass binds the stencil aspect too, so the pipeline declares it.
 				if ((VkAspectMaskForFormat(rendering.depthAttachmentFormat) & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) {
 					rendering.stencilAttachmentFormat = rendering.depthAttachmentFormat;
@@ -9741,7 +9755,7 @@ namespace rhi {
 
 			const VkImageViewType viewType = VkImageViewTypeForSrv(desc.dimension);
 			const bool isDepthStencilResource = VkIsDepthStencilFormat(resourceState->format);
-			const VkFormat requestedViewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(desc.formatOverride) : resourceState->format;
+			const VkFormat requestedViewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(impl, desc.formatOverride) : resourceState->format;
 			const VkFormat viewFormat = isDepthStencilResource ? resourceState->format : requestedViewFormat;
 			const VkImageAspectFlags aspectMask = isDepthStencilResource ? VkSampledImageAspectMaskForFormat(resourceState->format) : VkAspectMaskForFormat(viewFormat);
 			if (viewType == VK_IMAGE_VIEW_TYPE_MAX_ENUM || viewFormat == VK_FORMAT_UNDEFINED) {
@@ -9885,7 +9899,7 @@ namespace rhi {
 			}
 
 			const VkImageViewType viewType = VkImageViewTypeForUav(desc.dimension);
-			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(desc.formatOverride) : resourceState->format;
+			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(impl, desc.formatOverride) : resourceState->format;
 			const VkImageAspectFlags aspectMask = VkAspectMaskForFormat(viewFormat);
 			if (viewType == VK_IMAGE_VIEW_TYPE_MAX_ENUM || viewFormat == VK_FORMAT_UNDEFINED) {
 				RHI_FAIL(Result::Unsupported);
@@ -10079,7 +10093,7 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(desc.formatOverride) : resource->format;
+			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(impl, desc.formatOverride) : resource->format;
 			const VkImageViewType viewType = VkImageViewTypeForRtv(desc.dimension);
 			return VkCreateImageViewSlot(impl, slot, DescriptorHeapType::RTV, texture, viewFormat, VK_IMAGE_ASPECT_COLOR_BIT, viewType, desc.range);
 		}
@@ -10095,7 +10109,10 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(desc.formatOverride) : resource->format;
+			// A depth-stencil image's view keeps the image's format (no other is allowed without MUTABLE_FORMAT): the override names a
+			// format of the same image, which its host may have backed with another (DXVK: D24S8 by D32S8 where D24S8 is no attachment).
+			const VkFormat requestedFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(impl, desc.formatOverride) : resource->format;
+			const VkFormat viewFormat = VkIsDepthStencilFormat(resource->format) ? resource->format : requestedFormat;
 			const VkImageAspectFlags aspectMask = VkAspectMaskForFormat(viewFormat);
 			const VkImageViewType viewType = VkImageViewTypeForDsv(desc.dimension);
 			return VkCreateImageViewSlot(impl, slot, DescriptorHeapType::DSV, texture, viewFormat, aspectMask, viewType, desc.range);
@@ -10352,7 +10369,7 @@ namespace rhi {
 				RHI_FAIL(Result::Unsupported);
 			}
 
-			const VkFormat format = ToVkFormat(desc.texture.format);
+			const VkFormat format = ToVkFormat(impl, desc.texture.format);
 			const VkImageType imageType = VkImageTypeForResourceType(desc.type);
 			const VkSampleCountFlagBits samples = VkSampleCountForDesc(desc.texture.sampleCount);
 			if (format == VK_FORMAT_UNDEFINED || imageType == VK_IMAGE_TYPE_MAX_ENUM || samples == VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM) {
@@ -10660,7 +10677,7 @@ namespace rhi {
 				RHI_FAIL(Result::Unsupported);
 			}
 
-			const VkFormat format = ToVkFormat(desc.texture.format);
+			const VkFormat format = ToVkFormat(impl, desc.texture.format);
 			const VkImageType imageType = VkImageTypeForResourceType(desc.type);
 			const VkSampleCountFlagBits samples = VkSampleCountForDesc(desc.texture.sampleCount);
 			if (format == VK_FORMAT_UNDEFINED || imageType == VK_IMAGE_TYPE_MAX_ENUM || samples == VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM) {
@@ -11140,7 +11157,7 @@ namespace rhi {
 					vkDestroyBuffer(impl->device, buffer, nullptr);
 				}
 				else if (desc.type == ResourceType::Texture1D || desc.type == ResourceType::Texture2D || desc.type == ResourceType::Texture3D) {
-					const VkFormat format = ToVkFormat(desc.texture.format);
+					const VkFormat format = ToVkFormat(impl, desc.texture.format);
 					const VkImageType imageType = VkImageTypeForResourceType(desc.type);
 					const VkSampleCountFlagBits samples = VkSampleCountForDesc(desc.texture.sampleCount);
 					if (format == VK_FORMAT_UNDEFINED || imageType == VK_IMAGE_TYPE_MAX_ENUM || samples == VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM) {
@@ -13154,6 +13171,7 @@ namespace rhi {
 		}
 		impl->physicalDevice = physicalDevice;
 		impl->device = device;
+		impl->d24Fallback = VkD24Fallback(physicalDevice);
 		impl->physicalDeviceProperties = physicalDeviceProperties;
 		impl->memoryProperties = memoryProperties;
 		impl->supportedFeatures = supportedFeatures;
@@ -13488,6 +13506,7 @@ namespace rhi {
 			impl->instance = info.instance;
 			impl->physicalDevice = info.physicalDevice;
 			impl->device = info.device;
+			impl->d24Fallback = VkD24Fallback(info.physicalDevice);
 			impl->ownsInstance = false;
 			impl->ownsDevice = false;
 			impl->debugUtilsEnabled = VkNameListContains(info.enabledInstanceExtensions, info.enabledInstanceExtensionCount, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
