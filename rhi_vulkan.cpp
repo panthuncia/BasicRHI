@@ -5416,6 +5416,11 @@ namespace rhi {
 						resource->concurrentSharing, ownershipSrcFamily, ownershipDstFamily);
 				const bool internalAcquire = internalTransfer && barrier.queueOwnership == QueueOwnership::Acquire;
 				const bool internalRelease = internalTransfer && barrier.queueOwnership == QueueOwnership::Release;
+				// An acquire repeats its release's layouts. When the transfer collapses (one family, a concurrent image) the
+				// release was an ordinary barrier that already made the transition: nothing is left to acquire.
+				if (barrier.queueOwnership == QueueOwnership::Acquire && !internalTransfer && !externalAcquire && !externalRelease) {
+					continue;
+				}
 				vkBarrier.srcAccessMask = (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire || internalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
 				vkBarrier.dstAccessMask = (afterPresent || externalRelease || internalRelease) ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
 				vkBarrier.oldLayout = (barrier.discard || firstUseFromUndefined) ? VK_IMAGE_LAYOUT_UNDEFINED : VkToImageLayout(barrier.beforeLayout, aspect);

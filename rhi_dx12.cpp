@@ -8318,6 +8318,9 @@ namespace rhi {
 					BreakIfDebugging();
 					continue;
 				}
+				// D3D12 has no queue-family ownership: the release half performed the transition, and the acquire half repeats it
+				// (Vulkan pairs them exactly).
+				if (t.queueOwnership == QueueOwnership::Acquire) continue;
 
 				// Enhanced DISCARD applies to the affected subresource range, not only
 				// to a whole texture. Suppressing it for a mip/layer subset leaves an
