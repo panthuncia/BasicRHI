@@ -34,6 +34,9 @@ set(BASICRHI_VULKAN_DXC_FLAGS
     -fvk-bind-resource-heap ${_basicrhi_VULKAN_RESOURCE_DESCRIPTOR_HEAP_BINDING} ${_basicrhi_VULKAN_DESCRIPTOR_HEAP_SET}
     -fvk-bind-sampler-heap ${_basicrhi_VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING} ${_basicrhi_VULKAN_DESCRIPTOR_HEAP_SET}
     -fvk-bind-counter-heap ${_basicrhi_VULKAN_COUNTER_DESCRIPTOR_HEAP_BINDING} ${_basicrhi_VULKAN_DESCRIPTOR_HEAP_SET})
+# The include guard skips this file in every later directory that includes it, where the variable above is not visible;
+# basicrhi_compile_spirv reads the flags from here instead.
+set_property(GLOBAL PROPERTY BASICRHI_VULKAN_DXC_FLAGS "${BASICRHI_VULKAN_DXC_FLAGS}")
 
 # -fvk-bind-*-heap needs a recent DXC; the Vulkan SDK's copy is the default.
 find_program(BASICRHI_DXC_EXECUTABLE dxc
@@ -56,7 +59,8 @@ function(basicrhi_compile_spirv)
     if(NOT _dxc)
         message(FATAL_ERROR "basicrhi_compile_spirv: DXC not found; install the Vulkan SDK or set BASICRHI_DXC_EXECUTABLE")
     endif()
-    set(_args -nologo -HV 2021 -E ${ARG_ENTRY} -T ${ARG_PROFILE} ${BASICRHI_VULKAN_DXC_FLAGS} -D BASICRHI_SHADER_API_VULKAN=1)
+    get_property(_flags GLOBAL PROPERTY BASICRHI_VULKAN_DXC_FLAGS)
+    set(_args -nologo -HV 2021 -E ${ARG_ENTRY} -T ${ARG_PROFILE} ${_flags} -D BASICRHI_SHADER_API_VULKAN=1)
     if(BASICRHI_SPIRV_DEBUG_INFO)
         list(APPEND _args -Zi)
     endif()
