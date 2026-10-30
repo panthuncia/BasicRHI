@@ -329,6 +329,12 @@ namespace rhi {
 #endif
 		Dx12Device* dev = nullptr;
 		void* tracyGpuContext = nullptr;
+		// Queue::Progress: a timeline every submission signals, made at the first; the last value submitted. Under progressMutex,
+		// which also orders the queue's submissions (shared by the state's copies).
+		TimelineHandle progress{};
+		bool hasProgress = false;
+		uint64_t progressSubmitted = 0;
+		std::shared_ptr<std::mutex> progressMutex = std::make_shared<std::mutex>();
 	};
 
 	struct Dx12Swapchain {

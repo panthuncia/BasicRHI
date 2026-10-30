@@ -165,6 +165,10 @@ namespace rhi {
 		bool external = false;
 		// One of the host's spare queues (AdoptedVulkanDeviceInfo::spareQueues): offered again when destroyed.
 		bool spare = false;
+		// Queue::Progress: a timeline every submission signals, made at the first; the last value submitted. Under timelinesMutex.
+		TimelineHandle progress{};
+		bool hasProgress = false;
+		uint64_t progressSubmitted = 0;
 	};
 
 	struct VulkanImageViewSlot;

@@ -2507,6 +2507,13 @@ namespace rhi {
 		TimelineHandle handle;
 	};
 
+	// A queue's progress (Queue::Progress): the timeline every submission on the queue signals, and the value of the last
+	// one. Everything submitted so far has completed once the timeline reaches `submitted`.
+	struct QueueProgress {
+		Timeline timeline;
+		uint64_t submitted = 0;
+	};
+
 	struct HeapVTable {
 		void (*setName)(Heap*, const char*) noexcept;
 		uint32_t abi_version = 1;
@@ -2538,6 +2545,8 @@ namespace rhi {
 		bool (*hasTracyGpuContext)(const Queue*) noexcept;
 		void (*tracyGpuFrameBegin)(Queue*, CommandList*) noexcept;
 		uint32_t abi_version = 3;
+		// abi_version 4. After abi_version, so tables written for version 3 still initialize.
+		QueueProgress(*progress)(const Queue*) noexcept = nullptr;
 	};
 
 	class Queue {
@@ -2566,6 +2575,11 @@ namespace rhi {
 		}
 		void TracyGpuFrameBegin(CommandList& firstCommandList) noexcept {
 			if (vt->abi_version >= 3 && vt->tracyGpuFrameBegin) vt->tracyGpuFrameBegin(this, &firstCommandList);
+		}
+		// What has been submitted to this queue, by any caller: an invalid timeline when nothing has been yet (or the backend has
+		// no timelines).
+		QueueProgress Progress() const noexcept {
+			return vt->abi_version >= 4 && vt->progress ? vt->progress(this) : QueueProgress{};
 		}
 		QueueKind GetKind() const noexcept { return kind; }
 		QueueHandle GetQueueHandle() const noexcept { return queueHandle; }

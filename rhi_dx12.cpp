@@ -1672,6 +1672,7 @@ namespace rhi {
 			// Drain the queue before destroying it
 			Dx12WaitQueueIdle(*qs);
 			Dx12DestroyTracyGpuContext(*qs);
+			if (qs->hasProgress) impl->timelines.free(qs->progress);
 			impl->queues.free(h);
 		}
 
@@ -4700,11 +4701,35 @@ namespace rhi {
 		}
 #endif
 
+		static QueueProgress q_progress(const Queue* q) noexcept {
+			auto* qs = dx12_detail::QState(const_cast<Queue*>(q));
+			if (!qs || !qs->dev) return {};
+			std::lock_guard lock(*qs->progressMutex);
+			if (!qs->hasProgress) return {};
+			QueueProgress progress{};
+			progress.timeline = Timeline{ qs->progress };
+			progress.timeline.impl = qs->dev;
+			progress.timeline.vt = &g_tlvt;
+			progress.submitted = qs->progressSubmitted;
+			return progress;
+		}
+
 		static Result q_submit(Queue* q, Span<CommandList> lists, const SubmitDesc& s) noexcept {
 			auto* qs = dx12_detail::QState(q);
 			auto* dev = qs->dev;
 			if (!dev) {
 				RHI_FAIL(Result::InvalidArgument);
+			}
+			std::lock_guard progressLock(*qs->progressMutex);
+			if (!qs->hasProgress) {
+				Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+				if (SUCCEEDED(dev->pNativeDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+					fence->SetName(L"BasicRHI.QueueProgress");
+					Dx12Timeline timeline(fence, dev);
+					timeline.debugName = "BasicRHI.QueueProgress";
+					qs->progress = dev->timelines.alloc(timeline);
+					qs->hasProgress = true;
+				}
 			}
 			for (auto& list : lists) {
 				if (auto* listState = dx12_detail::CL(&list); !listState || listState->bundle) {
@@ -4812,6 +4837,15 @@ namespace rhi {
 					RHI_FAIL(ToRHI(hr));
 				}
 				Dx12RecordTimelineSignal(*TL, *q, sgn.value, completedBefore, lists.size, "q_submit");
+			}
+			if (qs->hasProgress) {
+				if (auto* progress = dev->timelines.get(qs->progress)) {
+					const uint64_t value = qs->progressSubmitted + 1;
+					if (SUCCEEDED(qs->pNativeQueue->Signal(progress->fence.Get(), value))) {
+						qs->progressSubmitted = value;
+						progress->lastSubmittedSignalValue = value;
+					}
+				}
 			}
 			return Result::Ok;
 		}
@@ -9959,7 +9993,8 @@ namespace rhi {
 		&q_initializeTracyGpuContext,
 		&q_hasTracyGpuContext,
 		&q_tracyGpuFrameBegin,
-		3u };
+		4u,
+		&q_progress };
 
 	const CommandAllocatorVTable g_calvt = {
 		&ca_reset,

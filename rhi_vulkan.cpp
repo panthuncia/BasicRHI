@@ -4442,6 +4442,58 @@ namespace rhi {
 			return ToRHI(vkWaitSemaphores(impl->device, &waitInfo, UINT64_MAX));
 		}
 
+		// The queue's progress timeline, made on first use. timelinesMutex is held: allocating can move the timeline pool, so
+		// call it before looking any other timeline up.
+		static VulkanTimeline* VkQueueProgressTimeline(VulkanDevice* impl, VulkanQueueState& queueState) noexcept {
+			if (queueState.hasProgress) return VkTimelineState(impl, queueState.progress);
+			VkSemaphoreTypeCreateInfo typeInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+			typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+			typeInfo.initialValue = 0;
+			VkSemaphoreCreateInfo createInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+			createInfo.pNext = &typeInfo;
+			VkSemaphore semaphore = VK_NULL_HANDLE;
+			if (vkCreateSemaphore(impl->device, &createInfo, nullptr, &semaphore) != VK_SUCCESS) return nullptr;
+			VkSetObjectName(impl, reinterpret_cast<uint64_t>(semaphore), VK_OBJECT_TYPE_SEMAPHORE, "BasicRHI.QueueProgress");
+			queueState.progress = impl->timelines.alloc(VulkanTimeline{ semaphore, 0 });
+			queueState.hasProgress = true;
+			return VkTimelineState(impl, queueState.progress);
+		}
+
+		// Destroys a queue's progress timeline once its last submission completed. timelinesMutex must not be held.
+		static void VkDestroyQueueProgress(VulkanDevice* impl, VulkanQueueState& queueState) noexcept {
+			std::unique_lock lock(impl->timelinesMutex);
+			if (!queueState.hasProgress) return;
+			VulkanTimeline* timeline = VkTimelineState(impl, queueState.progress);
+			if (timeline && timeline->semaphore != VK_NULL_HANDLE) {
+				const VkSemaphore semaphore = timeline->semaphore;
+				const uint64_t value = queueState.progressSubmitted;
+				lock.unlock();
+				VkSemaphoreWaitInfo waitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+				waitInfo.semaphoreCount = 1;
+				waitInfo.pSemaphores = &semaphore;
+				waitInfo.pValues = &value;
+				(void)vkWaitSemaphores(impl->device, &waitInfo, UINT64_MAX);
+				lock.lock();
+				vkDestroySemaphore(impl->device, semaphore, nullptr);
+			}
+			impl->timelines.free(queueState.progress);
+			queueState.hasProgress = false;
+		}
+
+		static QueueProgress q_progress(const Queue* queue) noexcept {
+			auto* impl = queue ? static_cast<VulkanDevice*>(queue->impl) : nullptr;
+			if (!impl) return {};
+			const std::lock_guard timelineLock(impl->timelinesMutex);
+			const VulkanQueueState* queueState = VkQueueStateForHandle(impl, queue->GetQueueHandle());
+			if (!queueState || !queueState->hasProgress) return {};
+			QueueProgress progress{};
+			progress.timeline = Timeline{ queueState->progress };
+			progress.timeline.impl = impl;
+			progress.timeline.vt = &g_vktlvt;
+			progress.submitted = queueState->progressSubmitted;
+			return progress;
+		}
+
 		static Result q_submit(Queue* queue, Span<CommandList> lists, const SubmitDesc& submit) noexcept {
 			auto* impl = queue ? static_cast<VulkanDevice*>(queue->impl) : nullptr;
 			if (!impl || impl->device == VK_NULL_HANDLE) {
@@ -4461,6 +4513,8 @@ namespace rhi {
 			if (lists.size == 0 && submit.waits.size == 0 && submit.signals.size == 0) {
 				return Result::Ok;
 			}
+			// First: making it can move the timeline pool.
+			const bool signalProgress = impl->timelineSemaphoreEnabled && VkQueueProgressTimeline(impl, *queueState) != nullptr;
 
 			std::vector<VkCommandBuffer> commandBuffers;
 			commandBuffers.reserve(lists.size);
@@ -4547,6 +4601,10 @@ namespace rhi {
 				signalSemaphores.push_back(timeline->semaphore);
 				signalValues.push_back(signal.value);
 			}
+			if (signalProgress) {
+				signalSemaphores.push_back(VkTimelineState(impl, queueState->progress)->semaphore);
+				signalValues.push_back(queueState->progressSubmitted + 1);
+			}
 
 			VkTimelineSemaphoreSubmitInfo timelineInfo{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
 			timelineInfo.waitSemaphoreValueCount = static_cast<uint32_t>(waitValues.size());
@@ -4608,6 +4666,10 @@ namespace rhi {
 					if (VulkanTimeline* timeline = VkTimelineState(impl, signal.t)) {
 						timeline->lastSubmittedSignalValue = (std::max)(timeline->lastSubmittedSignalValue, signal.value);
 					}
+				}
+				if (signalProgress) {
+					++queueState->progressSubmitted;
+					VkTimelineState(impl, queueState->progress)->lastSubmittedSignalValue = queueState->progressSubmitted;
 				}
 				for (uint32_t index = 0; index < lists.size; ++index) {
 					if (VulkanCommandList* commandListState = VkCommandListState(impl, lists.data[index].GetHandle())) {
@@ -8417,10 +8479,12 @@ namespace rhi {
 			const VulkanQueueState* queueState = impl->queues.get(handle);
 			if (queueState && queueState->external) {
 				// Host-owned queue: BasicRHI's work on it is covered by its timelines. A spare one is offered again.
+				if (auto* mutableQueueState = impl->queues.get(handle)) VkDestroyQueueProgress(impl, *mutableQueueState);
 				if (queueState->spare) {
 					std::lock_guard lock(impl->spareQueuesMutex);
 					VulkanQueueState state = *queueState;
 					state.tracyGpuContext = nullptr;
+					state.progressSubmitted = 0;
 					impl->spareQueues.push_back(state);
 				}
 				impl->queues.free(handle);
@@ -8433,6 +8497,7 @@ namespace rhi {
 				if (mutableQueueState->queue != VK_NULL_HANDLE) {
 					vkQueueWaitIdle(mutableQueueState->queue);
 				}
+				VkDestroyQueueProgress(impl, *mutableQueueState);
 				VkDestroyTracyGpuContext(*mutableQueueState);
 			}
 			impl->queues.free(handle);
@@ -11734,7 +11799,8 @@ namespace rhi {
 		&q_initializeTracyGpuContext,
 		&q_hasTracyGpuContext,
 		&q_tracyGpuFrameBegin,
-		3u
+		4u,
+		&q_progress
 	};
 
 	const CommandAllocatorVTable g_vkcalvt = {
