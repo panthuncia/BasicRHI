@@ -8318,9 +8318,10 @@ namespace rhi {
 					BreakIfDebugging();
 					continue;
 				}
-				// D3D12 has no queue-family ownership: the release half performed the transition, and the acquire half repeats it
-				// (Vulkan pairs them exactly).
-				if (t.queueOwnership == QueueOwnership::Acquire) continue;
+				// D3D12 has no queue-family ownership. An acquire that repeats its release (to Common; Vulkan pairs them exactly)
+				// has nothing left to do: the release made the transition. Any other acquire carries the consumer's own transition
+				// out of Common and records as an ordinary barrier.
+				if (t.queueOwnership == QueueOwnership::Acquire && t.afterLayout == ResourceLayout::Common) continue;
 
 				// Enhanced DISCARD applies to the affected subresource range, not only
 				// to a whole texture. Suppressing it for a mip/layer subset leaves an
