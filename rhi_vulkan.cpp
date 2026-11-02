@@ -1477,6 +1477,16 @@ namespace rhi {
 			return (value + mask) & ~mask;
 		}
 
+		// The graph's memory is read by every pass: under memory pressure, the driver demotes everything else first.
+		static VkResult VkAllocateDeviceMemory(VulkanDevice* impl, const VkMemoryAllocateInfo* info, VkDeviceMemory* memory) noexcept {
+			const VkResult result = vkAllocateMemory(impl->device, info, nullptr, memory);
+			if (result == VK_SUCCESS && vkSetDeviceMemoryPriorityEXT
+				&& (impl->memoryProperties.memoryTypes[info->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+				vkSetDeviceMemoryPriorityEXT(impl->device, *memory, 1.0f);
+			}
+			return result;
+		}
+
 		static bool VkFindMemoryTypeIndex(const VkPhysicalDeviceMemoryProperties& memoryProperties,
 			uint32_t memoryTypeBits,
 			VkMemoryPropertyFlags preferredFlags,
@@ -1566,7 +1576,7 @@ namespace rhi {
 			allocateInfo.pNext = &allocateFlagsInfo;
 
 			VkDeviceMemory memory = VK_NULL_HANDLE;
-			if (vkAllocateMemory(impl->device, &allocateInfo, nullptr, &memory) != VK_SUCCESS) {
+			if (VkAllocateDeviceMemory(impl, &allocateInfo, &memory) != VK_SUCCESS) {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return false;
 			}
@@ -3295,7 +3305,7 @@ namespace rhi {
 			allocateInfo.pNext = &allocateFlags;
 			allocateInfo.allocationSize = bufferRequirements.size;
 			allocateInfo.memoryTypeIndex = page.memoryTypeIndex;
-			result = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &page.memory);
+			result = VkAllocateDeviceMemory(impl, &allocateInfo, &page.memory);
 			if (result != VK_SUCCESS) {
 				vkDestroyBuffer(impl->device, page.buffer, nullptr);
 				return ToRHI(result);
@@ -9500,7 +9510,7 @@ namespace rhi {
 			allocateInfo.pNext = &allocateFlagsInfo;
 			allocateInfo.allocationSize = memoryRequirements.size;
 			allocateInfo.memoryTypeIndex = memoryTypeIndex;
-			VkResult result = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &heap.memory);
+			VkResult result = VkAllocateDeviceMemory(impl, &allocateInfo, &heap.memory);
 			if (result == VK_SUCCESS) {
 				result = VkBindBufferMemorySynchronized(impl, heap.buffer, heap.memory, 0);
 			}
@@ -9618,7 +9628,7 @@ namespace rhi {
 				allocateInfo.allocationSize = memoryRequirements.size;
 				allocateInfo.memoryTypeIndex = memoryTypeIndex;
 
-				const VkResult allocateResult = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &heap.memory);
+				const VkResult allocateResult = VkAllocateDeviceMemory(impl, &allocateInfo, &heap.memory);
 				if (allocateResult != VK_SUCCESS) {
 					vkDestroyBuffer(impl->device, heap.buffer, nullptr);
 					out.Reset();
@@ -10464,7 +10474,7 @@ namespace rhi {
 			}
 
 			VkDeviceMemory memory = VK_NULL_HANDLE;
-			result = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &memory);
+			result = VkAllocateDeviceMemory(impl, &allocateInfo, &memory);
 			if (result != VK_SUCCESS) {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				out.Reset();
@@ -10584,7 +10594,7 @@ namespace rhi {
 			allocateInfo.memoryTypeIndex = memoryTypeIndex;
 
 			VkDeviceMemory memory = VK_NULL_HANDLE;
-			result = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &memory);
+			result = VkAllocateDeviceMemory(impl, &allocateInfo, &memory);
 			if (result != VK_SUCCESS) {
 				vkDestroyImage(impl->device, image, nullptr);
 				out.Reset();
@@ -10731,7 +10741,7 @@ namespace rhi {
 				allocateInfo.pNext = &allocateFlagsInfo;
 			}
 			VkDeviceMemory memory = VK_NULL_HANDLE;
-			const VkResult result = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &memory);
+			const VkResult result = VkAllocateDeviceMemory(impl, &allocateInfo, &memory);
 			if (result != VK_SUCCESS) {
 				out.Reset();
 				return ToRHI(result);
@@ -14215,7 +14225,7 @@ namespace rhi {
 			allocateInfo.allocationSize = requirements.size;
 			allocateInfo.memoryTypeIndex = memoryTypeIndex;
 			VkDeviceMemory memory = VK_NULL_HANDLE;
-			vkResult = vkAllocateMemory(impl->device, &allocateInfo, nullptr, &memory);
+			vkResult = VkAllocateDeviceMemory(impl, &allocateInfo, &memory);
 			if (vkResult != VK_SUCCESS) {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return ToRHI(vkResult);
