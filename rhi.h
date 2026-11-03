@@ -3401,7 +3401,7 @@ namespace rhi {
 	// shader-visible heap larger than them cannot be created.
 	struct DescriptorHeapCapacities {
 		uint32_t preferredResources = 1000000;  // D3D12 resource binding tier 2
-		uint32_t minResources = 65536;
+		uint32_t minResources = 65535;
 		uint32_t preferredSamplers = 2048;      // D3D12's sampler heap limit
 		uint32_t minSamplers = 256;
 	};

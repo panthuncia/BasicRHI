@@ -12444,6 +12444,20 @@ namespace rhi {
 		model.staticSamplerCapacity = static_cast<uint32_t>((std::min<uint64_t>)(VulkanDescriptorBufferModel::kMaxStaticSamplers,
 			samplerElements - model.samplerCapacity));
 		const uint32_t samplerCount = model.samplerCapacity + model.staticSamplerCapacity;
+		// The layout query can hold fewer descriptors than the properties above say (65535 on Intel Arc under Mesa, against 33554432).
+		{
+			const VkUniversalSetLayoutInfo probe(resourceTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, model.resourceCapacity, true);
+			VkDescriptorSetVariableDescriptorCountLayoutSupport variableSupport{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT };
+			VkDescriptorSetLayoutSupport support{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT };
+			support.pNext = &variableSupport;
+			vkGetDescriptorSetLayoutSupport(impl->device, &probe.createInfo, &support);
+			if (support.supported == VK_TRUE && variableSupport.maxVariableDescriptorCount < model.resourceCapacity &&
+				variableSupport.maxVariableDescriptorCount >= capacities.minResources) {
+				spdlog::warn("{}: the device's set layout holds {} resource descriptors, not the {} its properties allow; using {}", caller,
+					variableSupport.maxVariableDescriptorCount, model.resourceCapacity, variableSupport.maxVariableDescriptorCount);
+				model.resourceCapacity = variableSupport.maxVariableDescriptorCount;
+			}
+		}
 		impl->shaderVisibleResourceCapacity = model.resourceCapacity;
 		impl->shaderVisibleSamplerCapacity = model.samplerCapacity;
 
