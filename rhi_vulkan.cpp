@@ -4396,7 +4396,7 @@ namespace rhi {
 					tracy::MemWrite(&item->gpuZoneBegin.srcloc, sourceLocation);
 					tracy::MemWrite(&item->gpuZoneBegin.thread, uint32_t{ 0 });
 					tracy::MemWrite(&item->gpuZoneBegin.queryId, static_cast<uint16_t>(event.queryId));
-					tracy::MemWrite(&item->gpuZoneBegin.context, context->GetId());
+					tracy::MemWrite(&item->gpuZoneBegin.context, static_cast<uint8_t>(context->GetId()));
 					tracy::Profiler::QueueSerialFinish();
 				}
 				else {
@@ -4405,7 +4405,7 @@ namespace rhi {
 					tracy::MemWrite(&item->gpuZoneEnd.cpuTime, tracy::Profiler::GetTime());
 					tracy::MemWrite(&item->gpuZoneEnd.thread, uint32_t{ 0 });
 					tracy::MemWrite(&item->gpuZoneEnd.queryId, static_cast<uint16_t>(event.queryId));
-					tracy::MemWrite(&item->gpuZoneEnd.context, context->GetId());
+					tracy::MemWrite(&item->gpuZoneEnd.context, static_cast<uint8_t>(context->GetId()));
 					tracy::Profiler::QueueSerialFinish();
 				}
 			}
