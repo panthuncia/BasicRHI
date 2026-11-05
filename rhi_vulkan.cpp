@@ -5442,8 +5442,10 @@ namespace rhi {
 				vkBarrier.dstAccessMask = (afterPresent || externalRelease || internalRelease) ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
 				vkBarrier.oldLayout = (barrier.discard || firstUseFromUndefined) ? VK_IMAGE_LAYOUT_UNDEFINED : VkToImageLayout(barrier.beforeLayout, aspect);
 				vkBarrier.newLayout = VkToImageLayout(barrier.afterLayout, aspect);
-				vkBarrier.srcQueueFamilyIndex = externalAcquire ? VK_QUEUE_FAMILY_EXTERNAL : (externalRelease ? recordingFamily : ownershipSrcFamily);
-				vkBarrier.dstQueueFamilyIndex = externalAcquire ? recordingFamily : (externalRelease ? VK_QUEUE_FAMILY_EXTERNAL : ownershipDstFamily);
+				// A concurrent resource belongs to no single family: its external transfers name EXTERNAL and IGNORED.
+				const uint32_t externalLocalFamily = resource->concurrentSharing ? VK_QUEUE_FAMILY_IGNORED : recordingFamily;
+				vkBarrier.srcQueueFamilyIndex = externalAcquire ? VK_QUEUE_FAMILY_EXTERNAL : (externalRelease ? externalLocalFamily : ownershipSrcFamily);
+				vkBarrier.dstQueueFamilyIndex = externalAcquire ? externalLocalFamily : (externalRelease ? VK_QUEUE_FAMILY_EXTERNAL : ownershipDstFamily);
 				vkBarrier.image = resource->image;
 				vkBarrier.subresourceRange = VkMakeImageSubresourceRange(*resource, barrier.range, aspect);
 				imageBarriers.push_back(vkBarrier);
@@ -5491,8 +5493,10 @@ namespace rhi {
 				}
 				vkBarrier.srcAccessMask = (barrier.discard || externalAcquire || internalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
 				vkBarrier.dstAccessMask = (externalRelease || internalRelease) ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
-				vkBarrier.srcQueueFamilyIndex = externalAcquire ? VK_QUEUE_FAMILY_EXTERNAL : (externalRelease ? recordingFamily : ownershipSrcFamily);
-				vkBarrier.dstQueueFamilyIndex = externalAcquire ? recordingFamily : (externalRelease ? VK_QUEUE_FAMILY_EXTERNAL : ownershipDstFamily);
+				// A concurrent resource belongs to no single family: its external transfers name EXTERNAL and IGNORED.
+				const uint32_t externalLocalFamily = resource->concurrentSharing ? VK_QUEUE_FAMILY_IGNORED : recordingFamily;
+				vkBarrier.srcQueueFamilyIndex = externalAcquire ? VK_QUEUE_FAMILY_EXTERNAL : (externalRelease ? externalLocalFamily : ownershipSrcFamily);
+				vkBarrier.dstQueueFamilyIndex = externalAcquire ? externalLocalFamily : (externalRelease ? VK_QUEUE_FAMILY_EXTERNAL : ownershipDstFamily);
 				addPreprocessReads(vkBarrier.srcAccessMask, vkBarrier.dstAccessMask);
 				vkBarrier.buffer = resource->buffer;
 				vkBarrier.offset = barrier.offset;
@@ -14096,7 +14100,10 @@ namespace rhi {
 			createInfo.samples = VK_SAMPLE_COUNT_1_BIT;
 			createInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
 			createInfo.usage = VkImageUsageForDesc(desc, format);
-			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			// Queue sharing as CreateCommittedResource applies it.
+			uint32_t sharingFamilies[kVkMaxSharingFamilies]{};
+			bool concurrentSharing = false;
+			VkApplyImageSharing(impl, desc, createInfo, sharingFamilies, concurrentSharing);
 			createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 			VkImage image = VK_NULL_HANDLE;
 			VkResult result = vkCreateImage(impl->device, &createInfo, nullptr, &image);
@@ -14136,6 +14143,7 @@ namespace rhi {
 			state.width = desc.texture.width; state.height = desc.texture.height;
 			state.depthOrLayers = desc.texture.depthOrLayers; state.mipLevels = desc.texture.mipLevels;
 			state.imageUsage = createInfo.usage; state.ownsImage = true; state.ownsMemory = true;
+			state.concurrentSharing = concurrentSharing;
 			const ResourceHandle handle = impl->resources.alloc(state);
 			Resource texture{ handle, true }; texture.impl = impl; texture.vt = &g_vktex_rvt;
 			out = MakeTexturePtr(&device, texture, impl->selfWeak.lock());
@@ -14202,8 +14210,13 @@ namespace rhi {
 			VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
 			createInfo.pNext = &externalInfo;
 			createInfo.size = desc.buffer.sizeBytes;
+			// As CreateCommittedResource creates a buffer: bindless descriptors are written from its device address, and its queue
+			// sharing follows the description.
 			createInfo.usage = VkBufferUsageForDesc(impl, desc);
-			createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			if (impl->bufferDeviceAddressEnabled) createInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+			uint32_t sharingFamilies[kVkMaxSharingFamilies]{};
+			bool concurrentSharing = false;
+			VkApplyBufferSharing(impl, desc, createInfo, sharingFamilies, concurrentSharing);
 			VkPhysicalDeviceExternalBufferInfo query{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO };
 			query.usage = createInfo.usage;
 			query.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
@@ -14239,8 +14252,11 @@ namespace rhi {
 			importInfo.pNext = &dedicated;
 			importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
 			importInfo.handle = static_cast<HANDLE>(sharedHandle.Get());
+			VkMemoryAllocateFlagsInfo allocateFlagsInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+			allocateFlagsInfo.pNext = &importInfo;
+			allocateFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
 			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-			allocateInfo.pNext = &importInfo;
+			allocateInfo.pNext = impl->bufferDeviceAddressEnabled ? static_cast<const void*>(&allocateFlagsInfo) : &importInfo;
 			allocateInfo.allocationSize = requirements.size;
 			allocateInfo.memoryTypeIndex = memoryTypeIndex;
 			VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -14261,10 +14277,16 @@ namespace rhi {
 			state.memory = memory;
 			state.bufferSize = desc.buffer.sizeBytes;
 			state.type = ResourceType::Buffer;
+			state.concurrentSharing = concurrentSharing;
 			state.currentLayout = ResourceLayout::Common;
 			state.submittedLayout = ResourceLayout::Common;
 			state.ownsBuffer = true;
 			state.ownsMemory = true;
+			if (impl->bufferDeviceAddressEnabled) {
+				VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+				addressInfo.buffer = buffer;
+				state.deviceAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
+			}
 			const ResourceHandle handle = impl->resources.alloc(state);
 			Resource resource{ handle, false };
 			resource.impl = impl;
