@@ -253,6 +253,7 @@ namespace rhi::vulkan_binding {
 			std::map<std::vector<uint32_t>, uint32_t> heapAliases;
 			// RecordValue's: by function, type, push offset and record offset.
 			std::map<std::tuple<opt::Function*, uint32_t, uint32_t, uint32_t>, uint32_t> recordValues;
+			std::map<std::pair<opt::Function*, uint32_t>, uint32_t> recordAddresses;
 
 			static IRContext::Analysis Preserved() { return IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping; }
 
@@ -1094,8 +1095,15 @@ namespace rhi::vulkan_binding {
 				if (const auto found = recordValues.find(key); found != recordValues.end()) {
 					return found->second;
 				}
-				Instruction* at = EntryInsertionPoint(a_where);
-				const uint32_t address = AddressPlus(at, ReadPushAddress(at, a_pushOffset), a_offset);
+				// The record's address once too. Spilled, it is itself a load, which the driver cannot merge either.
+				const auto addressKey = std::pair{ function, a_pushOffset };
+				auto recordAddress = recordAddresses.find(addressKey);
+				if (recordAddress == recordAddresses.end()) {
+					recordAddress = recordAddresses.emplace(addressKey, ReadPushAddress(EntryInsertionPoint(a_where), a_pushOffset)).first;
+				}
+				// After the address: the entry block's first instruction may be above it by now.
+				Instruction* at = context()->get_def_use_mgr()->GetDef(recordAddress->second)->NextNode();
+				const uint32_t address = AddressPlus(at, recordAddress->second, a_offset);
 				const uint32_t value = LoadPhysical(at, a_type, address, AlignmentAt(target.recordAlignment, a_offset));
 				recordValues.emplace(key, value);
 				return value;
