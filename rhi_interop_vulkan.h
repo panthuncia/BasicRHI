@@ -50,6 +50,10 @@ namespace rhi::vulkan {
 	ExternalImageSupport query_d3d12_texture_support(
 		rhi::Device device,
 		const rhi::ResourceDesc& desc) noexcept;
+	// Whether a texture like `desc` can be placed in a D3D12 heap imported with import_d3d12_heap (not dedicated-only).
+	ExternalImageSupport query_d3d12_heap_texture_support(
+		rhi::Device device,
+		const rhi::ResourceDesc& desc) noexcept;
 	Result import_d3d12_texture(
 		rhi::Device device,
 		const ExternalHandle& sharedHandle,

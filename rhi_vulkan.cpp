@@ -14018,7 +14018,8 @@ namespace rhi {
 			return caps;
 		}
 
-		ExternalImageSupport query_d3d12_texture_support(Device device, const ResourceDesc& desc) noexcept {
+		static ExternalImageSupport QueryD3D12ImageSupport(Device device, const ResourceDesc& desc,
+			VkExternalMemoryHandleTypeFlagBits handleType) noexcept {
 			ExternalImageSupport support{};
 #ifdef _WIN32
 			if (!device || device.vt != &g_vkdevvt || !device.impl || desc.type != ResourceType::Texture2D ||
@@ -14031,7 +14032,7 @@ namespace rhi {
 			if (format == VK_FORMAT_UNDEFINED || VkIsDepthStencilFormat(format)) return support;
 
 			VkPhysicalDeviceExternalImageFormatInfo externalQuery{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO };
-			externalQuery.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+			externalQuery.handleType = handleType;
 			VkPhysicalDeviceImageFormatInfo2 query{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2 };
 			query.pNext = &externalQuery;
 			query.format = format;
@@ -14049,7 +14050,7 @@ namespace rhi {
 			if (!support.supported) return support;
 
 			VkExternalMemoryImageCreateInfo externalInfo{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
-			externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+			externalInfo.handleTypes = handleType;
 			VkImageCreateInfo createInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
 			createInfo.pNext = &externalInfo;
 			createInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -14072,9 +14073,30 @@ namespace rhi {
 				vkDestroyImage(impl->device, image, nullptr);
 			}
 #else
-			(void)device; (void)desc;
+			(void)device; (void)desc; (void)handleType;
 #endif
 			return support;
+		}
+
+		ExternalImageSupport query_d3d12_texture_support(Device device, const ResourceDesc& desc) noexcept {
+#ifdef _WIN32
+			return QueryD3D12ImageSupport(device, desc, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT);
+#else
+			(void)device; (void)desc;
+			return {};
+#endif
+		}
+
+		ExternalImageSupport query_d3d12_heap_texture_support(Device device, const ResourceDesc& desc) noexcept {
+#ifdef _WIN32
+			auto support = QueryD3D12ImageSupport(device, desc, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT);
+			// Placed in a heap: an image the driver can only import with its own allocation does not qualify.
+			support.supported = support.supported && !support.dedicatedOnly;
+			return support;
+#else
+			(void)device; (void)desc;
+			return {};
+#endif
 		}
 
 		Result import_d3d12_texture(Device device, const ExternalHandle& sharedHandle, const ResourceDesc& desc, ResourcePtr& out) noexcept {
