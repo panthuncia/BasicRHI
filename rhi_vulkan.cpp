@@ -4535,6 +4535,7 @@ namespace rhi {
 				}
 
 				if (commandListState->pendingError != Result::Ok) {
+					spdlog::error("Vulkan queue submit rejected a command list that failed while recording: {}", ResultName(commandListState->pendingError));
 					RHI_FAIL(commandListState->pendingError);
 				}
 
@@ -4591,6 +4592,8 @@ namespace rhi {
 							"Vulkan queue submit rejected timeline wait on terminal value UINT64_MAX (timeline idx={}, gen={})",
 							wait.t.index,
 							wait.t.generation);
+					} else {
+						spdlog::error("Vulkan queue submit rejected a wait on a timeline this device does not own (timeline idx={}, gen={}, value={})", wait.t.index, wait.t.generation, wait.value);
 					}
 					RHI_FAIL(Result::InvalidArgument);
 				}
@@ -4605,6 +4608,8 @@ namespace rhi {
 							"Vulkan queue submit rejected timeline signal to terminal value UINT64_MAX (timeline idx={}, gen={})",
 							signal.t.index,
 							signal.t.generation);
+					} else {
+						spdlog::error("Vulkan queue submit rejected a signal on a timeline this device does not own, or of value 0 (timeline idx={}, gen={}, value={})", signal.t.index, signal.t.generation, signal.value);
 					}
 					RHI_FAIL(Result::InvalidArgument);
 				}

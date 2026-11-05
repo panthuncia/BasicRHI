@@ -539,6 +539,10 @@ namespace rhi {
 		case Format::R8G8B8A8_UNorm_sRGB: case Format::R8G8B8A8_UInt:
 		case Format::R8G8B8A8_SNorm:  case Format::R8G8B8A8_SInt:               return 4;
 
+		case Format::R16G16_Typeless: case Format::R16G16_Float:
+		case Format::R16G16_UNorm:    case Format::R16G16_UInt:
+		case Format::R16G16_SNorm:    case Format::R16G16_SInt:                  return 4;
+
 		case Format::R32_Typeless: case Format::D32_Float:
 		case Format::R32_Float:    case Format::R32_UInt:
 		case Format::R32_SInt:                                                     return 4;

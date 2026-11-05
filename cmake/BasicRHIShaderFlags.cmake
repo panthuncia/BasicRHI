@@ -30,6 +30,7 @@ endforeach()
 set(BASICRHI_VULKAN_DXC_FLAGS
     -spirv
     -fvk-use-dx-layout
+    -fvk-use-dx-position-w
     -fspv-target-env=vulkan1.3
     -fvk-bind-resource-heap ${_basicrhi_VULKAN_RESOURCE_DESCRIPTOR_HEAP_BINDING} ${_basicrhi_VULKAN_DESCRIPTOR_HEAP_SET}
     -fvk-bind-sampler-heap ${_basicrhi_VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING} ${_basicrhi_VULKAN_DESCRIPTOR_HEAP_SET}

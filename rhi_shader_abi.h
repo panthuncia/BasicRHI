@@ -15,7 +15,7 @@ inline constexpr uint32_t VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING = 1000001;
 inline constexpr uint32_t VULKAN_COUNTER_DESCRIPTOR_HEAP_BINDING = 1000002;
 
 // The DXC arguments every SPIR-V shader consumed by the Vulkan backend must be compiled with:
-// DX buffer layout and ResourceDescriptorHeap/SamplerDescriptorHeap mapped onto the
+// DX buffer layout, DX SV_Position.w, and ResourceDescriptorHeap/SamplerDescriptorHeap mapped onto the
 // VK_EXT_descriptor_heap bindings above. Runtime compilers append these; build-time
 // compilation uses BASICRHI_VULKAN_DXC_FLAGS from cmake/BasicRHIShaderFlags.cmake,
 // which parses the constants from this header.
@@ -24,6 +24,7 @@ inline void AppendVulkanDxcSpirvArguments(std::vector<std::wstring>& args) {
 	args.insert(args.end(), {
 		L"-spirv",
 		L"-fvk-use-dx-layout",
+		L"-fvk-use-dx-position-w", // SV_Position.w reads as clip W in a pixel shader, not its reciprocal (SPIR-V FragCoord.w), as on D3D12.
 		L"-fspv-target-env=vulkan1.3",
 		L"-fvk-bind-resource-heap", std::to_wstring(VULKAN_RESOURCE_DESCRIPTOR_HEAP_BINDING), set,
 		L"-fvk-bind-sampler-heap", std::to_wstring(VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING), set,
