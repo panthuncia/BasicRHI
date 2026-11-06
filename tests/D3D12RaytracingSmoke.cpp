@@ -5,6 +5,7 @@
 #include "rhi_interop_dx12.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -998,6 +999,160 @@ namespace {
 		}
 		return ok;
 	}
+
+	// --- Compressed1 positions. The spec fixes the 12-byte header but not the order of the per-vertex offset bits, so
+	// the standard scene is encoded with distinct x/y/z widths in each candidate layout; exactly one must trace correctly.
+	enum class Compressed1Layout { VertexMajorLsbFirst, ComponentPlanarLsbFirst };
+
+	struct BitWriter {
+		std::vector<uint8_t> bytes;
+		uint64_t bit = 0;
+		void Put(uint32_t value, uint32_t count) {
+			for (uint32_t i = 0; i < count; ++i, ++bit) {
+				if ((bit >> 3) >= bytes.size()) bytes.push_back(0);
+				if ((value >> i) & 1u) bytes[bit >> 3] |= static_cast<uint8_t>(1u << (bit & 7u));
+			}
+		}
+	};
+
+	// One cluster: header + vertex block, padded to 4 bytes. positions are integer grid coordinates (scale 2^exponent).
+	std::vector<uint8_t> EncodeCompressed1(const std::vector<std::array<int32_t, 3>>& grid, int exponent, const uint32_t bits[3], Compressed1Layout layout) {
+		std::array<int32_t, 3> anchor = grid[0];
+		for (const auto& p : grid) for (int a = 0; a < 3; ++a) anchor[a] = std::min(anchor[a], p[a]);
+		const uint32_t biased = static_cast<uint32_t>(exponent + 127);
+		const uint32_t header[3] = {
+			(biased & 0xFFu) | (static_cast<uint32_t>(anchor[0]) << 8u),
+			((bits[0] - 1u) & 0xFu) | (((bits[1] - 1u) & 0xFu) << 4u) | (static_cast<uint32_t>(anchor[1]) << 8u),
+			((bits[2] - 1u) & 0xFu) | (static_cast<uint32_t>(anchor[2]) << 8u),
+		};
+		BitWriter w;
+		for (uint32_t word : header) w.Put(word, 32);
+		if (layout == Compressed1Layout::VertexMajorLsbFirst) {
+			for (const auto& p : grid) for (int a = 0; a < 3; ++a) w.Put(static_cast<uint32_t>(p[a] - anchor[a]), bits[a]);
+		} else {
+			for (int a = 0; a < 3; ++a) for (const auto& p : grid) w.Put(static_cast<uint32_t>(p[a] - anchor[a]), bits[a]);
+		}
+		w.bytes.resize((w.bytes.size() + 3u) & ~size_t(3));
+		return w.bytes;
+	}
+
+	struct ClasBuild { rhi::Resource addresses; std::vector<uint32_t> sizes; };
+
+	ClasBuild BuildClasImplicit(Context& c, const std::vector<rhi::PackedDxr2ClusterBuildTriangleInfo>& args, const rhi::RayTracingClusterTriangleInputsDesc& triangles) {
+		const uint32_t count = static_cast<uint32_t>(args.size());
+		rhi::RayTracingRtasOperationInputs inputs{};
+		inputs.operationType = rhi::RayTracingRtasOperationType::BuildTriangleCluster;
+		inputs.flags = rhi::RTASBuild_PreferFastTrace;
+		inputs.maxAccelerationStructureCount = count;
+		inputs.triangleClusters = &triangles;
+		rhi::RayTracingRtasPrebuildInfo prebuild{};
+		if (!Check(c.device->GetRayTracingAccelerationStructureOperationPrebuildInfo(inputs, prebuild), "Compressed1 CLAS prebuild")) return {};
+		rhi::Resource result = MakeAsStorage(c, prebuild.resultDataMaxSizeInBytes, "Compressed1 CLAS data");
+		rhi::Resource scratch = MakeUav(c, prebuild.scratchDataSizeInBytes, "Compressed1 CLAS scratch");
+		rhi::Resource addresses = MakeUav(c, 8ull * count, "Compressed1 CLAS addresses");
+		rhi::Resource sizes = MakeUav(c, 8ull * count, "Compressed1 CLAS sizes");
+		rhi::Resource argsBuffer = MakeUpload(c, args, "Compressed1 cluster args");
+		rhi::RayTracingRtasOperationDesc desc{};
+		desc.inputs = inputs;
+		desc.batched.dstImplicitData = { result.GetHandle(), 0 };
+		desc.batched.scratchData = { scratch.GetHandle(), 0 };
+		desc.batched.dstAddressesArray = { addresses.GetHandle(), 0, 8ull * count, 8 };
+		desc.batched.dstSizesArray = { sizes.GetHandle(), 0, 8ull * count, 8 };
+		desc.batched.srcInfosArray = { argsBuffer.GetHandle(), 0, args.size() * sizeof(args[0]), sizeof(args[0]) };
+		if (!Submit(c, [&](rhi::CommandList& list) { list.ExecuteIndirectRtasOperations(&desc, 1); })) return {};
+		ClasBuild out{ addresses, {} };
+		const auto raw = Readback<uint32_t>(c, sizes, 2 * count);
+		for (uint32_t i = 0; i < count && 2 * i < raw.size(); ++i) out.sizes.push_back(raw[2 * i]);
+		return out;
+	}
+
+	bool RunCompressed1Tests(Context& c, rhi::Resource indices) {
+		// The standard scene on a quarter-unit grid (exponent -2): A spans 0..4, B 8..12 in x.
+		const int exponent = -2;
+		const uint32_t bits[3] = { 4, 5, 2 }; // distinct widths, so a wrong bit order scrambles the triangles
+		std::vector<std::array<int32_t, 3>> gridA, gridB;
+		for (uint32_t i = 0; i < kClusterBFirstVertex; ++i) gridA.push_back({ int32_t(kPositions[i].x * 4), int32_t(kPositions[i].y * 4), int32_t(kPositions[i].z * 4) });
+		for (uint32_t i = kClusterBFirstVertex; i < kPositions.size(); ++i) gridB.push_back({ int32_t(kPositions[i].x * 4), int32_t(kPositions[i].y * 4), int32_t(kPositions[i].z * 4) });
+
+		bool anyPassed = false;
+		for (Compressed1Layout layout : { Compressed1Layout::VertexMajorLsbFirst, Compressed1Layout::ComponentPlanarLsbFirst }) {
+			const char* name = layout == Compressed1Layout::VertexMajorLsbFirst ? "vertex-major" : "component-planar";
+			std::vector<uint8_t> blockA = EncodeCompressed1(gridA, exponent, bits, layout);
+			std::vector<uint8_t> blockB = EncodeCompressed1(gridB, exponent, bits, layout);
+			const size_t offsetB = (blockA.size() + 15u) & ~size_t(15);
+			std::vector<uint8_t> blob(offsetB + blockB.size(), 0);
+			std::memcpy(blob.data(), blockA.data(), blockA.size());
+			std::memcpy(blob.data() + offsetB, blockB.data(), blockB.size());
+			rhi::Resource vertices = MakeUpload(c, blob, "Compressed1 vertices");
+
+			std::vector<rhi::PackedDxr2ClusterBuildTriangleInfo> args = {
+				ClusterArgs(c, vertices, indices, kClusterAId, 2, 4, 0, 0),
+				ClusterArgs(c, vertices, indices, kClusterBId, 1, 3, 0, kClusterBFirstIndex),
+			};
+			for (auto& a : args) a.vertexBufferStride = 0;
+			args[1].vertexBuffer = Va(c, vertices, offsetB);
+			auto triangles = ClusterInputs();
+			triangles.vertexFormat = rhi::RayTracingClusterVertexFormat::Compressed1;
+			triangles.maxCompressedClusterPositionsSize = static_cast<uint32_t>(std::max(blockA.size(), blockB.size()));
+			const ClasBuild clas = BuildClasImplicit(c, args, triangles);
+			if (!clas.addresses) return false;
+			const uint64_t blas = BuildBlas(c, Va(c, clas.addresses), 2);
+			const rhi::AccelerationStructureHandle tlas = blas ? BuildClassicTlas(c, { { 7u, 0.0f }, { 8u, 10.0f } }, blas) : rhi::AccelerationStructureHandle{};
+			if (!tlas.valid()) return false;
+			const auto results = TraceHandle(c, tlas, true);
+			bool passed = results.size() == kRayCount;
+			for (uint32_t r = 0; passed && r < kRayCount; ++r) {
+				static const uint32_t wantHit[kRayCount] = { 1, 1, 1, 1, 0, 0 };
+				passed = results[r].hit == wantHit[r];
+			}
+			// Quiet probe first; only the matching layout must reproduce the full scene (barycentrics included).
+			if (passed) passed = ExpectStandardScene(name, results);
+			std::printf("Compressed1 %s layout: %s\n", name, passed ? "matches the float scene" : "does not match");
+			anyPassed |= passed;
+		}
+		if (!anyPassed) {
+			std::fputs("Compressed1: no candidate bit layout reproduced the scene\n", stderr);
+			return false;
+		}
+
+		// Size comparison on a production-shaped cluster: a 9x9 vertex, 128-triangle bumpy grid, float3 vs Compressed1.
+		std::vector<Vec3> grid;
+		std::vector<std::array<int32_t, 3>> quantized;
+		const int gridExponent = -5;
+		for (int y = 0; y < 9; ++y) for (int x = 0; x < 9; ++x) {
+			const float fx = x * 3.7f, fy = y * 3.1f, fz = std::sin(x * 0.9f) * std::cos(y * 1.3f) * 2.5f + 100.0f;
+			std::array<int32_t, 3> q = { int32_t(std::floor(fx * 32 + 0.5f)), int32_t(std::floor(fy * 32 + 0.5f)), int32_t(std::floor(fz * 32 + 0.5f)) };
+			quantized.push_back(q);
+			grid.push_back({ q[0] / 32.0f, q[1] / 32.0f, q[2] / 32.0f });
+		}
+		std::vector<uint8_t> gridIndices;
+		for (int y = 0; y < 8; ++y) for (int x = 0; x < 8; ++x) {
+			const uint8_t i0 = uint8_t(y * 9 + x), i1 = uint8_t(i0 + 1), i2 = uint8_t(i0 + 9), i3 = uint8_t(i0 + 10);
+			gridIndices.insert(gridIndices.end(), { i0, i1, i3, i0, i3, i2 });
+		}
+		std::array<int32_t, 3> lo = quantized[0], hi = quantized[0];
+		for (const auto& q : quantized) for (int a = 0; a < 3; ++a) { lo[a] = std::min(lo[a], q[a]); hi[a] = std::max(hi[a], q[a]); }
+		uint32_t gridBits[3];
+		for (int a = 0; a < 3; ++a) { uint32_t range = uint32_t(hi[a] - lo[a]); gridBits[a] = 1; while ((1u << gridBits[a]) <= range) ++gridBits[a]; }
+		const std::vector<uint8_t> gridBlock = EncodeCompressed1(quantized, gridExponent, gridBits, Compressed1Layout::VertexMajorLsbFirst);
+		rhi::Resource floatVertices = MakeUpload(c, grid, "size grid float3");
+		rhi::Resource packedVertices = MakeUpload(c, gridBlock, "size grid Compressed1");
+		rhi::Resource gridIndexBuffer = MakeUpload(c, gridIndices, "size grid indices");
+		auto sizeInputs = ClusterInputs();
+		sizeInputs.maxClusterTriangleCount = sizeInputs.maxTotalTriangleCount = 128;
+		sizeInputs.maxClusterVertexCount = sizeInputs.maxTotalVertexCount = 81;
+		std::vector<rhi::PackedDxr2ClusterBuildTriangleInfo> sizeArgs = { ClusterArgs(c, floatVertices, gridIndexBuffer, 1, 128, 81, 0, 0) };
+		const ClasBuild floatClas = BuildClasImplicit(c, sizeArgs, sizeInputs);
+		sizeArgs[0].vertexBuffer = Va(c, packedVertices);
+		sizeArgs[0].vertexBufferStride = 0;
+		sizeInputs.vertexFormat = rhi::RayTracingClusterVertexFormat::Compressed1;
+		sizeInputs.maxCompressedClusterPositionsSize = static_cast<uint32_t>(gridBlock.size());
+		const ClasBuild packedClas = BuildClasImplicit(c, sizeArgs, sizeInputs);
+		if (floatClas.sizes.empty() || packedClas.sizes.empty()) return false;
+		std::printf("CLAS size, 128 triangles / 81 vertices: float3 positions %u bytes (input %zu), Compressed1 %u-%u-%u bits %u bytes (input %zu)\n",
+			floatClas.sizes[0], grid.size() * sizeof(Vec3), gridBits[0], gridBits[1], gridBits[2], packedClas.sizes[0], gridBlock.size());
+		return true;
+	}
 }
 
 int main() {
@@ -1105,6 +1260,8 @@ int main() {
 	const auto reordered = TraceReorderedIndirect(c, tlas);
 	ok &= ExpectStandardScene("classic TLAS, reordered indirect", reordered);
 	ok &= ExpectHitShaderFeatures("classic TLAS, reordered indirect", reordered, 7u);
+
+	ok &= RunCompressed1Tests(c, indices);
 
 	// --- Get-sizes, explicit destinations and a move: what the persistent CLAS cache does.
 	{

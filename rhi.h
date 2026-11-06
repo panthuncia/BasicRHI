@@ -1137,7 +1137,9 @@ namespace rhi {
 	static_assert(sizeof(PackedRayTracingOpacityMicromapDesc) == 8);
 
 	enum class RayTracingClusterAccelerationStructureType : uint32_t { ClustersBottomLevel, TriangleCluster, TriangleClusterTemplate };
-	enum class RayTracingClusterVertexFormat : uint32_t { Unknown, Float32x3, Float16x3, Float16x4, Snorm16x3, Snorm16x4 };
+	// Compressed1 (D3D12 only): per-cluster 12-byte header (exponent, 24-bit xyz anchor, 1-16 bits per axis) followed by
+	// bit-packed per-vertex offsets from the anchor. See the DXR 2.0 spec's "Compressed1 position encoding".
+	enum class RayTracingClusterVertexFormat : uint32_t { Unknown, Float32x3, Float16x3, Float16x4, Snorm16x3, Snorm16x4, Compressed1 };
 	enum class RayTracingClusterIndexFormat : uint32_t { None = 0, Uint8 = 1, Uint16 = 2, Uint32 = 4 };
 	enum class RayTracingRtasOperationType : uint32_t { MoveObjects, BuildClustersBottomLevel, BuildTriangleCluster, BuildTriangleClusterTemplate, InstantiateTriangleCluster, GetClusterTemplateIndices, BuildPartitionedTopLevel };
 	enum class RayTracingRtasOperationMode : uint32_t { ImplicitDestinations, ExplicitDestinations, ComputeSizes };
@@ -1187,6 +1189,7 @@ namespace rhi {
 		uint32_t maxTotalTriangleCount{ 0 };
 		uint32_t maxTotalVertexCount{ 0 };
 		uint32_t minPositionTruncateBitCount{ 0 };
+		uint32_t maxCompressedClusterPositionsSize{ 0 }; // Compressed1 only: largest header + vertex block of any cluster in the batch, in bytes.
 		// Opacity micromaps. None: the batch's CLAS have no OMM index buffer (D3D12 then indexes sequentially from
 		// OpacityMicromapBaseLocation if a per-argument OpacityMicromapArray is non-null). Otherwise the index size in
 		// each argument's OpacityMicromapIndexBuffer; the stride must be a multiple of it and the buffer aligned to it.

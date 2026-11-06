@@ -480,6 +480,33 @@ namespace rhi {
 		case D3D12_AUTO_BREADCRUMB_OP_ESTIMATEMOTION:                                 return "EstimateMotion";
 		case D3D12_AUTO_BREADCRUMB_OP_RESOLVEMOTIONVECTORHEAP:                        return "ResolveMotionVectorHeap";
 		case D3D12_AUTO_BREADCRUMB_OP_SETPIPELINESTATE1:                              return "SetPipelineState1";
+		case D3D12_AUTO_BREADCRUMB_OP_INITIALIZEEXTENSIONCOMMAND:                     return "Initializeextensioncommand";
+		case D3D12_AUTO_BREADCRUMB_OP_EXECUTEEXTENSIONCOMMAND:                        return "Executeextensioncommand";
+		case D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH:                                   return "Dispatchmesh";
+		case D3D12_AUTO_BREADCRUMB_OP_ENCODEFRAME:                                    return "Encodeframe";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOLVEENCODEROUTPUTMETADATA:                   return "Resolveencoderoutputmetadata";
+		case D3D12_AUTO_BREADCRUMB_OP_BARRIER:                                        return "Barrier";
+		case D3D12_AUTO_BREADCRUMB_OP_BEGIN_COMMAND_LIST:                             return "BeginCommandList";
+		case D3D12_AUTO_BREADCRUMB_OP_DISPATCHGRAPH:                                  return "Dispatchgraph";
+		case D3D12_AUTO_BREADCRUMB_OP_SETPROGRAM:                                     return "Setprogram";
+		case D3D12_AUTO_BREADCRUMB_OP_ENCODEFRAME1:                                   return "Encodeframe1";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOLVEENCODEROUTPUTMETADATA1:                  return "Resolveencoderoutputmetadata1";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOLVEINPUTPARAMLAYOUT:                        return "Resolveinputparamlayout";
+		case D3D12_AUTO_BREADCRUMB_OP_PROCESSFRAMES2:                                 return "Processframes2";
+		case D3D12_AUTO_BREADCRUMB_OP_SET_WORK_GRAPH_MAXIMUM_GPU_INPUT_RECORDS:       return "SetWorkGraphMaximumGpuInputRecords";
+		case D3D12_AUTO_BREADCRUMB_OP_WAITBARRIER:                                    return "Waitbarrier";
+		case D3D12_AUTO_BREADCRUMB_OP_SIGNALBARRIER:                                  return "Signalbarrier";
+		case D3D12_AUTO_BREADCRUMB_OP_CONVERT_LINEAR_ALGEBRA_MATRIX:                  return "ConvertLinearAlgebraMatrix";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGIONS:                              return "Copybufferregions";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGIONS:                             return "Copytextureregions";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCES:                                  return "Copyresources";
+		case D3D12_AUTO_BREADCRUMB_OP_ASYNCCOPYTILES:                                 return "Asynccopytiles";
+		case D3D12_AUTO_BREADCRUMB_OP_ASYNCRESOLVESUBRESOURCEREGION:                  return "Asyncresolvesubresourceregion";
+		case D3D12_AUTO_BREADCRUMB_OP_ASYNCRESOLVEQUERYDATA:                          return "Asyncresolvequerydata";
+		case D3D12_AUTO_BREADCRUMB_OP_CLEARBOUNDDEPTHSTENCILVIEW:                     return "Clearbounddepthstencilview";
+		case D3D12_AUTO_BREADCRUMB_OP_CLEARBOUNDRENDERTARGETVIEWS:                    return "Clearboundrendertargetviews";
+		case D3D12_AUTO_BREADCRUMB_OP_CLEARTEXTURESUBRESOURCES:                       return "Cleartexturesubresources";
+		case D3D12_AUTO_BREADCRUMB_OP_FILLBUFFERS:                                    return "Fillbuffers";
 		default:                                                                      return "Unknown";
 		}
 	}
@@ -725,12 +752,22 @@ namespace rhi {
 					for (UINT32 i = start; i < end; ++i) {
 						const char* marker = (i == last) ? " <<< LAST COMPLETED" :
 						                     (i == last + 1) ? " <<< LIKELY FAULTING OP" : "";
-						spdlog::error("    [{:5}] {}{}", i, BreadcrumbOpToString(node->pCommandHistory[i]), marker);
+						spdlog::error("    [{:5}] {} ({}){}", i, BreadcrumbOpToString(node->pCommandHistory[i]), static_cast<int>(node->pCommandHistory[i]), marker);
 					}
 				}
 				if (node->pBreadcrumbContexts && node->BreadcrumbContextsCount > 0) {
 					const UINT32 contextStart = last >= 4 ? last - 4 : 0;
 					const UINT32 contextEnd = last + 5;
+					// The pass enclosing the faulting op: the last context recorded at or before it, however far back.
+					const D3D12_DRED_BREADCRUMB_CONTEXT* enclosing = nullptr;
+					for (UINT32 contextIndex = 0; contextIndex < node->BreadcrumbContextsCount; ++contextIndex) {
+						const auto& context = node->pBreadcrumbContexts[contextIndex];
+						if (context.BreadcrumbIndex <= last + 1 && (!enclosing || context.BreadcrumbIndex >= enclosing->BreadcrumbIndex)) enclosing = &context;
+					}
+					if (enclosing && enclosing->BreadcrumbIndex < contextStart) {
+						spdlog::error("      enclosing context breadcrumb={} '{}'", enclosing->BreadcrumbIndex,
+							enclosing->pContextString ? Dx12WideToUtf8(enclosing->pContextString) : "<null>");
+					}
 					for (UINT32 contextIndex = 0; contextIndex < node->BreadcrumbContextsCount; ++contextIndex) {
 						const auto& context = node->pBreadcrumbContexts[contextIndex];
 						if (context.BreadcrumbIndex < contextStart || context.BreadcrumbIndex > contextEnd) {
@@ -4303,6 +4340,7 @@ namespace rhi {
 			case RayTracingClusterVertexFormat::Float32x3: out = D3D12_VERTEX_FORMAT_FLOAT32_3; return true;
 			case RayTracingClusterVertexFormat::Float16x3: out = D3D12_VERTEX_FORMAT_FLOAT16_3; return true;
 			case RayTracingClusterVertexFormat::Snorm16x3: out = D3D12_VERTEX_FORMAT_SNORM16_3; return true;
+			case RayTracingClusterVertexFormat::Compressed1: out = D3D12_VERTEX_FORMAT_COMPRESSED1; return true;
 			default: return false; // D3D12 has no four-component position formats.
 			}
 		}
@@ -4370,7 +4408,10 @@ namespace rhi {
 				out.triangles.Mode = mode;
 				out.triangles.GeometryIndexAndFlagsIndexFormat = D3D12_INDEX_FORMAT_NONE;
 				if (!ommIndexFormat(triangles, out.triangles.OpacityMicromapIndexFormat)) return false;
-				out.triangles.MinPositionTruncateBitCount = triangles.minPositionTruncateBitCount;
+				// A union in D3D12: the truncation count for uncompressed positions, the block size cap for Compressed1.
+				out.triangles.MinPositionTruncateBitCount = triangles.vertexFormat == RayTracingClusterVertexFormat::Compressed1
+					? triangles.maxCompressedClusterPositionsSize
+					: triangles.minPositionTruncateBitCount;
 				if (!Dx12ClusterVertexFormat(triangles.vertexFormat, out.triangles.VertexFormat)
 					|| !Dx12ClusterIndexFormat(triangles.indexFormat, out.triangles.IndexFormat)) return false;
 				out.inputs.pClusterTrianglesDesc = &out.triangles;
