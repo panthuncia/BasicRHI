@@ -120,6 +120,7 @@ struct RayTracingFeatureInfo {
     // Optional/newer features. These are false unless the backend can expose a real native path.
     bool opacityMicromap = false;
     bool shaderExecutionReordering = false;
+    bool shaderExecutionReorderingActuallyReorders = false; // False means the calls are valid but do nothing.
     bool gpuRtasOperations = false;
     bool clusterAccelerationStructure = false;
     bool clusterTemplates = false;

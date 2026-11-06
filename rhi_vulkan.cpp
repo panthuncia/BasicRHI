@@ -5931,7 +5931,7 @@ namespace rhi {
 				return true;
 			}
 			case RayTracingRtasOperationType::GetClusterTemplateIndices:
-#if defined(VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_GET_CLUSTER_TEMPLATE_INDICES_NV)
+#if defined(VK_NV_cluster_acceleration_structure) // The op type is an enum value, not a macro.
 				if (!inputs.triangleClusters) return false;
 				out.input.opType = VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_GET_CLUSTER_TEMPLATE_INDICES_NV;
 				out.triangleClusters.vertexFormat = VkClusterVertexFormat(inputs.triangleClusters->vertexFormat);
@@ -7891,6 +7891,11 @@ namespace rhi {
 				if ((static_cast<uint32_t>(rayTracingPipeline->flags) & RTPipeline_SkipProceduralPrimitives) != 0) {
 					createFlags.flags |= VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR;
 				}
+				// Opacity micromaps are not wired up on Vulkan (RayTracingFeatureInfo::opacityMicromap is false).
+				if ((static_cast<uint32_t>(rayTracingPipeline->flags) & RTPipeline_AllowOpacityMicromaps) != 0) {
+					for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
+					RHI_FAIL(Result::Unsupported);
+				}
 				const bool allowClusteredGeometry = (static_cast<uint32_t>(rayTracingPipeline->flags) & RTPipeline_AllowClusteredGeometry) != 0;
 				if (allowClusteredGeometry && !impl->clusterAccelerationStructureEnabled) {
 					for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
@@ -8924,7 +8929,7 @@ namespace rhi {
 					out->gpuRtasOperations = impl->clusterAccelerationStructureEnabled || impl->partitionedAccelerationStructureEnabled;
 					out->clusterAccelerationStructure = impl->clusterAccelerationStructureEnabled;
 					out->clusterTemplates = impl->clusterAccelerationStructureEnabled;
-#if defined(VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_GET_CLUSTER_TEMPLATE_INDICES_NV)
+#if defined(VK_NV_cluster_acceleration_structure) // The op type is an enum value, not a macro.
 					out->clusterTemplateIndexFetch = impl->clusterAccelerationStructureEnabled;
 #else
 					out->clusterTemplateIndexFetch = false;
@@ -11176,6 +11181,10 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 			*out = {};
+			// Cluster OMMs are not wired up on Vulkan (RayTracingFeatureInfo::opacityMicromap is false).
+			if (inputs.allowOpacityMicromaps || (inputs.triangleClusters && inputs.triangleClusters->opacityMicromapIndexFormat != RayTracingClusterIndexFormat::None)) {
+				RHI_FAIL(Result::Unsupported);
+			}
 
 			if (inputs.operationType == RayTracingRtasOperationType::BuildPartitionedTopLevel) {
 #if defined(VK_NV_partitioned_acceleration_structure)
@@ -11749,6 +11758,7 @@ namespace rhi {
 		&d_getRayTracingShaderGroupHandles,
 		&d_setRayTracingPipelineStackSize,
 		&d_getRayTracingAccelerationStructureOperationPrebuildInfo,
+		nullptr, // getOpacityMicromapArrayPrebuildInfo: VK_EXT_opacity_micromap not wired up
 
 		&d_destroySampler,
 		&d_destroyPipelineLayout,
@@ -11853,6 +11863,7 @@ namespace rhi {
 		&cl_traceRays,
 		&cl_traceRaysIndirect,
 		&cl_executeIndirectRtasOperations,
+		nullptr, // buildOpacityMicromapArrays: VK_EXT_opacity_micromap not wired up
 		&cl_clearRTV_slot,
 		&cl_clearDSV_slot,
 		&cl_executeIndirect,

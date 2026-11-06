@@ -205,6 +205,7 @@ namespace rhi {
 		}
 		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList10> cl;
 		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> slProxyCl;
+		Microsoft::WRL::ComPtr<ID3D12CommandListRaytracing2> clRaytracing2; // Null unless the device has ID3D12DeviceRaytracing2.
 		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc;
 		D3D12_COMMAND_LIST_TYPE type{};
 		// A secondary, recorded as a bundle (D3D12_COMMAND_LIST_TYPE_BUNDLE) from its allocator's bundleAlloc.
@@ -551,6 +552,9 @@ namespace rhi {
 		Microsoft::WRL::ComPtr<IDXGIFactory7>  pSLProxyFactory;   // upgraded proxy
 		ComPtr<ID3D12Device10> pNativeDevice;
 		Microsoft::WRL::ComPtr<ID3D12Device>   pSLProxyDevice;// upgraded base iface
+		// Set when the preview features were accepted and the native device exposes them.
+		ComPtr<ID3D12DeviceRaytracing2> pNativeDeviceRaytracing2;
+		bool previewRayTracingEnabled = false;
 		ComPtr<IDXGIAdapter4>  adapter;
 
 		Registry<Dx12Resource> resources;

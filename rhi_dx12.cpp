@@ -933,14 +933,25 @@ namespace rhi {
 			}
 		}
 
+		static bool Dx12EnablePreviewRayTracing() noexcept {
+			const UUID features[] = { D3D12ExperimentalShaderModels, D3D12RaytracingPreview };
+			const HRESULT hr = D3D12EnableExperimentalFeatures(static_cast<UINT>(std::size(features)), features, nullptr, nullptr);
+			if (FAILED(hr)) {
+				// E_NOINTERFACE: Windows Developer Mode is off, or the loaded runtime isn't the preview.
+				spdlog::warn("DX12 preview raytracing unavailable: D3D12EnableExperimentalFeatures hr=0x{:08X}", static_cast<uint32_t>(hr));
+				return false;
+			}
+			spdlog::info("DX12 preview raytracing enabled (experimental shader models, Raytracing2)");
+			return true;
+		}
+
 		static D3D12_RAYTRACING_PIPELINE_FLAGS Dx12RtPipelineFlags(RayTracingPipelineFlags flags) noexcept {
 			const uint32_t bits = static_cast<uint32_t>(flags);
 			D3D12_RAYTRACING_PIPELINE_FLAGS out = D3D12_RAYTRACING_PIPELINE_FLAG_NONE;
 			if ((bits & RTPipeline_SkipTriangles) != 0) out |= D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_TRIANGLES;
 			if ((bits & RTPipeline_SkipProceduralPrimitives) != 0) out |= D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_PROCEDURAL_PRIMITIVES;
-#if BASICRHI_HAS_DXR2_HEADERS && defined(D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY)
 			if ((bits & RTPipeline_AllowClusteredGeometry) != 0) out |= D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY;
-#endif
+			if ((bits & RTPipeline_AllowOpacityMicromaps) != 0) out |= D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS;
 			return out;
 		}
 
@@ -957,11 +968,13 @@ namespace rhi {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
 			}
-			if ((static_cast<uint32_t>(rt.flags) & RTPipeline_AllowClusteredGeometry) != 0) {
-#if !(BASICRHI_HAS_DXR2_HEADERS && defined(D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY))
+			if ((static_cast<uint32_t>(rt.flags) & RTPipeline_AllowClusteredGeometry) != 0 && !dimpl->pNativeDeviceRaytracing2) {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
-#endif
+			}
+			if ((static_cast<uint32_t>(rt.flags) & RTPipeline_AllowOpacityMicromaps) != 0 && options5.RaytracingTier < D3D12_RAYTRACING_TIER_1_2) {
+				out.Reset();
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			struct StringStore {
@@ -2086,7 +2099,7 @@ namespace rhi {
 					sizeof(options0));
 
 				D3D12_FEATURE_DATA_SHADER_MODEL shaderModelFeature{};
-				shaderModelFeature.HighestShaderModel = D3D_SHADER_MODEL_6_8;
+				shaderModelFeature.HighestShaderModel = D3D_HIGHEST_SHADER_MODEL;
 				(void)impl->pNativeDevice->CheckFeatureSupport(
 					D3D12_FEATURE_SHADER_MODEL,
 					&shaderModelFeature,
@@ -2232,6 +2245,8 @@ namespace rhi {
 		}
 
 		inline std::vector<D3D_SHADER_MODEL> shaderModels = {
+			D3D_SHADER_MODEL_6_10,
+			D3D_SHADER_MODEL_6_9,
 			D3D_SHADER_MODEL_6_8,
 			D3D_SHADER_MODEL_6_7,
 			D3D_SHADER_MODEL_6_6,
@@ -2250,8 +2265,10 @@ namespace rhi {
 			for (const auto& model : shaderModels) {
 				D3D12_FEATURE_DATA_SHADER_MODEL sm{};
 				sm.HighestShaderModel = model;
+				// A runtime that doesn't know the requested model fails the query; otherwise it
+				// lowers HighestShaderModel to what the device supports.
 				if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) {
-					return model;
+					return sm.HighestShaderModel;
 				}
 			}
 			BreakIfDebugging(); // Nothing under 6_0 is supported
@@ -2338,10 +2355,25 @@ namespace rhi {
 			const bool hasRayTracing11 =
 				(opt5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1);
 
-			bool hasRayTracing20 = false;
-#if BASICRHI_HAS_DXR2_HEADERS && defined(D3D12_RAYTRACING_TIER_2_0)
-			hasRayTracing20 = opt5.RaytracingTier >= D3D12_RAYTRACING_TIER_2_0;
-#endif
+			const bool hasOpacityMicromaps =
+				(opt5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_2);
+
+			// A required part of shader model 6.9 with ray tracing, so the calls are valid even where the driver doesn't sort.
+			D3D12_FEATURE_DATA_SHADER_MODEL serShaderModel{ D3D_SHADER_MODEL_6_9 };
+			const bool hasShaderExecutionReordering = hasRayTracingPipeline
+				&& SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &serShaderModel, sizeof(serShaderModel)))
+				&& serShaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_9;
+			D3D12_FEATURE_DATA_D3D12_OPTIONS22 options22{};
+			const bool actuallyReorders = hasShaderExecutionReordering
+				&& SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS22, &options22, sizeof(options22)))
+				&& options22.ShaderExecutionReorderingActuallyReorders;
+
+			// The cap, not the tier: tier 2.0 also needs opacity micromaps, which clusters can do without.
+			const Dx12Device* raytracing2Device = static_cast<const Dx12Device*>(d ? d->impl : nullptr);
+			D3D12_FEATURE_DATA_D3D12_OPTIONS_RAYTRACING2 optRaytracing2{};
+			const bool hasRayTracing20 = raytracing2Device && raytracing2Device->pNativeDeviceRaytracing2
+				&& SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS_RAYTRACING2, &optRaytracing2, sizeof(optRaytracing2)))
+				&& optRaytracing2.ClustersAndPTLASSupported;
 
 			const bool hasVrsPerDraw =
 				(opt6.VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_1) ||
@@ -2468,8 +2500,9 @@ namespace rhi {
 					out->pipelineLibrary = hasRayTracingPipeline;
 					out->deferredHostOperations = false;
 					out->shaderGroupHandleCaptureReplay = false;
-					out->opacityMicromap = false;
-					out->shaderExecutionReordering = false;
+					out->opacityMicromap = hasOpacityMicromaps;
+					out->shaderExecutionReordering = hasShaderExecutionReordering;
+					out->shaderExecutionReorderingActuallyReorders = actuallyReorders;
 					out->gpuRtasOperations = hasRayTracing20;
 					out->clusterAccelerationStructure = hasRayTracing20;
 					out->clusterTemplates = hasRayTracing20;
@@ -2493,16 +2526,16 @@ namespace rhi {
 					out->maxPrimitiveCount = hasRayTracingPipeline ? D3D12_RAYTRACING_MAX_PRIMITIVES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE : 0;
 					out->scratchAlignment = hasRayTracingPipeline ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
 					out->resultAlignment = hasRayTracingPipeline ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
-					out->maxClusterVertices = 0;
-					out->maxClusterTriangles = 0;
-					out->maxClusterGeometryIndex = 0;
-					out->maxClusterUniqueGeometryCount = 0;
+					out->maxClusterVertices = hasRayTracing20 ? 256u : 0u;
+					out->maxClusterTriangles = hasRayTracing20 ? 256u : 0u;
+					out->maxClusterGeometryIndex = hasRayTracing20 ? D3D12_RAYTRACING_MAXIMUM_GEOMETRY_INDEX : 0u;
+					out->maxClusterUniqueGeometryCount = hasRayTracing20 ? 256u : 0u;
 					out->maxPartitionCount = 0;
 					out->clusterScratchAlignment = hasRayTracing20 ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
-					out->clusterAlignment = hasRayTracing20 ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
-					out->clusterTemplateAlignment = hasRayTracing20 ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
+					out->clusterAlignment = hasRayTracing20 ? D3D12_RAYTRACING_CLAS_BYTE_ALIGNMENT : 0;
+					out->clusterTemplateAlignment = hasRayTracing20 ? D3D12_RAYTRACING_CLUSTER_TEMPLATE_BYTE_ALIGNMENT : 0;
 					out->clusterBottomLevelAlignment = hasRayTracing20 ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
-					out->clusterTemplateBoundsAlignment = 0;
+					out->clusterTemplateBoundsAlignment = hasRayTracing20 ? D3D12_RAYTRACING_CLUSTER_TEMPLATE_BOUNDS_BYTE_ALIGNMENT : 0;
 				} break;
 
 				case FeatureInfoStructType::ShadingRate: {
@@ -2841,7 +2874,8 @@ namespace rhi {
 				? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
 				: dv.componentMapping;
 
-			if (!resource.valid()) {
+			// An acceleration structure is named by address, so its view never has a resource.
+			if (!resource.valid() && dv.dimension != SrvDim::AccelerationStruct) {
 				// A null view: reads return zero. D3D12 needs only its dimension and format.
 				switch (dv.dimension) {
 				case SrvDim::Buffer:
@@ -3566,6 +3600,9 @@ namespace rhi {
 			
 			Dx12CommandList rec(cl, A->alloc, A->type, impl);
 			rec.slProxyCl = proxyCl;
+			if (impl->pNativeDeviceRaytracing2) {
+				(void)cl.As(&rec.clRaytracing2);
+			}
 			Dx12CommandList recWithScratch = rec;
 			if (!Dx12EnsureRootCbvScratchPage(impl, recWithScratch, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT)) {
 				spdlog::error("DX12 create command list EnsureRootCbvScratchPage failed queue={}", static_cast<int>(q));
@@ -4173,6 +4210,244 @@ namespace rhi {
 			return Dx12BufferAddress(impl, GpuBufferAddress{ as->storage, as->storageOffset });
 		}
 
+		// Layouts the GPU reads directly. A mismatch here fails silently as garbage geometry, so check every field.
+#define BASICRHI_DXR2_FIELD(rhiType, rhiField, nativeType, nativeField) \
+		static_assert(offsetof(rhiType, rhiField) == offsetof(nativeType, nativeField), #rhiType "::" #rhiField " does not match " #nativeType "::" #nativeField)
+		static_assert(sizeof(PackedDxr2ClusterBuildTriangleInfo) == sizeof(D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS));
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, clusterID, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, ClusterID);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, clusterFlags, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, ClusterFlags);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, triangleCount, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, TriangleCount);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, uniqueVertexIndexCount, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, UniqueVertexIndexCount);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, baseGeometryIndexAndFlags, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, BaseGeometryIndexAndFlags);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, opacityMicromapBaseLocation, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, OpacityMicromapBaseLocation);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, vertexBufferStride, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, VertexBufferStride);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, indexBufferStride, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, IndexBufferStride);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, opacityMicromapIndexBufferStride, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, OpacityMicromapIndexBufferStride);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, geometryIndexAndFlagsBufferStride, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, GeometryIndexAndFlagsArrayStride);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, positionTruncateBitCount, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, PositionTruncateBitCount);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, vertexBuffer, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, VertexBuffer);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, indexBuffer, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, IndexBuffer);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, geometryIndexAndFlagsBuffer, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, GeometryIndexAndFlagsArray);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, geometryIndexAndFlagsIndexBuffer, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, GeometryIndexAndFlagsIndexBuffer);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, opacityMicromapArray, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, OpacityMicromapArray);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, opacityMicromapIndexBuffer, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, OpacityMicromapIndexBuffer);
+		static_assert(sizeof(PackedDxr2ClusterBuildTriangleTemplateInfo) == sizeof(D3D12_RTAS_OPERATION_BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES_ARGS));
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleTemplateInfo, instantiationBoundingBoxLimit, D3D12_RTAS_OPERATION_BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES_ARGS, InstantiationBoundingBoxLimit);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleTemplateInfo, compressed1Header, D3D12_RTAS_OPERATION_BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES_ARGS, Compressed1.Header);
+		static_assert(sizeof(PackedDxr2ClusterInstantiateTemplateInfo) == sizeof(D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS));
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterInstantiateTemplateInfo, geometryIndexOffset, D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS, GeometryIndexOffset);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterInstantiateTemplateInfo, clusterIdOffset, D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS, ClusterIdOffset);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterInstantiateTemplateInfo, clusterTemplateAddress, D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS, ClusterTemplate);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterInstantiateTemplateInfo, vertexBufferStartAddress, D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS, VertexBuffer.StartAddress);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterInstantiateTemplateInfo, vertexBufferStrideInBytes, D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS, VertexBuffer.StrideInBytes);
+		static_assert(sizeof(PackedDxr2PartitionedTlasWriteInstanceData) == sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS));
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, transform, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, Transform);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, instanceID, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, InstanceID);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, instanceMask, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, InstanceMask);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, instanceContributionToHitGroupIndex, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, InstanceContributionToHitGroupIndex);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, instanceFlags, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, InstanceFlags);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, accelerationStructure, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, AccelerationStructure);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, instanceIndex, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, InstanceIndex);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, partitionIndex, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, PartitionIndex);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, explicitAabb, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, ExplicitAABB);
+		// The shared layouts.
+		static_assert(sizeof(PackedRayTracingClusterBuildBottomLevelInfo) == sizeof(D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS));
+		BASICRHI_DXR2_FIELD(PackedRayTracingClusterBuildBottomLevelInfo, clusterReferencesCount, D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS, ClasAddressCount);
+		BASICRHI_DXR2_FIELD(PackedRayTracingClusterBuildBottomLevelInfo, clusterReferencesStride, D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS, ClasAddressStride);
+		BASICRHI_DXR2_FIELD(PackedRayTracingClusterBuildBottomLevelInfo, clusterReferences, D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS, ClasAddressArray);
+		static_assert(sizeof(PackedRayTracingClusterMoveObjectsInfo) == sizeof(D3D12_RTAS_OPERATION_MOVE_CLUSTER_OBJECTS_ARGS));
+		static_assert(sizeof(PackedRayTracingPartitionedTlasIndirectCommand) == sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION));
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasIndirectCommand, operationType, D3D12_RTAS_PARTITIONED_TLAS_OPERATION, Type);
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasIndirectCommand, argumentCount, D3D12_RTAS_PARTITIONED_TLAS_OPERATION, ArgCount);
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasIndirectCommand, argumentDataStartAddress, D3D12_RTAS_PARTITIONED_TLAS_OPERATION, ArgData.StartAddress);
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasIndirectCommand, argumentDataStrideInBytes, D3D12_RTAS_PARTITIONED_TLAS_OPERATION, ArgData.StrideInBytes);
+		static_assert(sizeof(PackedRayTracingPartitionedTlasUpdateInstanceData) == sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_UPDATE_INSTANCE_ARGS));
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasUpdateInstanceData, instanceIndex, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_UPDATE_INSTANCE_ARGS, InstanceIndex);
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasUpdateInstanceData, instanceContributionToHitGroupIndex, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_UPDATE_INSTANCE_ARGS, InstanceContributionToHitGroupIndex);
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasUpdateInstanceData, accelerationStructure, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_UPDATE_INSTANCE_ARGS, AccelerationStructure);
+		static_assert(sizeof(PackedRayTracingPartitionedTlasWritePartitionTranslationData) == sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TRANSLATE_PARTITION_ARGS));
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasWritePartitionTranslationData, partitionIndex, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TRANSLATE_PARTITION_ARGS, PartitionIndex);
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasWritePartitionTranslationData, partitionTranslation, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TRANSLATE_PARTITION_ARGS, PartitionTranslation);
+#undef BASICRHI_DXR2_FIELD
+		static_assert(static_cast<uint32_t>(RayTracingPartitionedTlasOperationType::WriteInstance) == D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TYPE_WRITE_INSTANCE);
+		static_assert(static_cast<uint32_t>(RayTracingPartitionedTlasOperationType::UpdateInstance) == D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TYPE_UPDATE_INSTANCE);
+		static_assert(static_cast<uint32_t>(RayTracingPartitionedTlasOperationType::WritePartitionTranslation) == D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TYPE_TRANSLATE_PARTITION);
+		static_assert(static_cast<uint32_t>(RTClusterGeometry_Opaque) << 29 == static_cast<uint32_t>(D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE));
+		static_assert(static_cast<uint32_t>(RTClusterGeometry_NoDuplicateAnyHitInvocation) << 29 == static_cast<uint32_t>(D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION));
+		static_assert(static_cast<uint32_t>(RTASAddressResolution_IndirectedDstImplicitData) == D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_INDIRECTED_BATCH_RESULT);
+		static_assert(static_cast<uint32_t>(RTASAddressResolution_IndirectedScratchData) == D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_INDIRECTED_BATCH_SCRATCH);
+		static_assert(static_cast<uint32_t>(RTASAddressResolution_IndirectedDstAddressArray) == D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_INDIRECTED_DESTINATION_ADDRESS_ARRAY);
+		static_assert(static_cast<uint32_t>(RTASAddressResolution_IndirectedDstSizesArray) == D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_INDIRECTED_RESULT_SIZE_ARRAY);
+		static_assert(static_cast<uint32_t>(RTASAddressResolution_IndirectedSrcInfosArray) == D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_INDIRECTED_INDIRECT_ARGUMENT_ARRAY);
+		static_assert(static_cast<uint32_t>(RTASAddressResolution_IndirectedSrcInfosCount) == D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_INDIRECTED_INDIRECT_ARGUMENT_COUNT);
+
+		static D3D12_RTAS_OPERATION_FLAGS Dx12RtasOperationFlags(RayTracingAccelerationStructureBuildFlags flags) noexcept {
+			const uint32_t bits = static_cast<uint32_t>(flags);
+			D3D12_RTAS_OPERATION_FLAGS out = D3D12_RTAS_OPERATION_FLAG_NONE;
+			if ((bits & RTASBuild_PreferFastTrace) != 0) out |= D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+			else if ((bits & RTASBuild_PreferFastBuild) != 0) out |= D3D12_RTAS_OPERATION_FLAG_FAST_OPERATION;
+			return out;
+		}
+
+		static D3D12_RTAS_OPERATION_MODE Dx12RtasOperationMode(RayTracingRtasOperationMode mode) noexcept {
+			switch (mode) {
+			case RayTracingRtasOperationMode::ExplicitDestinations: return D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
+			case RayTracingRtasOperationMode::ComputeSizes: return D3D12_RTAS_OPERATION_MODE_GET_SIZES;
+			case RayTracingRtasOperationMode::ImplicitDestinations:
+			default: return D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
+			}
+		}
+
+		static bool Dx12ClusterVertexFormat(RayTracingClusterVertexFormat format, D3D12_VERTEX_FORMAT& out) noexcept {
+			switch (format) {
+			case RayTracingClusterVertexFormat::Float32x3: out = D3D12_VERTEX_FORMAT_FLOAT32_3; return true;
+			case RayTracingClusterVertexFormat::Float16x3: out = D3D12_VERTEX_FORMAT_FLOAT16_3; return true;
+			case RayTracingClusterVertexFormat::Snorm16x3: out = D3D12_VERTEX_FORMAT_SNORM16_3; return true;
+			default: return false; // D3D12 has no four-component position formats.
+			}
+		}
+
+		static bool Dx12ClusterIndexFormat(RayTracingClusterIndexFormat format, D3D12_INDEX_FORMAT& out) noexcept {
+			switch (format) {
+			case RayTracingClusterIndexFormat::Uint8: out = D3D12_INDEX_FORMAT_UINT8; return true;
+			case RayTracingClusterIndexFormat::Uint16: out = D3D12_INDEX_FORMAT_UINT16; return true;
+			case RayTracingClusterIndexFormat::Uint32: out = D3D12_INDEX_FORMAT_UINT32; return true;
+			default: return false; // None is not valid for cluster positions.
+			}
+		}
+
+		static D3D12_RTAS_PARTITIONED_TLAS_FLAGS Dx12PartitionedTlasFlags(const RayTracingPartitionedTlasInputsDesc& inputs) noexcept {
+			const uint32_t bits = static_cast<uint32_t>(inputs.flags);
+			D3D12_RTAS_PARTITIONED_TLAS_FLAGS out = D3D12_RTAS_PARTITIONED_TLAS_FLAG_NONE;
+			if ((bits & RTASBuild_PreferFastTrace) != 0) out |= D3D12_RTAS_PARTITIONED_TLAS_FLAG_FAST_TRACE;
+			else if ((bits & RTASBuild_PreferFastBuild) != 0) out |= D3D12_RTAS_PARTITIONED_TLAS_FLAG_FAST_BUILD;
+			if (inputs.enablePartitionTranslation) out |= D3D12_RTAS_PARTITIONED_TLAS_FLAG_ENABLE_PARTITION_TRANSLATION;
+			return out;
+		}
+
+		// D3D12_RTAS_OPERATION_INPUTS points at one of these, so they have to outlive the call.
+		struct Dx12RtasInputStorage {
+			D3D12_RTAS_OPERATION_INPUTS inputs{};
+			D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC triangles{};
+			D3D12_RTAS_CLUSTER_TEMPLATE_TRIANGLES_INPUTS_DESC templateTriangles{};
+			D3D12_RTAS_INSTANTIATE_CLUSTER_TEMPLATE_INPUTS_DESC instantiate{};
+			D3D12_RTAS_CLAS_INPUTS_DESC bottomLevel{};
+			D3D12_RTAS_CLUSTER_MOVES_DESC moves{};
+			D3D12_RTAS_PARTITIONED_TLAS_INPUTS_DESC partitioned{};
+		};
+
+		// partitionedFallback: the execute path also accepts partitioned inputs from the operation's own data.
+		static bool Dx12FillRtasInputs(const RayTracingRtasOperationInputs& src, const RayTracingPartitionedTlasInputsDesc* partitionedFallback, Dx12RtasInputStorage& out) noexcept {
+			out = {};
+			D3D12_RTAS_OPERATION_FLAGS flags = Dx12RtasOperationFlags(src.flags);
+			if (src.allowOpacityMicromaps) flags |= D3D12_RTAS_OPERATION_FLAG_ALLOW_OMM;
+			const D3D12_RTAS_OPERATION_MODE mode = Dx12RtasOperationMode(src.operationMode);
+			// NONE: no OMM index buffer. A non-null per-argument OpacityMicromapArray then indexes sequentially.
+			const auto ommIndexFormat = [](const RayTracingClusterTriangleInputsDesc& triangles, D3D12_INDEX_FORMAT& out) noexcept {
+				out = D3D12_INDEX_FORMAT_NONE;
+				return triangles.opacityMicromapIndexFormat == RayTracingClusterIndexFormat::None || Dx12ClusterIndexFormat(triangles.opacityMicromapIndexFormat, out);
+			};
+			const auto limits = [&](const RayTracingClusterTriangleInputsDesc& triangles) {
+				D3D12_RTAS_CLUSTER_LIMITS value{};
+				value.MaxArgCount = src.maxAccelerationStructureCount;
+				value.MaxGeometryIndexValue = triangles.maxGeometryIndexValue;
+				value.MaxUniqueGeometryIndexAndFlagsCountPerCluster = triangles.maxClusterUniqueGeometryCount;
+				value.MaxTriangleCountPerCluster = triangles.maxClusterTriangleCount;
+				value.MaxUniqueVertexIndexCountPerCluster = triangles.maxClusterVertexCount;
+				value.MaxTotalTriangleCount = triangles.maxTotalTriangleCount;
+				value.MaxSumOfUniqueVertexIndexCounts = triangles.maxTotalVertexCount;
+				value.MaxOpacityMicromapIndicesPerCluster = triangles.opacityMicromapIndexFormat != RayTracingClusterIndexFormat::None ? triangles.maxOpacityMicromapIndicesPerCluster : 0;
+				return value;
+			};
+
+			switch (src.operationType) {
+			case RayTracingRtasOperationType::BuildTriangleCluster: {
+				if (!src.triangleClusters) return false;
+				const auto& triangles = *src.triangleClusters;
+				out.inputs.Type = D3D12_RTAS_OPERATION_TYPE_BUILD_CLAS_FROM_TRIANGLES;
+				out.triangles.ClusterLimits = limits(triangles);
+				out.triangles.Flags = flags;
+				out.triangles.Mode = mode;
+				out.triangles.GeometryIndexAndFlagsIndexFormat = D3D12_INDEX_FORMAT_NONE;
+				if (!ommIndexFormat(triangles, out.triangles.OpacityMicromapIndexFormat)) return false;
+				out.triangles.MinPositionTruncateBitCount = triangles.minPositionTruncateBitCount;
+				if (!Dx12ClusterVertexFormat(triangles.vertexFormat, out.triangles.VertexFormat)
+					|| !Dx12ClusterIndexFormat(triangles.indexFormat, out.triangles.IndexFormat)) return false;
+				out.inputs.pClusterTrianglesDesc = &out.triangles;
+				return true;
+			}
+			case RayTracingRtasOperationType::BuildTriangleClusterTemplate: {
+				if (!src.triangleClusters) return false;
+				const auto& triangles = *src.triangleClusters;
+				out.inputs.Type = D3D12_RTAS_OPERATION_TYPE_BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES;
+				out.templateTriangles.ClusterLimits = limits(triangles);
+				out.templateTriangles.Flags = flags;
+				out.templateTriangles.Mode = mode;
+				out.templateTriangles.GeometryIndexAndFlagsIndexFormat = D3D12_INDEX_FORMAT_NONE;
+				if (!ommIndexFormat(triangles, out.templateTriangles.OpacityMicromapIndexFormat)) return false;
+				if (!Dx12ClusterVertexFormat(triangles.vertexFormat, out.templateTriangles.VertexInstantiationFormat)
+					|| !Dx12ClusterIndexFormat(triangles.indexFormat, out.templateTriangles.IndexFormat)) return false;
+				out.templateTriangles.VertexHintFormat = out.templateTriangles.VertexInstantiationFormat;
+				out.inputs.pClusterTemplateTrianglesDesc = &out.templateTriangles;
+				return true;
+			}
+			case RayTracingRtasOperationType::InstantiateTriangleCluster: {
+				if (!src.triangleClusters) return false;
+				const auto& triangles = *src.triangleClusters;
+				out.inputs.Type = D3D12_RTAS_OPERATION_TYPE_INSTANTIATE_CLUSTER_TEMPLATES;
+				out.instantiate.ClusterLimits = limits(triangles);
+				out.instantiate.Flags = flags;
+				out.instantiate.Mode = mode;
+				if (!Dx12ClusterVertexFormat(triangles.vertexFormat, out.instantiate.VertexSourceFormat)) return false;
+				out.inputs.pInstantiateClusterTemplateDesc = &out.instantiate;
+				return true;
+			}
+			case RayTracingRtasOperationType::BuildClustersBottomLevel: {
+				if (!src.clustersBottomLevel) return false;
+				out.inputs.Type = D3D12_RTAS_OPERATION_TYPE_BUILD_BLAS_FROM_CLAS;
+				out.bottomLevel.Flags = flags;
+				out.bottomLevel.MaxArgCount = src.maxAccelerationStructureCount;
+				out.bottomLevel.Mode = mode;
+				out.bottomLevel.MaxTotalClasCount = src.clustersBottomLevel->maxTotalClusterCount;
+				out.bottomLevel.MaxClasCountPerArg = src.clustersBottomLevel->maxClusterCountPerAccelerationStructure;
+				out.inputs.pClasDesc = &out.bottomLevel;
+				return true;
+			}
+			case RayTracingRtasOperationType::MoveObjects: {
+				if (!src.moveObjects) return false;
+				out.inputs.Type = D3D12_RTAS_OPERATION_TYPE_MOVE_CLUSTER_OBJECTS;
+				out.moves.Flags = src.moveObjects->noMoveOverlap ? D3D12_RTAS_CLUSTER_MOVE_OPERATION_FLAG_NO_OVERLAP : D3D12_RTAS_CLUSTER_MOVE_OPERATION_FLAG_NONE;
+				if (src.allowOpacityMicromaps) out.moves.Flags |= D3D12_RTAS_CLUSTER_MOVE_OPERATION_FLAG_ALLOW_OMM;
+				out.moves.MaxArgCount = src.maxAccelerationStructureCount;
+				out.moves.Mode = mode;
+				out.moves.MaxBytesMoved = src.moveObjects->maxMovedBytes;
+				switch (src.moveObjects->type) {
+				case RayTracingClusterAccelerationStructureType::ClustersBottomLevel: out.moves.Type = D3D12_RTAS_MOVE_OPERATION_TYPE_CLUSTER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE; break;
+				case RayTracingClusterAccelerationStructureType::TriangleClusterTemplate: out.moves.Type = D3D12_RTAS_MOVE_OPERATION_TYPE_CLUSTER_TEMPLATE; break;
+				case RayTracingClusterAccelerationStructureType::TriangleCluster:
+				default: out.moves.Type = D3D12_RTAS_MOVE_OPERATION_TYPE_CLUSTER_LEVEL_ACCELERATION_STRUCTURE; break;
+				}
+				out.inputs.pClusterMovesDesc = &out.moves;
+				return true;
+			}
+			case RayTracingRtasOperationType::BuildPartitionedTopLevel: {
+				const RayTracingPartitionedTlasInputsDesc* partitioned = src.partitionedTopLevel ? src.partitionedTopLevel : partitionedFallback;
+				if (!partitioned) return false;
+				out.inputs.Type = D3D12_RTAS_OPERATION_TYPE_PARTITIONED_TLAS;
+				out.partitioned.Flags = Dx12PartitionedTlasFlags(*partitioned);
+				out.partitioned.InstanceCount = partitioned->instanceCount;
+				out.partitioned.MaxInstancePerPartitionCount = partitioned->maxInstancePerPartitionCount;
+				out.partitioned.PartitionCount = partitioned->partitionCount;
+				out.partitioned.MaxInstanceInGlobalPartitionCount = partitioned->maxInstanceInGlobalPartitionCount;
+				out.inputs.pPartitionedTLASInputsDesc = &out.partitioned;
+				return true;
+			}
+			case RayTracingRtasOperationType::GetClusterTemplateIndices:
+			default:
+				return false; // No D3D12 equivalent: see RayTracingFeatureInfo::clusterTemplateIndexFetch.
+			}
+		}
+
 		struct Dx12BuildInputsStorage {
 			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
 			std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geometries;
@@ -4298,13 +4573,84 @@ namespace rhi {
 		}
 
 		static Result d_getRayTracingAccelerationStructureOperationPrebuildInfo(Device* d, const RayTracingRtasOperationInputs& inputs, RayTracingRtasPrebuildInfo* out) noexcept {
-			(void)d;
-			(void)inputs;
-			if (!out) {
+			auto* impl = static_cast<Dx12Device*>(d ? d->impl : nullptr);
+			if (!impl || !out) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 			*out = {};
-			RHI_FAIL(Result::Unsupported);
+			if (!impl->pNativeDeviceRaytracing2) {
+				RHI_FAIL(Result::Unsupported);
+			}
+			Dx12RtasInputStorage storage{};
+			if (!Dx12FillRtasInputs(inputs, nullptr, storage)) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			D3D12_RTAS_OPERATION_PREBUILD_INFO info{};
+			impl->pNativeDeviceRaytracing2->GetRTASOperationPrebuildInfo(&storage.inputs, &info);
+			out->resultDataMaxSizeInBytes = info.ResultDataMaxSizeInBytes;
+			out->scratchDataSizeInBytes = info.ScratchDataSizeInBytes;
+			out->updateScratchDataSizeInBytes = info.ScratchDataSizeInBytes;
+			return info.ScratchDataSizeInBytes != 0 || info.ResultDataMaxSizeInBytes != 0 ? Result::Ok : Result::Unsupported;
+		}
+
+		static_assert(sizeof(RayTracingOpacityMicromapHistogramEntry) == sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY));
+		static_assert(offsetof(RayTracingOpacityMicromapHistogramEntry, count) == offsetof(D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY, Count));
+		static_assert(offsetof(RayTracingOpacityMicromapHistogramEntry, subdivisionLevel) == offsetof(D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY, SubdivisionLevel));
+		static_assert(offsetof(RayTracingOpacityMicromapHistogramEntry, format) == offsetof(D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY, Format));
+		static_assert(sizeof(PackedRayTracingOpacityMicromapDesc) == sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC));
+		static_assert(static_cast<uint32_t>(RayTracingOpacityMicromapFormat::OC1_2State) == D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_2_STATE);
+		static_assert(static_cast<uint32_t>(RayTracingOpacityMicromapFormat::OC1_4State) == D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_4_STATE);
+		static_assert(static_cast<int32_t>(RTOmmSpecialIndex_FullyTransparent) == D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_TRANSPARENT);
+		static_assert(static_cast<int32_t>(RTOmmSpecialIndex_FullyOpaque) == D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_OPAQUE);
+		static_assert(static_cast<int32_t>(RTOmmSpecialIndex_FullyUnknownTransparent) == D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_TRANSPARENT);
+		static_assert(static_cast<int32_t>(RTOmmSpecialIndex_FullyUnknownOpaque) == D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_OPAQUE);
+		static_assert(static_cast<int32_t>(RTOmmSpecialIndex_ClusterSkipOpacityMicromap) == D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_CLUSTER_SKIP_OMM);
+		static_assert(static_cast<uint32_t>(RTInstance_ForceOpacityMicromap2State) == D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OMM_2_STATE);
+		static_assert(static_cast<uint32_t>(RTInstance_DisableOpacityMicromaps) == D3D12_RAYTRACING_INSTANCE_FLAG_DISABLE_OMMS);
+		static_assert(static_cast<uint32_t>(RTCluster_AllowDisableOpacityMicromaps) == D3D12_RTAS_CLUSTER_OPERATION_CLAS_FLAG_ALLOW_DISABLE_OMMS);
+
+		// D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS points at these, so they have to outlive the call.
+		struct Dx12OmmInputsStorage {
+			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+			D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_DESC array{};
+		};
+
+		static bool Dx12FillOmmInputs(const RayTracingOpacityMicromapArrayInputs& src, Dx12OmmInputsStorage& out) noexcept {
+			out = {};
+			if (src.histogram.size == 0 || !src.histogram.data) return false;
+			out.array.NumOmmHistogramEntries = static_cast<UINT>(src.histogram.size);
+			out.array.pOmmHistogram = reinterpret_cast<const D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY*>(src.histogram.data);
+			out.inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY;
+			// OMM arrays cannot be updated in place.
+			out.inputs.Flags = Dx12AsBuildFlags(static_cast<RayTracingAccelerationStructureBuildFlags>(src.flags & ~RTASBuild_AllowUpdate));
+			out.inputs.NumDescs = 1;
+			out.inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+			out.inputs.pOpacityMicromapArrayDesc = &out.array;
+			return true;
+		}
+
+		static Result d_getOpacityMicromapArrayPrebuildInfo(Device* d, const RayTracingOpacityMicromapArrayInputs& inputs, AccelerationStructurePrebuildInfo* out) noexcept {
+			auto* impl = static_cast<Dx12Device*>(d ? d->impl : nullptr);
+			if (!impl || !impl->pNativeDevice || !out) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			*out = {};
+			Dx12OmmInputsStorage storage{};
+			if (!Dx12FillOmmInputs(inputs, storage)) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			// The runtime rejects null InputBuffer / PerOmmDescs even here. The spec (v1.44, prebuild info) allows dummy
+			// non-zero addresses for the prebuild call, since they are inspected for null but never dereferenced.
+			storage.array.InputBuffer = D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_BYTE_ALIGNMENT;
+			storage.array.PerOmmDescs.StartAddress = D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_BYTE_ALIGNMENT;
+			storage.array.PerOmmDescs.StrideInBytes = sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC);
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO native{};
+			impl->pNativeDevice->GetRaytracingAccelerationStructurePrebuildInfo(&storage.inputs, &native);
+			out->resultDataMaxSizeInBytes = native.ResultDataMaxSizeInBytes;
+			out->scratchDataSizeInBytes = native.ScratchDataSizeInBytes;
+			out->updateScratchDataSizeInBytes = native.UpdateScratchDataSizeInBytes;
+			// Zero means the runtime or driver rejected the inputs (or OMMs are unsupported: below raytracing tier 1.2).
+			return native.ResultDataMaxSizeInBytes != 0 ? Result::Ok : Result::Unsupported;
 		}
 
 		static Result d_getRayTracingShaderGroupHandles(Device* d, PipelineHandle pipeline, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept {
@@ -8011,6 +8357,44 @@ namespace rhi {
 			}
 		}
 
+		static void cl_buildOpacityMicromapArrays(CommandList* cl, const RayTracingOpacityMicromapArrayBuildDesc* descs, uint32_t count) noexcept {
+			if (DxRejectInBundle(cl, "an opacity micromap array build")) {
+				return;
+			}
+			auto* list = dx12_detail::CL(cl);
+			if (!list || !list->cl || (!descs && count != 0)) {
+				BreakIfDebugging();
+				return;
+			}
+
+			for (uint32_t index = 0; index < count; ++index) {
+				const RayTracingOpacityMicromapArrayBuildDesc& desc = descs[index];
+				Dx12OmmInputsStorage storage{};
+				if (!Dx12FillOmmInputs(desc.inputs, storage)) {
+					spdlog::error("DX12 BuildOpacityMicromapArrays: empty histogram");
+					BreakIfDebugging();
+					return;
+				}
+				storage.array.InputBuffer = Dx12BufferAddress(list->dev, desc.inputBuffer);
+				storage.array.PerOmmDescs.StartAddress = Dx12BufferAddress(list->dev, GpuBufferAddress{ desc.perOmmDescs.buffer, desc.perOmmDescs.offset });
+				storage.array.PerOmmDescs.StrideInBytes = desc.perOmmDescs.stride != 0 ? desc.perOmmDescs.stride : sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC);
+
+				D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC native{};
+				native.Inputs = storage.inputs;
+				native.DestAccelerationStructureData = Dx12BufferAddress(list->dev, desc.destination);
+				native.ScratchAccelerationStructureData = Dx12BufferAddress(list->dev, desc.scratch);
+				if (storage.array.InputBuffer == 0 || storage.array.PerOmmDescs.StartAddress == 0 || native.DestAccelerationStructureData == 0 || native.ScratchAccelerationStructureData == 0
+					|| (native.DestAccelerationStructureData % D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_BYTE_ALIGNMENT) != 0
+					|| (storage.array.InputBuffer % D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_BYTE_ALIGNMENT) != 0
+					|| (storage.array.PerOmmDescs.StartAddress % D3D12_RAYTRACING_OPACITY_MICROMAP_DESCS_BYTE_ALIGNMENT) != 0) {
+					spdlog::error("DX12 BuildOpacityMicromapArrays: missing or misaligned address (destination and input 128-byte, descs 4-byte)");
+					BreakIfDebugging();
+					return;
+				}
+				list->cl->BuildRaytracingAccelerationStructure(&native, 0, nullptr);
+			}
+		}
+
 		static void cl_copyAccelerationStructure(CommandList* cl, const AccelerationStructureCopyDesc& desc) noexcept {
 			if (DxRejectInBundle(cl, "an acceleration structure operation")) {
 				return;
@@ -8138,10 +8522,58 @@ namespace rhi {
 			list->cl->ExecuteIndirect(signature, 1, argumentBuffer->res.Get(), desc.dispatchRaysDescBuffer.offset, nullptr, 0);
 		}
 
+		static D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE Dx12BufferAddressAndStride(Dx12Device* impl, GpuBufferStridedRange range) noexcept {
+			D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE out{};
+			out.StartAddress = Dx12BufferAddress(impl, GpuBufferAddress{ range.buffer, range.offset });
+			out.StrideInBytes = range.stride;
+			return out;
+		}
+
 		static void cl_executeIndirectRtasOperations(CommandList* cl, const RayTracingRtasOperationDesc* descs, uint32_t count) noexcept {
-			(void)cl;
-			(void)descs;
-			(void)count;
+			auto* list = dx12_detail::CL(cl);
+			auto* impl = list ? list->dev : nullptr;
+			if (!list || !impl || (!descs && count != 0) || !list->clRaytracing2) {
+				BreakIfDebugging();
+				return;
+			}
+			if (DxRejectInBundle(cl, "ExecuteIndirectRtasOperations")) {
+				return;
+			}
+
+			for (uint32_t operationIndex = 0; operationIndex < count; ++operationIndex) {
+				const RayTracingRtasOperationDesc& desc = descs[operationIndex];
+				Dx12RtasInputStorage storage{};
+				if (!Dx12FillRtasInputs(desc.inputs, &desc.partitionedTopLevel.input, storage)) {
+					spdlog::error("DX12 ExecuteIndirectRtasOperations: invalid inputs for operation type {}", static_cast<uint32_t>(desc.inputs.operationType));
+					BreakIfDebugging();
+					return;
+				}
+
+				D3D12_RTAS_OPERATION_DESC native{};
+				native.Inputs = storage.inputs;
+				D3D12_RTAS_BATCHED_OPERATION_DATA batched{};
+				D3D12_RTAS_PARTITIONED_TLAS_OPERATION_DATA partitioned{};
+				if (desc.inputs.operationType == RayTracingRtasOperationType::BuildPartitionedTopLevel) {
+					partitioned.SourceAccelerationStructureData = Dx12BufferAddress(impl, desc.partitionedTopLevel.srcAccelerationStructureData);
+					partitioned.DestAccelerationStructureData = Dx12BufferAddress(impl, desc.partitionedTopLevel.dstAccelerationStructureData);
+					partitioned.ScratchAccelerationStructureData = Dx12BufferAddress(impl, desc.partitionedTopLevel.scratchData);
+					partitioned.IndirectPartitionedTlasOps = Dx12BufferAddress(impl, desc.partitionedTopLevel.srcInfos);
+					partitioned.IndirectPartitionedTlasOpCount = Dx12BufferAddress(impl, desc.partitionedTopLevel.srcInfosCount);
+					native.pPartitionedTlasOperationData = &partitioned;
+				}
+				else {
+					batched.AddressResolutionFlags = static_cast<D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAGS>(desc.batched.addressResolutionFlags);
+					batched.BatchResultData = Dx12BufferAddress(impl, desc.batched.dstImplicitData);
+					batched.BatchScratchData = Dx12BufferAddress(impl, desc.batched.scratchData);
+					batched.ResultAddressArray = Dx12BufferAddressAndStride(impl, desc.batched.dstAddressesArray);
+					batched.ResultSizeArray = Dx12BufferAddressAndStride(impl, desc.batched.dstSizesArray);
+					batched.IndirectArgumentArray = Dx12BufferAddressAndStride(impl, desc.batched.srcInfosArray);
+					batched.IndirectArgumentArraySize = Dx12BufferAddress(impl, desc.batched.srcInfosCount);
+					batched.ToolsInfo = 0;
+					native.pBatchedOperationData = &batched;
+				}
+				list->clRaytracing2->ExecuteIndirectRTASOperations(1u, &native, D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
+			}
 		}
 
 		static void cl_clearRTV_slot(CommandList* c, DescriptorSlot s, const rhi::ClearValue& cv) noexcept {
@@ -8858,10 +9290,10 @@ namespace rhi {
 			if (dstOffset32 >= maxAvail) return;
 			if (dstOffset32 + num32 > maxAvail) num32 = maxAvail - dstOffset32;
 
-			// Write to requested stages. On DX12, graphics/compute have distinct root constant slots.
+			// Write to requested stages. On DX12, graphics/compute have distinct root constant slots, and raytracing shaders read the compute ones.
 			const auto* p32 = static_cast<const uint32_t*>(data);
 			if (rc->type == PushConstantRangeType::RootConstants32) {
-				if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::Compute)) {
+				if (static_cast<uint32_t>(stages) & (static_cast<uint32_t>(ShaderStage::Compute) | static_cast<uint32_t>(ShaderStage::AllRayTracing))) {
 					impl->cl->SetComputeRoot32BitConstants(rc->rootIndex, num32, p32, dstOffset32);
 				}
 				if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::AllGraphics)) {
@@ -8891,7 +9323,7 @@ namespace rhi {
 			}
 			std::memcpy(cpuAddress, shadowState->values.data(), uploadBytes);
 
-			if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::Compute)) {
+			if (static_cast<uint32_t>(stages) & (static_cast<uint32_t>(ShaderStage::Compute) | static_cast<uint32_t>(ShaderStage::AllRayTracing))) {
 				impl->cl->SetComputeRootConstantBufferView(rc->rootIndex, gpuAddress);
 			}
 			if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::AllGraphics)) {
@@ -9804,7 +10236,7 @@ namespace rhi {
 			pref.engine = sl::EngineType::eCustom; // If using UE or Unity
 			pref.engineVersion = "0.0.1"; // Optional version
 			pref.projectId = "72a89ee2-1139-4cc5-8daa-d27189bed781"; // Optional project id
-			sl::Feature myFeatures[] = { sl::kFeatureDLSS };
+			sl::Feature myFeatures[] = { sl::kFeatureDLSS, sl::kFeatureDLSS_RR };
 			pref.featuresToLoad = myFeatures;
 			pref.numFeaturesToLoad = _countof(myFeatures);
 			pref.renderAPI = sl::RenderAPI::eD3D12;
@@ -9920,6 +10352,7 @@ namespace rhi {
 		&d_getRayTracingShaderGroupHandles,
 		&d_setRayTracingPipelineStackSize,
 		&d_getRayTracingAccelerationStructureOperationPrebuildInfo,
+		&d_getOpacityMicromapArrayPrebuildInfo,
 
 		&d_destroySampler,
 		&d_destroyPipelineLayout,
@@ -10023,6 +10456,7 @@ namespace rhi {
 		&cl_traceRays,
 		&cl_traceRaysIndirect,
 		&cl_executeIndirectRtasOperations,
+		&cl_buildOpacityMicromapArrays,
 		cl_clearRTV_slot,
 		cl_clearDSV_slot,
 		&cl_executeIndirect,
@@ -10129,6 +10563,9 @@ namespace rhi {
 	#if !BASICRHI_ENABLE_STREAMLINE
 		l_enableStreamline = false;
 	#endif
+
+		// Experimental features apply to devices created afterwards, so this comes first.
+		const bool previewRayTracingEnabled = ci.enablePreviewRayTracing && Dx12EnablePreviewRayTracing();
 
 		UINT flags = 0;
 		if (ci.enableDebug)
@@ -10257,6 +10694,15 @@ namespace rhi {
 			auto hasDevice10 = base.As(&impl->pNativeDevice);
 			if (FAILED(hasDevice10)) {
 				RHI_FAIL(ToRHI(hasDevice10));
+			}
+		}
+
+		// Queried on the native device: the Streamline proxy doesn't need to know these interfaces.
+		if (previewRayTracingEnabled && impl->pNativeDevice) {
+			impl->previewRayTracingEnabled = true;
+			const HRESULT raytracing2Hr = impl->pNativeDevice.As(&impl->pNativeDeviceRaytracing2);
+			if (FAILED(raytracing2Hr)) {
+				spdlog::warn("DX12 device setup: ID3D12DeviceRaytracing2 unavailable hr=0x{:08X}", static_cast<uint32_t>(raytracing2Hr));
 			}
 		}
 

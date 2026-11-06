@@ -505,6 +505,7 @@ namespace rhi {
 	{
 		switch (model)
 		{
+			case D3D_SHADER_MODEL_6_10: return ShaderModel::SM_6_10;
 			case D3D_SHADER_MODEL_6_9: return ShaderModel::SM_6_9;
 			case D3D_SHADER_MODEL_6_8: return ShaderModel::SM_6_8;
 			case D3D_SHADER_MODEL_6_7: return ShaderModel::SM_6_7;

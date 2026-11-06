@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -20,10 +20,6 @@
 #include "resource_states.h"
 #include "rhi_shader_abi.h"
 #include "rhi_feature_info.h"
-
-#ifndef BASICRHI_HAS_DXR2_HEADERS
-#define BASICRHI_HAS_DXR2_HEADERS 0
-#endif
 
 namespace rhi {
 
@@ -1004,6 +1000,9 @@ namespace rhi {
 		RTInstance_TriangleFrontCounterClockwise = 1u << 1,
 		RTInstance_ForceOpaque = 1u << 2,
 		RTInstance_ForceNonOpaque = 1u << 3,
+		// Opacity micromaps. Same bits in D3D12 and Vulkan (FORCE_OMM_2_STATE 0x10, DISABLE_OMMS 0x20).
+		RTInstance_ForceOpacityMicromap2State = 1u << 4,
+		RTInstance_DisableOpacityMicromaps = 1u << 5,
 	};
 
 	struct RayTracingTriangleGeometryDesc {
@@ -1080,6 +1079,63 @@ namespace rhi {
 		GpuBufferRange destinationBuffer{};
 	};
 
+	// Opacity micromaps (DXR 1.2 / VK_EXT_opacity_micromap). Needs RayTracingFeatureInfo::opacityMicromap.
+	//
+	// An OMM array is built from:
+	// - inputBuffer: the packed opacity states. Each OMM's data starts at its ByteOffset. Micro-triangle i of an OMM
+	//   occupies bits [i*b, i*b + b) (b = 1 for OC1_2State, 2 for OC1_4State), little-endian within the data, with
+	//   micro-triangles in the space-filling-curve order (BarycentricsToSpaceFillingCurveIndex in the Vulkan spec).
+	//   A level-L OMM has 4^L micro-triangles. 4-state values: 0 transparent, 1 opaque, 2 unknown-transparent, 3 unknown-opaque.
+	// - perOmmDescs: one 8-byte entry per OMM, the D3D12_RAYTRACING_OPACITY_MICROMAP_DESC layout:
+	//   uint32 byteOffset (into inputBuffer), uint16 subdivisionLevel (0..12), uint16 format (RayTracingOpacityMicromapFormat).
+	//   Use PackedRayTracingOpacityMicromapDesc. The stride may exceed 8 (4-byte aligned).
+	// - histogram: how many OMMs of each (subdivisionLevel, format) pair perOmmDescs holds. Must match the descs exactly.
+	// destination must be 128-byte aligned (the array address the CLAS/BLAS geometry references), scratch 256-byte aligned.
+	// OMM array storage lives in a buffer in the acceleration-structure state, like any other RTAS.
+	enum class RayTracingOpacityMicromapFormat : uint32_t { OC1_2State = 1, OC1_4State = 2 };
+
+	// Special OMM index values, usable in place of an index in a geometry's OMM index buffer (signed, sign-extended for 8/16-bit indices).
+	enum RayTracingOpacityMicromapSpecialIndex : int32_t {
+		RTOmmSpecialIndex_FullyTransparent = -1,
+		RTOmmSpecialIndex_FullyOpaque = -2,
+		RTOmmSpecialIndex_FullyUnknownTransparent = -3,
+		RTOmmSpecialIndex_FullyUnknownOpaque = -4,
+		RTOmmSpecialIndex_ClusterSkipOpacityMicromap = -5, // Cluster (CLAS) geometry only: this triangle has no OMM.
+	};
+
+	enum RayTracingOpacityMicromapState : uint32_t {
+		RTOmmState_Transparent = 0,
+		RTOmmState_Opaque = 1,
+		RTOmmState_UnknownTransparent = 2,
+		RTOmmState_UnknownOpaque = 3,
+	};
+
+	struct RayTracingOpacityMicromapHistogramEntry {
+		uint32_t count{ 0 };
+		uint32_t subdivisionLevel{ 0 };
+		RayTracingOpacityMicromapFormat format{ RayTracingOpacityMicromapFormat::OC1_4State };
+	};
+
+	struct RayTracingOpacityMicromapArrayInputs {
+		RayTracingAccelerationStructureBuildFlags flags{ RTASBuild_None }; // PreferFastTrace / PreferFastBuild / AllowCompaction / MinimizeMemory
+		Span<RayTracingOpacityMicromapHistogramEntry> histogram{};
+	};
+
+	struct RayTracingOpacityMicromapArrayBuildDesc {
+		RayTracingOpacityMicromapArrayInputs inputs{};
+		GpuBufferAddress inputBuffer{};
+		GpuBufferStridedRange perOmmDescs{}; // buffer + offset + stride are used; size is informational.
+		GpuBufferAddress destination{};
+		GpuBufferAddress scratch{};
+	};
+
+	struct alignas(4) PackedRayTracingOpacityMicromapDesc {
+		uint32_t byteOffset{ 0 };
+		uint16_t subdivisionLevel{ 0 };
+		uint16_t format{ static_cast<uint16_t>(RayTracingOpacityMicromapFormat::OC1_4State) };
+	};
+	static_assert(sizeof(PackedRayTracingOpacityMicromapDesc) == 8);
+
 	enum class RayTracingClusterAccelerationStructureType : uint32_t { ClustersBottomLevel, TriangleCluster, TriangleClusterTemplate };
 	enum class RayTracingClusterVertexFormat : uint32_t { Unknown, Float32x3, Float16x3, Float16x4, Snorm16x3, Snorm16x4 };
 	enum class RayTracingClusterIndexFormat : uint32_t { None = 0, Uint8 = 1, Uint16 = 2, Uint32 = 4 };
@@ -1122,6 +1178,8 @@ namespace rhi {
 
 	struct RayTracingClusterTriangleInputsDesc {
 		RayTracingClusterVertexFormat vertexFormat{ RayTracingClusterVertexFormat::Float32x3 };
+		// D3D12 takes this per batch. Vulkan takes it per argument (PackRayTracingClusterCountsAndFormats), so match the two.
+		RayTracingClusterIndexFormat indexFormat{ RayTracingClusterIndexFormat::Uint8 };
 		uint32_t maxGeometryIndexValue{ 0 };
 		uint32_t maxClusterUniqueGeometryCount{ 1 };
 		uint32_t maxClusterTriangleCount{ 0 };
@@ -1129,6 +1187,12 @@ namespace rhi {
 		uint32_t maxTotalTriangleCount{ 0 };
 		uint32_t maxTotalVertexCount{ 0 };
 		uint32_t minPositionTruncateBitCount{ 0 };
+		// Opacity micromaps. None: the batch's CLAS have no OMM index buffer (D3D12 then indexes sequentially from
+		// OpacityMicromapBaseLocation if a per-argument OpacityMicromapArray is non-null). Otherwise the index size in
+		// each argument's OpacityMicromapIndexBuffer; the stride must be a multiple of it and the buffer aligned to it.
+		// The operation must also set RayTracingRtasOperationInputs::allowOpacityMicromaps.
+		RayTracingClusterIndexFormat opacityMicromapIndexFormat{ RayTracingClusterIndexFormat::None };
+		uint32_t maxOpacityMicromapIndicesPerCluster{ 0 }; // Distinct OMMs one cluster may reference. Used only with an index format.
 	};
 
 	using RayTracingClusterTemplateTriangleInputsDesc = RayTracingClusterTriangleInputsDesc;
@@ -1163,6 +1227,11 @@ namespace rhi {
 		const RayTracingClusterTriangleInputsDesc* triangleClusters{ nullptr };
 		const RayTracingClusterMovesDesc* moveObjects{ nullptr };
 		const RayTracingPartitionedTlasInputsDesc* partitionedTopLevel{ nullptr };
+		// The operation interacts with CLAS, templates or cluster BLAS that reference OMMs. Must be set on every
+		// operation type and mode that touches such objects: the CLAS build itself, the BLAS-from-CLAS build, moves,
+		// get-sizes, and the matching prebuild-info queries. D3D12: RTAS_OPERATION_FLAG_ALLOW_OMM, or
+		// CLUSTER_MOVE_OPERATION_FLAG_ALLOW_OMM for moves. Ignored for partitioned TLAS (no such flag).
+		bool allowOpacityMicromaps{ false };
 	};
 
 	struct RayTracingRtasPrebuildInfo {
@@ -1291,16 +1360,84 @@ namespace rhi {
 	};
 	static_assert(sizeof(PackedRayTracingPartitionedTlasWritePartitionTranslationData) == 16);
 
+	inline constexpr uint32_t PackRayTracingClusterGeometryIndexAndFlags(uint32_t geometryIndex, RayTracingClusterGeometryFlags geometryFlags) noexcept {
+		return (geometryIndex & 0x00FFFFFFu) | ((static_cast<uint32_t>(geometryFlags) & 0x7u) << 29);
+	}
+
+	// GPU argument layouts for D3D12. The Packed* structs above follow the VK_NV extensions and only some of them
+	// match DXR 2; the ones that differ have a D3D12 twin here, and rhi_dx12.cpp asserts each against d3d12.h.
+	// Shaders write the matching layout through shaders/rhiRtasArgs.hlsli. These are shared between backends:
+	// PackedRayTracingClusterMoveObjectsInfo, PackedRayTracingClusterBuildBottomLevelInfo,
+	// PackedRayTracingPartitionedTlasIndirectCommand, PackedRayTracingPartitionedTlasUpdateInstanceData,
+	// PackedRayTracingPartitionedTlasWritePartitionTranslationData.
+	struct alignas(8) PackedDxr2ClusterBuildTriangleInfo {
+		uint32_t clusterID{ 0 };
+		uint32_t clusterFlags{ RTCluster_None };
+		uint16_t triangleCount{ 0 };
+		uint16_t uniqueVertexIndexCount{ 0 };
+		uint32_t baseGeometryIndexAndFlags{ 0 };
+		uint32_t opacityMicromapBaseLocation{ 0 };
+		uint16_t vertexBufferStride{ 0 };
+		uint16_t indexBufferStride{ 0 };
+		uint16_t opacityMicromapIndexBufferStride{ 0 };
+		uint16_t geometryIndexAndFlagsBufferStride{ 0 };
+		uint16_t positionTruncateBitCount{ 0 };
+		uint16_t reservedPadding{ 0 };
+		uint64_t vertexBuffer{ 0 };
+		uint64_t indexBuffer{ 0 };
+		uint64_t geometryIndexAndFlagsBuffer{ 0 };
+		uint64_t geometryIndexAndFlagsIndexBuffer{ 0 };
+		uint64_t opacityMicromapArray{ 0 };
+		uint64_t opacityMicromapIndexBuffer{ 0 };
+	};
+	static_assert(sizeof(PackedDxr2ClusterBuildTriangleInfo) == 80);
+
+	struct alignas(8) PackedDxr2ClusterBuildTriangleTemplateInfo {
+		PackedDxr2ClusterBuildTriangleInfo triangles{};
+		uint64_t instantiationBoundingBoxLimit{ 0 };
+		uint32_t compressed1Header{ 0 };
+		uint32_t reservedPadding{ 0 };
+	};
+	static_assert(sizeof(PackedDxr2ClusterBuildTriangleTemplateInfo) == 96);
+
+	struct alignas(8) PackedDxr2ClusterInstantiateTemplateInfo {
+		int32_t geometryIndexOffset{ 0 };
+		uint32_t clusterIdOffset{ 0 };
+		uint64_t clusterTemplateAddress{ 0 };
+		uint64_t vertexBufferStartAddress{ 0 };
+		uint64_t vertexBufferStrideInBytes{ 0 };
+	};
+	static_assert(sizeof(PackedDxr2ClusterInstantiateTemplateInfo) == 32);
+
+	struct alignas(8) PackedDxr2PartitionedTlasWriteInstanceData {
+		float transform[3][4]{};
+		uint32_t instanceID{ 0 };
+		uint32_t instanceMask{ 0xFF };
+		uint32_t instanceContributionToHitGroupIndex{ 0 };
+		uint32_t instanceFlags{ 0 }; // PackDxr2PartitionedTlasInstanceFlags
+		uint64_t accelerationStructure{ 0 };
+		uint32_t instanceIndex{ 0 };
+		uint32_t partitionIndex{ 0 };
+		float explicitAabb[6]{};
+	};
+	static_assert(sizeof(PackedDxr2PartitionedTlasWriteInstanceData) == 104);
+
+	inline constexpr uint32_t PackDxr2PartitionedTlasInstanceFlags(uint32_t flags) noexcept {
+		// The low four bits agree. D3D12 keeps bits 4 and 5 for opacity micromaps, which moves the AABB flag up.
+		return (flags & 0xFu) | ((flags & RTPartitionedTlasInstance_EnableExplicitBoundingBox) != 0 ? 0x40u : 0u);
+	}
+
+	inline constexpr uint32_t PackDxr2ClusterGeometryIndexAndFlags(uint32_t geometryIndex, RayTracingClusterGeometryFlags geometryFlags) noexcept {
+		// No per-cluster cull-disable in D3D12: bit 29 is reserved, and culling is set by instance flags instead.
+		return PackRayTracingClusterGeometryIndexAndFlags(geometryIndex, static_cast<RayTracingClusterGeometryFlags>(geometryFlags & ~RTClusterGeometry_CullDisable));
+	}
+
 	inline constexpr uint32_t PackRayTracingClusterCountsAndFormats(uint32_t triangleCount, uint32_t vertexCount, uint32_t positionTruncateBitCount, RayTracingClusterIndexFormat indexFormat, RayTracingClusterIndexFormat opacityMicromapIndexFormat = RayTracingClusterIndexFormat::None) noexcept {
 		return (triangleCount & 0x1FFu) |
 			((vertexCount & 0x1FFu) << 9) |
 			((positionTruncateBitCount & 0x3Fu) << 18) |
 			((static_cast<uint32_t>(indexFormat) & 0xFu) << 24) |
 			((static_cast<uint32_t>(opacityMicromapIndexFormat) & 0xFu) << 28);
-	}
-
-	inline constexpr uint32_t PackRayTracingClusterGeometryIndexAndFlags(uint32_t geometryIndex, RayTracingClusterGeometryFlags geometryFlags) noexcept {
-		return (geometryIndex & 0x00FFFFFFu) | ((static_cast<uint32_t>(geometryFlags) & 0x7u) << 29);
 	}
 
 	inline constexpr uint32_t PackRayTracingClusterInstantiationGeometryIndexOffset(uint32_t geometryIndexOffset) noexcept {
@@ -1378,6 +1515,27 @@ namespace rhi {
 		GpuBufferAddress dimensionsBuffer{};
 		GpuBufferAddress dispatchRaysDescBuffer{};
 	};
+
+	// What dispatchRaysDescBuffer holds, in device addresses. This is the layout of D3D12_DISPATCH_RAYS_DESC, so a CPU or a
+	// shader can write one into a buffer without naming the backend.
+	struct RayTracingDispatchRaysArguments {
+		uint64_t rayGenerationAddress{ 0 };
+		uint64_t rayGenerationSize{ 0 };
+		uint64_t missAddress{ 0 };
+		uint64_t missSize{ 0 };
+		uint64_t missStride{ 0 };
+		uint64_t hitGroupAddress{ 0 };
+		uint64_t hitGroupSize{ 0 };
+		uint64_t hitGroupStride{ 0 };
+		uint64_t callableAddress{ 0 };
+		uint64_t callableSize{ 0 };
+		uint64_t callableStride{ 0 };
+		uint32_t width{ 0 };
+		uint32_t height{ 1 };
+		uint32_t depth{ 1 };
+		uint32_t padding{ 0 };
+	};
+	static_assert(sizeof(RayTracingDispatchRaysArguments) == 104);
 
 	struct UavDesc {
 		UavDim	dimension{ UavDim::Buffer };
@@ -1745,7 +1903,8 @@ namespace rhi {
 
 	enum class PrimitiveTopology : uint32_t { Unknown, PointList, LineList, LineStrip, TriangleList, TriangleStrip, TriangleFan };
 	enum class RayTracingShaderGroupType : uint32_t { General, TrianglesHitGroup, ProceduralHitGroup };
-	enum RayTracingPipelineFlags : uint32_t { RTPipeline_None = 0, RTPipeline_SkipTriangles = 1u << 0, RTPipeline_SkipProceduralPrimitives = 1u << 1, RTPipeline_AllowClusteredGeometry = 1u << 2 };
+	// RTPipeline_AllowOpacityMicromaps: without it, TraceRay ignores OMMs (geometry acts as plain non-opaque). Needs RayTracingFeatureInfo::opacityMicromap.
+	enum RayTracingPipelineFlags : uint32_t { RTPipeline_None = 0, RTPipeline_SkipTriangles = 1u << 0, RTPipeline_SkipProceduralPrimitives = 1u << 1, RTPipeline_AllowClusteredGeometry = 1u << 2, RTPipeline_AllowOpacityMicromaps = 1u << 3 };
 
 	enum class PsoSubobj : uint32_t {
 		Layout,
@@ -2719,6 +2878,7 @@ namespace rhi {
 		void (*traceRays)(CommandList*, const RayTracingDispatchDesc&) noexcept;
 		void (*traceRaysIndirect)(CommandList*, const RayTracingDispatchIndirectDesc&) noexcept;
 		void (*executeIndirectRtasOperations)(CommandList*, const RayTracingRtasOperationDesc*, uint32_t) noexcept;
+		void (*buildOpacityMicromapArrays)(CommandList*, const RayTracingOpacityMicromapArrayBuildDesc*, uint32_t) noexcept;
 		void (*clearRenderTargetViewBySlot)(CommandList*, DescriptorSlot, const ClearValue&) noexcept;
 		void (*clearDepthStencilViewBySlot)(CommandList*, DescriptorSlot,
 			bool clearDepth, bool clearStencil,
@@ -2809,6 +2969,9 @@ namespace rhi {
 		void TraceRays(const RayTracingDispatchDesc& desc) noexcept;
 		void TraceRaysIndirect(const RayTracingDispatchIndirectDesc& desc) noexcept;
 		void ExecuteIndirectRtasOperations(const RayTracingRtasOperationDesc* descs, uint32_t count) noexcept;
+		// Builds OMM arrays (see RayTracingOpacityMicromapArrayBuildDesc). Before a CLAS/BLAS build reads the result, barrier the
+		// array's buffer BuildRaytracingAccelerationStructure/RaytracingAccelerationStructureWrite -> same sync/RaytracingAccelerationStructureRead.
+		void BuildOpacityMicromapArrays(const RayTracingOpacityMicromapArrayBuildDesc* descs, uint32_t count) noexcept;
 		inline void ClearRenderTargetView(DescriptorSlot s, const ClearValue& c) noexcept { vt->clearRenderTargetViewBySlot(this, s, c); }
 		inline void ClearDepthStencilView(DescriptorSlot s, bool clearDepth, bool clearStencil, float depth, uint8_t stencil) noexcept {
 			vt->clearDepthStencilViewBySlot(this, s, clearDepth, clearStencil, depth, stencil);
@@ -2990,6 +3153,7 @@ namespace rhi {
 		Result(*getRayTracingShaderGroupHandles)(Device*, PipelineHandle, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept;
 		Result(*setRayTracingPipelineStackSize)(Device*, PipelineHandle, uint64_t stackSizeBytes) noexcept;
 		Result(*getRayTracingAccelerationStructureOperationPrebuildInfo)(Device*, const RayTracingRtasOperationInputs&, RayTracingRtasPrebuildInfo*) noexcept;
+		Result(*getOpacityMicromapArrayPrebuildInfo)(Device*, const RayTracingOpacityMicromapArrayInputs&, AccelerationStructurePrebuildInfo*) noexcept;
 
 		void (*destroySampler)(DeviceDeletionContext*, SamplerHandle) noexcept;
 		void (*destroyPipelineLayout)(DeviceDeletionContext*, PipelineLayoutHandle) noexcept;
@@ -3203,6 +3367,8 @@ namespace rhi {
 		Result GetRayTracingShaderGroupHandles(PipelineHandle p, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept { return vt->getRayTracingShaderGroupHandles(this, p, firstGroup, groupCount, outData, outDataBytes); }
 		Result SetRayTracingPipelineStackSize(PipelineHandle p, uint64_t stackSizeBytes) noexcept { return vt->setRayTracingPipelineStackSize(this, p, stackSizeBytes); }
 		Result GetRayTracingAccelerationStructureOperationPrebuildInfo(const RayTracingRtasOperationInputs& inputs, RayTracingRtasPrebuildInfo& out) noexcept { return vt->getRayTracingAccelerationStructureOperationPrebuildInfo ? vt->getRayTracingAccelerationStructureOperationPrebuildInfo(this, inputs, &out) : Result::Unsupported; }
+		// Result size (destination, 128-byte aligned) and scratch for an OMM array build. updateScratchDataSizeInBytes is 0.
+		Result GetOpacityMicromapArrayPrebuildInfo(const RayTracingOpacityMicromapArrayInputs& inputs, AccelerationStructurePrebuildInfo& out) noexcept { return vt->getOpacityMicromapArrayPrebuildInfo ? vt->getOpacityMicromapArrayPrebuildInfo(this, inputs, &out) : Result::Unsupported; }
 		TimestampCalibration GetTimestampCalibration(QueueKind q) noexcept { return vt->getTimestampCalibration(this, q); }
 		CopyableFootprintsInfo GetCopyableFootprints(const FootprintRangeDesc& r, CopyableFootprint* out, uint32_t outCap) noexcept {
 			return vt->getCopyableFootprints(this, r, out, outCap);
@@ -3348,6 +3514,7 @@ namespace rhi {
 	inline void CommandList::TraceRays(const RayTracingDispatchDesc& desc) noexcept { vt->traceRays(this, desc); }
 	inline void CommandList::TraceRaysIndirect(const RayTracingDispatchIndirectDesc& desc) noexcept { vt->traceRaysIndirect(this, desc); }
 	inline void CommandList::ExecuteIndirectRtasOperations(const RayTracingRtasOperationDesc* descs, uint32_t count) noexcept { if (vt->executeIndirectRtasOperations) vt->executeIndirectRtasOperations(this, descs, count); }
+	inline void CommandList::BuildOpacityMicromapArrays(const RayTracingOpacityMicromapArrayBuildDesc* descs, uint32_t count) noexcept { if (vt->buildOpacityMicromapArrays) vt->buildOpacityMicromapArrays(this, descs, count); }
 	inline void CommandList::ExecuteIndirect(CommandSignatureHandle sig, ResourceHandle argBuf, uint64_t argOff, ResourceHandle cntBuf, uint64_t cntOff, uint32_t maxCount) noexcept {
 		vt->executeIndirect(this, sig, argBuf, argOff, cntBuf, cntOff, maxCount);
 	}
@@ -3430,6 +3597,10 @@ namespace rhi {
 		// instead of performing adapter selection. BasicRHI does not retain it.
 		void* nativeAdapter = nullptr;
 		DebugInstrumentationCreateInfo instrumentation{};
+		// D3D12: request the preview shader models and clustered raytracing before the device
+		// exists. They need a preview Agility SDK and Windows Developer Mode. When either is
+		// missing the device is still created and reports the raytracing it does have.
+		bool enablePreviewRayTracing = false;
 	};
 
 	// Accepts any blob exposing GetBufferPointer/GetBufferSize (ID3DBlob, IDxcBlob) without

@@ -10,7 +10,6 @@ include(GNUInstallDirs)
 option(BASICRHI_ENABLE_STREAMLINE "Enable Streamline integration in BasicRHI" ON)
 option(BASICRHI_ENABLE_PIX "Enable PIX integration in BasicRHI" ON)
 option(BASICRHI_ENABLE_RESHAPE "Enable GPU-Reshape debug instrumentation scaffolding in BasicRHI" OFF)
-option(BASICRHI_ENABLE_DXR2_HEADERS "Enable native DXR 2.0 header-dependent code paths in BasicRHI" OFF)
 option(BASICRHI_ENABLE_TRACY_GPU_PROFILING "Enable Tracy GPU timeline support in BasicRHI" ON)
 option(BASICRHI_ENABLE_TRACY_CPU_PROFILING "Enable Tracy CPU recording zones in BasicRHI" OFF)
 option(BASICRHI_ENABLE_D3D12 "Build the D3D12 backend" ON)
@@ -387,7 +386,6 @@ target_compile_definitions(BasicRHI PUBLIC
     BASICRHI_ENABLE_STREAMLINE=$<IF:$<BOOL:${_basicrhi_streamline_available}>,1,0>
     BASICRHI_ENABLE_PIX=$<IF:$<BOOL:${_basicrhi_pix_available}>,1,0>
     BASICRHI_ENABLE_RESHAPE=$<IF:$<BOOL:${_basicrhi_reshape_available}>,1,0>
-    BASICRHI_HAS_DXR2_HEADERS=$<IF:$<BOOL:${BASICRHI_ENABLE_DXR2_HEADERS}>,1,0>
     BASICRHI_ENABLE_TRACY_GPU_PROFILING=$<IF:$<BOOL:${BASICRHI_ENABLE_TRACY_GPU_PROFILING}>,1,0>
     BASICRHI_ENABLE_TRACY_CPU_PROFILING=$<BOOL:${BASICRHI_ENABLE_TRACY_CPU_PROFILING}>
     BASICRHI_ENABLE_D3D12=$<IF:$<BOOL:${BASICRHI_ENABLE_D3D12}>,1,0>
@@ -431,6 +429,47 @@ if(BASICRHI_BUILD_TESTS)
     if(BASICRHI_ENABLE_D3D12 AND WIN32)
         add_executable(BasicRHID3D12AliasingSmoke tests/D3D12AliasingSmoke.cpp)
         target_link_libraries(BasicRHID3D12AliasingSmoke PRIVATE BasicRHI::BasicRHI)
+
+        # Clustered raytracing needs the preview runtime and SM 6.10 compiler the renderer ships beside BasicRHI.
+        set(_basicrhi_rt_tools "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer")
+        if(EXISTS "${_basicrhi_rt_tools}/dxc.exe" AND EXISTS "${_basicrhi_rt_tools}/D3D/D3D12Core.dll")
+            set(_basicrhi_rt_generated "${CMAKE_CURRENT_BINARY_DIR}/rt_smoke_shaders")
+            file(MAKE_DIRECTORY "${_basicrhi_rt_generated}")
+            set(_basicrhi_rt_source "${CMAKE_CURRENT_SOURCE_DIR}/tests/D3D12RaytracingSmoke.hlsl")
+            add_custom_command(
+                OUTPUT "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_cs.h"
+                COMMAND "${_basicrhi_rt_tools}/dxc.exe" -nologo -T cs_6_10 -E CSMain -D RAY_QUERY_PATH=1 -Vn g_rayQueryCS
+                    -Fh "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_cs.h" "${_basicrhi_rt_source}"
+                DEPENDS "${_basicrhi_rt_source}" VERBATIM)
+            add_custom_command(
+                OUTPUT "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_omm_cs.h"
+                COMMAND "${_basicrhi_rt_tools}/dxc.exe" -nologo -T cs_6_10 -E CSOmm -D RAY_QUERY_PATH=1 -Vn g_ommQueryCS
+                    -Fh "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_omm_cs.h" "${_basicrhi_rt_source}"
+                DEPENDS "${_basicrhi_rt_source}" VERBATIM)
+            add_custom_command(
+                OUTPUT "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_lib.h"
+                COMMAND "${_basicrhi_rt_tools}/dxc.exe" -nologo -T lib_6_10 -Vn g_traceLibrary
+                    -Fh "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_lib.h" "${_basicrhi_rt_source}"
+                DEPENDS "${_basicrhi_rt_source}" VERBATIM)
+            add_executable(BasicRHID3D12RaytracingSmoke tests/D3D12RaytracingSmoke.cpp
+                "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_cs.h" "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_omm_cs.h"
+                "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_lib.h")
+            target_include_directories(BasicRHID3D12RaytracingSmoke PRIVATE "${_basicrhi_rt_generated}")
+            target_link_libraries(BasicRHID3D12RaytracingSmoke PRIVATE BasicRHI::BasicRHI)
+            if(_basicrhi_streamline_available)
+                # BasicRHI references the Streamline C API; the test doesn't load the interposer.
+                target_sources(BasicRHID3D12RaytracingSmoke PRIVATE tests/StreamlineStubs.cpp)
+                if(TARGET Streamline::headers)
+                    target_link_libraries(BasicRHID3D12RaytracingSmoke PRIVATE Streamline::headers)
+                else()
+                    target_include_directories(BasicRHID3D12RaytracingSmoke PRIVATE "${_basicrhi_streamline_manual_include}")
+                endif()
+            endif()
+            add_custom_command(TARGET BasicRHID3D12RaytracingSmoke POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_directory "${_basicrhi_rt_tools}/D3D" "$<TARGET_FILE_DIR:BasicRHID3D12RaytracingSmoke>/D3D" VERBATIM)
+            add_test(NAME BasicRHID3D12RaytracingSmoke COMMAND BasicRHID3D12RaytracingSmoke)
+            set_tests_properties(BasicRHID3D12RaytracingSmoke PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
     endif()
     if(BASICRHI_ENABLE_D3D12 AND BASICRHI_ENABLE_VULKAN AND WIN32)
         add_executable(BasicRHIWin32InteropSmoke tests/Win32InteropSmoke.cpp tests/StreamlineStubs.cpp)
