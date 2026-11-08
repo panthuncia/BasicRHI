@@ -3354,7 +3354,8 @@ namespace rhi {
 			case ResourceLayout::GenericRead:
 			case ResourceLayout::DirectGenericRead:
 			case ResourceLayout::ComputeGenericRead:
-				return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+				return (aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0
+					? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 			case ResourceLayout::RenderTarget:
 				return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 			case ResourceLayout::RenderTargetClear:
@@ -3372,7 +3373,10 @@ namespace rhi {
 			case ResourceLayout::ShaderResource:
 			case ResourceLayout::DirectShaderResource:
 			case ResourceLayout::ComputeShaderResource:
-				return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+				// Read-only depth is one layout, sampled or tested: the one an imported host depth buffer rests in, and the one a
+				// pass that both samples it and tests against it needs.
+				return (aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0
+					? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 			case ResourceLayout::CopyDest:
 			case ResourceLayout::DirectCopyDest:
 			case ResourceLayout::ComputeCopyDest:
