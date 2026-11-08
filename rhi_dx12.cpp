@@ -2644,6 +2644,8 @@ namespace rhi {
 					out->vertexBufferArguments = true;
 					out->indirectBindings = false;
 					out->maxSequenceCount = UINT32_MAX;  // ExecuteIndirect's MaxCommandCount has no device limit
+					if (h->structVersion >= 3)
+						out->countedDraws = true;  // ExecuteIndirect's count buffer is core D3D12
 				} break;
 				default:
 					// Unknown sType: ignore

@@ -209,7 +209,7 @@ struct WorkGraphFeatureInfo {
 };
 
 struct IndirectCommandsFeatureInfo {
-    FeatureInfoHeader header{ FeatureInfoStructType::IndirectCommands, nullptr, sizeof(IndirectCommandsFeatureInfo), 2 };
+    FeatureInfoHeader header{ FeatureInfoStructType::IndirectCommands, nullptr, sizeof(IndirectCommandsFeatureInfo), 3 };
 
     bool constantArguments = false;    // Constant arguments in a command signature
     bool indexBufferArguments = false; // IndexBuffer arguments (D3D12 index buffer view layout)
@@ -223,4 +223,7 @@ struct IndirectCommandsFeatureInfo {
     // of a larger layout's constants in memory, so a command signature whose Constant argument reaches past it is refused.
     // 0: no limit beyond the layout's own.
     uint32_t constantArgumentBytes = 0;
+    // (structVersion 3) ExecuteIndirect with a count buffer draws the count it reads (Vulkan's drawIndirectCount). Without it, a
+    // single-draw signature draws its max count.
+    bool countedDraws = false;
 };

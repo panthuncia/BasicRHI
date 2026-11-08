@@ -642,6 +642,7 @@ namespace rhi {
 		bool taskShaderEnabled = false;
 		bool meshShaderPipelineStatsEnabled = false;
 		bool deviceGeneratedCommandsEnabled = false;
+		bool drawIndirectCountEnabled = false;  // Vulkan 1.2 drawIndirectCount: vkCmdDraw*IndirectCount
 		bool dynamicGeneratedPipelineLayoutEnabled = false;
 		bool dynamicRenderingEnabled = false;
 		// VK_KHR_maintenance5: pipeline create flags go in VkPipelineCreateFlags2CreateInfo; without it (AMD's legacy Polaris driver)

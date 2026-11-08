@@ -9063,6 +9063,8 @@ namespace rhi {
 						// kPushConstantBytes (VulkanPipelineLayout::pushedBytes); the descriptor-heap model pushes all of them.
 						out->constantArgumentBytes = VkDescriptorBufferModel(impl) ? VulkanDescriptorBufferModel::kPushedPrefixBytes : 0u;
 					}
+					if (header->structVersion >= 3)
+						out->countedDraws = impl->drawIndirectCountEnabled && vkCmdDrawIndexedIndirectCount;
 				} break;
 
 				default:
@@ -12052,6 +12054,7 @@ namespace rhi {
 		impl->taskShaderEnabled = e.meshShader.taskShader == VK_TRUE;
 		impl->meshShaderPipelineStatsEnabled = e.meshShader.meshShaderQueries == VK_TRUE;
 		impl->deviceGeneratedCommandsEnabled = e.deviceGeneratedCommands.deviceGeneratedCommands == VK_TRUE;
+		impl->drawIndirectCountEnabled = e.vulkan12.drawIndirectCount == VK_TRUE;
 		impl->dynamicGeneratedPipelineLayoutEnabled = e.deviceGeneratedCommands.dynamicGeneratedPipelineLayout == VK_TRUE;
 		impl->dynamicRenderingEnabled = e.vulkan13.dynamicRendering == VK_TRUE;
 		impl->shaderDemoteToHelperInvocationEnabled = e.vulkan13.shaderDemoteToHelperInvocation == VK_TRUE;
