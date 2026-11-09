@@ -3607,6 +3607,10 @@ namespace rhi {
 		// exists. They need a preview Agility SDK and Windows Developer Mode. When either is
 		// missing the device is still created and reports the raytracing it does have.
 		bool enablePreviewRayTracing = false;
+		// Vulkan: native crash markers and fault reports (VK_AMD_buffer_marker, VK_NV_device_diagnostic_checkpoints,
+		// VK_EXT_device_fault, whichever the device has), logged on device loss. BASICRHI_VK_CRASH_MARKERS=1 turns it on
+		// too. Off by default: markers cost a write per command list boundary and debug label. D3D12 ignores it.
+		bool enableCrashMarkers = false;
 	};
 
 	// Accepts any blob exposing GetBufferPointer/GetBufferSize (ID3DBlob, IDxcBlob) without

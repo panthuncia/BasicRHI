@@ -2929,6 +2929,48 @@ namespace {
 	}
 #endif
 
+	// Native crash markers (BASICRHI_VK_CRASH_MARKERS=1): a named list with nested labels, submitted and waited for, must show
+	// in the dump with its markers finished. Skipped when the device runs without them.
+	rhi::Result ValidateCrashMarkers(rhi::Device& device, rhi::Queue& queue) {
+		const rhi::vulkan::CrashDiagnosticsState state = rhi::vulkan::GetCrashDiagnostics(device);
+		std::printf("BasicRHIVulkanSmoke: crash markers: VK_EXT_device_fault %s, VK_AMD_buffer_marker %s, VK_NV_device_diagnostic_checkpoints %s\n",
+			state.deviceFault ? "on" : "off", state.bufferMarkers ? "on" : "off", state.checkpoints ? "on" : "off");
+		if (!state.deviceFault && !state.bufferMarkers && !state.checkpoints) {
+			std::puts("BasicRHIVulkanSmoke: crash marker validation skipped (BASICRHI_VK_CRASH_MARKERS is not 1, or the device has no source)");
+			return rhi::Result::Ok;
+		}
+		rhi::CommandAllocatorPtr allocator;
+		rhi::CommandListPtr list;
+		if (Check(device.CreateCommandAllocator(rhi::QueueKind::Graphics, allocator), "CreateCommandAllocator (crash markers)") != rhi::Result::Ok ||
+			Check(device.CreateCommandList(rhi::QueueKind::Graphics, allocator.Get(), list), "CreateCommandList (crash markers)") != rhi::Result::Ok) {
+			return rhi::Result::Failed;
+		}
+		rhi::CommandList commandList = list.Get();
+		commandList.SetName("CrashMarkerSmoke");
+		if (commandList.SupportsDebugLabels()) {
+			const float color[4] = { 1.0f, 0.5f, 0.0f, 1.0f };
+			commandList.vt->beginDebugLabel(&commandList, color, "Smoke outer pass");
+			commandList.vt->insertDebugLabel(&commandList, color, "Smoke inserted label");
+			commandList.vt->beginDebugLabel(&commandList, color, "Smoke inner pass");
+			commandList.vt->endDebugLabel(&commandList);
+			commandList.vt->endDebugLabel(&commandList);
+		}
+		commandList.End();
+		const rhi::CommandList lists[] = { commandList };
+		if (Check(queue.Submit(lists, {}), "Queue::Submit (crash markers)") != rhi::Result::Ok ||
+			Check(device.WaitIdle(), "Device::WaitIdle (crash markers)") != rhi::Result::Ok) {
+			return rhi::Result::Failed;
+		}
+		const uint32_t lines = rhi::vulkan::DumpCrashDiagnostics(device, false);
+		std::printf("BasicRHIVulkanSmoke: crash marker dump logged %u lines\n", lines);
+		if (state.bufferMarkers && lines == 0) {
+			std::fprintf(stderr, "crash markers: VK_AMD_buffer_marker is on, but the dump found no list markers\n");
+			return rhi::Result::Failed;
+		}
+		std::puts("BasicRHIVulkanSmoke: crash markers OK");
+		return rhi::Result::Ok;
+	}
+
 	// Memory budget: QueryVideoMemoryInfo per segment group and QueryMemoryHeapBudgets per heap. The local budget must be
 	// non-zero, and with VK_EXT_memory_budget the local usage too (the smoke has allocated by now). The segment sums must
 	// match the heaps they group.
@@ -3272,6 +3314,10 @@ int main() {
 	}
 
 	if (ValidateMemoryBudget(device.Get()) != rhi::Result::Ok) {
+		return 1;
+	}
+
+	if (ValidateCrashMarkers(device.Get(), graphicsQueue) != rhi::Result::Ok) {
 		return 1;
 	}
 

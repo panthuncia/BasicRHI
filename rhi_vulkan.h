@@ -12,6 +12,7 @@ using namespace volk;
 #endif
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -20,6 +21,7 @@ using namespace volk;
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <vector>
 
@@ -455,6 +457,10 @@ namespace rhi {
 		QueueKind kind = QueueKind::Graphics;
 		Result pendingError = Result::Ok;
 		bool isRecording = false;
+		// Native crash markers (VulkanCrashMarkers): the list's slot pair, given at its first marker, and its open debug
+		// labels' marker names.
+		uint32_t crashMarkerSlot = UINT32_MAX;
+		std::vector<const char*> crashLabelStack;
 		// A secondary (VK_COMMAND_BUFFER_LEVEL_SECONDARY, Device::CreateSecondaryCommandList).
 		bool secondary = false;
 		// This recording of a secondary continues the executing primary's rendering (BeginSecondary with insideRendering):
@@ -581,6 +587,34 @@ namespace rhi {
 		uint32_t staticSamplersUsed = 0;
 	};
 
+	// Native crash diagnostics on a device BasicRHI created (DeviceCreateInfo::enableCrashMarkers or
+	// BASICRHI_VK_CRASH_MARKERS=1). Markers are written at command list begin and end and at every debug label, with
+	// VK_AMD_buffer_marker and VK_NV_device_diagnostic_checkpoints when present. VK_EXT_device_fault is queried on device
+	// loss. An adopted device uses its host's checkpoint callbacks instead (VulkanDevice::registerCheckpoint).
+	struct VulkanCrashMarkers {
+		// Command lists that hold a marker slot pair: the last marker the GPU began (top of pipe) and the last it finished
+		// (bottom of pipe). Lists past this many share slots.
+		static constexpr uint32_t kSlots = 1024;
+		// Marker ids remembered with their names; older ids show as overwritten.
+		static constexpr uint32_t kHistory = 8192;
+		bool enabled = false;
+		bool deviceFault = false;
+		bool deviceFaultVendorBinary = false;
+		bool bufferMarkers = false;
+		bool checkpoints = false;
+		VkBuffer buffer = VK_NULL_HANDLE;
+		VkDeviceMemory memory = VK_NULL_HANDLE;
+		volatile uint32_t* mapped = nullptr;  // kSlots pairs of { begun, finished } marker ids
+		std::atomic<uint32_t> nextSlot{ 0 };
+		std::atomic<bool> lossReported{ false };
+		std::mutex mutex;  // guards everything below
+		uint32_t nextId = 1;
+		std::array<uint32_t, kHistory> historyIds{};
+		std::array<const char*, kHistory> historyNames{};
+		std::array<const char*, kSlots> slotNames{};  // the command list's name (SetName) per slot
+		std::unordered_set<std::string> names;  // interned, so the pointers above stay valid
+	};
+
 	struct VulkanDevice {
 		~VulkanDevice();
 		void Shutdown() noexcept;
@@ -673,6 +707,7 @@ namespace rhi {
 		bool debugUtilsEnabled = false;
 		// VK_EXT_memory_budget: per-heap budgets and usage for QueryVideoMemoryInfo and QueryMemoryHeapBudgets.
 		bool memoryBudgetEnabled = false;
+		VulkanCrashMarkers crashMarkers;
 		PFN_vkCmdSetCheckpointNV setCheckpoint = nullptr;
 		void* checkpointUser = nullptr;
 		const void* (*registerCheckpoint)(void*, const char*) noexcept = nullptr;
