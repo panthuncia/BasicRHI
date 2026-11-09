@@ -429,6 +429,10 @@ if(BASICRHI_BUILD_TESTS)
     if(BASICRHI_ENABLE_D3D12 AND WIN32)
         add_executable(BasicRHID3D12AliasingSmoke tests/D3D12AliasingSmoke.cpp)
         target_link_libraries(BasicRHID3D12AliasingSmoke PRIVATE BasicRHI::BasicRHI)
+        # Stencil, blend factor and dynamic viewport/scissor draws; the shaders are compiled at run time (d3dcompiler).
+        add_executable(BasicRHID3D12FixedFunctionSmoke tests/D3D12FixedFunctionSmoke.cpp)
+        target_link_libraries(BasicRHID3D12FixedFunctionSmoke PRIVATE BasicRHI::BasicRHI d3dcompiler)
+        add_test(NAME BasicRHID3D12FixedFunctionSmoke COMMAND BasicRHID3D12FixedFunctionSmoke)
 
         # Clustered raytracing needs the preview runtime and SM 6.10 compiler the renderer ships beside BasicRHI.
         set(_basicrhi_rt_tools "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer")
