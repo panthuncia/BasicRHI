@@ -177,6 +177,28 @@ namespace rhi::vulkan {
     // The binding model a Vulkan device runs on (one BindingModelBits value), 0 for a device of another backend.
     uint32_t GetBindingModel(rhi::Device device) noexcept;
 
+    /// One memory heap's budget and usage (VK_EXT_memory_budget).
+    struct MemoryHeapBudget {
+        uint32_t heapIndex = 0;
+        VkMemoryHeapFlags flags = 0;
+        uint64_t heapSize = 0;
+        // VK_EXT_memory_budget was enabled: budget and usage are the driver's. Without it the budget is the heap's size and
+        // the usage is 0.
+        bool hasBudget = false;
+        uint64_t budget = 0;  // heapBudget: what the process can use before the OS starts demoting its memory
+        uint64_t usage = 0;   // heapUsage: what the whole process uses, not BasicRHI alone
+        // The usage reached the budget. AMD's Windows driver clamps heapUsage to heapBudget, so the real usage can be
+        // higher: do not derive memory outside your own allocations as usage minus them while this is set.
+        bool usageAtBudget = false;
+    };
+
+    /// Queries the budget and usage of every memory heap of a Vulkan device.
+    /// @param device A device from CreateVulkanDevice or AdoptVulkanDevice.
+    /// @param out Receives up to capacity heaps, in heap order. May be null when capacity is 0.
+    /// @param capacity The number of entries out holds.
+    /// @return The device's heap count (0 for a device of another backend); fewer than that are written when capacity is smaller.
+    uint32_t QueryMemoryHeapBudgets(rhi::Device device, MemoryHeapBudget* out, uint32_t capacity) noexcept;
+
     // Non-owning import of a host image. currentLayout is the layout the image is in
     // when BasicRHI first uses it; the host keeps ownership of image and memory.
     struct ImportedImageDesc {

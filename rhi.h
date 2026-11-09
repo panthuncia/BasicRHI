@@ -2860,6 +2860,9 @@ namespace rhi {
 		uint64_t currentUsageBytes = 0;            // current usage
 		uint64_t availableForReservationBytes = 0; // how much can be reserved
 		uint64_t currentReservationBytes = 0;      // current reservation level
+		// Vulkan: the usage of a heap in the group reached its budget. AMD's driver clamps usage to the budget, so the real
+		// usage can be higher: usage minus the caller's own allocations is not a reliable count of other memory then.
+		bool usageAtBudget = false;
 	};
 
 	struct CommandListVTable {

@@ -3972,6 +3972,34 @@ namespace rhi {
 			return total;
 		}
 
+		// Every heap's budget and usage: VK_EXT_memory_budget's when it is enabled, otherwise the heap's size as its budget and
+		// no usage. Writes up to capacity heaps and returns the heap count.
+		static uint32_t VkQueryHeapBudgets(const VulkanDevice& impl, vulkan::MemoryHeapBudget* out, uint32_t capacity) noexcept {
+			VkPhysicalDeviceMemoryBudgetPropertiesEXT budgetProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+			VkPhysicalDeviceMemoryProperties2 properties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2 };
+			const bool hasBudget = impl.memoryBudgetEnabled && vkGetPhysicalDeviceMemoryProperties2 != nullptr;
+			if (hasBudget) {
+				properties.pNext = &budgetProperties;
+				vkGetPhysicalDeviceMemoryProperties2(impl.physicalDevice, &properties);
+			} else {
+				properties.memoryProperties = impl.memoryProperties;
+			}
+			const VkPhysicalDeviceMemoryProperties& memory = properties.memoryProperties;
+			const uint32_t count = (std::min)(memory.memoryHeapCount, static_cast<uint32_t>(VK_MAX_MEMORY_HEAPS));
+			for (uint32_t heapIndex = 0; out && heapIndex < (std::min)(count, capacity); ++heapIndex) {
+				vulkan::MemoryHeapBudget& heap = out[heapIndex];
+				heap = {};
+				heap.heapIndex = heapIndex;
+				heap.flags = memory.memoryHeaps[heapIndex].flags;
+				heap.heapSize = memory.memoryHeaps[heapIndex].size;
+				heap.hasBudget = hasBudget;
+				heap.budget = hasBudget ? budgetProperties.heapBudget[heapIndex] : heap.heapSize;
+				heap.usage = hasBudget ? budgetProperties.heapUsage[heapIndex] : 0;
+				heap.usageAtBudget = hasBudget && heap.budget != 0 && heap.usage >= heap.budget;
+			}
+			return count;
+		}
+
 		static QueryResultInfo qp_getQueryResultInfo(QueryPool* qp) noexcept {
 			auto* impl = qp ? static_cast<VulkanDevice*>(qp->impl) : nullptr;
 			VulkanQueryPool* queryPool = VkQueryPoolState(impl, qp ? qp->GetHandle() : QueryPoolHandle{});
@@ -9079,6 +9107,9 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// D3D12's QueryVideoMemoryInfo from the heaps: Local sums the device-local heaps, NonLocal the others (the grouping
+		// AdapterInfo uses). Budget and usage are VK_EXT_memory_budget's; without it the budget is the heaps' size and the usage
+		// is 0. Vulkan has no reservations: what can be reserved is the budget, and nothing is reserved.
 		static Result d_queryVideoMemoryInfo(const Device* device, uint32_t nodeIndex, MemorySegmentGroup segmentGroup, VideoMemoryInfo& out) noexcept {
 			VkIgnoreUnused(nodeIndex);
 			auto* impl = device ? static_cast<const VulkanDevice*>(device->impl) : nullptr;
@@ -9088,17 +9119,20 @@ namespace rhi {
 			}
 
 			out = {};
-			switch (segmentGroup) {
-			case MemorySegmentGroup::Local:
-				out.budgetBytes = VkSumHeapBudget(impl->memoryProperties, true);
-				break;
-			case MemorySegmentGroup::NonLocal:
-				out.budgetBytes = VkSumHeapBudget(impl->memoryProperties, false);
-				break;
-			default:
+			if (segmentGroup != MemorySegmentGroup::Local && segmentGroup != MemorySegmentGroup::NonLocal) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
-
+			const bool wantLocal = segmentGroup == MemorySegmentGroup::Local;
+			std::array<vulkan::MemoryHeapBudget, VK_MAX_MEMORY_HEAPS> heaps{};
+			const uint32_t count = VkQueryHeapBudgets(*impl, heaps.data(), static_cast<uint32_t>(heaps.size()));
+			for (uint32_t heapIndex = 0; heapIndex < count; ++heapIndex) {
+				const vulkan::MemoryHeapBudget& heap = heaps[heapIndex];
+				if (((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) != wantLocal) continue;
+				out.budgetBytes += heap.budget;
+				out.currentUsageBytes += heap.usage;
+				out.usageAtBudget = out.usageAtBudget || heap.usageAtBudget;
+			}
+			out.availableForReservationBytes = out.budgetBytes;
 			return Result::Ok;
 		}
 
@@ -12020,11 +12054,13 @@ namespace rhi {
 		bool externalMemoryWin32 = false;
 		bool externalSemaphoreWin32 = false;
 		bool maintenance5 = false;  // VK_KHR_maintenance5 enabled
+		bool memoryBudget = false;  // VK_EXT_memory_budget enabled
 		VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipelineExecutableProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
 	};
 
 	static void VkApplyEnabledDeviceState(VulkanDevice* impl, const VkEnabledDeviceState& e) noexcept {
 		impl->maintenance5Enabled = e.maintenance5;
+		impl->memoryBudgetEnabled = e.memoryBudget;
 		impl->pipelineExecutableInfoEnabled = e.pipelineExecutableProperties.pipelineExecutableInfo == VK_TRUE;
 		impl->accelerationStructureFeatures = e.accelerationStructure;
 		impl->rayTracingPipelineFeatures = e.rayTracingPipeline;
@@ -13350,6 +13386,12 @@ namespace rhi {
 		}
 #endif
 
+		// Memory budget and crash diagnostics: extensions that change nothing until they are queried.
+		const bool hasMemoryBudgetExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+		if (hasMemoryBudgetExtension) {
+			appendUniqueName(enabledDeviceExtensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+		}
+
 		VkDeviceCreateInfo deviceCreateInfo{};
 		deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		deviceCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
@@ -13479,6 +13521,7 @@ namespace rhi {
 			enabled.externalSemaphoreWin32 = ci.enableExternalInterop && hasExternalSemaphoreWin32Extension;
 			enabled.maintenance5 = std::any_of(enabledDeviceExtensions.begin(), enabledDeviceExtensions.end(),
 				[](const char* a_name) { return std::strcmp(a_name, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0; });
+			enabled.memoryBudget = hasMemoryBudgetExtension;
 			VkApplyEnabledDeviceState(impl.get(), enabled);
 		}
 		impl->validateBarrierTransitions = ci.validateBarrierTransitions;
@@ -13766,6 +13809,7 @@ namespace rhi {
 			enabled.externalSemaphoreWin32 = hasExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
 			enabled.maintenance5 = hasExtension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 #endif
+			enabled.memoryBudget = hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 
 			auto impl = std::make_shared<VulkanDevice>();
 			impl->selfWeak = impl;
@@ -13921,6 +13965,13 @@ namespace rhi {
 			case VulkanBindingModel::DescriptorBuffer: return BindingModel_DescriptorBuffer;
 			default: return 0;
 			}
+		}
+
+		uint32_t QueryMemoryHeapBudgets(Device device, MemoryHeapBudget* out, uint32_t capacity) noexcept {
+			if (!device || device.vt != &g_vkdevvt || !device.impl) return 0;
+			const auto* impl = static_cast<const VulkanDevice*>(device.impl);
+			if (impl->physicalDevice == VK_NULL_HANDLE) return 0;
+			return VkQueryHeapBudgets(*impl, out, capacity);
 		}
 
 		Result import_image(Device device, const ImportedImageDesc& desc, ResourcePtr& out) noexcept {

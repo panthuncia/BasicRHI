@@ -671,6 +671,8 @@ namespace rhi {
 		// VK_EXT_debug_utils was enabled on the instance: object names and command buffer labels may
 		// be issued. volk resolves the entry points whether or not it was, so a null check is not enough.
 		bool debugUtilsEnabled = false;
+		// VK_EXT_memory_budget: per-heap budgets and usage for QueryVideoMemoryInfo and QueryMemoryHeapBudgets.
+		bool memoryBudgetEnabled = false;
 		PFN_vkCmdSetCheckpointNV setCheckpoint = nullptr;
 		void* checkpointUser = nullptr;
 		const void* (*registerCheckpoint)(void*, const char*) noexcept = nullptr;
