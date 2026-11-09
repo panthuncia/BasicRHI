@@ -5660,9 +5660,9 @@ namespace rhi {
 		// preprocess and runs the execution, so the scratch lives as long as both, whatever becomes of stateList) with that
 		// address at the layout's spillAddressOffset. Pushed whole onto stateList now and onto the executing list before the
 		// execution, so both see identical push constants.
-		static_assert(VulkanDescriptorBufferModel::kPushConstantBytes == sizeof(VulkanCommandList::PreprocessedIndirect::pushConstants));
+		static_assert(VulkanDescriptorBufferModel::kMaxPushConstantBytes == sizeof(VulkanCommandList::PreprocessedIndirect::pushConstants));
 		static bool VkBufferModelPreprocessPushConstants(VulkanDevice* impl, VulkanCommandList& stateList, VulkanCommandList& a_scratchList,
-			std::array<uint8_t, VulkanDescriptorBufferModel::kPushConstantBytes>& outImage) noexcept {
+			std::array<uint8_t, VulkanDescriptorBufferModel::kMaxPushConstantBytes>& outImage) noexcept {
 			outImage.fill(0u);
 			const VulkanPipelineLayout* layoutState = VkPipelineLayoutState(impl, stateList.boundLayout);
 			if (!layoutState || !layoutState->usesDescriptorBuffer) {
@@ -5686,7 +5686,7 @@ namespace rhi {
 				std::memcpy(outImage.data() + layoutState->spillAddressOffset, &spillAddress, sizeof(spillAddress));
 			}
 			vkCmdPushConstants(stateList.commandBuffer, impl->descriptorBuffer.pipelineLayout, VK_SHADER_STAGE_ALL, 0,
-				static_cast<uint32_t>(outImage.size()), outImage.data());
+				impl->descriptorBuffer.pushConstantBytes, outImage.data());
 			// The state list's own commands upload their spill again: this one is the executing list's.
 			stateList.pushedDataDirty = false;
 			stateList.spilledDataDirty = layoutState->spillAddressOffset != vulkan_binding::kNoSpill;
@@ -6601,14 +6601,14 @@ namespace rhi {
 					generatedInfo.preprocessAddress = match->preprocessAddress;
 					generatedInfo.preprocessSize = match->preprocessSize;
 					const bool pushConstantsRecorded = match->pushConstantsRecorded;
-					const std::array<uint8_t, VulkanDescriptorBufferModel::kPushConstantBytes> recordedPushConstants = match->pushConstants;
+					const std::array<uint8_t, VulkanDescriptorBufferModel::kMaxPushConstantBytes> recordedPushConstants = match->pushConstants;
 					preprocessed.erase(match);
 					if (!commandListState->passActive)
 						VkFlushPreprocessBarrier(*commandListState);
 					if (pushConstantsRecorded) {
 						// Exactly the push constants the preprocess saw (VkBufferModelPreprocessPushConstants).
 						vkCmdPushConstants(commandListState->commandBuffer, impl->descriptorBuffer.pipelineLayout, VK_SHADER_STAGE_ALL, 0,
-							static_cast<uint32_t>(recordedPushConstants.size()), recordedPushConstants.data());
+							impl->descriptorBuffer.pushConstantBytes, recordedPushConstants.data());
 					}
 					else {
 						VkFlushPendingPushData(impl, *commandListState);
@@ -7537,7 +7537,7 @@ namespace rhi {
 				target.samplerBinding = 0;
 				target.pushedBytes = layoutState.pushedBytes;
 				target.spillAddressOffset = layoutState.spillAddressOffset;
-				target.pushConstantBytes = VulkanDescriptorBufferModel::kPushConstantBytes;
+				target.pushConstantBytes = impl->descriptorBuffer.pushConstantBytes;
 				// What the heap model's contract guarantees of the addresses shaders read (rhi_vulkan_spirv_lowering.h), and the
 				// alignment of the scratch the spill image is uploaded to (VkAllocateEmulatedRootConstantScratch).
 				target.recordAlignment = 8;
@@ -8761,24 +8761,24 @@ namespace rhi {
 			}
 
 			if (VkDescriptorBufferModel(impl)) {
-				// The push data image reaches shaders through the universal layout's kPushConstantBytes of push constants. A layout
+				// The push data image reaches shaders through the universal layout's pushConstantBytes of push constants. A layout
 				// that fits is pushed whole. A larger one pushes a strict prefix of its ranges in declaration order - those ending
-				// within kPushedPrefixBytes, stopping at the first that does not (ranges are never split) - and spills the rest to
-				// memory, whose address is the push constant at kSpillAddressOffset.
-				using Model = VulkanDescriptorBufferModel;
-				if (layoutState.totalPushDataBytes <= Model::kPushConstantBytes) {
+				// within pushedPrefixBytes, stopping at the first that does not (ranges are never split) - and spills the rest to
+				// memory, whose address is the push constant at spillAddressOffset.
+				const VulkanDescriptorBufferModel& model = impl->descriptorBuffer;
+				if (layoutState.totalPushDataBytes <= model.pushConstantBytes) {
 					layoutState.pushedBytes = layoutState.totalPushDataBytes;
 					layoutState.spillAddressOffset = vulkan_binding::kNoSpill;
 				}
 				else {
 					layoutState.pushedBytes = 0;
 					for (const VulkanPushConstantRange& range : layoutState.pushConstantRanges) {
-						if (range.byteOffset + range.byteSize > Model::kPushedPrefixBytes) {
+						if (range.byteOffset + range.byteSize > model.pushedPrefixBytes) {
 							break;
 						}
 						layoutState.pushedBytes = range.byteOffset + range.byteSize;
 					}
-					layoutState.spillAddressOffset = Model::kSpillAddressOffset;
+					layoutState.spillAddressOffset = model.spillAddressOffset;
 				}
 				if (const Result result = VkRegisterStaticSamplers(impl, layoutState); result != Result::Ok) {
 					out.Reset();
@@ -9063,9 +9063,9 @@ namespace rhi {
 					out->indirectBindings = VkBindlessModel(impl);
 					out->maxSequenceCount = generated ? dgcProperties.maxIndirectSequenceCount : 0;
 					if (header->structVersion >= 2) {
-						// The descriptor-buffer model pushes a layout's root constants within kPushedPrefixBytes when they exceed
-						// kPushConstantBytes (VulkanPipelineLayout::pushedBytes); the descriptor-heap model pushes all of them.
-						out->constantArgumentBytes = VkDescriptorBufferModel(impl) ? VulkanDescriptorBufferModel::kPushedPrefixBytes : 0u;
+						// The descriptor-buffer model pushes a layout's root constants within pushedPrefixBytes when they exceed
+						// pushConstantBytes (VulkanPipelineLayout::pushedBytes); the descriptor-heap model pushes all of them.
+						out->constantArgumentBytes = VkDescriptorBufferModel(impl) ? impl->descriptorBuffer.pushedPrefixBytes : 0u;
 					}
 					if (header->structVersion >= 3)
 						out->countedDraws = impl->drawIndirectCountEnabled && vkCmdDrawIndexedIndirectCount;
@@ -9257,7 +9257,7 @@ namespace rhi {
 							spdlog::error("Vulkan CreateCommandSignature: the Constant argument for root parameter {} writes push data bytes [{}, {}), past the {} "
 								"bytes this layout pushes in the descriptor-buffer model (its later ranges are spilled to memory); declare that range "
 								"first or keep the layout's root constants within {} bytes", rootIndex, pushToken.updateRange.offset,
-								pushToken.updateRange.offset + pushToken.updateRange.size, layoutState->pushedBytes, VulkanDescriptorBufferModel::kPushedPrefixBytes);
+								pushToken.updateRange.offset + pushToken.updateRange.size, layoutState->pushedBytes, impl->descriptorBuffer.pushedPrefixBytes);
 							out.Reset();
 							RHI_FAIL(Result::InvalidArgument);
 						}
@@ -12240,7 +12240,7 @@ namespace rhi {
 			feature(bufferSupported, kBuffer, "shaderStorageTexelBufferArrayNonUniformIndexing", features12.shaderStorageTexelBufferArrayNonUniformIndexing == VK_TRUE);
 
 			const VkPhysicalDeviceLimits& limits = properties.limits;
-			atLeast(bufferSupported, kBuffer, "maxPushConstantsSize", VulkanDescriptorBufferModel::kPushConstantBytes, limit(limits.maxPushConstantsSize, 128));
+			atLeast(bufferSupported, kBuffer, "maxPushConstantsSize", VulkanDescriptorBufferModel::kMinPushConstantBytes, limit(limits.maxPushConstantsSize, 128));
 			uint64_t resourceLimit = (std::numeric_limits<uint32_t>::max)();
 			const auto resourceLimitOf = [&](const char* name, uint64_t device, uint64_t baseSpecMinimum) {
 				const uint64_t value = limit(device, baseSpecMinimum);
@@ -12514,7 +12514,12 @@ namespace rhi {
 		vkGetDescriptorSetLayoutBindingOffsetEXT(impl->device, model.samplerSetLayout, 0, &model.samplerBindingOffset);
 
 		const std::array<VkDescriptorSetLayout, 2> setLayouts{ model.resourceSetLayout, model.samplerSetLayout };
-		const VkPushConstantRange pushRange{ VK_SHADER_STAGE_ALL, 0, VulkanDescriptorBufferModel::kPushConstantBytes };
+		// The device's whole push range (a multiple of 8, for the spill address in its last 8 bytes).
+		model.pushConstantBytes = (std::clamp)(impl->physicalDeviceProperties.limits.maxPushConstantsSize, VulkanDescriptorBufferModel::kMinPushConstantBytes,
+			VulkanDescriptorBufferModel::kMaxPushConstantBytes) & ~7u;
+		model.pushedPrefixBytes = model.pushConstantBytes - 8;
+		model.spillAddressOffset = model.pushConstantBytes - 8;
+		const VkPushConstantRange pushRange{ VK_SHADER_STAGE_ALL, 0, model.pushConstantBytes };
 		VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
 		layoutInfo.setLayoutCount = static_cast<uint32_t>(setLayouts.size());
 		layoutInfo.pSetLayouts = setLayouts.data();
@@ -12542,8 +12547,8 @@ namespace rhi {
 			"structures {}), sampler heap {} + {} static x {} bytes (binding offset {}), push constants {} bytes (pushed prefix {} when spilling), "
 			"descriptorBufferOffsetAlignment {}, robust buffer descriptors {}, sampler budget {}", caller, model.resourceCapacity, model.resourceStride,
 			model.resourceBindingOffset, model.uniformBuffers, model.accelerationStructures, model.samplerCapacity,
-			model.staticSamplerCapacity, model.samplerStride, model.samplerBindingOffset, VulkanDescriptorBufferModel::kPushConstantBytes,
-			VulkanDescriptorBufferModel::kPushedPrefixBytes, static_cast<uint64_t>(properties.descriptorBufferOffsetAlignment), robust, model.samplerBudget);
+			model.staticSamplerCapacity, model.samplerStride, model.samplerBindingOffset, model.pushConstantBytes,
+			model.pushedPrefixBytes, static_cast<uint64_t>(properties.descriptorBufferOffsetAlignment), robust, model.samplerBudget);
 		return Result::Ok;
 	}
 

@@ -494,9 +494,9 @@ namespace rhi {
 			VkDeviceAddress preprocessAddress = 0;
 			VkDeviceSize preprocessSize = 0;
 			// Descriptor-buffer model: the universal layout's whole push constant range (VulkanDescriptorBufferModel::
-			// kPushConstantBytes) as the preprocess saw it - the pushed prefix and the spill address, whose scratch is this list's
-			// - pushed again, unchanged, before the execution (VUID-vkCmdExecuteGeneratedCommandsEXT-isPreprocessed-11048).
-			std::array<uint8_t, 128> pushConstants{};
+			// pushConstantBytes of it) as the preprocess saw it - the pushed prefix and the spill address, whose scratch is this
+			// list's - pushed again, unchanged, before the execution (VUID-vkCmdExecuteGeneratedCommandsEXT-isPreprocessed-11048).
+			std::array<uint8_t, 256> pushConstants{};
 			bool pushConstantsRecorded = false;
 		};
 		std::vector<PreprocessedIndirect> preprocessedIndirect;
@@ -531,12 +531,16 @@ namespace rhi {
 		// bound.
 		static constexpr uint32_t kMaxStaticSamplers = 256;
 		// The universal pipeline layout: set 0 the resource heap (one MUTABLE_EXT variable-count binding), set 1 the sampler
-		// heap (one SAMPLER variable-count binding), push constants [0, kPushConstantBytes) for every stage.
-		static constexpr uint32_t kPushConstantBytes = 128;
-		// A layout whose push data exceeds kPushConstantBytes pushes the ranges within kPushedPrefixBytes and spills the rest;
-		// the spill image's address is the push constant at kSpillAddressOffset.
-		static constexpr uint32_t kPushedPrefixBytes = 120;
-		static constexpr uint32_t kSpillAddressOffset = 120;
+		// heap (one SAMPLER variable-count binding), push constants [0, pushConstantBytes) for every stage: the device's
+		// maxPushConstantsSize, at least the base spec's 128 and at most kMaxPushConstantBytes. Spilled push data is read through
+		// pointers, which some drivers load per lane (AMD's: never scalar loads), so a device's whole push range is used.
+		static constexpr uint32_t kMinPushConstantBytes = 128;
+		static constexpr uint32_t kMaxPushConstantBytes = 256;
+		uint32_t pushConstantBytes = kMinPushConstantBytes;
+		// A layout whose push data exceeds pushConstantBytes pushes the ranges within pushedPrefixBytes and spills the rest;
+		// the spill image's address is the push constant at spillAddressOffset (the range's last 8 bytes).
+		uint32_t pushedPrefixBytes = kMinPushConstantBytes - 8;
+		uint32_t spillAddressOffset = kMinPushConstantBytes - 8;
 		VkDescriptorSetLayout resourceSetLayout = VK_NULL_HANDLE;
 		VkDescriptorSetLayout samplerSetLayout = VK_NULL_HANDLE;
 		VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
