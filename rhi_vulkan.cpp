@@ -3447,8 +3447,8 @@ namespace rhi {
 				return;
 			}
 
-			const VkImageLayout oldLayout = VkToImageLayout(resource.currentLayout, aspectMask);
-			const VkImageLayout targetLayout = VkToImageLayout(newLayout, aspectMask);
+			const VkImageLayout oldLayout = VkCommandLayout(resource, VkToImageLayout(resource.currentLayout, aspectMask));
+			const VkImageLayout targetLayout = VkCommandLayout(resource, VkToImageLayout(newLayout, aspectMask));
 			if (oldLayout == targetLayout) {
 				resource.currentLayout = newLayout;
 				return;
@@ -5440,8 +5440,10 @@ namespace rhi {
 				}
 				vkBarrier.srcAccessMask = (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire || internalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
 				vkBarrier.dstAccessMask = (afterPresent || externalRelease || internalRelease) ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
-				vkBarrier.oldLayout = (barrier.discard || firstUseFromUndefined) ? VK_IMAGE_LAYOUT_UNDEFINED : VkToImageLayout(barrier.beforeLayout, aspect);
-				vkBarrier.newLayout = VkToImageLayout(barrier.afterLayout, aspect);
+				// A simultaneous-access image stays in GENERAL (VkCommandLayout): its passes and descriptors name GENERAL, and so does its owner
+				// (DXVK) between them. Only an undefined first use or a discard leaves GENERAL out of the old layout.
+				vkBarrier.oldLayout = (barrier.discard || firstUseFromUndefined) ? VK_IMAGE_LAYOUT_UNDEFINED : VkCommandLayout(*resource, VkToImageLayout(barrier.beforeLayout, aspect));
+				vkBarrier.newLayout = VkCommandLayout(*resource, VkToImageLayout(barrier.afterLayout, aspect));
 				// A concurrent resource belongs to no single family: its external transfers name EXTERNAL and IGNORED.
 				const uint32_t externalLocalFamily = resource->concurrentSharing ? VK_QUEUE_FAMILY_IGNORED : recordingFamily;
 				vkBarrier.srcQueueFamilyIndex = externalAcquire ? VK_QUEUE_FAMILY_EXTERNAL : (externalRelease ? externalLocalFamily : ownershipSrcFamily);
