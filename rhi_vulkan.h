@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rhi.h"
+#include "rhi_pipeline_cache.h"
 
 #include "volk.h"
 
@@ -752,6 +753,18 @@ namespace rhi {
 		QueueHandle gfxHandle{};
 		QueueHandle compHandle{};
 		QueueHandle copyHandle{};
+		// The on-disk pipeline cache (Device::OpenPipelineCache). Pipeline creation reads `cache` under a shared lock, so
+		// threads create pipelines in parallel; opening and closing it take the lock exclusively.
+		struct PipelineCacheState {
+			mutable std::shared_mutex mutex;
+			VkPipelineCache cache = VK_NULL_HANDLE;
+			std::string path;
+			detail::PipelineCacheIdentity identity{};
+			// VK_EXT_pipeline_creation_feedback (core in 1.3) tells hits from misses.
+			bool creationFeedback = false;
+			std::mutex saveMutex;
+			detail::PipelineCacheCounters counters;
+		} pipelineCache;
 		std::weak_ptr<VulkanDevice> selfWeak;
 	};
 

@@ -1152,6 +1152,377 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// A pipeline layout's root signature carries the hash of its serialized description, so a pipeline cache key can
+		// name the root signature by content rather than by pointer.
+		static constexpr GUID kDx12RootSignatureHashGuid = { 0x5b8d2c61, 0x93a4, 0x4f0e, { 0x8c, 0x27, 0x1d, 0x6e, 0x4a, 0x90, 0xb3, 0x52 } };
+
+		// A subobject in a PSO stream is laid out as PsoStreamBuilder writes it: a PsoSubobject of its value type.
+		template<class T>
+		using Dx12StreamSlot = PsoSubobject<T, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MAX_VALID>;
+
+		template<class T>
+		static const T& Dx12StreamValue(const uint8_t* subobject) noexcept {
+			return *reinterpret_cast<const T*>(subobject + offsetof(Dx12StreamSlot<T>, Value));
+		}
+
+		template<class T>
+		static constexpr size_t Dx12StreamSubobjectSize() noexcept {
+			return sizeof(Dx12StreamSlot<T>);
+		}
+
+		static void Dx12HashStencilOp(detail::Fnv1a64& hash, const D3D12_DEPTH_STENCILOP_DESC& op) noexcept {
+			hash.AddValue(op.StencilFailOp);
+			hash.AddValue(op.StencilDepthFailOp);
+			hash.AddValue(op.StencilPassOp);
+			hash.AddValue(op.StencilFunc);
+		}
+
+		static void Dx12HashStencilOp1(detail::Fnv1a64& hash, const D3D12_DEPTH_STENCILOP_DESC1& op) noexcept {
+			hash.AddValue(op.StencilFailOp);
+			hash.AddValue(op.StencilDepthFailOp);
+			hash.AddValue(op.StencilPassOp);
+			hash.AddValue(op.StencilFunc);
+			hash.AddValue(op.StencilReadMask);
+			hash.AddValue(op.StencilWriteMask);
+		}
+
+		// The pipeline cache key of a PSO stream: every subobject by content, field by field where a struct has padding or
+		// pointers. False for a subobject this does not know, which leaves that pipeline uncached.
+		static bool Dx12PipelineStreamKey(const D3D12_PIPELINE_STATE_STREAM_DESC& stream, uint64_t& key) noexcept {
+			constexpr uint32_t kKeyVersion = 1u;
+			detail::Fnv1a64 hash;
+			hash.AddValue(kKeyVersion);
+			const auto* bytes = static_cast<const uint8_t*>(stream.pPipelineStateSubobjectStream);
+			size_t offset = 0;
+			while (offset < stream.SizeInBytes) {
+				const uint8_t* subobject = bytes + offset;
+				D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type{};
+				std::memcpy(&type, subobject, sizeof(type));
+				hash.AddValue(type);
+				size_t size = 0;
+				auto shader = [&]() {
+					const auto& bytecode = Dx12StreamValue<D3D12_SHADER_BYTECODE>(subobject);
+					hash.AddValue(static_cast<uint64_t>(bytecode.BytecodeLength));
+					hash.Add(bytecode.pShaderBytecode, bytecode.BytecodeLength);
+					size = Dx12StreamSubobjectSize<D3D12_SHADER_BYTECODE>();
+				};
+				auto plain = [&]<class T>(const T*) {
+					hash.AddValue(Dx12StreamValue<T>(subobject));
+					size = Dx12StreamSubobjectSize<T>();
+				};
+				switch (type) {
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: {
+					ID3D12RootSignature* root = Dx12StreamValue<ID3D12RootSignature*>(subobject);
+					uint64_t rootHash = 0;
+					UINT rootHashSize = sizeof(rootHash);
+					if (!root || FAILED(root->GetPrivateData(kDx12RootSignatureHashGuid, &rootHashSize, &rootHash)) || rootHashSize != sizeof(rootHash)) {
+						return false;
+					}
+					hash.AddValue(rootHash);
+					size = Dx12StreamSubobjectSize<ID3D12RootSignature*>();
+				} break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
+					shader();
+					break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: {
+					const auto& blend = Dx12StreamValue<D3D12_BLEND_DESC>(subobject);
+					hash.AddValue(blend.AlphaToCoverageEnable);
+					hash.AddValue(blend.IndependentBlendEnable);
+					for (const D3D12_RENDER_TARGET_BLEND_DESC& target : blend.RenderTarget) {
+						hash.AddValue(target.BlendEnable);
+						hash.AddValue(target.LogicOpEnable);
+						hash.AddValue(target.SrcBlend);
+						hash.AddValue(target.DestBlend);
+						hash.AddValue(target.BlendOp);
+						hash.AddValue(target.SrcBlendAlpha);
+						hash.AddValue(target.DestBlendAlpha);
+						hash.AddValue(target.BlendOpAlpha);
+						hash.AddValue(target.LogicOp);
+						hash.AddValue(target.RenderTargetWriteMask);
+					}
+					size = Dx12StreamSubobjectSize<D3D12_BLEND_DESC>();
+				} break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: {
+					const auto& depth = Dx12StreamValue<D3D12_DEPTH_STENCIL_DESC>(subobject);
+					hash.AddValue(depth.DepthEnable);
+					hash.AddValue(depth.DepthWriteMask);
+					hash.AddValue(depth.DepthFunc);
+					hash.AddValue(depth.StencilEnable);
+					hash.AddValue(depth.StencilReadMask);
+					hash.AddValue(depth.StencilWriteMask);
+					Dx12HashStencilOp(hash, depth.FrontFace);
+					Dx12HashStencilOp(hash, depth.BackFace);
+					size = Dx12StreamSubobjectSize<D3D12_DEPTH_STENCIL_DESC>();
+				} break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
+					const auto& depth = Dx12StreamValue<D3D12_DEPTH_STENCIL_DESC1>(subobject);
+					hash.AddValue(depth.DepthEnable);
+					hash.AddValue(depth.DepthWriteMask);
+					hash.AddValue(depth.DepthFunc);
+					hash.AddValue(depth.StencilEnable);
+					hash.AddValue(depth.StencilReadMask);
+					hash.AddValue(depth.StencilWriteMask);
+					Dx12HashStencilOp(hash, depth.FrontFace);
+					Dx12HashStencilOp(hash, depth.BackFace);
+					hash.AddValue(depth.DepthBoundsTestEnable);
+					size = Dx12StreamSubobjectSize<D3D12_DEPTH_STENCIL_DESC1>();
+				} break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: {
+					const auto& depth = Dx12StreamValue<D3D12_DEPTH_STENCIL_DESC2>(subobject);
+					hash.AddValue(depth.DepthEnable);
+					hash.AddValue(depth.DepthWriteMask);
+					hash.AddValue(depth.DepthFunc);
+					hash.AddValue(depth.StencilEnable);
+					Dx12HashStencilOp1(hash, depth.FrontFace);
+					Dx12HashStencilOp1(hash, depth.BackFace);
+					hash.AddValue(depth.DepthBoundsTestEnable);
+					size = Dx12StreamSubobjectSize<D3D12_DEPTH_STENCIL_DESC2>();
+				} break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: {
+					const auto& layout = Dx12StreamValue<D3D12_INPUT_LAYOUT_DESC>(subobject);
+					hash.AddValue(layout.NumElements);
+					for (UINT index = 0; index < layout.NumElements; ++index) {
+						const D3D12_INPUT_ELEMENT_DESC& element = layout.pInputElementDescs[index];
+						hash.AddString(element.SemanticName);
+						hash.AddValue(element.SemanticIndex);
+						hash.AddValue(element.Format);
+						hash.AddValue(element.InputSlot);
+						hash.AddValue(element.AlignedByteOffset);
+						hash.AddValue(element.InputSlotClass);
+						hash.AddValue(element.InstanceDataStepRate);
+					}
+					size = Dx12StreamSubobjectSize<D3D12_INPUT_LAYOUT_DESC>();
+				} break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
+					const auto& viewInstancing = Dx12StreamValue<D3D12_VIEW_INSTANCING_DESC>(subobject);
+					hash.AddValue(viewInstancing.ViewInstanceCount);
+					for (UINT index = 0; index < viewInstancing.ViewInstanceCount; ++index) {
+						hash.AddValue(viewInstancing.pViewInstanceLocations[index].ViewportArrayIndex);
+						hash.AddValue(viewInstancing.pViewInstanceLocations[index].RenderTargetArrayIndex);
+					}
+					hash.AddValue(viewInstancing.Flags);
+					size = Dx12StreamSubobjectSize<D3D12_VIEW_INSTANCING_DESC>();
+				} break;
+				// Structs of 4-byte fields: no padding, so their bytes are their content.
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: plain(static_cast<const UINT*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: plain(static_cast<const D3D12_RASTERIZER_DESC*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1: plain(static_cast<const D3D12_RASTERIZER_DESC1*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2: plain(static_cast<const D3D12_RASTERIZER_DESC2*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: plain(static_cast<const D3D12_INDEX_BUFFER_STRIP_CUT_VALUE*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: plain(static_cast<const D3D12_PRIMITIVE_TOPOLOGY_TYPE*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: plain(static_cast<const D3D12_RT_FORMAT_ARRAY*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: plain(static_cast<const DXGI_FORMAT*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: plain(static_cast<const DXGI_SAMPLE_DESC*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: plain(static_cast<const UINT*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: plain(static_cast<const D3D12_PIPELINE_STATE_FLAGS*>(nullptr)); break;
+				default:
+					return false;
+				}
+				offset += size;
+			}
+			key = hash.Value();
+			return true;
+		}
+
+		// Creates a PSO through the open pipeline cache, if any: loads it by key, or compiles and stores it.
+		static HRESULT Dx12CreatePipelineStateThroughCache(Dx12Device* impl, const D3D12_PIPELINE_STATE_STREAM_DESC& stream, ComPtr<ID3D12PipelineState>& pso) noexcept {
+			auto& state = impl->pipelineCache;
+			const std::shared_lock lock(state.mutex);
+			uint64_t key = 0;
+			if (!state.library || !Dx12PipelineStreamKey(stream, key)) {
+				return impl->pNativeDevice->CreatePipelineState(&stream, IID_PPV_ARGS(&pso));
+			}
+			wchar_t name[24]{};
+			std::swprintf(name, std::size(name), L"BRPC%016llX", static_cast<unsigned long long>(key));
+			bool stored = false;
+			{
+				const std::lock_guard keysLock(state.keysMutex);
+				stored = state.keys.contains(key);
+			}
+			if (stored) {
+				D3D12_PIPELINE_STATE_STREAM_DESC loadStream = stream;
+				const std::lock_guard stripe(state.keyStripes[key % state.keyStripes.size()]);
+				// A description that differs from the stored one under the same key fails here and is compiled below.
+				if (SUCCEEDED(state.library->LoadPipeline(name, &loadStream, IID_PPV_ARGS(&pso)))) {
+					++state.counters.hits;
+					return S_OK;
+				}
+			}
+			const HRESULT hr = impl->pNativeDevice->CreatePipelineState(&stream, IID_PPV_ARGS(&pso));
+			if (FAILED(hr)) {
+				return hr;
+			}
+			++state.counters.misses;
+			if (stored) {
+				return S_OK;
+			}
+			// Another thread may store the same key first; then this store fails and the pipeline is already cached.
+			if (SUCCEEDED(state.library->StorePipeline(name, pso.Get()))) {
+				const std::lock_guard keysLock(state.keysMutex);
+				state.keys.insert(key);
+				++state.counters.added;
+			}
+			return S_OK;
+		}
+
+		static detail::PipelineCacheIdentity Dx12PipelineCacheIdentity(const Dx12Device* impl) noexcept {
+			detail::PipelineCacheIdentity identity{};
+			identity.backend = static_cast<uint32_t>(Backend::D3D12);
+			if (impl->adapter) {
+				DXGI_ADAPTER_DESC1 desc{};
+				if (SUCCEEDED(impl->adapter->GetDesc1(&desc))) {
+					identity.vendorId = desc.VendorId;
+					identity.deviceId = desc.DeviceId;
+				}
+				LARGE_INTEGER driverVersion{};
+				if (SUCCEEDED(impl->adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driverVersion))) {
+					identity.driverVersion = static_cast<uint64_t>(driverVersion.QuadPart);
+				}
+			}
+			return identity;
+		}
+
+		// Drops the open library without saving it. The caller holds the cache's lock exclusively.
+		static void Dx12ClosePipelineCacheLocked(Dx12Device* impl) noexcept {
+			auto& state = impl->pipelineCache;
+			state.library.Reset();
+			state.blob.clear();
+			{
+				const std::lock_guard keysLock(state.keysMutex);
+				state.keys.clear();
+			}
+			state.path.clear();
+			state.counters.Reset(PipelineCacheLoadResult::Off, 0);
+		}
+
+		static Result Dx12OpenPipelineCache(Dx12Device* impl, const char* path) noexcept {
+			if (!impl || !impl->pNativeDevice) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			auto& state = impl->pipelineCache;
+			const std::unique_lock lock(state.mutex);
+			Dx12ClosePipelineCacheLocked(impl);
+			if (!path || !*path) {
+				return Result::Ok;
+			}
+			try {
+				state.identity = Dx12PipelineCacheIdentity(impl);
+				PipelineCacheLoadResult load = detail::ReadPipelineCacheFile(path, state.identity, state.blob);
+				// The payload: a key count, the keys, then the serialized library.
+				size_t libraryOffset = 0;
+				if (load == PipelineCacheLoadResult::Loaded) {
+					uint64_t keyCount = 0;
+					if (state.blob.size() >= sizeof(keyCount)) {
+						std::memcpy(&keyCount, state.blob.data(), sizeof(keyCount));
+					}
+					if (state.blob.size() < sizeof(keyCount) || keyCount > (state.blob.size() - sizeof(keyCount)) / sizeof(uint64_t)) {
+						load = PipelineCacheLoadResult::Corrupt;
+						state.blob.clear();
+					} else {
+						libraryOffset = sizeof(keyCount) + static_cast<size_t>(keyCount) * sizeof(uint64_t);
+						std::vector<uint64_t> keys(static_cast<size_t>(keyCount));
+						std::memcpy(keys.data(), state.blob.data() + sizeof(keyCount), keys.size() * sizeof(uint64_t));
+						const std::lock_guard keysLock(state.keysMutex);
+						state.keys.insert(keys.begin(), keys.end());
+					}
+				}
+				const size_t libraryBytes = state.blob.size() - libraryOffset;
+				HRESULT hr = impl->pNativeDevice->CreatePipelineLibrary(libraryBytes ? state.blob.data() + libraryOffset : nullptr, libraryBytes,
+					IID_PPV_ARGS(&state.library));
+				if (FAILED(hr) && libraryBytes) {
+					// The runtime checks the driver and adapter too.
+					load = (hr == D3D12_ERROR_DRIVER_VERSION_MISMATCH || hr == D3D12_ERROR_ADAPTER_NOT_FOUND) ? PipelineCacheLoadResult::Stale : PipelineCacheLoadResult::Corrupt;
+					state.blob.clear();
+					{
+						const std::lock_guard keysLock(state.keysMutex);
+						state.keys.clear();
+					}
+					hr = impl->pNativeDevice->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&state.library));
+				}
+				if (FAILED(hr)) {
+					state.library.Reset();
+					state.counters.Reset(PipelineCacheLoadResult::Unsupported, 0);
+					spdlog::warn("DX12 pipeline cache: CreatePipelineLibrary failed (hr=0x{:08X}); pipelines are not cached", static_cast<uint32_t>(hr));
+					return ToRHI(hr);
+				}
+				state.path = path;
+				state.counters.Reset(load, state.blob.size());
+				spdlog::info("DX12 pipeline cache '{}': {} ({} bytes)", path, detail::PipelineCacheLoadName(load), state.blob.size());
+				return Result::Ok;
+			} catch (...) {
+				Dx12ClosePipelineCacheLocked(impl);
+				RHI_FAIL(Result::OutOfMemory);
+			}
+		}
+
+		static Result Dx12SavePipelineCache(Dx12Device* impl) noexcept {
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			auto& state = impl->pipelineCache;
+			const std::unique_lock lock(state.mutex);
+			if (!state.library) {
+				return Result::Ok;
+			}
+			const uint64_t added = state.counters.added.exchange(0);
+			if (added == 0) {
+				return Result::Ok;
+			}
+			try {
+				// Stores take the shared lock, so the keys and the library are consistent here.
+				const uint64_t keyCount = state.keys.size();
+				const size_t libraryOffset = sizeof(keyCount) + static_cast<size_t>(keyCount) * sizeof(uint64_t);
+				std::vector<uint8_t> data(libraryOffset + state.library->GetSerializedSize());
+				std::memcpy(data.data(), &keyCount, sizeof(keyCount));
+				size_t keyOffset = sizeof(keyCount);
+				for (const uint64_t key : state.keys) {
+					std::memcpy(data.data() + keyOffset, &key, sizeof(key));
+					keyOffset += sizeof(key);
+				}
+				HRESULT hr = state.library->Serialize(data.data() + libraryOffset, data.size() - libraryOffset);
+				Result written = ToRHI(hr);
+				if (SUCCEEDED(hr)) {
+					written = detail::WritePipelineCacheFile(state.path.c_str(), state.identity, data.data(), data.size());
+				}
+				if (written != Result::Ok) {
+					state.counters.added += added;
+					spdlog::warn("DX12 pipeline cache '{}': save failed", state.path);
+					return written;
+				}
+				state.counters.savedBytes = data.size();
+				++state.counters.saves;
+				return Result::Ok;
+			} catch (...) {
+				state.counters.added += added;
+				RHI_FAIL(Result::OutOfMemory);
+			}
+		}
+
+		static Result d_openPipelineCache(Device* d, const char* path) noexcept {
+			return Dx12OpenPipelineCache(d ? static_cast<Dx12Device*>(d->impl) : nullptr, path);
+		}
+
+		static Result d_savePipelineCache(Device* d) noexcept {
+			return Dx12SavePipelineCache(d ? static_cast<Dx12Device*>(d->impl) : nullptr);
+		}
+
+		static Result d_getPipelineCacheStats(const Device* d, PipelineCacheStats& out) noexcept {
+			const auto* impl = d ? static_cast<const Dx12Device*>(d->impl) : nullptr;
+			out = {};
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			impl->pipelineCache.counters.Fill(out);
+			return Result::Ok;
+		}
+
 		static Result d_createPipelineFromStream(Device* d,
 			const PipelineStreamItem* items,
 			uint32_t count,
@@ -1350,7 +1721,7 @@ namespace rhi {
 			}
 
 			ComPtr<ID3D12PipelineState> pso;
-			if (const auto hr = dimpl->pNativeDevice->CreatePipelineState(&sd, IID_PPV_ARGS(&pso)); FAILED(hr)) {
+			if (const auto hr = Dx12CreatePipelineStateThroughCache(dimpl, sd, pso); FAILED(hr)) {
 				spdlog::error(
 					"DX12 CreatePipelineState failed: hr=0x{:08X}, isCompute={}, hasCS={}, hasGfx={}, hasVS={}, hasPS={}, hasAS={}, hasMS={}, rootSet={}, topologyType={}, rtvCount={}, rtv0=0x{:X}, dsv=0x{:X}, sampleCount={}, sampleQuality={}, hasDepth={}, depthEnable={}, depthWrite={}, streamSize={}",
 					static_cast<uint32_t>(hr),
@@ -2258,6 +2629,13 @@ namespace rhi {
 				L.staticSamplers.assign(ld.staticSamplers.data, ld.staticSamplers.data + ld.staticSamplers.size);
 			}
 			L.root = root;
+			{
+				// The pipeline cache keys pipelines by this hash (Dx12PipelineStreamKey).
+				detail::Fnv1a64 rootHash;
+				rootHash.Add(blob->GetBufferPointer(), blob->GetBufferSize());
+				const uint64_t rootHashValue = rootHash.Value();
+				root->SetPrivateData(kDx12RootSignatureHashGuid, sizeof(rootHashValue), &rootHashValue);
+			}
 			auto handle = impl->pipelineLayouts.alloc(L);
 			PipelineLayout ret(handle);
 			ret.vt = &g_plvt;
@@ -10319,6 +10697,11 @@ namespace rhi {
 		for (auto& slot : queues.slots) {
 			if (slot.alive) Dx12DestroyTracyGpuContext(slot.obj);
 		}
+		if (pipelineCache.library) {
+			Dx12SavePipelineCache(this);
+			const std::unique_lock lock(pipelineCache.mutex);
+			Dx12ClosePipelineCacheLocked(this);
+		}
 
 		swapchains.clear();
 		queryPools.clear();
@@ -10457,10 +10840,13 @@ namespace rhi {
 		&d_destroyIndirectPipelineSet,
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
-		14u,
+		15u,
 		&d_createCompletionWait,
 		&d_createCommandAllocatorForQueue,
-		&d_createSecondaryCommandList
+		&d_createSecondaryCommandList,
+		&d_openPipelineCache,
+		&d_savePipelineCache,
+		&d_getPipelineCacheStats
 	};
 
 	const QueueVTable g_qvt = {
@@ -10893,6 +11279,11 @@ namespace rhi {
 		impl->gfxHandle  = makeQ(D3D12_COMMAND_LIST_TYPE_DIRECT,  L"DX12 Graphics Queue");
 		impl->compHandle = makeQ(D3D12_COMMAND_LIST_TYPE_COMPUTE, L"DX12 Compute Queue");
 		impl->copyHandle = makeQ(D3D12_COMMAND_LIST_TYPE_COPY,    L"DX12 Copy Queue");
+
+		if (ci.pipelineCachePath) {
+			// A cache that cannot open leaves pipelines uncached; the device still works.
+			Dx12OpenPipelineCache(pImpl, ci.pipelineCachePath);
+		}
 
 		Device d{ pImpl, &g_devvt };
 		outPtr = MakeDevicePtr(&d, impl);

@@ -124,7 +124,8 @@ add_library(BasicRHI STATIC
     "rhi_debug.h"
     "rhi_colors.h"
     "rhi_allocator.h" 
-    "rhi_allocator.cpp" "rhi_feature_info.h" "rhi_dx12_casting.h")
+    "rhi_allocator.cpp" "rhi_feature_info.h" "rhi_dx12_casting.h"
+    "rhi_pipeline_cache.h")
 
 target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/WX>)
 target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
@@ -484,5 +485,32 @@ if(BASICRHI_BUILD_TESTS)
             target_link_libraries(BasicRHIWin32SharedHeapAliasSmoke PRIVATE Streamline::headers)
         endif()
         add_test(NAME BasicRHIWin32SharedHeapAliasSmoke COMMAND BasicRHIWin32SharedHeapAliasSmoke)
+    endif()
+    if(WIN32 AND (BASICRHI_ENABLE_VULKAN OR BASICRHI_ENABLE_D3D12))
+        # The on-disk pipeline cache; the backend is the argument.
+        set(_basicrhi_pc_source "${CMAKE_CURRENT_SOURCE_DIR}/tests/pipeline_cache/PipelineCacheSmoke.hlsl")
+        add_executable(BasicRHIPipelineCacheSmoke tests/PipelineCacheSmoke.cpp)
+        target_link_libraries(BasicRHIPipelineCacheSmoke PRIVATE BasicRHI::BasicRHI)
+        target_compile_definitions(BasicRHIPipelineCacheSmoke PRIVATE BASICRHI_PIPELINE_CACHE_HLSL="${_basicrhi_pc_source}")
+        if(BASICRHI_ENABLE_VULKAN)
+            set(_basicrhi_pc_spirv "${CMAKE_CURRENT_BINARY_DIR}/pipeline_cache_spirv")
+            set(_basicrhi_pc_outputs)
+            foreach(_threads 1 2 4 8)
+                basicrhi_compile_spirv(OUTPUT "${_basicrhi_pc_spirv}/CSMain${_threads}.spv" SOURCE "${_basicrhi_pc_source}"
+                    ENTRY CSMain PROFILE cs_6_6 DEFINES THREADS=${_threads})
+                list(APPEND _basicrhi_pc_outputs "${_basicrhi_pc_spirv}/CSMain${_threads}.spv")
+            endforeach()
+            basicrhi_compile_spirv(OUTPUT "${_basicrhi_pc_spirv}/VSMain.spv" SOURCE "${_basicrhi_pc_source}" ENTRY VSMain PROFILE vs_6_6)
+            basicrhi_compile_spirv(OUTPUT "${_basicrhi_pc_spirv}/PSMain.spv" SOURCE "${_basicrhi_pc_source}" ENTRY PSMain PROFILE ps_6_6)
+            list(APPEND _basicrhi_pc_outputs "${_basicrhi_pc_spirv}/VSMain.spv" "${_basicrhi_pc_spirv}/PSMain.spv")
+            target_sources(BasicRHIPipelineCacheSmoke PRIVATE ${_basicrhi_pc_outputs})
+            target_compile_definitions(BasicRHIPipelineCacheSmoke PRIVATE BASICRHI_PIPELINE_CACHE_SPIRV_DIR="${_basicrhi_pc_spirv}")
+            add_test(NAME BasicRHIPipelineCacheSmoke.Vulkan COMMAND BasicRHIPipelineCacheSmoke vulkan)
+        endif()
+        if(BASICRHI_ENABLE_D3D12)
+            # The D3D12 shaders are compiled at run time (d3dcompiler).
+            target_link_libraries(BasicRHIPipelineCacheSmoke PRIVATE d3dcompiler)
+            add_test(NAME BasicRHIPipelineCacheSmoke.D3D12 COMMAND BasicRHIPipelineCacheSmoke d3d12)
+        endif()
     endif()
 endif()

@@ -1,5 +1,6 @@
 ﻿#pragma once
 #include "rhi.h"
+#include "rhi_pipeline_cache.h"
 #include "rhi_reshape_shared.h"
 #include "rhi_dx12_headers.h"
 
@@ -578,6 +579,25 @@ namespace rhi {
 
 		bool steamlineInitialized = false;
 		Dx12DebugInstrumentationSession debugInstrumentation;
+
+		// The on-disk pipeline cache (Device::OpenPipelineCache): an ID3D12PipelineLibrary that keys each pipeline by a hash
+		// of its description. Creation reads `library` under a shared lock, so threads create pipelines in parallel. Opening,
+		// closing and saving take it exclusively: Serialize must not race StorePipeline.
+		struct PipelineCacheState {
+			mutable std::shared_mutex mutex;
+			ComPtr<ID3D12PipelineLibrary1> library;
+			// The file's payload: the stored keys, then the serialized library. The library reads its part in place, so the
+			// bytes live as long as the library.
+			std::vector<uint8_t> blob;
+			std::string path;
+			detail::PipelineCacheIdentity identity{};
+			// The keys in the library. A pipeline not stored is not looked up: the debug layer warns about every failed load.
+			std::mutex keysMutex;
+			std::unordered_set<uint64_t> keys;
+			// Two threads must not load the same pipeline at once; a key's stripe serializes that.
+			std::array<std::mutex, 32> keyStripes;
+			detail::PipelineCacheCounters counters;
+		} pipelineCache;
 
 		// lifetime anchor
 		std::weak_ptr<Dx12Device> selfWeak;

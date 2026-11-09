@@ -7606,6 +7606,179 @@ namespace rhi {
 			}
 		}
 
+		static detail::PipelineCacheIdentity VkPipelineCacheIdentity(const VulkanDevice* impl) noexcept {
+			detail::PipelineCacheIdentity identity{};
+			identity.backend = static_cast<uint32_t>(Backend::Vulkan);
+			identity.vendorId = impl->physicalDeviceProperties.vendorID;
+			identity.deviceId = impl->physicalDeviceProperties.deviceID;
+			identity.driverVersion = impl->physicalDeviceProperties.driverVersion;
+			static_assert(sizeof(identity.uuid) == VK_UUID_SIZE);
+			std::memcpy(identity.uuid, impl->physicalDeviceProperties.pipelineCacheUUID, VK_UUID_SIZE);
+			return identity;
+		}
+
+		// The payload's own header (VkPipelineCacheHeaderVersionOne) must name this device too: a driver may reject or
+		// misread data from another one.
+		static bool VkPipelineCacheDataMatchesDevice(const VulkanDevice* impl, const std::vector<uint8_t>& data) noexcept {
+			VkPipelineCacheHeaderVersionOne header{};
+			if (data.size() < sizeof(header)) {
+				return false;
+			}
+			std::memcpy(&header, data.data(), sizeof(header));
+			return header.headerSize >= sizeof(header) && header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+				header.vendorID == impl->physicalDeviceProperties.vendorID && header.deviceID == impl->physicalDeviceProperties.deviceID &&
+				std::memcmp(header.pipelineCacheUUID, impl->physicalDeviceProperties.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+		}
+
+		// Destroys the open cache without saving it. The caller holds the cache's lock exclusively.
+		static void VkClosePipelineCacheLocked(VulkanDevice* impl) noexcept {
+			auto& state = impl->pipelineCache;
+			if (state.cache != VK_NULL_HANDLE && impl->device != VK_NULL_HANDLE) {
+				vkDestroyPipelineCache(impl->device, state.cache, nullptr);
+			}
+			state.cache = VK_NULL_HANDLE;
+			state.path.clear();
+			state.counters.Reset(PipelineCacheLoadResult::Off, 0);
+		}
+
+		static Result d_openPipelineCache(Device* device, const char* path) noexcept {
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl || impl->device == VK_NULL_HANDLE) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			auto& state = impl->pipelineCache;
+			const std::unique_lock lock(state.mutex);
+			VkClosePipelineCacheLocked(impl);
+			if (!path || !*path) {
+				return Result::Ok;
+			}
+			try {
+				state.identity = VkPipelineCacheIdentity(impl);
+				std::vector<uint8_t> payload;
+				PipelineCacheLoadResult load = detail::ReadPipelineCacheFile(path, state.identity, payload);
+				if (load == PipelineCacheLoadResult::Loaded && !VkPipelineCacheDataMatchesDevice(impl, payload)) {
+					load = PipelineCacheLoadResult::Stale;
+					payload.clear();
+				}
+				VkPipelineCacheCreateInfo createInfo{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+				createInfo.initialDataSize = payload.size();
+				createInfo.pInitialData = payload.empty() ? nullptr : payload.data();
+				VkResult result = vkCreatePipelineCache(impl->device, &createInfo, nullptr, &state.cache);
+				if (result != VK_SUCCESS && !payload.empty()) {
+					// The driver refused the data: start empty.
+					load = PipelineCacheLoadResult::Corrupt;
+					payload.clear();
+					createInfo.initialDataSize = 0;
+					createInfo.pInitialData = nullptr;
+					result = vkCreatePipelineCache(impl->device, &createInfo, nullptr, &state.cache);
+				}
+				if (result != VK_SUCCESS) {
+					state.cache = VK_NULL_HANDLE;
+					state.counters.Reset(PipelineCacheLoadResult::Unsupported, 0);
+					spdlog::warn("Vulkan pipeline cache: vkCreatePipelineCache failed ({}); pipelines are not cached", static_cast<int>(result));
+					return ToRHI(result);
+				}
+				state.path = path;
+				const uint32_t apiVersion = (std::min)(impl->instanceApiVersion, impl->physicalDeviceProperties.apiVersion);
+				state.creationFeedback = apiVersion >= VK_API_VERSION_1_3;
+				state.counters.Reset(load, payload.size());
+				spdlog::info("Vulkan pipeline cache '{}': {} ({} bytes)", path, detail::PipelineCacheLoadName(load), payload.size());
+				return Result::Ok;
+			} catch (...) {
+				VkClosePipelineCacheLocked(impl);
+				RHI_FAIL(Result::OutOfMemory);
+			}
+		}
+
+		static Result d_savePipelineCache(Device* device) noexcept {
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl || impl->device == VK_NULL_HANDLE) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			auto& state = impl->pipelineCache;
+			const std::shared_lock lock(state.mutex);
+			if (state.cache == VK_NULL_HANDLE) {
+				return Result::Ok;
+			}
+			const std::lock_guard saveLock(state.saveMutex);
+			// Pipelines created while this runs stay counted for the next save.
+			const uint64_t added = state.counters.added.exchange(0);
+			if (added == 0) {
+				return Result::Ok;
+			}
+			try {
+				std::vector<uint8_t> data;
+				VkResult result = VK_INCOMPLETE;
+				while (result == VK_INCOMPLETE) {
+					size_t size = 0;
+					result = vkGetPipelineCacheData(impl->device, state.cache, &size, nullptr);
+					if (result != VK_SUCCESS) {
+						break;
+					}
+					data.resize(size);
+					result = vkGetPipelineCacheData(impl->device, state.cache, &size, data.data());
+					data.resize(size);
+				}
+				Result written = ToRHI(result);
+				if (result == VK_SUCCESS) {
+					written = detail::WritePipelineCacheFile(state.path.c_str(), state.identity, data.data(), data.size());
+				}
+				if (written != Result::Ok) {
+					state.counters.added += added;
+					spdlog::warn("Vulkan pipeline cache '{}': save failed", state.path);
+					return written;
+				}
+				state.counters.savedBytes = data.size();
+				++state.counters.saves;
+				return Result::Ok;
+			} catch (...) {
+				state.counters.added += added;
+				RHI_FAIL(Result::OutOfMemory);
+			}
+		}
+
+		static Result d_getPipelineCacheStats(const Device* device, PipelineCacheStats& out) noexcept {
+			const auto* impl = device ? static_cast<const VulkanDevice*>(device->impl) : nullptr;
+			out = {};
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			impl->pipelineCache.counters.Fill(out);
+			return Result::Ok;
+		}
+
+		// Creates one pipeline through the open pipeline cache, if any, and counts the hit or miss. `create` makes the
+		// vkCreate*Pipelines call with the cache it is given.
+		template<class CreateInfo, class CreateFn>
+		static VkResult VkCreatePipelineThroughCache(VulkanDevice* impl, CreateInfo& info, CreateFn&& create) noexcept {
+			auto& state = impl->pipelineCache;
+			const std::shared_lock lock(state.mutex);
+			if (state.cache == VK_NULL_HANDLE) {
+				return create(VkPipelineCache{ VK_NULL_HANDLE });
+			}
+			VkPipelineCreationFeedback feedback{};
+			VkPipelineCreationFeedbackCreateInfo feedbackInfo{ VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO };
+			feedbackInfo.pPipelineCreationFeedback = &feedback;
+			const void* next = info.pNext;
+			if (state.creationFeedback) {
+				feedbackInfo.pNext = info.pNext;
+				info.pNext = &feedbackInfo;
+			}
+			const VkResult result = create(state.cache);
+			info.pNext = next;
+			if (result == VK_SUCCESS) {
+				const bool hit = (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) != 0 &&
+					(feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0;
+				if (hit) {
+					++state.counters.hits;
+				} else {
+					++state.counters.misses;
+					++state.counters.added;
+				}
+			}
+			return result;
+		}
+
 		static Result d_createPipelineFromStream(Device* device, const PipelineStreamItem* items, uint32_t count, PipelinePtr& out) noexcept {
 			out.Reset();
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
@@ -7944,7 +8117,9 @@ namespace rhi {
 				pipelineInfo.layout = bufferModel ? impl->descriptorBuffer.pipelineLayout : VK_NULL_HANDLE;
 
 				VkPipeline nativePipeline = VK_NULL_HANDLE;
-				VkResult pipelineResult = vkCreateRayTracingPipelinesKHR(impl->device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &nativePipeline);
+				VkResult pipelineResult = VkCreatePipelineThroughCache(impl, pipelineInfo, [&](VkPipelineCache cache) {
+					return vkCreateRayTracingPipelinesKHR(impl->device, VK_NULL_HANDLE, cache, 1, &pipelineInfo, nullptr, &nativePipeline);
+				});
 				for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
 				if (pipelineResult != VK_SUCCESS) {
 					spdlog::error("Vulkan ray tracing pipeline: vkCreateRayTracingPipelinesKHR failed ({})", static_cast<int>(pipelineResult));
@@ -8210,7 +8385,9 @@ namespace rhi {
 				}
 				if (t_pipelineStatisticsLabel)
 					for (VkShaderModule module : modules) VkSetObjectName(impl, reinterpret_cast<uint64_t>(module), VK_OBJECT_TYPE_SHADER_MODULE, t_pipelineStatisticsLabel);
-				VkResult vkResult = vkCreateGraphicsPipelines(impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &nativePipeline);
+				VkResult vkResult = VkCreatePipelineThroughCache(impl, pipelineInfo, [&](VkPipelineCache cache) {
+					return vkCreateGraphicsPipelines(impl->device, cache, 1, &pipelineInfo, nullptr, &nativePipeline);
+				});
 				if (vkResult == VK_SUCCESS && t_pipelineStatisticsLabel)
 					VkSetObjectName(impl, reinterpret_cast<uint64_t>(nativePipeline), VK_OBJECT_TYPE_PIPELINE, t_pipelineStatisticsLabel);
 				for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
@@ -8309,7 +8486,9 @@ namespace rhi {
 			pipelineInfo.layout = bufferModel ? impl->descriptorBuffer.pipelineLayout : nativeLayout;
 
 			VkPipeline nativePipeline = VK_NULL_HANDLE;
-			vkResult = vkCreateComputePipelines(impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &nativePipeline);
+			vkResult = VkCreatePipelineThroughCache(impl, pipelineInfo, [&](VkPipelineCache cache) {
+				return vkCreateComputePipelines(impl->device, cache, 1, &pipelineInfo, nullptr, &nativePipeline);
+			});
 			vkDestroyShaderModule(impl->device, shaderModule, nullptr);
 			if (vkResult != VK_SUCCESS) {
 				spdlog::error("Vulkan compute pipeline creation: vkCreateComputePipelines failed with VkResult {}", static_cast<int>(vkResult));
@@ -11547,6 +11726,11 @@ namespace rhi {
 		if (device != VK_NULL_HANDLE) {
 			if (ownsDevice) VkDeviceWaitIdleHooked(device);
 			else VkWaitForSubmittedTimelines(this);
+			if (pipelineCache.cache != VK_NULL_HANDLE) {
+				d_savePipelineCache(&self);
+				const std::unique_lock lock(pipelineCache.mutex);
+				VkClosePipelineCacheLocked(this);
+			}
 		}
 		for (auto& slot : queues.slots) {
 			if (slot.alive) {
@@ -11828,10 +12012,13 @@ namespace rhi {
 		&d_destroyIndirectPipelineSet,
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
-		14u,
+		15u,
 		&d_createCompletionWait,
 		&d_createCommandAllocatorForQueue,
-		&d_createSecondaryCommandList
+		&d_createSecondaryCommandList,
+		&d_openPipelineCache,
+		&d_savePipelineCache,
+		&d_getPipelineCacheStats
 	};
 
 	const QueueVTable g_vkqvt = {
@@ -13518,6 +13705,10 @@ namespace rhi {
 				impl->Shutdown();
 				RHI_FAIL(modelResult);
 			}
+		}
+		if (ci.pipelineCachePath) {
+			// A cache that cannot open leaves pipelines uncached; the device still works.
+			d_openPipelineCache(&impl->self, ci.pipelineCachePath);
 		}
 
 		spdlog::info(
