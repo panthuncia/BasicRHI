@@ -12418,6 +12418,33 @@ namespace rhi {
 		if (model.uniformBuffers) mutableTypes.push_back(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
 		mutableTypes.push_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
 		if (model.accelerationStructures) mutableTypes.push_back(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+
+		// vkGetDescriptorSetLayoutSupport for a variable-count universal binding: whether the driver supports the layout, and
+		// the variable count it reports for it.
+		const auto layoutSupport = [&](std::span<const VkDescriptorType> types, VkDescriptorType type, uint32_t count, uint32_t& maxVariable) -> bool {
+			const VkUniversalSetLayoutInfo probe(types, type, count, true);
+			VkDescriptorSetVariableDescriptorCountLayoutSupport variableSupport{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT };
+			VkDescriptorSetLayoutSupport support{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT };
+			support.pNext = &variableSupport;
+			vkGetDescriptorSetLayoutSupport(impl->device, &probe.createInfo, &support);
+			maxVariable = variableSupport.maxVariableDescriptorCount;
+			return support.supported == VK_TRUE;
+		};
+		// Some drivers reject a type in the mutable list at any count, which the evaluation cannot see without a device. AMD's
+		// Windows driver rejects acceleration structures there (as their own binding they are fine). Such a list fails even at
+		// the minimum count: acceleration structures then leave the list, and their SRVs are unsupported.
+		uint32_t maxVariable = 0;
+		if (model.accelerationStructures &&
+			!layoutSupport(mutableTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, requirements.heapCapacities.minResources, maxVariable)) {
+			mutableTypes.pop_back();
+			if (layoutSupport(mutableTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, requirements.heapCapacities.minResources, maxVariable)) {
+				spdlog::warn("{}: the device does not support acceleration structures in a mutable descriptor list; acceleration structure "
+					"SRVs are unsupported on the descriptor-buffer model", caller);
+				model.accelerationStructures = false;
+			} else {
+				mutableTypes.push_back(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+			}
+		}
 		const std::span<const VkDescriptorType> resourceTypes(mutableTypes.data(), mutableTypes.size());
 
 		const auto measureStride = [&](std::span<const VkDescriptorType> types, VkDescriptorType type, uint64_t& stride) -> bool {
@@ -12474,17 +12501,22 @@ namespace rhi {
 			samplerElements - model.samplerCapacity));
 		const uint32_t samplerCount = model.samplerCapacity + model.staticSamplerCapacity;
 		// The layout query can hold fewer descriptors than the properties above say (65535 on Intel Arc under Mesa, against 33554432).
+		// A layout the driver rejects at the chosen count steps down by halves to the minimum, which is tried last.
 		{
-			const VkUniversalSetLayoutInfo probe(resourceTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, model.resourceCapacity, true);
-			VkDescriptorSetVariableDescriptorCountLayoutSupport variableSupport{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT };
-			VkDescriptorSetLayoutSupport support{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT };
-			support.pNext = &variableSupport;
-			vkGetDescriptorSetLayoutSupport(impl->device, &probe.createInfo, &support);
-			if (support.supported == VK_TRUE && variableSupport.maxVariableDescriptorCount < model.resourceCapacity &&
-				variableSupport.maxVariableDescriptorCount >= capacities.minResources) {
+			const uint32_t chosen = model.resourceCapacity;
+			uint32_t capacity = chosen;
+			bool supported = layoutSupport(resourceTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, capacity, maxVariable);
+			while (!supported && capacity > capacities.minResources) {
+				capacity = (std::max)(capacity / 2, capacities.minResources);
+				supported = layoutSupport(resourceTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, capacity, maxVariable);
+			}
+			if (supported && maxVariable < capacity && maxVariable >= capacities.minResources) {
+				capacity = maxVariable;
+			}
+			if (supported && capacity != chosen) {
 				spdlog::warn("{}: the device's set layout holds {} resource descriptors, not the {} its properties allow; using {}", caller,
-					variableSupport.maxVariableDescriptorCount, model.resourceCapacity, variableSupport.maxVariableDescriptorCount);
-				model.resourceCapacity = variableSupport.maxVariableDescriptorCount;
+					capacity, chosen, capacity);
+				model.resourceCapacity = capacity;
 			}
 		}
 		impl->shaderVisibleResourceCapacity = model.resourceCapacity;
