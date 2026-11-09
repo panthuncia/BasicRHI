@@ -177,6 +177,47 @@ namespace rhi::vulkan {
     // The binding model a Vulkan device runs on (one BindingModelBits value), 0 for a device of another backend.
     uint32_t GetBindingModel(rhi::Device device) noexcept;
 
+    /// One memory heap's budget and usage (VK_EXT_memory_budget).
+    struct MemoryHeapBudget {
+        uint32_t heapIndex = 0;
+        VkMemoryHeapFlags flags = 0;
+        uint64_t heapSize = 0;
+        // VK_EXT_memory_budget was enabled: budget and usage are the driver's. Without it the budget is the heap's size and
+        // the usage is 0.
+        bool hasBudget = false;
+        uint64_t budget = 0;  // heapBudget: what the process can use before the OS starts demoting its memory
+        uint64_t usage = 0;   // heapUsage: what the whole process uses, not BasicRHI alone
+        // The usage reached the budget. AMD's Windows driver clamps heapUsage to heapBudget, so the real usage can be
+        // higher: do not derive memory outside your own allocations as usage minus them while this is set.
+        bool usageAtBudget = false;
+    };
+
+    /// Queries the budget and usage of every memory heap of a Vulkan device.
+    /// @param device A device from CreateVulkanDevice or AdoptVulkanDevice.
+    /// @param out Receives up to capacity heaps, in heap order. May be null when capacity is 0.
+    /// @param capacity The number of entries out holds.
+    /// @return The device's heap count (0 for a device of another backend); fewer than that are written when capacity is smaller.
+    uint32_t QueryMemoryHeapBudgets(rhi::Device device, MemoryHeapBudget* out, uint32_t capacity) noexcept;
+
+    /// The native crash-diagnostic sources a device runs with (DeviceCreateInfo::enableCrashMarkers).
+    struct CrashDiagnosticsState {
+        bool deviceFault = false;    // VK_EXT_device_fault: queried on device loss
+        bool bufferMarkers = false;  // VK_AMD_buffer_marker: the last marker begun and finished per command list
+        bool checkpoints = false;    // VK_NV_device_diagnostic_checkpoints: the last checkpoints per queue
+    };
+
+    /// Which native crash-diagnostic sources a Vulkan device runs with. All false when they are off, and for an adopted
+    /// device (its host's checkpoint callbacks are used instead).
+    CrashDiagnosticsState GetCrashDiagnostics(rhi::Device device) noexcept;
+
+    /// Logs the native crash markers: per command list the last marker the GPU began and the last it finished, and per
+    /// queue the last checkpoints. BasicRHI does this by itself when it sees VK_ERROR_DEVICE_LOST; a host that sees the
+    /// loss first calls it.
+    /// @param device A device from CreateVulkanDevice.
+    /// @param deviceLost Also query and log VK_EXT_device_fault's report (only meaningful once the device is lost).
+    /// @return The number of marker lines logged; 0 when crash markers are off.
+    uint32_t DumpCrashDiagnostics(rhi::Device device, bool deviceLost) noexcept;
+
     // Non-owning import of a host image. currentLayout is the layout the image is in
     // when BasicRHI first uses it; the host keeps ownership of image and memory.
     struct ImportedImageDesc {

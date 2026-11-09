@@ -2860,6 +2860,9 @@ namespace rhi {
 		uint64_t currentUsageBytes = 0;            // current usage
 		uint64_t availableForReservationBytes = 0; // how much can be reserved
 		uint64_t currentReservationBytes = 0;      // current reservation level
+		// Vulkan: the usage of a heap in the group reached its budget. AMD's driver clamps usage to the budget, so the real
+		// usage can be higher: usage minus the caller's own allocations is not a reliable count of other memory then.
+		bool usageAtBudget = false;
 	};
 
 	struct CommandListVTable {
@@ -3604,6 +3607,10 @@ namespace rhi {
 		// exists. They need a preview Agility SDK and Windows Developer Mode. When either is
 		// missing the device is still created and reports the raytracing it does have.
 		bool enablePreviewRayTracing = false;
+		// Vulkan: native crash markers and fault reports (VK_AMD_buffer_marker, VK_NV_device_diagnostic_checkpoints,
+		// VK_EXT_device_fault, whichever the device has), logged on device loss. BASICRHI_VK_CRASH_MARKERS=1 turns it on
+		// too. Off by default: markers cost a write per command list boundary and debug label. D3D12 ignores it.
+		bool enableCrashMarkers = false;
 	};
 
 	// Accepts any blob exposing GetBufferPointer/GetBufferSize (ID3DBlob, IDxcBlob) without

@@ -2481,6 +2481,263 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// ---------------------------------------------------------------------------------------------------------------------
+		// Native crash markers (VulkanCrashMarkers).
+
+		// DeviceCreateInfo::enableCrashMarkers, or BASICRHI_VK_CRASH_MARKERS=1.
+		static bool VkCrashMarkersRequested(const DeviceCreateInfo& ci) noexcept {
+			if (ci.enableCrashMarkers) return true;
+			const char* value = std::getenv("BASICRHI_VK_CRASH_MARKERS");
+			return value && std::strcmp(value, "1") == 0;
+		}
+
+		// A new marker id for the name, remembered in the history with the interned name. Ids start at 1: 0 means none.
+		static uint32_t VkRegisterCrashMarker(VulkanCrashMarkers& markers, std::string_view name, const char** interned = nullptr) noexcept {
+			try {
+				const std::lock_guard lock(markers.mutex);
+				const char* stored = markers.names.emplace(name.empty() ? std::string_view("(unnamed)") : name).first->c_str();
+				uint32_t id = markers.nextId++;
+				if (id == 0) id = markers.nextId++;
+				markers.historyIds[id % VulkanCrashMarkers::kHistory] = id;
+				markers.historyNames[id % VulkanCrashMarkers::kHistory] = stored;
+				if (interned) *interned = stored;
+				return id;
+			} catch (...) {
+				return 0;
+			}
+		}
+
+		// The name of a marker id. markers.mutex is held.
+		static const char* VkCrashMarkerName(const VulkanCrashMarkers& markers, uint32_t id) noexcept {
+			if (id == 0) return "(none)";
+			const uint32_t index = id % VulkanCrashMarkers::kHistory;
+			return markers.historyIds[index] == id && markers.historyNames[index] ? markers.historyNames[index] : "(overwritten)";
+		}
+
+		// The list's slot pair, given at its first use.
+		static uint32_t VkCrashMarkerSlot(VulkanCrashMarkers& markers, VulkanCommandList& list) noexcept {
+			if (list.crashMarkerSlot == UINT32_MAX) {
+				list.crashMarkerSlot = markers.nextSlot.fetch_add(1, std::memory_order_relaxed) % VulkanCrashMarkers::kSlots;
+			}
+			return list.crashMarkerSlot;
+		}
+
+		// Records a marker into the list: the slot pair's begun (top of pipe) and finished (bottom of pipe) ids, and an NV
+		// checkpoint whose marker is the id.
+		static void VkWriteCrashMarker(VulkanDevice* impl, VulkanCommandList& list, std::string_view name, const char** interned = nullptr) noexcept {
+			VulkanCrashMarkers& markers = impl->crashMarkers;
+			if (!markers.enabled || list.commandBuffer == VK_NULL_HANDLE) return;
+			const uint32_t id = VkRegisterCrashMarker(markers, name, interned);
+			if (id == 0) return;
+			if (markers.bufferMarkers) {
+				const VkDeviceSize offset = static_cast<VkDeviceSize>(VkCrashMarkerSlot(markers, list)) * 2 * sizeof(uint32_t);
+				vkCmdWriteBufferMarkerAMD(list.commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, markers.buffer, offset, id);
+				vkCmdWriteBufferMarkerAMD(list.commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, markers.buffer, offset + sizeof(uint32_t), id);
+			}
+			if (markers.checkpoints) {
+				vkCmdSetCheckpointNV(list.commandBuffer, reinterpret_cast<const void*>(static_cast<uintptr_t>(id)));
+			}
+		}
+
+		// Names the list's slot after the list (SetName), for the dump.
+		static void VkNameCrashMarkerSlot(VulkanDevice* impl, VulkanCommandList& list, const char* name) noexcept {
+			VulkanCrashMarkers& markers = impl->crashMarkers;
+			if (!markers.enabled || !markers.bufferMarkers || !name) return;
+			try {
+				const uint32_t slot = VkCrashMarkerSlot(markers, list);
+				const std::lock_guard lock(markers.mutex);
+				markers.slotNames[slot] = markers.names.emplace(name).first->c_str();
+			} catch (...) {
+			}
+		}
+
+		// A debug label's marker, for the host's checkpoint callbacks (adopted devices) and the native markers. depthChange is
+		// +1 for a label's begin, -1 for its end and 0 for an inserted label.
+		static void VkLabelCheckpoint(CommandList* commandList, const char* name, int depthChange) noexcept {
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* state = VkCommandListState(commandList);
+			if (!impl || !state || !state->commandBuffer) return;
+			if (impl->setCheckpoint && impl->registerCheckpoint) {
+				if (const void* marker = impl->registerCheckpoint(impl->checkpointUser, depthChange < 0 ? "ORG pass end" : name))
+					impl->setCheckpoint(state->commandBuffer, const_cast<void*>(marker));
+			}
+			if (!impl->crashMarkers.enabled || !state->isRecording) return;
+			try {
+				if (depthChange < 0) {
+					const char* open = state->crashLabelStack.empty() ? "(unmatched label)" : state->crashLabelStack.back();
+					if (!state->crashLabelStack.empty()) state->crashLabelStack.pop_back();
+					VkWriteCrashMarker(impl, *state, std::string("end: ") + open);
+				} else {
+					const char* interned = nullptr;
+					VkWriteCrashMarker(impl, *state, name ? name : "", &interned);
+					if (depthChange > 0) state->crashLabelStack.push_back(interned ? interned : "(unnamed)");
+				}
+			} catch (...) {
+			}
+		}
+
+		static void VkDestroyCrashMarkers(VulkanDevice* impl) noexcept {
+			VulkanCrashMarkers& markers = impl->crashMarkers;
+			if (impl->device != VK_NULL_HANDLE && !impl->abandoned) {
+				if (markers.buffer != VK_NULL_HANDLE) vkDestroyBuffer(impl->device, markers.buffer, nullptr);
+				if (markers.memory != VK_NULL_HANDLE) vkFreeMemory(impl->device, markers.memory, nullptr);
+			}
+			markers.buffer = VK_NULL_HANDLE;
+			markers.memory = VK_NULL_HANDLE;
+			markers.mapped = nullptr;
+			markers.bufferMarkers = false;
+			markers.checkpoints = false;
+			markers.deviceFault = false;
+			markers.enabled = false;
+		}
+
+		// The marker buffer: kSlots pairs of uint32 ids in host-visible, coherent memory, zeroed.
+		static bool VkCreateCrashMarkerBuffer(VulkanDevice* impl) noexcept {
+			VulkanCrashMarkers& markers = impl->crashMarkers;
+			const VkDeviceSize size = VkDeviceSize(VulkanCrashMarkers::kSlots) * 2 * sizeof(uint32_t);
+			VkBufferCreateInfo bufferInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			bufferInfo.size = size;
+			bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+			bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			if (vkCreateBuffer(impl->device, &bufferInfo, nullptr, &markers.buffer) != VK_SUCCESS) return false;
+			VkMemoryRequirements requirements{};
+			vkGetBufferMemoryRequirements(impl->device, markers.buffer, &requirements);
+			uint32_t memoryTypeIndex = 0;
+			const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+			if (!VkFindMemoryTypeIndex(impl->memoryProperties, requirements.memoryTypeBits, required, required, memoryTypeIndex)) return false;
+			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+			allocateInfo.allocationSize = requirements.size;
+			allocateInfo.memoryTypeIndex = memoryTypeIndex;
+			void* mapped = nullptr;
+			if (vkAllocateMemory(impl->device, &allocateInfo, nullptr, &markers.memory) != VK_SUCCESS ||
+				vkBindBufferMemory(impl->device, markers.buffer, markers.memory, 0) != VK_SUCCESS ||
+				vkMapMemory(impl->device, markers.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+				return false;
+			}
+			std::memset(mapped, 0, static_cast<size_t>(size));
+			markers.mapped = static_cast<volatile uint32_t*>(mapped);
+			VkSetObjectName(impl, reinterpret_cast<uint64_t>(markers.buffer), VK_OBJECT_TYPE_BUFFER, "BasicRHI::CrashMarkers");
+			return true;
+		}
+
+		// Turns on the sources CreateVulkanDevice enabled, once the device exists. A source without its entry points stays off.
+		static void VkInitCrashMarkers(VulkanDevice* impl, bool deviceFault, bool bufferMarkers, bool checkpoints) noexcept {
+			VulkanCrashMarkers& markers = impl->crashMarkers;
+			const bool fault = deviceFault && vkGetDeviceFaultInfoEXT != nullptr;
+			const bool nv = checkpoints && vkCmdSetCheckpointNV != nullptr && vkGetQueueCheckpointDataNV != nullptr;
+			markers.bufferMarkers = bufferMarkers && vkCmdWriteBufferMarkerAMD != nullptr;
+			if (markers.bufferMarkers && !VkCreateCrashMarkerBuffer(impl)) {
+				spdlog::warn("CreateVulkanDevice: could not create the crash marker buffer; VK_AMD_buffer_marker markers are off");
+				VkDestroyCrashMarkers(impl);
+			}
+			markers.deviceFault = fault;
+			markers.checkpoints = nv;
+			markers.enabled = markers.deviceFault || markers.bufferMarkers || markers.checkpoints;
+			spdlog::info("CreateVulkanDevice: crash markers {}: VK_EXT_device_fault {}, VK_AMD_buffer_marker {}, VK_NV_device_diagnostic_checkpoints {}",
+				markers.enabled ? "on" : "requested, but the device has no source", markers.deviceFault ? "on" : "off",
+				markers.bufferMarkers ? "on" : "off", markers.checkpoints ? "on" : "off");
+		}
+
+		static const char* VkDeviceFaultAddressTypeName(VkDeviceFaultAddressTypeEXT type) noexcept {
+			switch (type) {
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: return "none";
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: return "invalid read";
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: return "invalid write";
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: return "invalid execute";
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "instruction pointer (unknown)";
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "instruction pointer (invalid)";
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: return "instruction pointer (fault)";
+			default: return "unknown";
+			}
+		}
+
+		// VK_EXT_device_fault's report: the description, the faulting address ranges and the vendor's fault codes.
+		static void VkLogDeviceFault(VulkanDevice* impl) noexcept {
+			try {
+				VkDeviceFaultCountsEXT counts{ VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT };
+				if (const VkResult result = vkGetDeviceFaultInfoEXT(impl->device, &counts, nullptr); result != VK_SUCCESS) {
+					spdlog::error("Vulkan device fault: vkGetDeviceFaultInfoEXT (counts) failed ({})", static_cast<int>(result));
+					return;
+				}
+				std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+				std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+				counts.vendorBinarySize = 0;  // the vendor binary dump is not enabled
+				VkDeviceFaultInfoEXT info{ VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT };
+				info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+				info.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
+				const VkResult result = vkGetDeviceFaultInfoEXT(impl->device, &counts, &info);
+				if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+					spdlog::error("Vulkan device fault: vkGetDeviceFaultInfoEXT failed ({})", static_cast<int>(result));
+					return;
+				}
+				spdlog::error("Vulkan device fault: '{}', {} addresses, {} vendor records", info.description, counts.addressInfoCount, counts.vendorInfoCount);
+				for (uint32_t i = 0; i < counts.addressInfoCount && i < addresses.size(); ++i) {
+					const VkDeviceFaultAddressInfoEXT& address = addresses[i];
+					const VkDeviceSize precision = address.addressPrecision ? address.addressPrecision : 1;
+					const VkDeviceAddress lower = address.reportedAddress & ~(precision - 1);
+					spdlog::error("Vulkan device fault:   {} at 0x{:x} (range 0x{:x}..0x{:x})", VkDeviceFaultAddressTypeName(address.addressType),
+						address.reportedAddress, lower, lower + precision - 1);
+				}
+				for (uint32_t i = 0; i < counts.vendorInfoCount && i < vendors.size(); ++i) {
+					spdlog::error("Vulkan device fault:   vendor '{}': code 0x{:x}, data 0x{:x}", vendors[i].description, vendors[i].vendorFaultCode,
+						vendors[i].vendorFaultData);
+				}
+			} catch (...) {
+			}
+		}
+
+		// Logs every list's last begun and finished marker and every queue's checkpoints; with deviceLost, the fault report too.
+		// A list whose two ids differ was still on the GPU. Returns the marker lines logged.
+		static uint32_t VkDumpCrashMarkers(VulkanDevice* impl, bool deviceLost) noexcept {
+			VulkanCrashMarkers& markers = impl->crashMarkers;
+			if (!markers.enabled) return 0;
+			const auto level = deviceLost ? spdlog::level::err : spdlog::level::info;
+			uint32_t lines = 0;
+			try {
+				if (markers.bufferMarkers && markers.mapped) {
+					const uint32_t used = (std::min)(markers.nextSlot.load(std::memory_order_relaxed), VulkanCrashMarkers::kSlots);
+					const std::lock_guard lock(markers.mutex);
+					for (uint32_t slot = 0; slot < used; ++slot) {
+						const uint32_t begun = markers.mapped[slot * 2];
+						const uint32_t finished = markers.mapped[slot * 2 + 1];
+						if (begun == 0 && finished == 0) continue;
+						spdlog::log(level, "Vulkan crash markers: list {} '{}' {}: began #{} '{}', finished #{} '{}'", slot,
+							markers.slotNames[slot] ? markers.slotNames[slot] : "", begun != finished ? "IN FLIGHT" : "idle",
+							begun, VkCrashMarkerName(markers, begun), finished, VkCrashMarkerName(markers, finished));
+						++lines;
+					}
+				}
+				if (markers.checkpoints) {
+					for (auto& slot : impl->queues.slots) {
+						if (!slot.alive || slot.obj.queue == VK_NULL_HANDLE) continue;
+						uint32_t count = 0;
+						vkGetQueueCheckpointDataNV(slot.obj.queue, &count, nullptr);
+						std::vector<VkCheckpointDataNV> data(count, { VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV });
+						if (count) vkGetQueueCheckpointDataNV(slot.obj.queue, &count, data.data());
+						const std::lock_guard lock(markers.mutex);
+						for (uint32_t i = 0; i < count; ++i) {
+							const uint32_t id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker));
+							spdlog::log(level, "Vulkan crash markers: queue family {} index {}: checkpoint #{} '{}' at stage 0x{:x}", slot.obj.familyIndex,
+								slot.obj.queueIndex, id, VkCrashMarkerName(markers, id), static_cast<uint32_t>(data[i].stage));
+							++lines;
+						}
+					}
+				}
+			} catch (...) {
+			}
+			if (deviceLost && markers.deviceFault) VkLogDeviceFault(impl);
+			return lines;
+		}
+
+		// Logs the crash markers once, at the first VK_ERROR_DEVICE_LOST BasicRHI sees. Returns the result unchanged.
+		static VkResult VkCheckDeviceLost(VulkanDevice* impl, VkResult result, const char* where) noexcept {
+			if (result == VK_ERROR_DEVICE_LOST && impl && impl->crashMarkers.enabled && !impl->crashMarkers.lossReported.exchange(true)) {
+				spdlog::critical("{}: the Vulkan device was lost; its crash markers follow", where);
+				VkDumpCrashMarkers(impl, true);
+			}
+			return result;
+		}
+
 		static Result VkAllocatePrimaryCommandBuffer(VkDevice device, VkCommandPool pool, VkCommandBuffer& outCommandBuffer) noexcept {
 			return VkAllocateCommandBuffer(device, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, outCommandBuffer);
 		}
@@ -3972,6 +4229,34 @@ namespace rhi {
 			return total;
 		}
 
+		// Every heap's budget and usage: VK_EXT_memory_budget's when it is enabled, otherwise the heap's size as its budget and
+		// no usage. Writes up to capacity heaps and returns the heap count.
+		static uint32_t VkQueryHeapBudgets(const VulkanDevice& impl, vulkan::MemoryHeapBudget* out, uint32_t capacity) noexcept {
+			VkPhysicalDeviceMemoryBudgetPropertiesEXT budgetProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+			VkPhysicalDeviceMemoryProperties2 properties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2 };
+			const bool hasBudget = impl.memoryBudgetEnabled && vkGetPhysicalDeviceMemoryProperties2 != nullptr;
+			if (hasBudget) {
+				properties.pNext = &budgetProperties;
+				vkGetPhysicalDeviceMemoryProperties2(impl.physicalDevice, &properties);
+			} else {
+				properties.memoryProperties = impl.memoryProperties;
+			}
+			const VkPhysicalDeviceMemoryProperties& memory = properties.memoryProperties;
+			const uint32_t count = (std::min)(memory.memoryHeapCount, static_cast<uint32_t>(VK_MAX_MEMORY_HEAPS));
+			for (uint32_t heapIndex = 0; out && heapIndex < (std::min)(count, capacity); ++heapIndex) {
+				vulkan::MemoryHeapBudget& heap = out[heapIndex];
+				heap = {};
+				heap.heapIndex = heapIndex;
+				heap.flags = memory.memoryHeaps[heapIndex].flags;
+				heap.heapSize = memory.memoryHeaps[heapIndex].size;
+				heap.hasBudget = hasBudget;
+				heap.budget = hasBudget ? budgetProperties.heapBudget[heapIndex] : heap.heapSize;
+				heap.usage = hasBudget ? budgetProperties.heapUsage[heapIndex] : 0;
+				heap.usageAtBudget = hasBudget && heap.budget != 0 && heap.usage >= heap.budget;
+			}
+			return count;
+		}
+
 		static QueryResultInfo qp_getQueryResultInfo(QueryPool* qp) noexcept {
 			auto* impl = qp ? static_cast<VulkanDevice*>(qp->impl) : nullptr;
 			VulkanQueryPool* queryPool = VkQueryPoolState(impl, qp ? qp->GetHandle() : QueryPoolHandle{});
@@ -4146,7 +4431,7 @@ namespace rhi {
 				}
 			}
 			impl->timelinesCondition.notify_all();
-			return ToRHI(waitResult);
+			return ToRHI(VkCheckDeviceLost(impl, waitResult, "Timeline::HostWait"));
 		}
 
 		class VulkanCompletionWait final : public CompletionWait {
@@ -4200,7 +4485,7 @@ namespace rhi {
 					info.semaphoreCount = points.size + 1;
 					info.pSemaphores = semaphores.data();
 					info.pValues = values.data();
-					result = ToRHI(vkWaitSemaphores(m_device->device, &info, UINT64_MAX));
+					result = ToRHI(VkCheckDeviceLost(m_device, vkWaitSemaphores(m_device->device, &info, UINT64_MAX), "CompletionWait::Wait"));
 					std::lock_guard lock(m_mutex);
 					m_waiting = false;
 				}
@@ -4453,7 +4738,7 @@ namespace rhi {
 			waitInfo.semaphoreCount = static_cast<uint32_t>(semaphores.size());
 			waitInfo.pSemaphores = semaphores.data();
 			waitInfo.pValues = values.data();
-			return ToRHI(vkWaitSemaphores(impl->device, &waitInfo, UINT64_MAX));
+			return ToRHI(VkCheckDeviceLost(impl, vkWaitSemaphores(impl->device, &waitInfo, UINT64_MAX), "Device::WaitIdle"));
 		}
 
 		// The queue's progress timeline, made on first use. timelinesMutex is held: allocating can move the timeline pool, so
@@ -4671,7 +4956,7 @@ namespace rhi {
 			}
 			else {
 				const VkQueueAccessGuard queueAccess(impl, queueState->queue);
-				submitResult = ToRHI(vkQueueSubmit(queueState->queue, 1, &submitInfo, VK_NULL_HANDLE));
+				submitResult = ToRHI(VkCheckDeviceLost(impl, vkQueueSubmit(queueState->queue, 1, &submitInfo, VK_NULL_HANDLE), "Queue::Submit"));
 			}
 			if (submitResult == Result::Ok) {
 				for (uint32_t index = 0; index < lists.size; ++index) {
@@ -4980,6 +5265,9 @@ namespace rhi {
 				return commandListState->pendingError;
 			}
 
+			if (auto* impl = static_cast<VulkanDevice*>(commandList->impl); impl && impl->crashMarkers.enabled) {
+				VkWriteCrashMarker(impl, *commandListState, "command list end");
+			}
 			const VkResult result = vkEndCommandBuffer(commandListState->commandBuffer);
 			if (result != VK_SUCCESS) {
 				spdlog::error("Vulkan command list end failed with VkResult {}", static_cast<int>(result));
@@ -5118,6 +5406,8 @@ namespace rhi {
 				spdlog::error("Vulkan command list reset failed to begin recording");
 				return;
 			}
+			commandListState->crashLabelStack.clear();
+			if (!commandListState->secondary) VkWriteCrashMarker(impl, *commandListState, "command list begin");
 
 			commandListState->passActive = false;
 			commandListState->boundLayout = {};
@@ -7179,6 +7469,7 @@ namespace rhi {
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
 			if (commandListState) {
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(commandListState->commandBuffer), VK_OBJECT_TYPE_COMMAND_BUFFER, name);
+				if (impl) VkNameCrashMarkerSlot(impl, *commandListState, name);
 			}
 		}
 
@@ -7205,15 +7496,7 @@ namespace rhi {
 		}
 
 		static void cl_beginDebugLabel(CommandList* commandList, const float rgba[4], const char* name) noexcept {
-			if (commandList) {
-				auto* impl = static_cast<VulkanDevice*>(commandList->impl);
-				if (impl && impl->setCheckpoint && impl->registerCheckpoint) {
-					if (auto* state = VkCommandListState(commandList); state && state->commandBuffer) {
-						if (const void* marker = impl->registerCheckpoint(impl->checkpointUser, name))
-							impl->setCheckpoint(state->commandBuffer, const_cast<void*>(marker));
-					}
-				}
-			}
+			VkLabelCheckpoint(commandList, name, 1);
 			if (const VkCommandBuffer commandBuffer = VkLabelTarget(commandList); commandBuffer != VK_NULL_HANDLE && vkCmdBeginDebugUtilsLabelEXT) {
 				const VkDebugUtilsLabelEXT label = VkMakeLabel(rgba, name);
 				vkCmdBeginDebugUtilsLabelEXT(commandBuffer, &label);
@@ -7221,29 +7504,13 @@ namespace rhi {
 		}
 
 		static void cl_endDebugLabel(CommandList* commandList) noexcept {
-			if (commandList) {
-				auto* impl = static_cast<VulkanDevice*>(commandList->impl);
-				if (impl && impl->setCheckpoint && impl->registerCheckpoint) {
-					if (auto* state = VkCommandListState(commandList); state && state->commandBuffer) {
-						if (const void* marker = impl->registerCheckpoint(impl->checkpointUser, "ORG pass end"))
-							impl->setCheckpoint(state->commandBuffer, const_cast<void*>(marker));
-					}
-				}
-			}
+			VkLabelCheckpoint(commandList, nullptr, -1);
 			if (const VkCommandBuffer commandBuffer = VkLabelTarget(commandList); commandBuffer != VK_NULL_HANDLE && vkCmdEndDebugUtilsLabelEXT)
 				vkCmdEndDebugUtilsLabelEXT(commandBuffer);
 		}
 
 		static void cl_insertDebugLabel(CommandList* commandList, const float rgba[4], const char* name) noexcept {
-			if (commandList) {
-				auto* impl = static_cast<VulkanDevice*>(commandList->impl);
-				if (impl && impl->setCheckpoint && impl->registerCheckpoint) {
-					if (auto* state = VkCommandListState(commandList); state && state->commandBuffer) {
-						if (const void* marker = impl->registerCheckpoint(impl->checkpointUser, name))
-							impl->setCheckpoint(state->commandBuffer, const_cast<void*>(marker));
-					}
-				}
-			}
+			VkLabelCheckpoint(commandList, name, 0);
 			if (const VkCommandBuffer commandBuffer = VkLabelTarget(commandList); commandBuffer != VK_NULL_HANDLE && vkCmdInsertDebugUtilsLabelEXT) {
 				const VkDebugUtilsLabelEXT label = VkMakeLabel(rgba, name);
 				vkCmdInsertDebugUtilsLabelEXT(commandBuffer, &label);
@@ -8549,7 +8816,7 @@ namespace rhi {
 				return VkWaitForSubmittedTimelines(impl);
 			}
 
-			return ToRHI(VkDeviceWaitIdleHooked(impl->device));
+			return ToRHI(VkCheckDeviceLost(impl, VkDeviceWaitIdleHooked(impl->device), "Device::WaitIdle"));
 		}
 
 		static void d_flushDeletionQueue(Device* device) noexcept {
@@ -9079,6 +9346,9 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// D3D12's QueryVideoMemoryInfo from the heaps: Local sums the device-local heaps, NonLocal the others (the grouping
+		// AdapterInfo uses). Budget and usage are VK_EXT_memory_budget's; without it the budget is the heaps' size and the usage
+		// is 0. Vulkan has no reservations: what can be reserved is the budget, and nothing is reserved.
 		static Result d_queryVideoMemoryInfo(const Device* device, uint32_t nodeIndex, MemorySegmentGroup segmentGroup, VideoMemoryInfo& out) noexcept {
 			VkIgnoreUnused(nodeIndex);
 			auto* impl = device ? static_cast<const VulkanDevice*>(device->impl) : nullptr;
@@ -9088,17 +9358,20 @@ namespace rhi {
 			}
 
 			out = {};
-			switch (segmentGroup) {
-			case MemorySegmentGroup::Local:
-				out.budgetBytes = VkSumHeapBudget(impl->memoryProperties, true);
-				break;
-			case MemorySegmentGroup::NonLocal:
-				out.budgetBytes = VkSumHeapBudget(impl->memoryProperties, false);
-				break;
-			default:
+			if (segmentGroup != MemorySegmentGroup::Local && segmentGroup != MemorySegmentGroup::NonLocal) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
-
+			const bool wantLocal = segmentGroup == MemorySegmentGroup::Local;
+			std::array<vulkan::MemoryHeapBudget, VK_MAX_MEMORY_HEAPS> heaps{};
+			const uint32_t count = VkQueryHeapBudgets(*impl, heaps.data(), static_cast<uint32_t>(heaps.size()));
+			for (uint32_t heapIndex = 0; heapIndex < count; ++heapIndex) {
+				const vulkan::MemoryHeapBudget& heap = heaps[heapIndex];
+				if (((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) != wantLocal) continue;
+				out.budgetBytes += heap.budget;
+				out.currentUsageBytes += heap.usage;
+				out.usageAtBudget = out.usageAtBudget || heap.usageAtBudget;
+			}
+			out.availableForReservationBytes = out.budgetBytes;
 			return Result::Ok;
 		}
 
@@ -10407,6 +10680,7 @@ namespace rhi {
 			commandList.impl = impl;
 			commandList.backendState = impl->commandLists.get(handle);
 			commandList.vt = &g_vkclvt;
+			if (VulkanCommandList* created = impl->commandLists.get(handle)) VkWriteCrashMarker(impl, *created, "command list begin");
 			out = MakeCommandListPtr(device, commandList, impl->selfWeak.lock());
 			return Result::Ok;
 		}
@@ -11539,6 +11813,7 @@ namespace rhi {
 			resources.clear(); commandSignatures.clear(); pipelines.clear(); pipelineLayouts.clear();
 			timelines.clear(); heaps.clear(); queryPools.clear(); allocators.clear(); queues.clear();
 			VkDestroyDescriptorBufferModel(this);
+			VkDestroyCrashMarkers(this);
 			device = VK_NULL_HANDLE;
 			instance = VK_NULL_HANDLE;
 			physicalDevice = VK_NULL_HANDLE;
@@ -11673,6 +11948,7 @@ namespace rhi {
 		// After the heaps (their slots' sampler references are released) and the pipelines and signatures that name the universal
 		// layout.
 		VkDestroyDescriptorBufferModel(this);
+		VkDestroyCrashMarkers(this);
 
 		if (device != VK_NULL_HANDLE) {
 			for (auto& slot : timelines.slots) {
@@ -12020,11 +12296,13 @@ namespace rhi {
 		bool externalMemoryWin32 = false;
 		bool externalSemaphoreWin32 = false;
 		bool maintenance5 = false;  // VK_KHR_maintenance5 enabled
+		bool memoryBudget = false;  // VK_EXT_memory_budget enabled
 		VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipelineExecutableProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
 	};
 
 	static void VkApplyEnabledDeviceState(VulkanDevice* impl, const VkEnabledDeviceState& e) noexcept {
 		impl->maintenance5Enabled = e.maintenance5;
+		impl->memoryBudgetEnabled = e.memoryBudget;
 		impl->pipelineExecutableInfoEnabled = e.pipelineExecutableProperties.pipelineExecutableInfo == VK_TRUE;
 		impl->accelerationStructureFeatures = e.accelerationStructure;
 		impl->rayTracingPipelineFeatures = e.rayTracingPipeline;
@@ -12418,6 +12696,33 @@ namespace rhi {
 		if (model.uniformBuffers) mutableTypes.push_back(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
 		mutableTypes.push_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
 		if (model.accelerationStructures) mutableTypes.push_back(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+
+		// vkGetDescriptorSetLayoutSupport for a variable-count universal binding: whether the driver supports the layout, and
+		// the variable count it reports for it.
+		const auto layoutSupport = [&](std::span<const VkDescriptorType> types, VkDescriptorType type, uint32_t count, uint32_t& maxVariable) -> bool {
+			const VkUniversalSetLayoutInfo probe(types, type, count, true);
+			VkDescriptorSetVariableDescriptorCountLayoutSupport variableSupport{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT };
+			VkDescriptorSetLayoutSupport support{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT };
+			support.pNext = &variableSupport;
+			vkGetDescriptorSetLayoutSupport(impl->device, &probe.createInfo, &support);
+			maxVariable = variableSupport.maxVariableDescriptorCount;
+			return support.supported == VK_TRUE;
+		};
+		// Some drivers reject a type in the mutable list at any count, which the evaluation cannot see without a device. AMD's
+		// Windows driver rejects acceleration structures there (as their own binding they are fine). Such a list fails even at
+		// the minimum count: acceleration structures then leave the list, and their SRVs are unsupported.
+		uint32_t maxVariable = 0;
+		if (model.accelerationStructures &&
+			!layoutSupport(mutableTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, requirements.heapCapacities.minResources, maxVariable)) {
+			mutableTypes.pop_back();
+			if (layoutSupport(mutableTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, requirements.heapCapacities.minResources, maxVariable)) {
+				spdlog::warn("{}: the device does not support acceleration structures in a mutable descriptor list; acceleration structure "
+					"SRVs are unsupported on the descriptor-buffer model", caller);
+				model.accelerationStructures = false;
+			} else {
+				mutableTypes.push_back(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+			}
+		}
 		const std::span<const VkDescriptorType> resourceTypes(mutableTypes.data(), mutableTypes.size());
 
 		const auto measureStride = [&](std::span<const VkDescriptorType> types, VkDescriptorType type, uint64_t& stride) -> bool {
@@ -12474,17 +12779,22 @@ namespace rhi {
 			samplerElements - model.samplerCapacity));
 		const uint32_t samplerCount = model.samplerCapacity + model.staticSamplerCapacity;
 		// The layout query can hold fewer descriptors than the properties above say (65535 on Intel Arc under Mesa, against 33554432).
+		// A layout the driver rejects at the chosen count steps down by halves to the minimum, which is tried last.
 		{
-			const VkUniversalSetLayoutInfo probe(resourceTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, model.resourceCapacity, true);
-			VkDescriptorSetVariableDescriptorCountLayoutSupport variableSupport{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT };
-			VkDescriptorSetLayoutSupport support{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT };
-			support.pNext = &variableSupport;
-			vkGetDescriptorSetLayoutSupport(impl->device, &probe.createInfo, &support);
-			if (support.supported == VK_TRUE && variableSupport.maxVariableDescriptorCount < model.resourceCapacity &&
-				variableSupport.maxVariableDescriptorCount >= capacities.minResources) {
+			const uint32_t chosen = model.resourceCapacity;
+			uint32_t capacity = chosen;
+			bool supported = layoutSupport(resourceTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, capacity, maxVariable);
+			while (!supported && capacity > capacities.minResources) {
+				capacity = (std::max)(capacity / 2, capacities.minResources);
+				supported = layoutSupport(resourceTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, capacity, maxVariable);
+			}
+			if (supported && maxVariable < capacity && maxVariable >= capacities.minResources) {
+				capacity = maxVariable;
+			}
+			if (supported && capacity != chosen) {
 				spdlog::warn("{}: the device's set layout holds {} resource descriptors, not the {} its properties allow; using {}", caller,
-					variableSupport.maxVariableDescriptorCount, model.resourceCapacity, variableSupport.maxVariableDescriptorCount);
-				model.resourceCapacity = variableSupport.maxVariableDescriptorCount;
+					capacity, chosen, capacity);
+				model.resourceCapacity = capacity;
 			}
 		}
 		impl->shaderVisibleResourceCapacity = model.resourceCapacity;
@@ -13318,12 +13628,39 @@ namespace rhi {
 		}
 #endif
 
+		// Memory budget and crash diagnostics: extensions that change nothing until they are queried. The crash-marker ones only
+		// when crash markers are requested (VkCrashMarkersRequested).
+		const bool hasMemoryBudgetExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+		if (hasMemoryBudgetExtension) {
+			appendUniqueName(enabledDeviceExtensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+		}
+		const bool crashMarkersRequested = VkCrashMarkersRequested(ci);
+		VkPhysicalDeviceFaultFeaturesEXT enabledFaultFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT };
+		const bool enableBufferMarkers = crashMarkersRequested && VkHasDeviceExtension(physicalDevice, VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+		const bool enableCheckpoints = crashMarkersRequested && VkHasDeviceExtension(physicalDevice, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+		if (crashMarkersRequested && VkHasDeviceExtension(physicalDevice, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			VkPhysicalDeviceFaultFeaturesEXT supportedFaultFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT };
+			VkPhysicalDeviceFeatures2 faultQuery{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+			faultQuery.pNext = &supportedFaultFeatures;
+			vkGetPhysicalDeviceFeatures2(physicalDevice, &faultQuery);
+			if (supportedFaultFeatures.deviceFault == VK_TRUE) {
+				enabledFaultFeatures.deviceFault = VK_TRUE;
+				appendUniqueName(enabledDeviceExtensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+			}
+		}
+		if (enableBufferMarkers) appendUniqueName(enabledDeviceExtensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+		if (enableCheckpoints) appendUniqueName(enabledDeviceExtensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+
 		VkDeviceCreateInfo deviceCreateInfo{};
 		deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		deviceCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
 		deviceCreateInfo.pQueueCreateInfos = queueCreateInfos.data();
 		deviceCreateInfo.pEnabledFeatures = &supportedFeatures;
 		deviceCreateInfo.pNext = &enabledVulkan12Features;
+		if (enabledFaultFeatures.deviceFault == VK_TRUE) {
+			enabledFaultFeatures.pNext = const_cast<void*>(deviceCreateInfo.pNext);
+			deviceCreateInfo.pNext = &enabledFaultFeatures;
+		}
 		deviceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(enabledDeviceExtensions.size());
 		deviceCreateInfo.ppEnabledExtensionNames = enabledDeviceExtensions.empty() ? nullptr : enabledDeviceExtensions.data();
 
@@ -13447,6 +13784,7 @@ namespace rhi {
 			enabled.externalSemaphoreWin32 = ci.enableExternalInterop && hasExternalSemaphoreWin32Extension;
 			enabled.maintenance5 = std::any_of(enabledDeviceExtensions.begin(), enabledDeviceExtensions.end(),
 				[](const char* a_name) { return std::strcmp(a_name, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0; });
+			enabled.memoryBudget = hasMemoryBudgetExtension;
 			VkApplyEnabledDeviceState(impl.get(), enabled);
 		}
 		impl->validateBarrierTransitions = ci.validateBarrierTransitions;
@@ -13502,6 +13840,9 @@ namespace rhi {
 			}
 		}
 		impl->self = Device{ impl.get(), &g_vkdevvt };
+		if (crashMarkersRequested) {
+			VkInitCrashMarkers(impl.get(), enabledFaultFeatures.deviceFault == VK_TRUE, enableBufferMarkers, enableCheckpoints);
+		}
 
 		impl->bindingModel = impl->descriptorHeapEnabled ? VulkanBindingModel::DescriptorHeap
 			: (useDescriptorBufferModel && impl->descriptorBufferEnabled && impl->mutableDescriptorTypeEnabled ? VulkanBindingModel::DescriptorBuffer : VulkanBindingModel::None);
@@ -13734,6 +14075,7 @@ namespace rhi {
 			enabled.externalSemaphoreWin32 = hasExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
 			enabled.maintenance5 = hasExtension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 #endif
+			enabled.memoryBudget = hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 
 			auto impl = std::make_shared<VulkanDevice>();
 			impl->selfWeak = impl;
@@ -13889,6 +14231,29 @@ namespace rhi {
 			case VulkanBindingModel::DescriptorBuffer: return BindingModel_DescriptorBuffer;
 			default: return 0;
 			}
+		}
+
+		uint32_t QueryMemoryHeapBudgets(Device device, MemoryHeapBudget* out, uint32_t capacity) noexcept {
+			if (!device || device.vt != &g_vkdevvt || !device.impl) return 0;
+			const auto* impl = static_cast<const VulkanDevice*>(device.impl);
+			if (impl->physicalDevice == VK_NULL_HANDLE) return 0;
+			return VkQueryHeapBudgets(*impl, out, capacity);
+		}
+
+		CrashDiagnosticsState GetCrashDiagnostics(Device device) noexcept {
+			if (!device || device.vt != &g_vkdevvt || !device.impl) return {};
+			const VulkanCrashMarkers& markers = static_cast<const VulkanDevice*>(device.impl)->crashMarkers;
+			if (!markers.enabled) return {};
+			CrashDiagnosticsState state{};
+			state.deviceFault = markers.deviceFault;
+			state.bufferMarkers = markers.bufferMarkers;
+			state.checkpoints = markers.checkpoints;
+			return state;
+		}
+
+		uint32_t DumpCrashDiagnostics(Device device, bool deviceLost) noexcept {
+			if (!device || device.vt != &g_vkdevvt || !device.impl) return 0;
+			return VkDumpCrashMarkers(static_cast<VulkanDevice*>(device.impl), deviceLost);
 		}
 
 		Result import_image(Device device, const ImportedImageDesc& desc, ResourcePtr& out) noexcept {
