@@ -1801,6 +1801,10 @@ namespace rhi {
 				imgs, imgHandles,
 				impl
 			);
+			scWrap.sdrFormat = fmt;
+			if (ComPtr<IDXGISwapChain2> sc2; SUCCEEDED(proxySc3.As(&sc2))) {
+				scWrap.frameLatencyWaitable = sc2->GetFrameLatencyWaitableObject();
+			}
 
 			auto scHandle = impl->swapchains.alloc(scWrap);
 
@@ -1814,6 +1818,10 @@ namespace rhi {
 		static void d_destroySwapchain(DeviceDeletionContext*, Swapchain* sc) noexcept {
 			auto* s = dx12_detail::SC(sc);
 			if (!s) { sc->impl = nullptr; sc->vt = nullptr; return; }
+			if (s->frameLatencyWaitable) {
+				CloseHandle(s->frameLatencyWaitable);
+				s->frameLatencyWaitable = nullptr;
+			}
 
 			// Ensure GPU is idle before ripping out backbuffers.
 			if (s->dev && s->dev->self.vt && s->dev->self.vt->deviceWaitIdle) {
@@ -9468,10 +9476,32 @@ namespace rhi {
 		static ResourceHandle sc_img(Swapchain* sc, uint32_t i) noexcept { return dx12_detail::SC(sc)->imageHandles[i]; }
 		static Result sc_present(Swapchain* sc, bool vsync, const PresentSyncDesc* presentSync) noexcept {
 			auto* s = dx12_detail::SC(sc);
+			// The present goes out on the graphics queue the swapchain was made on. A frame finished on another queue is
+			// waited for there, on the GPU.
+			if (presentSync && presentSync->queue && presentSync->wait.value != 0 && !HandleEqual<QueueHandle>{}(presentSync->queue.GetQueueHandle(), s->dev->gfxHandle)) {
+				auto* gfxState = s->dev->queues.get(s->dev->gfxHandle);
+				auto* timeline = s->dev->timelines.get(presentSync->wait.t);
+				if (!gfxState || !timeline || !timeline->fence) {
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				if (FAILED(gfxState->pNativeQueue->Wait(timeline->fence.Get(), presentSync->wait.value))) {
+					RHI_FAIL(Result::Failed);
+				}
+			}
 			UINT syncInterval = vsync ? 1 : 0; UINT flags = 0;
+			// Tearing needs the swapchain flag, vsync off, and no exclusive fullscreen.
+			if (!vsync && (s->flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)) {
+				BOOL fullscreen = FALSE;
+				if (FAILED(s->pSlProxySC->GetFullscreenState(&fullscreen, nullptr)) || !fullscreen) {
+					flags |= DXGI_PRESENT_ALLOW_TEARING;
+				}
+			}
 			const UINT64 infoQueueStart = Dx12GetInfoQueueMessageCount(s->dev->pNativeDevice.Get());
 			const HRESULT hr = s->pSlProxySC->Present(syncInterval, flags);
 			Dx12LogInfoQueueMessagesSince(s->dev->pNativeDevice.Get(), infoQueueStart, 64);
+			if (SUCCEEDED(hr)) {
+				++s->presentCount;
+			}
 			if (FAILED(hr)) {
 				const uint64_t waitValue = presentSync ? presentSync->wait.value : 0;
 				const auto queueKind = presentSync ? presentSync->queue.GetKind() : QueueKind::Graphics;
@@ -9584,6 +9614,7 @@ namespace rhi {
 			s->fmt = newFmt;
 			s->count = (UINT)newCount;
 			s->flags = resizeFlags;
+			if (newFormat != Format::Unknown && s->colorSpace == SwapchainColorSpace::SrgbNonlinear) s->sdrFormat = newFormat;
 
 			// Adjust handle arrays (free excess if shrinking, alloc new if growing).
 			if (newCount < s->imageHandles.size())
@@ -9655,6 +9686,152 @@ namespace rhi {
 			return Result::Ok;
 		}
 		static void sc_setName(Swapchain* sc, const char* n) noexcept {} // Cannot name IDXGISwapChain
+
+		static DXGI_COLOR_SPACE_TYPE Dx12ColorSpace(SwapchainColorSpace colorSpace) noexcept {
+			switch (colorSpace) {
+			case SwapchainColorSpace::Hdr10St2084: return DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+			case SwapchainColorSpace::ScRgbLinear: return DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+			case SwapchainColorSpace::SrgbNonlinear: break;
+			}
+			return DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+		}
+
+		static void Dx12ApplyHdrMetadata(Dx12Swapchain& s) noexcept {
+			ComPtr<IDXGISwapChain4> sc4;
+			if (FAILED(s.pSlProxySC.As(&sc4))) return;
+			if (!s.hasHdrMetadata || s.colorSpace == SwapchainColorSpace::SrgbNonlinear) {
+				sc4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr);
+				return;
+			}
+			// DXGI units: chromaticity in 0.00002 steps, minimum mastering luminance in 0.0001 nits, the rest in nits.
+			auto xy = [](float value) { return static_cast<UINT16>(std::clamp(value, 0.0f, 1.0f) * 50000.0f + 0.5f); };
+			auto nits = [](float value) { return static_cast<UINT16>(std::clamp(value, 0.0f, 65535.0f) + 0.5f); };
+			const HdrMetadata& m = s.hdrMetadata;
+			DXGI_HDR_METADATA_HDR10 metadata{};
+			metadata.RedPrimary[0] = xy(m.redPrimary[0]);
+			metadata.RedPrimary[1] = xy(m.redPrimary[1]);
+			metadata.GreenPrimary[0] = xy(m.greenPrimary[0]);
+			metadata.GreenPrimary[1] = xy(m.greenPrimary[1]);
+			metadata.BluePrimary[0] = xy(m.bluePrimary[0]);
+			metadata.BluePrimary[1] = xy(m.bluePrimary[1]);
+			metadata.WhitePoint[0] = xy(m.whitePoint[0]);
+			metadata.WhitePoint[1] = xy(m.whitePoint[1]);
+			metadata.MaxMasteringLuminance = static_cast<UINT>((std::max)(m.maxLuminance, 0.0f) + 0.5f);
+			metadata.MinMasteringLuminance = static_cast<UINT>((std::max)(m.minLuminance, 0.0f) * 10000.0f + 0.5f);
+			metadata.MaxContentLightLevel = nits(m.maxContentLightLevel);
+			metadata.MaxFrameAverageLightLevel = nits(m.maxFrameAverageLightLevel);
+			sc4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, sizeof(metadata), &metadata);
+		}
+
+		static SwapchainCaps sc_caps(Swapchain* sc) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			if (!s) return {};
+			SwapchainCaps caps{};
+			caps.tearing = (s->flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+			caps.presentModeSwitch = true;
+			caps.presentWait = false;
+			ComPtr<IDXGISwapChain4> sc4;
+			caps.hdrMetadata = SUCCEEDED(s->pSlProxySC.As(&sc4));
+			return caps;
+		}
+
+		static bool sc_isColorSpaceSupported(Swapchain* sc, SwapchainColorSpace colorSpace) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			if (!s) return false;
+			if (colorSpace != SwapchainColorSpace::SrgbNonlinear) {
+				// HDR needs the output itself in HDR mode (Windows HDR on), not only a swapchain that accepts the colour space.
+				ComPtr<IDXGIOutput> output;
+				ComPtr<IDXGIOutput6> output6;
+				DXGI_OUTPUT_DESC1 outputDesc{};
+				if (FAILED(s->pSlProxySC->GetContainingOutput(&output)) || FAILED(output.As(&output6)) || FAILED(output6->GetDesc1(&outputDesc)) ||
+					outputDesc.ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+					return false;
+				}
+			}
+			UINT support = 0;
+			return SUCCEEDED(s->pSlProxySC->CheckColorSpaceSupport(Dx12ColorSpace(colorSpace), &support)) &&
+				(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0;
+		}
+
+		static Result sc_setColorSpace(Swapchain* sc, SwapchainColorSpace colorSpace) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			if (!s) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (colorSpace == s->colorSpace) return Result::Ok;
+			if (!sc_isColorSpaceSupported(sc, colorSpace)) return Result::Unsupported;
+			const Format sdrFormat = s->sdrFormat;
+			const Format format = colorSpace == SwapchainColorSpace::Hdr10St2084 ? Format::R10G10B10A2_UNorm
+				: colorSpace == SwapchainColorSpace::ScRgbLinear ? Format::R16G16B16A16_Float
+				: sdrFormat;
+			if (const Result resizeResult = sc_resizeBuffers(sc, 0, s->w, s->h, format, 0); resizeResult != Result::Ok) {
+				return resizeResult;
+			}
+			s->sdrFormat = sdrFormat;  // resizing to an HDR format does not change the SDR one
+			if (const HRESULT hr = s->pSlProxySC->SetColorSpace1(Dx12ColorSpace(colorSpace)); FAILED(hr)) {
+				return ToRHI(hr);
+			}
+			s->colorSpace = colorSpace;
+			Dx12ApplyHdrMetadata(*s);
+			return Result::Ok;
+		}
+
+		static SwapchainColorSpace sc_colorSpace(Swapchain* sc) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			return s ? s->colorSpace : SwapchainColorSpace::SrgbNonlinear;
+		}
+
+		static Result sc_setHdrMetadata(Swapchain* sc, const HdrMetadata& metadata) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			if (!s) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			ComPtr<IDXGISwapChain4> sc4;
+			if (FAILED(s->pSlProxySC.As(&sc4))) return Result::Unsupported;
+			s->hdrMetadata = metadata;
+			s->hasHdrMetadata = true;
+			// Sent now in HDR; an SDR swapchain sends it when it switches.
+			if (s->colorSpace != SwapchainColorSpace::SrgbNonlinear) Dx12ApplyHdrMetadata(*s);
+			return Result::Ok;
+		}
+
+		static Result sc_setMaximumFrameLatency(Swapchain* sc, uint32_t frames) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			if (!s || frames == 0) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			ComPtr<IDXGISwapChain2> sc2;
+			if (FAILED(s->pSlProxySC.As(&sc2))) return Result::Unsupported;
+			return ToRHI(sc2->SetMaximumFrameLatency(frames));
+		}
+
+		static Result sc_waitForFrameLatency(Swapchain* sc, uint64_t timeoutNs) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			if (!s) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (!s->frameLatencyWaitable) return Result::Unsupported;
+			const DWORD timeoutMs = timeoutNs == UINT64_MAX ? INFINITE
+				: static_cast<DWORD>((std::min)((timeoutNs + 999'999ull) / 1'000'000ull, static_cast<uint64_t>(INFINITE - 1)));
+			const DWORD waitResult = WaitForSingleObjectEx(s->frameLatencyWaitable, timeoutMs, TRUE);
+			if (waitResult == WAIT_OBJECT_0) return Result::Ok;
+			if (waitResult == WAIT_TIMEOUT) return Result::WaitTimeout;
+			return Result::Failed;
+		}
+
+		static void* sc_frameLatencyWaitableObject(Swapchain* sc) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			return s ? s->frameLatencyWaitable : nullptr;
+		}
+
+		static uint64_t sc_presentCount(Swapchain* sc) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			return s ? s->presentCount : 0;
+		}
+
+		static Result sc_waitForPresent(Swapchain*, uint64_t, uint64_t) noexcept {
+			return Result::Unsupported;
+		}
 		// ---------------- Resource vtable funcs ----------------
 
 		static void buf_map(Resource* r, void** data, uint64_t offset, uint64_t size) noexcept {
@@ -10541,7 +10718,17 @@ namespace rhi {
 		&sc_present,
 		&sc_resizeBuffers,
 		&sc_setName,
-		1u };
+		2u,
+		&sc_caps,
+		&sc_isColorSpaceSupported,
+		&sc_setColorSpace,
+		&sc_colorSpace,
+		&sc_setHdrMetadata,
+		&sc_setMaximumFrameLatency,
+		&sc_waitForFrameLatency,
+		&sc_frameLatencyWaitableObject,
+		&sc_presentCount,
+		&sc_waitForPresent };
 	const ResourceVTable g_buf_rvt = {
 		&buf_map,
 		&buf_unmap,
