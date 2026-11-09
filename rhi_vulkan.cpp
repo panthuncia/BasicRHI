@@ -3950,50 +3950,208 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		struct VkQueueAccessGuard {
+			VulkanDevice* impl;
+			VkQueue queue;
+			VkQueueAccessGuard(VulkanDevice* device, VkQueue vkQueue) noexcept : impl(device), queue(vkQueue) {
+				if (impl && impl->submissionLock) impl->submissionLock(impl->submissionHookUser, queue);
+			}
+			~VkQueueAccessGuard() {
+				if (impl && impl->submissionUnlock) impl->submissionUnlock(impl->submissionHookUser, queue);
+			}
+			VkQueueAccessGuard(const VkQueueAccessGuard&) = delete;
+			VkQueueAccessGuard& operator=(const VkQueueAccessGuard&) = delete;
+		};
+
+		// Waits for every acquire slot's batch, so their semaphores and command buffers are free.
+		static Result VkWaitSwapchainAcquireSlots(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			for (size_t slot = 0; slot < swapchain.acquireFences.size(); ++slot) {
+				if (!swapchain.acquireFencePending[slot]) continue;
+				VkResult result = vkWaitForFences(impl->device, 1, &swapchain.acquireFences[slot], VK_TRUE, UINT64_MAX);
+				if (result == VK_SUCCESS) result = vkResetFences(impl->device, 1, &swapchain.acquireFences[slot]);
+				if (result != VK_SUCCESS) return ToRHI(result);
+				swapchain.acquireFencePending[slot] = 0;
+			}
+			return Result::Ok;
+		}
+
+		// Destroys the acquire slots and their command pool. Their batches must be done (the device is idle).
+		static void VkReleaseSwapchainAcquireSlots(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			if (impl && impl->device != VK_NULL_HANDLE) {
+				for (VkSemaphore semaphore : swapchain.acquireSemaphores) {
+					if (semaphore != VK_NULL_HANDLE) vkDestroySemaphore(impl->device, semaphore, nullptr);
+				}
+				for (VkFence fence : swapchain.acquireFences) {
+					if (fence != VK_NULL_HANDLE) vkDestroyFence(impl->device, fence, nullptr);
+				}
+				if (swapchain.acquireCommandPool != VK_NULL_HANDLE) vkDestroyCommandPool(impl->device, swapchain.acquireCommandPool, nullptr);
+			}
+			swapchain.acquireSemaphores.clear();
+			swapchain.acquireFences.clear();
+			swapchain.acquireFencePending.clear();
+			swapchain.acquireCommandBuffers.clear();
+			swapchain.acquireCommandPool = VK_NULL_HANDLE;
+			swapchain.acquireCommandPoolFamily = 0xFFFFFFFFu;
+			swapchain.nextAcquireSlot = 0;
+		}
+
+		// One acquire slot more than there are images: an acquire never has to wait for the slot of the image it is about to
+		// get. Kept across a recreation that leaves the image count alone.
+		static Result VkCreateSwapchainAcquireSlots(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			const uint32_t slotCount = swapchain.imageCount + 1;
+			if (swapchain.acquireSemaphores.size() == slotCount) {
+				return VkWaitSwapchainAcquireSlots(impl, swapchain);
+			}
+			if (const Result waitResult = VkWaitSwapchainAcquireSlots(impl, swapchain); waitResult != Result::Ok) return waitResult;
+			VkReleaseSwapchainAcquireSlots(impl, swapchain);
+			swapchain.acquireSemaphores.assign(slotCount, VK_NULL_HANDLE);
+			swapchain.acquireFences.assign(slotCount, VK_NULL_HANDLE);
+			swapchain.acquireFencePending.assign(slotCount, 0);
+			swapchain.acquireCommandBuffers.assign(slotCount, VK_NULL_HANDLE);
+			for (uint32_t slot = 0; slot < slotCount; ++slot) {
+				VkSemaphoreCreateInfo semaphoreInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+				VkResult result = vkCreateSemaphore(impl->device, &semaphoreInfo, nullptr, &swapchain.acquireSemaphores[slot]);
+				if (result == VK_SUCCESS) {
+					VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+					result = vkCreateFence(impl->device, &fenceInfo, nullptr, &swapchain.acquireFences[slot]);
+				}
+				if (result != VK_SUCCESS) {
+					VkReleaseSwapchainAcquireSlots(impl, swapchain);
+					return ToRHI(result);
+				}
+				VkSetObjectName(impl, reinterpret_cast<uint64_t>(swapchain.acquireSemaphores[slot]), VK_OBJECT_TYPE_SEMAPHORE,
+					std::format("Swapchain Acquire Semaphore {}", slot).c_str());
+			}
+			return Result::Ok;
+		}
+
+		// Records, into the slot's command buffer, the move of a never-used image from UNDEFINED to PRESENT_SRC.
+		static Result VkRecordSwapchainInitialLayout(VulkanDevice* impl, VulkanSwapchain& swapchain, uint32_t familyIndex, uint32_t slot,
+			uint32_t imageIndex, VkCommandBuffer& out) noexcept {
+			out = VK_NULL_HANDLE;
+			if (swapchain.acquireCommandPool != VK_NULL_HANDLE && swapchain.acquireCommandPoolFamily != familyIndex) {
+				// The present queue moved to another family: the pool goes once no slot's command buffer is in flight.
+				if (const Result waitResult = VkWaitSwapchainAcquireSlots(impl, swapchain); waitResult != Result::Ok) return waitResult;
+				vkDestroyCommandPool(impl->device, swapchain.acquireCommandPool, nullptr);
+				swapchain.acquireCommandPool = VK_NULL_HANDLE;
+				std::fill(swapchain.acquireCommandBuffers.begin(), swapchain.acquireCommandBuffers.end(), VK_NULL_HANDLE);
+			}
+			if (swapchain.acquireCommandPool == VK_NULL_HANDLE) {
+				VkCommandPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+				poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+				poolInfo.queueFamilyIndex = familyIndex;
+				const VkResult result = vkCreateCommandPool(impl->device, &poolInfo, nullptr, &swapchain.acquireCommandPool);
+				if (result != VK_SUCCESS) return ToRHI(result);
+				swapchain.acquireCommandPoolFamily = familyIndex;
+			}
+			VkCommandBuffer& commandBuffer = swapchain.acquireCommandBuffers[slot];
+			if (commandBuffer == VK_NULL_HANDLE) {
+				VkCommandBufferAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+				allocateInfo.commandPool = swapchain.acquireCommandPool;
+				allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+				allocateInfo.commandBufferCount = 1;
+				const VkResult result = vkAllocateCommandBuffers(impl->device, &allocateInfo, &commandBuffer);
+				if (result != VK_SUCCESS) {
+					commandBuffer = VK_NULL_HANDLE;
+					return ToRHI(result);
+				}
+				VkSetObjectName(impl, reinterpret_cast<uint64_t>(commandBuffer), VK_OBJECT_TYPE_COMMAND_BUFFER,
+					std::format("Swapchain Initial Layout {}", slot).c_str());
+			}
+			VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+			beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+			VkResult result = vkBeginCommandBuffer(commandBuffer, &beginInfo);
+			if (result != VK_SUCCESS) return ToRHI(result);
+			VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+			barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.image = swapchain.images[imageIndex];
+			barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+			// Source ALL_COMMANDS chains to the acquire semaphore's wait stage.
+			vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+			result = vkEndCommandBuffer(commandBuffer);
+			if (result != VK_SUCCESS) return ToRHI(result);
+			out = commandBuffer;
+			return Result::Ok;
+		}
+
+		// Acquires the next image. The acquire semaphore is waited on the GPU, in a batch on the queue that presented last:
+		// a semaphore wait made by vkQueueSubmit orders every later submission on that queue, so the host does not wait.
+		// The batch also moves an image used for the first time to PRESENT_SRC.
 		static Result VkAcquireNextSwapchainImage(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
-			if (!impl || impl->device == VK_NULL_HANDLE || swapchain.swapchain == VK_NULL_HANDLE ||
-				swapchain.acquireSemaphore == VK_NULL_HANDLE || swapchain.acquireFence == VK_NULL_HANDLE) {
+			if (!impl || impl->device == VK_NULL_HANDLE || swapchain.swapchain == VK_NULL_HANDLE || swapchain.acquireSemaphores.empty()) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			VkResult result = vkResetFences(impl->device, 1, &swapchain.acquireFence);
-			if (result != VK_SUCCESS) {
-				return ToRHI(result);
+			const uint32_t slot = swapchain.nextAcquireSlot;
+			if (swapchain.acquireFencePending[slot]) {
+				// Normally long done: the slot was last used imageCount + 1 acquires ago.
+				VkResult result = vkWaitForFences(impl->device, 1, &swapchain.acquireFences[slot], VK_TRUE, UINT64_MAX);
+				if (result == VK_SUCCESS) result = vkResetFences(impl->device, 1, &swapchain.acquireFences[slot]);
+				if (result != VK_SUCCESS) return ToRHI(result);
+				swapchain.acquireFencePending[slot] = 0;
 			}
 
 			uint32_t imageIndex = 0;
-			result = VkAcquireNextImageKHRHooked(
+			const VkResult result = VkAcquireNextImageKHRHooked(
 				impl->device,
 				swapchain.swapchain,
 				UINT64_MAX,
-				swapchain.acquireSemaphore,
+				swapchain.acquireSemaphores[slot],
 				VK_NULL_HANDLE,
 				&imageIndex);
 			if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
 				return ToRHI(result);
 			}
 
-			const VulkanQueueState* graphicsQueueState = VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
-			if (!graphicsQueueState || graphicsQueueState->queue == VK_NULL_HANDLE) {
+			VulkanQueueState* queueState = VkQueueStateForHandle(impl, swapchain.presentQueue);
+			if (!queueState || queueState->queue == VK_NULL_HANDLE) {
+				queueState = VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
+			}
+			if (!queueState || queueState->queue == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::Failed);
 			}
+
+			VkCommandBuffer initialLayout = VK_NULL_HANDLE;
+			const bool needsInitialLayout = imageIndex < swapchain.imageNeedsInitialLayout.size() && swapchain.imageNeedsInitialLayout[imageIndex];
+			if (needsInitialLayout) {
+				const Result recordResult = VkRecordSwapchainInitialLayout(impl, swapchain, queueState->familyIndex, slot, imageIndex, initialLayout);
+				if (recordResult != Result::Ok) return recordResult;
+			}
+
 			const VkPipelineStageFlags acquireWaitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 			VkSubmitInfo acquireSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
 			acquireSubmit.waitSemaphoreCount = 1;
-			acquireSubmit.pWaitSemaphores = &swapchain.acquireSemaphore;
+			acquireSubmit.pWaitSemaphores = &swapchain.acquireSemaphores[slot];
 			acquireSubmit.pWaitDstStageMask = &acquireWaitStage;
-			const VkResult submitResult = vkQueueSubmit(graphicsQueueState->queue, 1, &acquireSubmit, swapchain.acquireFence);
+			acquireSubmit.commandBufferCount = initialLayout != VK_NULL_HANDLE ? 1u : 0u;
+			acquireSubmit.pCommandBuffers = initialLayout != VK_NULL_HANDLE ? &initialLayout : nullptr;
+			VkResult submitResult = VK_SUCCESS;
+			{
+				// timelinesMutex serializes BasicRHI's submissions to a queue (q_submit holds it too).
+				const std::lock_guard timelineLock(impl->timelinesMutex);
+				const VkQueueAccessGuard queueAccess(impl, queueState->queue);
+				submitResult = vkQueueSubmit(queueState->queue, 1, &acquireSubmit, swapchain.acquireFences[slot]);
+			}
 			if (submitResult != VK_SUCCESS) {
 				return ToRHI(submitResult);
 			}
+			swapchain.acquireFencePending[slot] = 1;
+			swapchain.nextAcquireSlot = (slot + 1) % static_cast<uint32_t>(swapchain.acquireSemaphores.size());
 
-			const VkResult waitResult = vkWaitForFences(impl->device, 1, &swapchain.acquireFence, VK_TRUE, UINT64_MAX);
-			if (waitResult != VK_SUCCESS) {
-				return ToRHI(waitResult);
+			if (needsInitialLayout) {
+				swapchain.imageNeedsInitialLayout[imageIndex] = 0;
+				if (VulkanResource* resource = VkResourceState(impl, swapchain.imageHandles[imageIndex])) {
+					resource->currentLayout = ResourceLayout::Present;
+					resource->currentAccess = ResourceAccessType::Present;
+				}
 			}
 
 			swapchain.currentImageIndex = imageIndex;
-			spdlog::info(
+			spdlog::debug(
 				"Vulkan swapchain acquire: swapchain=0x{:x} imageIndex={} image=0x{:x}",
 				reinterpret_cast<uint64_t>(swapchain.swapchain),
 				imageIndex,
@@ -4003,40 +4161,122 @@ namespace rhi {
 			return ToRHI(result);
 		}
 
-		static VkSurfaceFormatKHR VkChooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& surfaceFormats, Format requestedFormat) noexcept {
-			const VkFormat requestedVkFormat = ToVkFormat(requestedFormat);
-			if (requestedVkFormat != VK_FORMAT_UNDEFINED) {
-				for (const VkSurfaceFormatKHR& format : surfaceFormats) {
-					if (format.format == requestedVkFormat) {
-						return format;
-					}
-				}
-			}
-
-			for (const VkSurfaceFormatKHR& format : surfaceFormats) {
-				if (format.format == VK_FORMAT_B8G8R8A8_UNORM || format.format == VK_FORMAT_R8G8B8A8_UNORM) {
-					return format;
-				}
-			}
-
-			return surfaceFormats.empty() ? VkSurfaceFormatKHR{ VK_FORMAT_UNDEFINED, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR } : surfaceFormats.front();
+		static bool VkHasPresentMode(const std::vector<VkPresentModeKHR>& modes, VkPresentModeKHR mode) noexcept {
+			return std::find(modes.begin(), modes.end(), mode) != modes.end();
 		}
 
-		static VkPresentModeKHR VkChoosePresentMode(const std::vector<VkPresentModeKHR>& presentModes, bool allowTearing) noexcept {
-			if (allowTearing) {
-				for (VkPresentModeKHR mode : presentModes) {
-					if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
-						return mode;
+		// The surface format of a colour space. SrgbNonlinear takes the requested format (then any 8-bit UNORM) in the sRGB
+		// colour space; the HDR colour spaces need their own format and colour space exactly.
+		static bool VkChooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& surfaceFormats, SwapchainColorSpace colorSpace,
+			Format requestedFormat, VkSurfaceFormatKHR& out) noexcept {
+			auto find = [&](VkFormat format, VkColorSpaceKHR space) {
+				for (const VkSurfaceFormatKHR& candidate : surfaceFormats) {
+					if (candidate.format == format && candidate.colorSpace == space) {
+						out = candidate;
+						return true;
 					}
 				}
-				for (VkPresentModeKHR mode : presentModes) {
-					if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
-						return mode;
-					}
-				}
+				return false;
+			};
+			switch (colorSpace) {
+			case SwapchainColorSpace::Hdr10St2084:
+				return find(ToVkFormat(Format::R10G10B10A2_UNorm), VK_COLOR_SPACE_HDR10_ST2084_EXT);
+			case SwapchainColorSpace::ScRgbLinear:
+				return find(ToVkFormat(Format::R16G16B16A16_Float), VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT);
+			case SwapchainColorSpace::SrgbNonlinear:
+				break;
 			}
 
+			const VkFormat requestedVkFormat = ToVkFormat(requestedFormat);
+			if (requestedVkFormat != VK_FORMAT_UNDEFINED && find(requestedVkFormat, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)) return true;
+			if (find(VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) || find(VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)) {
+				return true;
+			}
+			// No sRGB entry: take the requested format in any colour space, as before colour spaces were chosen.
+			for (const VkSurfaceFormatKHR& format : surfaceFormats) {
+				if (format.format == requestedVkFormat) {
+					out = format;
+					return true;
+				}
+			}
+			if (surfaceFormats.empty()) return false;
+			out = surfaceFormats.front();
+			return true;
+		}
+
+		static Result VkQuerySurfaceFormats(VulkanDevice* impl, VkSurfaceKHR surface, std::vector<VkSurfaceFormatKHR>& out) noexcept {
+			uint32_t formatCount = 0;
+			VkResult result = vkGetPhysicalDeviceSurfaceFormatsKHR(impl->physicalDevice, surface, &formatCount, nullptr);
+			if (result != VK_SUCCESS || formatCount == 0) {
+				return result != VK_SUCCESS ? ToRHI(result) : Result::Unsupported;
+			}
+			out.resize(formatCount);
+			result = vkGetPhysicalDeviceSurfaceFormatsKHR(impl->physicalDevice, surface, &formatCount, out.data());
+			out.resize(formatCount);
+			return ToRHI(result);
+		}
+
+		// The present mode for a vsync choice. Vsync on is FIFO. Vsync off tears (IMMEDIATE) when the swapchain allows
+		// tearing, and otherwise is MAILBOX where the swapchain already uses it or can switch to it in a present; failing
+		// those it stays FIFO.
+		static VkPresentModeKHR VkPresentModeForVsync(const VulkanSwapchain& swapchain, bool vsync) noexcept {
+			if (vsync) return VK_PRESENT_MODE_FIFO_KHR;
+			if (swapchain.allowTearing) {
+				if (VkHasPresentMode(swapchain.surfacePresentModes, VK_PRESENT_MODE_IMMEDIATE_KHR)) return VK_PRESENT_MODE_IMMEDIATE_KHR;
+				if (VkHasPresentMode(swapchain.surfacePresentModes, VK_PRESENT_MODE_MAILBOX_KHR)) return VK_PRESENT_MODE_MAILBOX_KHR;
+				return VK_PRESENT_MODE_FIFO_KHR;
+			}
+			if (swapchain.presentMode == VK_PRESENT_MODE_MAILBOX_KHR || VkHasPresentMode(swapchain.switchablePresentModes, VK_PRESENT_MODE_MAILBOX_KHR)) {
+				return VK_PRESENT_MODE_MAILBOX_KHR;
+			}
 			return VK_PRESENT_MODE_FIFO_KHR;
+		}
+
+		// VK_EXT_surface_maintenance1: the modes a swapchain created with presentMode can switch to in a present, and the
+		// largest minImageCount among them. Empty when the device cannot switch.
+		static void VkQuerySwitchablePresentModes(VulkanDevice* impl, VkSurfaceKHR surface, VkPresentModeKHR presentMode,
+			std::vector<VkPresentModeKHR>& out, uint32_t& minImageCount) noexcept {
+			out.clear();
+			if (!impl->swapchainMaintenance1Enabled || !impl->surfaceMaintenance1Enabled) return;
+			auto query = [&](VkPresentModeKHR mode, VkSurfacePresentModeCompatibilityEXT* compatibility, VkSurfaceCapabilitiesKHR& capabilities) {
+				VkSurfacePresentModeEXT modeInfo{ VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT };
+				modeInfo.presentMode = mode;
+				VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR };
+				surfaceInfo.pNext = &modeInfo;
+				surfaceInfo.surface = surface;
+				VkSurfaceCapabilities2KHR capabilities2{ VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR };
+				capabilities2.pNext = compatibility;
+				const VkResult result = vkGetPhysicalDeviceSurfaceCapabilities2KHR(impl->physicalDevice, &surfaceInfo, &capabilities2);
+				capabilities = capabilities2.surfaceCapabilities;
+				return result == VK_SUCCESS;
+			};
+			VkSurfacePresentModeCompatibilityEXT compatibility{ VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT };
+			VkSurfaceCapabilitiesKHR capabilities{};
+			if (!query(presentMode, &compatibility, capabilities) || compatibility.presentModeCount == 0) return;
+			std::vector<VkPresentModeKHR> modes(compatibility.presentModeCount);
+			compatibility.pPresentModes = modes.data();
+			if (!query(presentMode, &compatibility, capabilities)) return;
+			modes.resize(compatibility.presentModeCount);
+			if (modes.size() < 2) return;
+			for (VkPresentModeKHR mode : modes) {
+				if (query(mode, nullptr, capabilities)) minImageCount = (std::max)(minImageCount, capabilities.minImageCount);
+			}
+			out = std::move(modes);
+		}
+
+		static void VkApplyHdrMetadata(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			if (!impl->hdrMetadataEnabled || !swapchain.hasHdrMetadata || swapchain.colorSpace == SwapchainColorSpace::SrgbNonlinear) return;
+			const HdrMetadata& m = swapchain.hdrMetadata;
+			VkHdrMetadataEXT metadata{ VK_STRUCTURE_TYPE_HDR_METADATA_EXT };
+			metadata.displayPrimaryRed = { m.redPrimary[0], m.redPrimary[1] };
+			metadata.displayPrimaryGreen = { m.greenPrimary[0], m.greenPrimary[1] };
+			metadata.displayPrimaryBlue = { m.bluePrimary[0], m.bluePrimary[1] };
+			metadata.whitePoint = { m.whitePoint[0], m.whitePoint[1] };
+			metadata.maxLuminance = m.maxLuminance;
+			metadata.minLuminance = m.minLuminance;
+			metadata.maxContentLightLevel = m.maxContentLightLevel;
+			metadata.maxFrameAverageLightLevel = m.maxFrameAverageLightLevel;
+			vkSetHdrMetadataEXT(impl->device, 1, &swapchain.swapchain, &metadata);
 		}
 
 		static uint32_t VkClampSwapchainImageCount(const VkSurfaceCapabilitiesKHR& capabilities, uint32_t requestedCount) noexcept {
@@ -4096,9 +4336,12 @@ namespace rhi {
 			}
 
 			swapchain.imageCount = imageCount;
+			swapchain.imageNeedsInitialLayout.assign(imageCount, 1);
 			return Result::Ok;
 		}
 
+		// Creates the swapchain, or replaces it (resize, colour space, present mode). A replacement must find the device
+		// idle. The first creation picks the present mode from allowTearing; later ones keep swapchain.presentMode.
 		static Result VkCreateOrResizeSwapchain(VulkanDevice* impl, VulkanSwapchain& swapchain, uint32_t width, uint32_t height, Format requestedFormat, uint32_t bufferCount, bool allowTearing) noexcept {
 			if (!impl || impl->device == VK_NULL_HANDLE || impl->physicalDevice == VK_NULL_HANDLE || swapchain.surface == VK_NULL_HANDLE || !impl->swapchainExtensionEnabled) {
 				RHI_FAIL(Result::Unsupported);
@@ -4123,16 +4366,9 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
-			uint32_t formatCount = 0;
-			result = vkGetPhysicalDeviceSurfaceFormatsKHR(impl->physicalDevice, swapchain.surface, &formatCount, nullptr);
-			if (result != VK_SUCCESS || formatCount == 0) {
-				return ToRHI(result);
-			}
-
-			std::vector<VkSurfaceFormatKHR> surfaceFormats(formatCount);
-			result = vkGetPhysicalDeviceSurfaceFormatsKHR(impl->physicalDevice, swapchain.surface, &formatCount, surfaceFormats.data());
-			if (result != VK_SUCCESS) {
-				return ToRHI(result);
+			std::vector<VkSurfaceFormatKHR> surfaceFormats;
+			if (const Result formatsResult = VkQuerySurfaceFormats(impl, swapchain.surface, surfaceFormats); formatsResult != Result::Ok) {
+				return formatsResult;
 			}
 
 			uint32_t presentModeCount = 0;
@@ -4147,19 +4383,48 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
-			const VkSurfaceFormatKHR surfaceFormat = VkChooseSurfaceFormat(surfaceFormats, requestedFormat);
-			if (surfaceFormat.format == VK_FORMAT_UNDEFINED) {
+			VkSurfaceFormatKHR surfaceFormat{ VK_FORMAT_UNDEFINED, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+			if (!VkChooseSurfaceFormat(surfaceFormats, swapchain.colorSpace, requestedFormat, surfaceFormat) || surfaceFormat.format == VK_FORMAT_UNDEFINED) {
 				RHI_FAIL(Result::Unsupported);
 			}
 
+			swapchain.allowTearing = allowTearing;
+			swapchain.surfacePresentModes = presentModes;
+			VkPresentModeKHR presentMode = swapchain.presentMode;
+			if (swapchain.swapchain == VK_NULL_HANDLE) {
+				// Vsync off is the likelier first present when tearing is allowed (it keeps the mode creation used to pick).
+				presentMode = VkPresentModeForVsync(swapchain, !allowTearing);
+			}
+			if (!VkHasPresentMode(presentModes, presentMode)) {
+				presentMode = VK_PRESENT_MODE_FIFO_KHR;
+			}
+
 			const VkExtent2D extent = VkChooseSwapchainExtent(capabilities, width, height);
-			const uint32_t imageCount = VkClampSwapchainImageCount(capabilities, bufferCount);
-			const VkPresentModeKHR presentMode = VkChoosePresentMode(presentModes, allowTearing);
+			std::vector<VkPresentModeKHR> switchableModes;
+			uint32_t switchableMinImageCount = 0;
+			VkQuerySwitchablePresentModes(impl, swapchain.surface, presentMode, switchableModes, switchableMinImageCount);
+			const uint32_t imageCount = (std::max)(VkClampSwapchainImageCount(capabilities, bufferCount),
+				capabilities.maxImageCount != 0 ? (std::min)(switchableMinImageCount, capabilities.maxImageCount) : switchableMinImageCount);
 
 			std::vector<ResourceHandle> oldImageHandles = std::move(swapchain.imageHandles);
 			std::vector<VkImage> oldImages = std::move(swapchain.images);
 			std::vector<VkSemaphore> oldPresentWaitSemaphores = std::move(swapchain.presentWaitSemaphores);
+			std::vector<uint8_t> oldNeedsInitialLayout = std::move(swapchain.imageNeedsInitialLayout);
+			const uint32_t oldImageCount = swapchain.imageCount;
 			VkSwapchainKHR oldSwapchain = swapchain.swapchain;
+			auto restoreOld = [&](VkSwapchainKHR newSwapchain) {
+				if (newSwapchain != VK_NULL_HANDLE) {
+					VkReleaseSwapchainImageHandles(impl, swapchain);
+					VkReleaseSwapchainPresentSemaphores(impl, swapchain);
+					VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
+				}
+				swapchain.swapchain = oldSwapchain;
+				swapchain.imageHandles = std::move(oldImageHandles);
+				swapchain.images = std::move(oldImages);
+				swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
+				swapchain.imageNeedsInitialLayout = std::move(oldNeedsInitialLayout);
+				swapchain.imageCount = oldImageCount;
+			};
 
 			VkSwapchainCreateInfoKHR createInfo{ VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
 			createInfo.surface = swapchain.surface;
@@ -4175,72 +4440,45 @@ namespace rhi {
 			createInfo.presentMode = presentMode;
 			createInfo.clipped = VK_TRUE;
 			createInfo.oldSwapchain = oldSwapchain;
+			VkSwapchainPresentModesCreateInfoEXT presentModesInfo{ VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT };
+			if (!switchableModes.empty()) {
+				presentModesInfo.presentModeCount = static_cast<uint32_t>(switchableModes.size());
+				presentModesInfo.pPresentModes = switchableModes.data();
+				createInfo.pNext = &presentModesInfo;
+			}
 
 			VkSwapchainKHR newSwapchain = VK_NULL_HANDLE;
 			result = VkCreateSwapchainKHRHooked(impl->device, &createInfo, nullptr, &newSwapchain);
 			if (result != VK_SUCCESS) {
-				swapchain.imageHandles = std::move(oldImageHandles);
-				swapchain.images = std::move(oldImages);
-				swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
-				swapchain.swapchain = oldSwapchain;
+				restoreOld(VK_NULL_HANDLE);
 				return ToRHI(result);
 			}
 
 			swapchain.swapchain = newSwapchain;
 			swapchain.format = surfaceFormat.format;
 			swapchain.rhiFormat = FromVkFormat(surfaceFormat.format);
+			swapchain.sdrFormat = requestedFormat;
 			swapchain.width = extent.width;
 			swapchain.height = extent.height;
-			swapchain.allowTearing = allowTearing;
-
-			if (swapchain.acquireFence == VK_NULL_HANDLE) {
-				VkFenceCreateInfo fenceCreateInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-				result = vkCreateFence(impl->device, &fenceCreateInfo, nullptr, &swapchain.acquireFence);
-				if (result != VK_SUCCESS) {
-					VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
-					swapchain.swapchain = oldSwapchain;
-					swapchain.imageHandles = std::move(oldImageHandles);
-					swapchain.images = std::move(oldImages);
-					swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
-					return ToRHI(result);
-				}
-			}
-			if (swapchain.acquireSemaphore == VK_NULL_HANDLE) {
-				VkSemaphoreCreateInfo semaphoreCreateInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-				result = vkCreateSemaphore(impl->device, &semaphoreCreateInfo, nullptr, &swapchain.acquireSemaphore);
-				if (result != VK_SUCCESS) {
-					VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
-					swapchain.swapchain = oldSwapchain;
-					swapchain.imageHandles = std::move(oldImageHandles);
-					swapchain.images = std::move(oldImages);
-					swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
-					return ToRHI(result);
-				}
-				VkSetObjectName(impl, reinterpret_cast<uint64_t>(swapchain.acquireSemaphore), VK_OBJECT_TYPE_SEMAPHORE, "Swapchain Acquire Semaphore");
-			}
+			swapchain.presentMode = presentMode;
+			swapchain.switchablePresentModes = std::move(switchableModes);
 
 			const Result populateResult = VkPopulateSwapchainImages(impl, swapchain);
 			if (populateResult != Result::Ok) {
-				VkReleaseSwapchainImageHandles(impl, swapchain);
-				VkReleaseSwapchainPresentSemaphores(impl, swapchain);
-				VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
-				swapchain.swapchain = oldSwapchain;
-				swapchain.imageHandles = std::move(oldImageHandles);
-				swapchain.images = std::move(oldImages);
-				swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
+				restoreOld(newSwapchain);
 				return populateResult;
 			}
 
 			const Result semaphoreResult = VkCreateSwapchainPresentSemaphores(impl, swapchain);
 			if (semaphoreResult != Result::Ok) {
-				VkReleaseSwapchainImageHandles(impl, swapchain);
-				VkReleaseSwapchainPresentSemaphores(impl, swapchain);
-				VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
-				swapchain.swapchain = oldSwapchain;
-				swapchain.imageHandles = std::move(oldImageHandles);
-				swapchain.images = std::move(oldImages);
-				swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
+				restoreOld(newSwapchain);
 				return semaphoreResult;
+			}
+
+			const Result slotsResult = VkCreateSwapchainAcquireSlots(impl, swapchain);
+			if (slotsResult != Result::Ok) {
+				restoreOld(newSwapchain);
+				return slotsResult;
 			}
 
 			for (const ResourceHandle handle : oldImageHandles) {
@@ -4259,6 +4497,10 @@ namespace rhi {
 				VkDestroySwapchainKHRHooked(impl->device, oldSwapchain, nullptr);
 			}
 
+			VkApplyHdrMetadata(impl, swapchain);
+			spdlog::info("Vulkan swapchain: {}x{} images={} format={} colorSpace={} presentMode={} switchableModes={}",
+				extent.width, extent.height, swapchain.imageCount, static_cast<int>(surfaceFormat.format), static_cast<int>(surfaceFormat.colorSpace),
+				static_cast<int>(presentMode), swapchain.switchablePresentModes.size());
 			return VkAcquireNextSwapchainImage(impl, swapchain);
 		}
 
@@ -4757,19 +4999,6 @@ namespace rhi {
 
 		// Brackets host access to a VkQueue with the adopting host's submission lock
 		// (AdoptVulkanDevice). A no-op for devices BasicRHI created itself.
-		struct VkQueueAccessGuard {
-			VulkanDevice* impl;
-			VkQueue queue;
-			VkQueueAccessGuard(VulkanDevice* device, VkQueue vkQueue) noexcept : impl(device), queue(vkQueue) {
-				if (impl && impl->submissionLock) impl->submissionLock(impl->submissionHookUser, queue);
-			}
-			~VkQueueAccessGuard() {
-				if (impl && impl->submissionUnlock) impl->submissionUnlock(impl->submissionHookUser, queue);
-			}
-			VkQueueAccessGuard(const VkQueueAccessGuard&) = delete;
-			VkQueueAccessGuard& operator=(const VkQueueAccessGuard&) = delete;
-		};
-
 		// Host-waits for everything BasicRHI submitted (its timelines' last signalled
 		// values). Used instead of vkDeviceWaitIdle on adopted devices, whose queues
 		// the host keeps submitting to and whose whole-device wait would need every
@@ -7817,95 +8046,155 @@ namespace rhi {
 			return {};
 		}
 
+		// Waits until no more than maxUnfinished presented frames are unfinished on the GPU, then forgets the finished ones.
+		static Result VkWaitPresentedFrames(VulkanDevice* impl, VulkanSwapchain& swapchain, uint32_t maxUnfinished, uint64_t timeoutNs) noexcept {
+			if (swapchain.pendingFrames.size() <= maxUnfinished) return Result::Ok;
+			const VulkanSwapchain::PendingFrame target = swapchain.pendingFrames[swapchain.pendingFrames.size() - maxUnfinished - 1];
+			VkSemaphore semaphore = VK_NULL_HANDLE;
+			{
+				const std::lock_guard timelineLock(impl->timelinesMutex);
+				if (const VulkanTimeline* timeline = VkTimelineState(impl, target.timeline)) semaphore = timeline->semaphore;
+			}
+			if (semaphore != VK_NULL_HANDLE) {
+				VkSemaphoreWaitInfo waitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+				waitInfo.semaphoreCount = 1;
+				waitInfo.pSemaphores = &semaphore;
+				waitInfo.pValues = &target.value;
+				const VkResult result = vkWaitSemaphores(impl->device, &waitInfo, timeoutNs);
+				if (result != VK_SUCCESS) return ToRHI(result);
+			}
+			while (swapchain.pendingFrames.size() > maxUnfinished) swapchain.pendingFrames.pop_front();
+			return Result::Ok;
+		}
+
 		static Result sc_present(Swapchain* swapchain, bool vsync, const PresentSyncDesc* sync) noexcept {
-			VkIgnoreUnused(vsync);
 			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
 			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
 			if (!impl || !swapchainState || swapchainState->swapchain == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
-			const std::lock_guard timelineLock(impl->timelinesMutex);
-			if (swapchainState->currentImageIndex >= swapchainState->presentWaitSemaphores.size()) {
-				RHI_FAIL(Result::InvalidArgument);
-			}
 
-			VkSemaphore presentWaitSemaphore = swapchainState->presentWaitSemaphores[swapchainState->currentImageIndex];
-			if (presentWaitSemaphore == VK_NULL_HANDLE) {
-				RHI_FAIL(Result::InvalidArgument);
-			}
-
-			VulkanQueueState* signalQueueState = nullptr;
-			VulkanTimeline* waitTimeline = nullptr;
-			if (sync && sync->queue && sync->wait.value != 0) {
-				signalQueueState = VkQueueStateForHandle(impl, sync->queue.GetQueueHandle());
-				waitTimeline = VkTimelineState(impl, sync->wait.t);
-				if (!signalQueueState || signalQueueState->queue == VK_NULL_HANDLE || !waitTimeline || waitTimeline->semaphore == VK_NULL_HANDLE) {
+			const VkPresentModeKHR presentMode = VkPresentModeForVsync(*swapchainState, vsync);
+			const bool switchInPresent = presentMode != swapchainState->presentMode &&
+				VkHasPresentMode(swapchainState->switchablePresentModes, presentMode);
+			VkResult presentResult = VK_SUCCESS;
+			{
+				const std::lock_guard timelineLock(impl->timelinesMutex);
+				if (swapchainState->currentImageIndex >= swapchainState->presentWaitSemaphores.size()) {
 					RHI_FAIL(Result::InvalidArgument);
 				}
-			} else {
-				signalQueueState = VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
-			}
 
-			VkTimelineSemaphoreSubmitInfo timelineInfo{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
-			VkSemaphore waitSemaphore = VK_NULL_HANDLE;
-			uint64_t waitValue = 0;
-			// VkTimelineSemaphoreSubmitInfo value arrays correspond one-for-one
-			// with every semaphore in VkSubmitInfo, including binary semaphores.
-			// The value for a binary semaphore is ignored, but omitting the entry
-			// leaves this mixed timeline-wait/binary-signal submit malformed and
-			// prevents synchronization validation from following the dependency
-			// through to vkQueuePresentKHR.
-			const uint64_t binarySignalValue = 0;
-			VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-			VkSubmitInfo signalPresentInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-			if (waitTimeline) {
-				waitSemaphore = waitTimeline->semaphore;
-				waitValue = sync->wait.value;
-				// vkQueuePresentKHR can only wait on a binary semaphore.  Complete the
-				// graph timeline wait on the host before relaying it to the per-image
-				// binary semaphore.  This also gives synchronization validation an
-				// explicit completion point for the swapchain layout transition.  The
-				// relay can move into the final graph submission once Queue::Submit can
-				// carry native binary signals.
-				VkSemaphoreWaitInfo hostWaitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-				hostWaitInfo.semaphoreCount = 1;
-				hostWaitInfo.pSemaphores = &waitSemaphore;
-				hostWaitInfo.pValues = &waitValue;
-				const VkResult hostWaitResult = vkWaitSemaphores(impl->device, &hostWaitInfo, UINT64_MAX);
-				if (hostWaitResult != VK_SUCCESS) {
-					return ToRHI(hostWaitResult);
+				VkSemaphore presentWaitSemaphore = swapchainState->presentWaitSemaphores[swapchainState->currentImageIndex];
+				if (presentWaitSemaphore == VK_NULL_HANDLE) {
+					RHI_FAIL(Result::InvalidArgument);
 				}
-				timelineInfo.waitSemaphoreValueCount = 1;
-				timelineInfo.pWaitSemaphoreValues = &waitValue;
-				timelineInfo.signalSemaphoreValueCount = 1;
-				timelineInfo.pSignalSemaphoreValues = &binarySignalValue;
-				signalPresentInfo.pNext = &timelineInfo;
-				signalPresentInfo.waitSemaphoreCount = 1;
-				signalPresentInfo.pWaitSemaphores = &waitSemaphore;
-				signalPresentInfo.pWaitDstStageMask = &waitStage;
-			}
-			signalPresentInfo.signalSemaphoreCount = 1;
-			signalPresentInfo.pSignalSemaphores = &presentWaitSemaphore;
-			VkResult signalResult = vkQueueSubmit(signalQueueState->queue, 1, &signalPresentInfo, VK_NULL_HANDLE);
-			if (signalResult != VK_SUCCESS) {
-				return ToRHI(signalResult);
-			}
 
-			VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-			presentInfo.waitSemaphoreCount = 1;
-			presentInfo.pWaitSemaphores = &presentWaitSemaphore;
-			presentInfo.swapchainCount = 1;
-			presentInfo.pSwapchains = &swapchainState->swapchain;
-			presentInfo.pImageIndices = &swapchainState->currentImageIndex;
+				const bool waitOnGraph = sync && sync->queue && sync->wait.value != 0;
+				VulkanQueueState* signalQueueState = waitOnGraph
+					? VkQueueStateForHandle(impl, sync->queue.GetQueueHandle())
+					: VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
+				if (!signalQueueState || signalQueueState->queue == VK_NULL_HANDLE) {
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				// First: making the progress timeline can move the timeline pool.
+				VulkanTimeline* progressTimeline = impl->timelineSemaphoreEnabled ? VkQueueProgressTimeline(impl, *signalQueueState) : nullptr;
+				VulkanTimeline* waitTimeline = nullptr;
+				if (waitOnGraph) {
+					waitTimeline = VkTimelineState(impl, sync->wait.t);
+					if (!waitTimeline || waitTimeline->semaphore == VK_NULL_HANDLE) {
+						RHI_FAIL(Result::InvalidArgument);
+					}
+				}
 
-			// Present on the queue which relayed the graph completion timeline into
-			// the binary present semaphore.  Presenting through a different logical
-			// wrapper for the same family obscures the execution chain from sync
-			// validation and is unsafe when the implementation returned distinct
-			// native queues for those wrappers.
-			const VkResult presentResult = VkQueuePresentKHRHooked(signalQueueState->queue, &presentInfo);
+				// The relay: the graph's timeline point is waited on the GPU and relayed to the image's binary semaphore, which
+				// is all vkQueuePresentKHR can wait on. It also signals the queue's progress timeline, which marks the frame
+				// finished for the latency limit. VkTimelineSemaphoreSubmitInfo's arrays cover every semaphore of the batch,
+				// binary ones included (their values are ignored); leaving one out makes the batch malformed and hides the
+				// dependency from synchronization validation.
+				const uint64_t waitValue = waitTimeline ? sync->wait.value : 0;
+				const uint64_t progressValue = signalQueueState->progressSubmitted + 1;
+				const VkSemaphore signalSemaphores[2] = { presentWaitSemaphore, progressTimeline ? progressTimeline->semaphore : VK_NULL_HANDLE };
+				const uint64_t signalValues[2] = { 0, progressValue };
+				const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+				VkTimelineSemaphoreSubmitInfo timelineInfo{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+				timelineInfo.waitSemaphoreValueCount = waitTimeline ? 1u : 0u;
+				timelineInfo.pWaitSemaphoreValues = waitTimeline ? &waitValue : nullptr;
+				timelineInfo.signalSemaphoreValueCount = progressTimeline ? 2u : 1u;
+				timelineInfo.pSignalSemaphoreValues = signalValues;
+				VkSubmitInfo relayInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+				relayInfo.pNext = (waitTimeline || progressTimeline) ? &timelineInfo : nullptr;
+				relayInfo.waitSemaphoreCount = waitTimeline ? 1u : 0u;
+				relayInfo.pWaitSemaphores = waitTimeline ? &waitTimeline->semaphore : nullptr;
+				relayInfo.pWaitDstStageMask = waitTimeline ? &waitStage : nullptr;
+				relayInfo.signalSemaphoreCount = progressTimeline ? 2u : 1u;
+				relayInfo.pSignalSemaphores = signalSemaphores;
+
+				const VkQueueAccessGuard queueAccess(impl, signalQueueState->queue);
+				const VkResult relayResult = vkQueueSubmit(signalQueueState->queue, 1, &relayInfo, VK_NULL_HANDLE);
+				if (relayResult != VK_SUCCESS) {
+					return ToRHI(relayResult);
+				}
+				if (progressTimeline) {
+					signalQueueState->progressSubmitted = progressValue;
+					progressTimeline->lastSubmittedSignalValue = progressValue;
+				}
+
+				VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+				presentInfo.waitSemaphoreCount = 1;
+				presentInfo.pWaitSemaphores = &presentWaitSemaphore;
+				presentInfo.swapchainCount = 1;
+				presentInfo.pSwapchains = &swapchainState->swapchain;
+				presentInfo.pImageIndices = &swapchainState->currentImageIndex;
+				const void** next = &presentInfo.pNext;
+				VkSwapchainPresentModeInfoEXT presentModeInfo{ VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT };
+				if (!swapchainState->switchablePresentModes.empty()) {
+					presentModeInfo.swapchainCount = 1;
+					presentModeInfo.pPresentModes = switchInPresent ? &presentMode : &swapchainState->presentMode;
+					*next = &presentModeInfo;
+					next = &presentModeInfo.pNext;
+				}
+				const uint64_t presentId = swapchainState->presentCount + 1;
+				VkPresentIdKHR presentIdInfo{ VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
+				if (impl->presentIdEnabled) {
+					presentIdInfo.swapchainCount = 1;
+					presentIdInfo.pPresentIds = &presentId;
+					*next = &presentIdInfo;
+				}
+
+				// Present on the queue that relayed the graph's timeline into the binary present semaphore. Presenting through
+				// a different logical wrapper for the same family hides the chain from synchronization validation, and is unsafe
+				// when the implementation returned distinct native queues for those wrappers.
+				presentResult = VkQueuePresentKHRHooked(signalQueueState->queue, &presentInfo);
+				if (presentResult == VK_SUCCESS || presentResult == VK_SUBOPTIMAL_KHR) {
+					swapchainState->presentCount = presentId;
+					swapchainState->presentQueue = waitOnGraph ? sync->queue.GetQueueHandle() : VkPrimaryQueueHandleForKind(impl, QueueKind::Graphics);
+					if (switchInPresent) swapchainState->presentMode = presentMode;
+					if (progressTimeline) {
+						swapchainState->pendingFrames.push_back({ signalQueueState->progress, progressValue, presentId });
+					}
+				}
+			}
 			if (presentResult != VK_SUCCESS && presentResult != VK_SUBOPTIMAL_KHR) {
 				return ToRHI(presentResult);
+			}
+
+			// The host-side limit on frames in flight.
+			if (const Result latencyResult = VkWaitPresentedFrames(impl, *swapchainState, swapchainState->maxFrameLatency, UINT64_MAX); latencyResult != Result::Ok) {
+				return latencyResult;
+			}
+
+			if (presentMode != swapchainState->presentMode) {
+				// No VK_EXT_swapchain_maintenance1 switch to this mode: it needs a new swapchain.
+				spdlog::info("Vulkan swapchain: vsync {} needs present mode {}; recreating the swapchain", vsync ? "on" : "off", static_cast<int>(presentMode));
+				const Result idleResult = ToRHI(VkDeviceWaitIdleHooked(impl->device));
+				if (idleResult != Result::Ok) {
+					return idleResult;
+				}
+				swapchainState->pendingFrames.clear();
+				swapchainState->presentMode = presentMode;
+				const Result recreateResult = VkCreateOrResizeSwapchain(impl, *swapchainState, swapchainState->width, swapchainState->height,
+					swapchainState->sdrFormat, swapchainState->imageCount, swapchainState->allowTearing);
+				return recreateResult == Result::Ok ? Result::ModeChanged : recreateResult;
 			}
 
 			const Result acquireResult = VkAcquireNextSwapchainImage(impl, *swapchainState);
@@ -7927,8 +8216,9 @@ namespace rhi {
 			if (idleResult != Result::Ok) {
 				return idleResult;
 			}
+			swapchainState->pendingFrames.clear();
 
-			const Format targetFormat = newFormat != Format::Unknown ? newFormat : swapchainState->rhiFormat;
+			const Format targetFormat = newFormat != Format::Unknown ? newFormat : swapchainState->sdrFormat;
 			const uint32_t targetWidth = width != 0 ? width : swapchainState->width;
 			const uint32_t targetHeight = height != 0 ? height : swapchainState->height;
 			const uint32_t targetBufferCount = bufferCount != 0 ? bufferCount : swapchainState->imageCount;
@@ -7937,6 +8227,118 @@ namespace rhi {
 
 		static void sc_setName(Swapchain* swapchain, const char* name) noexcept {
 			VkIgnoreUnused(swapchain, name);
+		}
+
+		static SwapchainCaps sc_caps(Swapchain* swapchain) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			const VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState) return {};
+			SwapchainCaps caps{};
+			caps.tearing = swapchainState->allowTearing && VkHasPresentMode(swapchainState->surfacePresentModes, VK_PRESENT_MODE_IMMEDIATE_KHR);
+			caps.presentModeSwitch = !swapchainState->switchablePresentModes.empty();
+			caps.presentWait = impl->presentIdEnabled && impl->presentWaitEnabled;
+			caps.hdrMetadata = impl->hdrMetadataEnabled;
+			return caps;
+		}
+
+		static bool sc_isColorSpaceSupported(Swapchain* swapchain, SwapchainColorSpace colorSpace) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			const VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState) return false;
+			std::vector<VkSurfaceFormatKHR> surfaceFormats;
+			if (VkQuerySurfaceFormats(impl, swapchainState->surface, surfaceFormats) != Result::Ok) return false;
+			VkSurfaceFormatKHR format{};
+			return VkChooseSurfaceFormat(surfaceFormats, colorSpace, swapchainState->sdrFormat, format);
+		}
+
+		static Result sc_setColorSpace(Swapchain* swapchain, SwapchainColorSpace colorSpace) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (colorSpace == swapchainState->colorSpace) return Result::Ok;
+			if (!sc_isColorSpaceSupported(swapchain, colorSpace)) return Result::Unsupported;
+
+			const Result idleResult = ToRHI(VkDeviceWaitIdleHooked(impl->device));
+			if (idleResult != Result::Ok) {
+				return idleResult;
+			}
+			swapchainState->pendingFrames.clear();
+			const SwapchainColorSpace previous = swapchainState->colorSpace;
+			swapchainState->colorSpace = colorSpace;
+			const Result recreateResult = VkCreateOrResizeSwapchain(impl, *swapchainState, swapchainState->width, swapchainState->height,
+				swapchainState->sdrFormat, swapchainState->imageCount, swapchainState->allowTearing);
+			if (recreateResult != Result::Ok) swapchainState->colorSpace = previous;
+			return recreateResult;
+		}
+
+		static SwapchainColorSpace sc_colorSpace(Swapchain* swapchain) noexcept {
+			const VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			return swapchainState ? swapchainState->colorSpace : SwapchainColorSpace::SrgbNonlinear;
+		}
+
+		static Result sc_setHdrMetadata(Swapchain* swapchain, const HdrMetadata& metadata) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (!impl->hdrMetadataEnabled) return Result::Unsupported;
+			swapchainState->hdrMetadata = metadata;
+			swapchainState->hasHdrMetadata = true;
+			// Sent now in HDR; an SDR swapchain sends it when it switches.
+			VkApplyHdrMetadata(impl, *swapchainState);
+			return Result::Ok;
+		}
+
+		static Result sc_setMaximumFrameLatency(Swapchain* swapchain, uint32_t frames) noexcept {
+			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!swapchainState || frames == 0) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			swapchainState->maxFrameLatency = frames;
+			return Result::Ok;
+		}
+
+		static Result sc_waitForFrameLatency(Swapchain* swapchain, uint64_t timeoutNs) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			// Room for one more frame: no more than maxFrameLatency - 1 outstanding.
+			const uint32_t outstanding = swapchainState->maxFrameLatency - 1;
+			if (impl->presentIdEnabled && impl->presentWaitEnabled) {
+				if (swapchainState->presentCount <= outstanding) return Result::Ok;
+				const VkResult result = vkWaitForPresentKHR(impl->device, swapchainState->swapchain, swapchainState->presentCount - outstanding, timeoutNs);
+				return result == VK_SUBOPTIMAL_KHR ? Result::Ok : ToRHI(result);
+			}
+			return VkWaitPresentedFrames(impl, *swapchainState, outstanding, timeoutNs);
+		}
+
+		static void* sc_frameLatencyWaitableObject(Swapchain*) noexcept {
+			return nullptr;
+		}
+
+		static uint64_t sc_presentCount(Swapchain* swapchain) noexcept {
+			const VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			return swapchainState ? swapchainState->presentCount : 0;
+		}
+
+		static Result sc_waitForPresent(Swapchain* swapchain, uint64_t presentId, uint64_t timeoutNs) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (!impl->presentIdEnabled || !impl->presentWaitEnabled) return Result::Unsupported;
+			if (presentId == 0) return Result::Ok;
+			if (presentId > swapchainState->presentCount) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			const VkResult result = vkWaitForPresentKHR(impl->device, swapchainState->swapchain, presentId, timeoutNs);
+			return result == VK_SUBOPTIMAL_KHR ? Result::Ok : ToRHI(result);
 		}
 
 		// Descriptor-buffer model: one stage's module, its SPIR-V lowered (rhi_vulkan_spirv_lowering.h) to the stage's binding plan
@@ -9073,14 +9475,15 @@ namespace rhi {
 			RHI_FAIL(Result::Unsupported);
 		#endif
 
+			swapchainState.presentQueue = VkPrimaryQueueHandleForKind(impl, QueueKind::Graphics);
 			const Result createResult = VkCreateOrResizeSwapchain(impl, swapchainState, width, height, format, bufferCount, allowTearing);
 			if (createResult != Result::Ok) {
+				VkDeviceWaitIdleHooked(impl->device);
+				VkReleaseSwapchainImageHandles(impl, swapchainState);
 				VkReleaseSwapchainPresentSemaphores(impl, swapchainState);
-				if (swapchainState.acquireFence != VK_NULL_HANDLE) {
-					vkDestroyFence(impl->device, swapchainState.acquireFence, nullptr);
-				}
-				if (swapchainState.acquireSemaphore != VK_NULL_HANDLE) {
-					vkDestroySemaphore(impl->device, swapchainState.acquireSemaphore, nullptr);
+				VkReleaseSwapchainAcquireSlots(impl, swapchainState);
+				if (swapchainState.swapchain != VK_NULL_HANDLE) {
+					VkDestroySwapchainKHRHooked(impl->device, swapchainState.swapchain, nullptr);
 				}
 				if (swapchainState.surface != VK_NULL_HANDLE) {
 					VkDestroySurfaceKHRHooked(impl->instance, swapchainState.surface, nullptr);
@@ -9113,14 +9516,7 @@ namespace rhi {
 				VkDeviceWaitIdleHooked(impl->device);
 				VkReleaseSwapchainImageHandles(impl, *swapchainState);
 				VkReleaseSwapchainPresentSemaphores(impl, *swapchainState);
-				if (swapchainState->acquireFence != VK_NULL_HANDLE) {
-					vkDestroyFence(impl->device, swapchainState->acquireFence, nullptr);
-					swapchainState->acquireFence = VK_NULL_HANDLE;
-				}
-				if (swapchainState->acquireSemaphore != VK_NULL_HANDLE) {
-					vkDestroySemaphore(impl->device, swapchainState->acquireSemaphore, nullptr);
-					swapchainState->acquireSemaphore = VK_NULL_HANDLE;
-				}
+				VkReleaseSwapchainAcquireSlots(impl, *swapchainState);
 				if (swapchainState->swapchain != VK_NULL_HANDLE) {
 					VkDestroySwapchainKHRHooked(impl->device, swapchainState->swapchain, nullptr);
 					swapchainState->swapchain = VK_NULL_HANDLE;
@@ -12117,12 +12513,7 @@ namespace rhi {
 
 			VkReleaseSwapchainImageHandles(this, slot.obj);
 			VkReleaseSwapchainPresentSemaphores(this, slot.obj);
-			if (device != VK_NULL_HANDLE && slot.obj.acquireFence != VK_NULL_HANDLE) {
-				vkDestroyFence(device, slot.obj.acquireFence, nullptr);
-			}
-			if (device != VK_NULL_HANDLE && slot.obj.acquireSemaphore != VK_NULL_HANDLE) {
-				vkDestroySemaphore(device, slot.obj.acquireSemaphore, nullptr);
-			}
+			VkReleaseSwapchainAcquireSlots(this, slot.obj);
 			if (device != VK_NULL_HANDLE && slot.obj.swapchain != VK_NULL_HANDLE) {
 				VkDestroySwapchainKHRHooked(device, slot.obj.swapchain, nullptr);
 			}
@@ -12426,7 +12817,17 @@ namespace rhi {
 		&sc_present,
 		&sc_resizeBuffers,
 		&sc_setName,
-		1u
+		2u,
+		&sc_caps,
+		&sc_isColorSpaceSupported,
+		&sc_setColorSpace,
+		&sc_colorSpace,
+		&sc_setHdrMetadata,
+		&sc_setMaximumFrameLatency,
+		&sc_waitForFrameLatency,
+		&sc_frameLatencyWaitableObject,
+		&sc_presentCount,
+		&sc_waitForPresent
 	};
 
 	const ResourceVTable g_vkbuf_rvt = {
@@ -12502,6 +12903,96 @@ namespace rhi {
 		&h_setName,
 		1u
 	};
+
+	// The present extensions CreateVulkanDevice enables when the instance and device have them, and the feature structs
+	// they need.
+	struct VkPresentExtensionState {
+		bool swapchainColorSpace = false;   // instance VK_EXT_swapchain_colorspace
+		bool surfaceMaintenance1 = false;   // instance VK_*_surface_maintenance1 with VK_KHR_get_surface_capabilities2
+		bool swapchainMaintenance1 = false;
+		bool presentId = false;
+		bool presentWait = false;
+		bool hdrMetadata = false;
+		VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swapchainMaintenance1Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT };
+		VkPhysicalDevicePresentIdFeaturesKHR presentIdFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR };
+		VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR };
+		// The enabled feature structs, linked, for the front of VkDeviceCreateInfo::pNext. Null when there are none.
+		void* featureChain = nullptr;
+		void** featureChainTail = nullptr;
+	};
+
+	// Instance side. VK_EXT_swapchain_colorspace makes the surface list its HDR colour spaces (without it only sRGB formats
+	// appear), and surface_maintenance1 reports which present modes a swapchain can switch between.
+	static void VkSelectPresentInstanceExtensions(std::vector<const char*>& extensions, VkPresentExtensionState& state) noexcept {
+		if (VkHasInstanceExtension(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+			extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+			state.swapchainColorSpace = true;
+		}
+		const char* surfaceMaintenance1 = VkHasInstanceExtension(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME) ? VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME
+			: VkHasInstanceExtension(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME) ? VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME : nullptr;
+		if (surfaceMaintenance1 && VkHasInstanceExtension(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+			extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+			extensions.push_back(surfaceMaintenance1);
+			state.surfaceMaintenance1 = true;
+		}
+	}
+
+	// Device side, with the swapchain extension. allowPresentId is false under Streamline: an interposer that drops the
+	// present ID leaves a present wait waiting forever.
+	static void VkSelectPresentDeviceExtensions(VkPhysicalDevice physicalDevice, bool allowPresentId, std::vector<const char*>& extensions,
+		VkPresentExtensionState& state) noexcept {
+		const char* swapchainMaintenance1 = nullptr;
+		if (state.surfaceMaintenance1) {
+			// Switchable modes are queried through surface_maintenance1, so the swapchain side is no use without it.
+			swapchainMaintenance1 = VkHasDeviceExtension(physicalDevice, VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) ? VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME
+				: VkHasDeviceExtension(physicalDevice, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) ? VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME : nullptr;
+		}
+		const bool hasPresentId = allowPresentId && VkHasDeviceExtension(physicalDevice, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+		const bool hasPresentWait = hasPresentId && VkHasDeviceExtension(physicalDevice, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+
+		VkPhysicalDeviceFeatures2 features2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+		void** link = &features2.pNext;
+		auto append = [&link](auto& features) {
+			features.pNext = nullptr;
+			*link = &features;
+			link = &features.pNext;
+		};
+		if (swapchainMaintenance1) append(state.swapchainMaintenance1Features);
+		if (hasPresentId) append(state.presentIdFeatures);
+		if (hasPresentWait) append(state.presentWaitFeatures);
+		if (features2.pNext) vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
+
+		link = &state.featureChain;
+		if (swapchainMaintenance1 && state.swapchainMaintenance1Features.swapchainMaintenance1 == VK_TRUE) {
+			extensions.push_back(swapchainMaintenance1);
+			append(state.swapchainMaintenance1Features);
+			state.swapchainMaintenance1 = true;
+		}
+		if (hasPresentId && state.presentIdFeatures.presentId == VK_TRUE) {
+			extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+			append(state.presentIdFeatures);
+			state.presentId = true;
+			if (hasPresentWait && state.presentWaitFeatures.presentWait == VK_TRUE) {
+				extensions.push_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+				append(state.presentWaitFeatures);
+				state.presentWait = true;
+			}
+		}
+		state.featureChainTail = state.featureChain ? link : nullptr;
+		if (VkHasDeviceExtension(physicalDevice, VK_EXT_HDR_METADATA_EXTENSION_NAME)) {
+			extensions.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
+			state.hdrMetadata = true;
+		}
+	}
+
+	static void VkApplyPresentExtensionState(VulkanDevice* impl, const VkPresentExtensionState& state) noexcept {
+		impl->swapchainColorSpaceEnabled = state.swapchainColorSpace;
+		impl->surfaceMaintenance1Enabled = state.surfaceMaintenance1;
+		impl->swapchainMaintenance1Enabled = state.swapchainMaintenance1;
+		impl->presentIdEnabled = state.presentId;
+		impl->presentWaitEnabled = state.presentWait;
+		impl->hdrMetadataEnabled = state.hdrMetadata;
+	}
 
 	// The feature set a VkDevice was actually created with. Extension-gated feature
 	// structs are zero unless their extension is enabled, so each impl flag follows
@@ -13149,6 +13640,10 @@ namespace rhi {
 			enabledExtensions.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
 		}
 	#endif
+		VkPresentExtensionState presentExtensions{};
+		if (VkHasInstanceExtension(VK_KHR_SURFACE_EXTENSION_NAME)) {
+			VkSelectPresentInstanceExtensions(enabledExtensions, presentExtensions);
+		}
 		if (ci.enableDebug) {
 			if (VkHasInstanceLayer("VK_LAYER_KHRONOS_validation")) {
 				enabledLayers.push_back("VK_LAYER_KHRONOS_validation");
@@ -13236,7 +13731,7 @@ namespace rhi {
 		applicationInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
 		applicationInfo.pApplicationName = "BasicRenderer";
 		applicationInfo.applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
-		applicationInfo.pEngineName = "BasicRHI";
+		applicationInfo.pEngineName = ci.vulkanEngineName && *ci.vulkanEngineName ? ci.vulkanEngineName : "BasicRHI";
 		applicationInfo.engineVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
 		applicationInfo.apiVersion = requestedApiVersion;
 
@@ -13524,6 +14019,7 @@ namespace rhi {
 		}
 		if (enableSwapchainExtension) {
 			enabledDeviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+			VkSelectPresentDeviceExtensions(physicalDevice, !streamlineInitialized, enabledDeviceExtensions, presentExtensions);
 		}
 		if (hasMaintenance5Extension && (hasDescriptorHeapExtension || hasDeviceGeneratedCommandsExtension)) {
 			enabledDeviceExtensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
@@ -13898,6 +14394,10 @@ namespace rhi {
 			enabledFaultFeatures.pNext = const_cast<void*>(deviceCreateInfo.pNext);
 			deviceCreateInfo.pNext = &enabledFaultFeatures;
 		}
+		if (presentExtensions.featureChain) {
+			*presentExtensions.featureChainTail = const_cast<void*>(deviceCreateInfo.pNext);
+			deviceCreateInfo.pNext = presentExtensions.featureChain;
+		}
 		deviceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(enabledDeviceExtensions.size());
 		deviceCreateInfo.ppEnabledExtensionNames = enabledDeviceExtensions.empty() ? nullptr : enabledDeviceExtensions.data();
 
@@ -14026,6 +14526,7 @@ namespace rhi {
 		}
 		impl->validateBarrierTransitions = ci.validateBarrierTransitions;
 		impl->streamlineInitialized = streamlineInitialized;
+		VkApplyPresentExtensionState(impl.get(), presentExtensions);
 		impl->loaderApiVersion = loaderApiVersion;
 		impl->instanceApiVersion = requestedApiVersion;
 		impl->queueFamilyProperties = std::move(queueFamilyProperties);

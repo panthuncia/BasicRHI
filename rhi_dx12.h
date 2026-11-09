@@ -365,6 +365,14 @@ namespace rhi {
 		std::vector<ComPtr<ID3D12Resource>> images;
 		std::vector<ResourceHandle> imageHandles;
 		Dx12Device* dev = nullptr;
+		// The format given at creation or resize, which SrgbNonlinear presents in.
+		Format sdrFormat = Format::Unknown;
+		SwapchainColorSpace colorSpace = SwapchainColorSpace::SrgbNonlinear;
+		bool hasHdrMetadata = false;
+		HdrMetadata hdrMetadata{};
+		// DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT's object. The swapchain owns it; it is closed with the swapchain.
+		HANDLE frameLatencyWaitable = nullptr;
+		uint64_t presentCount = 0;
 	};
 
 	struct Dx12Heap {

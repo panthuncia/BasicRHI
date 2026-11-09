@@ -271,16 +271,49 @@ namespace rhi {
 		VkSwapchainKHR swapchain = VK_NULL_HANDLE;
 		VkFormat format = VK_FORMAT_UNDEFINED;
 		Format rhiFormat = Format::Unknown;
+		// The format asked for at creation or resize. SrgbNonlinear presents in it; the HDR colour spaces fix their own.
+		Format sdrFormat = Format::Unknown;
+		SwapchainColorSpace colorSpace = SwapchainColorSpace::SrgbNonlinear;
 		uint32_t width = 0;
 		uint32_t height = 0;
 		uint32_t imageCount = 0;
 		uint32_t currentImageIndex = 0;
 		bool allowTearing = false;
+		// The mode the swapchain was created with, or the last one a present switched to.
+		VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
+		// The surface's modes, and those a present can switch to without recreation (VK_EXT_swapchain_maintenance1;
+		// empty without it).
+		std::vector<VkPresentModeKHR> surfacePresentModes;
+		std::vector<VkPresentModeKHR> switchablePresentModes;
 		std::vector<VkImage> images;
 		std::vector<ResourceHandle> imageHandles;
 		std::vector<VkSemaphore> presentWaitSemaphores;
-		VkSemaphore acquireSemaphore = VK_NULL_HANDLE;
-		VkFence acquireFence = VK_NULL_HANDLE;
+		// Acquire slots, one per acquire in flight. A slot's wait batch signals its fence, and the slot (its semaphore and
+		// command buffer) is reused once that fence has signalled.
+		std::vector<VkSemaphore> acquireSemaphores;
+		std::vector<VkFence> acquireFences;
+		std::vector<uint8_t> acquireFencePending;
+		std::vector<VkCommandBuffer> acquireCommandBuffers;
+		uint32_t nextAcquireSlot = 0;
+		// Images still in VK_IMAGE_LAYOUT_UNDEFINED. Their first acquire batch moves them to PRESENT_SRC, the layout every
+		// later use starts from (as D3D12 back buffers start in PRESENT).
+		std::vector<uint8_t> imageNeedsInitialLayout;
+		VkCommandPool acquireCommandPool = VK_NULL_HANDLE;
+		uint32_t acquireCommandPoolFamily = 0xFFFFFFFFu;
+		// The queue that presented last. The next acquire's wait goes on it, which orders the acquire before every later
+		// submission there.
+		QueueHandle presentQueue{};
+		// Presented frames not yet known to have finished: each one's point on its queue's progress timeline.
+		struct PendingFrame {
+			TimelineHandle timeline{};
+			uint64_t value = 0;
+			uint64_t presentId = 0;
+		};
+		std::deque<PendingFrame> pendingFrames;
+		uint32_t maxFrameLatency = 2;
+		uint64_t presentCount = 0;
+		bool hasHdrMetadata = false;
+		HdrMetadata hdrMetadata{};
 	};
 
 	struct VulkanCommandAllocator {
@@ -665,6 +698,14 @@ namespace rhi {
 		uint32_t loaderApiVersion = VK_API_VERSION_1_0;
 		uint32_t instanceApiVersion = VK_API_VERSION_1_0;
 		bool swapchainExtensionEnabled = false;
+		// Present extensions, each enabled when the device has it (VkEnablePresentExtensions). VK_KHR_present_id and
+		// VK_KHR_present_wait are left off under Streamline, whose interposer may not pass a present ID through.
+		bool swapchainColorSpaceEnabled = false;      // instance VK_EXT_swapchain_colorspace
+		bool surfaceMaintenance1Enabled = false;      // instance VK_EXT_surface_maintenance1 + VK_KHR_get_surface_capabilities2
+		bool swapchainMaintenance1Enabled = false;    // VK_EXT_swapchain_maintenance1 (or the KHR promotion)
+		bool presentIdEnabled = false;                // VK_KHR_present_id
+		bool presentWaitEnabled = false;              // VK_KHR_present_wait
+		bool hdrMetadataEnabled = false;              // VK_EXT_hdr_metadata
 		bool bufferDeviceAddressEnabled = false;
 		bool bufferDeviceAddressCaptureReplayEnabled = false;
 		bool timelineSemaphoreEnabled = false;
