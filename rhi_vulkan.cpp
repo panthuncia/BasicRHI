@@ -2276,7 +2276,60 @@ namespace rhi {
 			case BlendFactor::InvDstAlpha: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
 			case BlendFactor::DstColor: return VK_BLEND_FACTOR_DST_COLOR;
 			case BlendFactor::InvDstColor: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+			// As alpha factors the constant's alpha is read, as in D3D12.
+			case BlendFactor::BlendFactor: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+			case BlendFactor::InvBlendFactor: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+			case BlendFactor::SrcAlphaSat: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+			case BlendFactor::Src1Color: return VK_BLEND_FACTOR_SRC1_COLOR;
+			case BlendFactor::InvSrc1Color: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+			case BlendFactor::Src1Alpha: return VK_BLEND_FACTOR_SRC1_ALPHA;
+			case BlendFactor::InvSrc1Alpha: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
 			default: return VK_BLEND_FACTOR_ONE;
+			}
+		}
+
+		static VkLogicOp VkLogicOpForRHI(LogicOp op) noexcept {
+			switch (op) {
+			case LogicOp::Clear: return VK_LOGIC_OP_CLEAR;
+			case LogicOp::Set: return VK_LOGIC_OP_SET;
+			case LogicOp::Copy: return VK_LOGIC_OP_COPY;
+			case LogicOp::CopyInverted: return VK_LOGIC_OP_COPY_INVERTED;
+			case LogicOp::Invert: return VK_LOGIC_OP_INVERT;
+			case LogicOp::And: return VK_LOGIC_OP_AND;
+			case LogicOp::Nand: return VK_LOGIC_OP_NAND;
+			case LogicOp::Or: return VK_LOGIC_OP_OR;
+			case LogicOp::Nor: return VK_LOGIC_OP_NOR;
+			case LogicOp::Xor: return VK_LOGIC_OP_XOR;
+			case LogicOp::Equiv: return VK_LOGIC_OP_EQUIVALENT;
+			case LogicOp::AndReverse: return VK_LOGIC_OP_AND_REVERSE;
+			case LogicOp::AndInverted: return VK_LOGIC_OP_AND_INVERTED;
+			case LogicOp::OrReverse: return VK_LOGIC_OP_OR_REVERSE;
+			case LogicOp::OrInverted: return VK_LOGIC_OP_OR_INVERTED;
+			case LogicOp::Noop:
+			default: return VK_LOGIC_OP_NO_OP;
+			}
+		}
+
+		static bool VkBlendFactorIsConstant(BlendFactor factor) noexcept {
+			return factor == BlendFactor::BlendFactor || factor == BlendFactor::InvBlendFactor;
+		}
+
+		static bool VkBlendFactorIsDualSource(BlendFactor factor) noexcept {
+			return factor == BlendFactor::Src1Color || factor == BlendFactor::InvSrc1Color ||
+				factor == BlendFactor::Src1Alpha || factor == BlendFactor::InvSrc1Alpha;
+		}
+
+		static VkStencilOp VkStencilOpForRHI(StencilOp op) noexcept {
+			switch (op) {
+			case StencilOp::Zero: return VK_STENCIL_OP_ZERO;
+			case StencilOp::Replace: return VK_STENCIL_OP_REPLACE;
+			case StencilOp::IncrSat: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+			case StencilOp::DecrSat: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+			case StencilOp::Invert: return VK_STENCIL_OP_INVERT;
+			case StencilOp::Incr: return VK_STENCIL_OP_INCREMENT_AND_WRAP;
+			case StencilOp::Decr: return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+			case StencilOp::Keep:
+			default: return VK_STENCIL_OP_KEEP;
 			}
 		}
 
@@ -5412,6 +5465,10 @@ namespace rhi {
 			commandListState->passActive = false;
 			commandListState->boundLayout = {};
 			commandListState->boundPipeline = {};
+			commandListState->stencilReference = 0;
+			commandListState->stencilReferenceApplied = false;
+			std::fill(std::begin(commandListState->blendConstants), std::end(commandListState->blendConstants), 1.0f);
+			commandListState->blendConstantsApplied = false;
 			commandListState->boundCbvSrvUavHeap = {};
 			commandListState->boundSamplerHeap = {};
 			commandListState->emittedCbvSrvUavHeap = {};
@@ -5471,6 +5528,27 @@ namespace rhi {
 			vkCmdPipelineBarrier(commandListState.commandBuffer, VK_PIPELINE_STAGE_COMMAND_PREPROCESS_BIT_EXT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1,
 				&barrier, 0, nullptr, 0, nullptr);
 			commandListState.preprocessBarrierPending = false;
+		}
+
+		// A D3D-convention viewport (top-left origin, y down) as the flipped Vulkan viewport every pass renders with: it
+		// starts at the bottom of the rectangle and grows upwards, which puts the image the same way up as D3D's.
+		static VkViewport VkFlippedViewport(float x, float y, float width, float height, float minDepth, float maxDepth) noexcept {
+			VkViewport viewport{};
+			viewport.x = x;
+			viewport.width = width;
+			viewport.y = y + height;
+			viewport.height = -height;
+			viewport.minDepth = minDepth;
+			viewport.maxDepth = maxDepth;
+			return viewport;
+		}
+
+		// How many viewports and scissors a list may set: 1 without multiViewport.
+		static uint32_t VMAX_VIEWPORTS(const VulkanDevice* impl) noexcept {
+			if (impl->supportedFeatures.multiViewport != VK_TRUE) {
+				return 1;
+			}
+			return (std::min)(impl->physicalDeviceProperties.limits.maxViewports, MAX_VIEWPORTS);
 		}
 
 		static void cl_beginPass(CommandList* commandList, const PassBeginInfo& passInfo) noexcept {
@@ -5586,14 +5664,8 @@ namespace rhi {
 				return;  // only vkCmdExecuteCommands until the pass ends; each secondary sets its own viewport and scissor
 			}
 
-			VkViewport viewport{};
-			viewport.x = static_cast<float>(passInfo.x);
-			viewport.width = static_cast<float>(passInfo.width);
-			// Flipped: the viewport starts at the bottom of the render area and grows upwards.
-			viewport.y = static_cast<float>(passInfo.y + passInfo.height);
-			viewport.height = -static_cast<float>(passInfo.height);
-			viewport.minDepth = passInfo.minDepth;
-			viewport.maxDepth = passInfo.maxDepth;
+			const VkViewport viewport = VkFlippedViewport(static_cast<float>(passInfo.x), static_cast<float>(passInfo.y),
+				static_cast<float>(passInfo.width), static_cast<float>(passInfo.height), passInfo.minDepth, passInfo.maxDepth);
 			vkCmdSetViewport(commandListState->commandBuffer, 0, 1, &viewport);
 
 			VkRect2D scissor{};
@@ -6004,6 +6076,26 @@ namespace rhi {
 			}
 		}
 
+		// D3D12 keeps the stencil reference on the command list, whatever pipeline is bound. Vulkan loses dynamic state
+		// when a pipeline that has it static is bound, so the list keeps the value and sets it again for the next pipeline
+		// that reads it.
+		static void VkApplyFixedFunctionState(VulkanCommandList& commandListState, const VulkanPipeline& pipelineState) noexcept {
+			if (!pipelineState.dynamicStencilReference) {
+				commandListState.stencilReferenceApplied = false;
+			}
+			else if (!commandListState.stencilReferenceApplied) {
+				vkCmdSetStencilReference(commandListState.commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, commandListState.stencilReference);
+				commandListState.stencilReferenceApplied = true;
+			}
+			if (!pipelineState.dynamicBlendConstants) {
+				commandListState.blendConstantsApplied = false;
+			}
+			else if (!commandListState.blendConstantsApplied) {
+				vkCmdSetBlendConstants(commandListState.commandBuffer, commandListState.blendConstants);
+				commandListState.blendConstantsApplied = true;
+			}
+		}
+
 		static void cl_bindPipeline(CommandList* commandList, PipelineHandle pipeline) noexcept {
 			ZoneScopedN("RHI.Vulkan.BindPipeline");
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
@@ -6019,6 +6111,72 @@ namespace rhi {
 
 			VkCmdBindPipelineHooked(commandListState->commandBuffer, pipelineState->bindPoint, pipelineState->pipeline);
 			commandListState->boundPipeline = pipeline;
+			if (pipelineState->bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+				VkApplyFixedFunctionState(*commandListState, *pipelineState);
+			}
+		}
+
+		static void cl_setStencilRef(CommandList* commandList, uint32_t reference) noexcept {
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE) {
+				return;
+			}
+			vkCmdSetStencilReference(commandListState->commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, reference);
+			commandListState->stencilReference = reference;
+			commandListState->stencilReferenceApplied = true;
+		}
+
+		static void cl_setViewports(CommandList* commandList, Span<const Viewport> viewports) noexcept {
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!impl || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE || viewports.size == 0) {
+				return;
+			}
+			if (viewports.size > VMAX_VIEWPORTS(impl)) {
+				spdlog::error("Vulkan SetViewports: {} viewports, the device takes {}", viewports.size, VMAX_VIEWPORTS(impl));
+				VkMarkCommandListError(commandListState, Result::Unsupported);
+				return;
+			}
+			std::array<VkViewport, MAX_VIEWPORTS> native{};
+			for (uint32_t i = 0; i < viewports.size; ++i) {
+				const Viewport& v = viewports.data[i];
+				native[i] = VkFlippedViewport(v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth);
+			}
+			vkCmdSetViewport(commandListState->commandBuffer, 0, viewports.size, native.data());
+		}
+
+		static void cl_setScissors(CommandList* commandList, Span<const ScissorRect> scissors) noexcept {
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!impl || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE || scissors.size == 0) {
+				return;
+			}
+			if (scissors.size > VMAX_VIEWPORTS(impl)) {
+				spdlog::error("Vulkan SetScissors: {} scissors, the device takes {}", scissors.size, VMAX_VIEWPORTS(impl));
+				VkMarkCommandListError(commandListState, Result::Unsupported);
+				return;
+			}
+			std::array<VkRect2D, MAX_VIEWPORTS> native{};
+			for (uint32_t i = 0; i < scissors.size; ++i) {
+				const ScissorRect& s = scissors.data[i];
+				// Vulkan takes no negative offsets: cut the part outside the target off, as D3D does.
+				const int64_t cutX = s.x < 0 ? -static_cast<int64_t>(s.x) : 0;
+				const int64_t cutY = s.y < 0 ? -static_cast<int64_t>(s.y) : 0;
+				native[i].offset = { (std::max)(s.x, 0), (std::max)(s.y, 0) };
+				native[i].extent.width = static_cast<uint32_t>((std::max)(int64_t{ 0 }, static_cast<int64_t>(s.width) - cutX));
+				native[i].extent.height = static_cast<uint32_t>((std::max)(int64_t{ 0 }, static_cast<int64_t>(s.height) - cutY));
+			}
+			vkCmdSetScissor(commandListState->commandBuffer, 0, scissors.size, native.data());
+		}
+
+		static void cl_setBlendFactor(CommandList* commandList, const float rgba[4]) noexcept {
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE || !rgba) {
+				return;
+			}
+			std::copy(rgba, rgba + 4, commandListState->blendConstants);
+			vkCmdSetBlendConstants(commandListState->commandBuffer, commandListState->blendConstants);
+			commandListState->blendConstantsApplied = true;
 		}
 
 		static void cl_setVB(CommandList* commandList, uint32_t startSlot, uint32_t numViews, VertexBufferView* views) noexcept {
@@ -7573,13 +7731,8 @@ namespace rhi {
 			commandListState->passRenderArea.extent = { inheritance.width, inheritance.height };
 
 			// As BeginPass sets them: flipped, the viewport starting at the bottom of the render area.
-			VkViewport viewport{};
-			viewport.x = static_cast<float>(inheritance.x);
-			viewport.width = static_cast<float>(inheritance.width);
-			viewport.y = static_cast<float>(inheritance.y + inheritance.height);
-			viewport.height = -static_cast<float>(inheritance.height);
-			viewport.minDepth = inheritance.minDepth;
-			viewport.maxDepth = inheritance.maxDepth;
+			const VkViewport viewport = VkFlippedViewport(static_cast<float>(inheritance.x), static_cast<float>(inheritance.y),
+				static_cast<float>(inheritance.width), static_cast<float>(inheritance.height), inheritance.minDepth, inheritance.maxDepth);
 			vkCmdSetViewport(commandListState->commandBuffer, 0, 1, &viewport);
 			vkCmdSetScissor(commandListState->commandBuffer, 0, 1, &commandListState->passRenderArea);
 			return Result::Ok;
@@ -7620,6 +7773,9 @@ namespace rhi {
 			}
 			vkCmdExecuteCommands(commandListState->commandBuffer, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
 			commandListState->boundPipeline = {};
+			// Dynamic state is undefined too: the next pipeline that reads it sets the list's values again.
+			commandListState->stencilReferenceApplied = false;
+			commandListState->blendConstantsApplied = false;
 			commandListState->emittedCbvSrvUavHeap = {};
 			commandListState->emittedSamplerHeap = {};
 			// Descriptor-buffer model: push constants are undefined too; the list's push data is recorded again before it is read.
@@ -8259,6 +8415,28 @@ namespace rhi {
 					spdlog::warn("Vulkan graphics pipeline creation: shader bytecode was not SPIR-V");
 					RHI_FAIL(Result::Unsupported);
 				}
+				// Fixed-function state behind optional core features (FixedFunctionFeatureInfo).
+				if (rasterState.viewportCount > VMAX_VIEWPORTS(impl)) {
+					spdlog::error("Vulkan graphics pipeline creation: {} viewports, the device takes {}", rasterState.viewportCount, VMAX_VIEWPORTS(impl));
+					RHI_FAIL(Result::Unsupported);
+				}
+				if (!rasterState.depthClip && impl->supportedFeatures.depthClamp != VK_TRUE) {
+					spdlog::error("Vulkan graphics pipeline creation: turning depth clip off needs the depthClamp feature");
+					RHI_FAIL(Result::Unsupported);
+				}
+				if (blendState.logicOpEnable && impl->supportedFeatures.logicOp != VK_TRUE) {
+					spdlog::error("Vulkan graphics pipeline creation: a logic op needs the logicOp feature");
+					RHI_FAIL(Result::Unsupported);
+				}
+				for (uint32_t i = 0; i < blendState.numAttachments && i < 8; ++i) {
+					const BlendAttachment& attachment = blendState.attachments[i];
+					if (attachment.enable && !blendState.logicOpEnable && impl->supportedFeatures.dualSrcBlend != VK_TRUE &&
+						(VkBlendFactorIsDualSource(attachment.srcColor) || VkBlendFactorIsDualSource(attachment.dstColor) ||
+							VkBlendFactorIsDualSource(attachment.srcAlpha) || VkBlendFactorIsDualSource(attachment.dstAlpha))) {
+						spdlog::error("Vulkan graphics pipeline creation: dual-source blending needs the dualSrcBlend feature");
+						RHI_FAIL(Result::Unsupported);
+					}
+				}
 
 				std::vector<VkShaderModule> modules;
 				std::vector<VkPipelineShaderStageCreateInfo> shaderStages;
@@ -8359,8 +8537,8 @@ namespace rhi {
 				VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
 				inputAssembly.topology = VkPrimitiveTopologyForRHI(primitiveTopology);
 				VkPipelineViewportStateCreateInfo viewportState{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-				viewportState.viewportCount = 1;
-				viewportState.scissorCount = 1;
+				viewportState.viewportCount = (std::max)(rasterState.viewportCount, 1u);
+				viewportState.scissorCount = viewportState.viewportCount;
 				VkPipelineRasterizationStateCreateInfo raster{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
 				raster.polygonMode = VkPolygonModeForRHI(rasterState.fill);
 				raster.cullMode = VkCullModeForRHI(rasterState.cull);
@@ -8371,6 +8549,9 @@ namespace rhi {
 				// This is DXVK's mapping too, under the same flip (d3d11_rasterizer.cpp, d3d11_context.cpp).
 				raster.frontFace = rasterState.frontCCW ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
 				raster.lineWidth = 1.0f;
+				// D3D's DepthClipEnable off skips the near and far clip and clamps depth to the viewport range,
+				// which is what depth clamp does.
+				raster.depthClampEnable = rasterState.depthClip ? VK_FALSE : VK_TRUE;
 				raster.depthBiasEnable = (rasterState.depthBias != 0.0f || rasterState.slopeScaledDepthBias != 0.0f) ? VK_TRUE : VK_FALSE;
 				raster.depthBiasConstantFactor = rasterState.depthBias;
 				raster.depthBiasClamp = rasterState.depthBiasClamp;
@@ -8381,17 +8562,46 @@ namespace rhi {
 					multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 				}
 				multisample.alphaToCoverageEnable = blendState.alphaToCoverage ? VK_TRUE : VK_FALSE;
+				// All bits set is Vulkan's default too, so only a real mask is passed.
+				const VkSampleMask sampleMask[2] = { blendState.sampleMask, 0xFFFFFFFFu };
+				if (blendState.sampleMask != 0xFFFFFFFFu) {
+					multisample.pSampleMask = sampleMask;  // two words cover up to 64 samples
+				}
 				VkPipelineDepthStencilStateCreateInfo depthStencil{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
 				depthStencil.depthTestEnable = depthState.depthEnable ? VK_TRUE : VK_FALSE;
 				depthStencil.depthWriteEnable = depthState.depthWrite ? VK_TRUE : VK_FALSE;
 				depthStencil.depthCompareOp = VkToCompareOp(depthState.depthFunc);
+				if (depthState.stencilEnable) {
+					// The reference is dynamic state (SetStencilRef); the masks are the pipeline's, as in D3D12.
+					auto toVk = [&](const StencilFaceState& face) {
+						VkStencilOpState state{};
+						state.failOp = VkStencilOpForRHI(face.failOp);
+						state.passOp = VkStencilOpForRHI(face.passOp);
+						state.depthFailOp = VkStencilOpForRHI(face.depthFailOp);
+						state.compareOp = VkToCompareOp(face.func);
+						state.compareMask = depthState.stencilReadMask;
+						state.writeMask = depthState.stencilWriteMask;
+						return state;
+					};
+					depthStencil.stencilTestEnable = VK_TRUE;
+					depthStencil.front = toVk(depthState.front);
+					depthStencil.back = toVk(depthState.back);
+				}
 				std::vector<VkPipelineColorBlendAttachmentState> blendAttachments;
 				const uint32_t attachmentCount = (std::max)(renderTargets.count, blendState.numAttachments);
 				blendAttachments.resize(attachmentCount);
+				bool dynamicBlendConstants = false;
 				for (uint32_t i = 0; i < attachmentCount; ++i) {
 					const BlendAttachment& src = blendState.attachments[(std::min)(i, blendState.numAttachments ? blendState.numAttachments - 1 : 0)];
 					auto& dst = blendAttachments[i];
-					dst.blendEnable = src.enable ? VK_TRUE : VK_FALSE;
+					// A logic op replaces blending on every attachment.
+					const bool blending = src.enable && !blendState.logicOpEnable;
+					if (blending) {
+						dynamicBlendConstants = dynamicBlendConstants ||
+							VkBlendFactorIsConstant(src.srcColor) || VkBlendFactorIsConstant(src.dstColor) ||
+							VkBlendFactorIsConstant(src.srcAlpha) || VkBlendFactorIsConstant(src.dstAlpha);
+					}
+					dst.blendEnable = blending ? VK_TRUE : VK_FALSE;
 					dst.srcColorBlendFactor = VkBlendFactorForRHI(src.srcColor);
 					dst.dstColorBlendFactor = VkBlendFactorForRHI(src.dstColor);
 					dst.colorBlendOp = VkBlendOpForRHI(src.colorOp);
@@ -8403,7 +8613,11 @@ namespace rhi {
 				VkPipelineColorBlendStateCreateInfo colorBlend{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
 				colorBlend.attachmentCount = static_cast<uint32_t>(blendAttachments.size());
 				colorBlend.pAttachments = blendAttachments.empty() ? nullptr : blendAttachments.data();
-				std::array<VkDynamicState, 4> dynamicStates = {
+				if (blendState.logicOpEnable) {
+					colorBlend.logicOpEnable = VK_TRUE;
+					colorBlend.logicOp = VkLogicOpForRHI(blendState.logicOp);
+				}
+				std::array<VkDynamicState, 6> dynamicStates = {
 					VK_DYNAMIC_STATE_VIEWPORT,
 					VK_DYNAMIC_STATE_SCISSOR,
 					VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
@@ -8412,6 +8626,11 @@ namespace rhi {
 				// Indirect commands bind vertex buffers with their strides (VertexBuffer argument).
 				const bool dynamicVertexStride = !hasMeshShader && !bindings.empty() && (pipelineFlags & PipelineFlags_IndirectBindable) != 0;
 				uint32_t dynamicStateCount = hasMeshShader ? 2u : (dynamicVertexStride ? 4u : 3u);
+				// Command list state in D3D12, so dynamic here. Only pipelines that read it declare it, which keeps
+				// the others as they were.
+				const bool dynamicStencilReference = depthState.stencilEnable;
+				if (dynamicStencilReference) dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
+				if (dynamicBlendConstants) dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;
 				VkPipelineDynamicStateCreateInfo dynamicState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
 				dynamicState.dynamicStateCount = dynamicStateCount;
 				dynamicState.pDynamicStates = dynamicStates.data();
@@ -8491,6 +8710,8 @@ namespace rhi {
 				VulkanPipeline graphicsPipelineState{ nativePipeline, nativeLayout, VK_PIPELINE_BIND_POINT_GRAPHICS, layoutHandle, false };
 				graphicsPipelineState.indirectBindable = indirectBindable;
 				graphicsPipelineState.dynamicVertexStride = dynamicVertexStride;
+				graphicsPipelineState.dynamicStencilReference = dynamicStencilReference;
+				graphicsPipelineState.dynamicBlendConstants = dynamicBlendConstants;
 				for (const VkPipelineShaderStageCreateInfo& stage : shaderStages) {
 					graphicsPipelineState.shaderStages |= stage.stage;
 				}
@@ -9336,6 +9557,18 @@ namespace rhi {
 					}
 					if (header->structVersion >= 3)
 						out->countedDraws = impl->drawIndirectCountEnabled && vkCmdDrawIndexedIndirectCount;
+				} break;
+
+				case FeatureInfoStructType::FixedFunction: {
+					if (header->structSize < sizeof(FixedFunctionFeatureInfo)) {
+						RHI_FAIL(Result::InvalidArgument);
+					}
+					// The core features the device was created (or adopted) with.
+					auto* out = reinterpret_cast<FixedFunctionFeatureInfo*>(header);
+					out->dualSourceBlend = impl->supportedFeatures.dualSrcBlend == VK_TRUE;
+					out->logicOp = impl->supportedFeatures.logicOp == VK_TRUE;
+					out->depthClipDisable = impl->supportedFeatures.depthClamp == VK_TRUE;
+					out->maxViewports = VMAX_VIEWPORTS(impl);
 				} break;
 
 				default:
@@ -12172,14 +12405,18 @@ namespace rhi {
 		&cl_setDebugInstrumentationContext,
 		&cl_beginTracyGpuZone,
 		&cl_endTracyGpuZone,
-		8u,
+		9u,
 		&cl_endChecked,
 		&cl_beginDebugLabel,
 		&cl_endDebugLabel,
 		&cl_insertDebugLabel,
 		&cl_preprocessIndirect,
 		&cl_beginSecondary,
-		&cl_executeCommands
+		&cl_executeCommands,
+		&cl_setStencilRef,
+		&cl_setBlendFactor,
+		&cl_setViewports,
+		&cl_setScissors
 	};
 
 	const SwapchainVTable g_vkscvt = {

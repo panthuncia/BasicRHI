@@ -1191,6 +1191,8 @@ namespace rhi {
 			D3D12_INPUT_LAYOUT_DESC inputLayoutDesc{ nullptr, 0 };
 
 			bool hasRast = false, hasBlend = false, hasDepth = false, hasRTV = false, hasDSV = false, hasSample = false, hasInputLayout = false, hasPrimitiveTopology = false;
+			UINT sampleMask = UINT_MAX;  // the stream's default when no mask subobject is pushed
+			bool readsBlendFactor = false;
 
 			for (uint32_t i = 0; i < count; i++) {
 				switch (items[i].type) {
@@ -1242,6 +1244,7 @@ namespace rhi {
 					rast.DepthBias = static_cast<int>(R.rs.depthBias);
 					rast.DepthBiasClamp = R.rs.depthBiasClamp;
 					rast.SlopeScaledDepthBias = R.rs.slopeScaledDepthBias;
+					rast.DepthClipEnable = R.rs.depthClip;
 				} break;
 				case PsoSubobj::Blend: {
 					hasBlend = true;
@@ -1249,10 +1252,14 @@ namespace rhi {
 					blend = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
 					blend.AlphaToCoverageEnable = B.bs.alphaToCoverage;
 					blend.IndependentBlendEnable = B.bs.independentBlend;
+					sampleMask = B.bs.sampleMask;
 					for (uint32_t a = 0; a < B.bs.numAttachments && a < 8; a++) {
 						const auto& src = B.bs.attachments[a];
 						auto& dst = blend.RenderTarget[a];
-						dst.BlendEnable = src.enable;
+						// A logic op replaces blending on every attachment, as on Vulkan.
+						dst.BlendEnable = src.enable && !B.bs.logicOpEnable;
+						dst.LogicOpEnable = B.bs.logicOpEnable;
+						dst.LogicOp = ToDX(B.bs.logicOp);
 						dst.RenderTargetWriteMask = src.writeMask;
 						dst.BlendOp = ToDX(src.colorOp);
 						dst.SrcBlend = ToDX(src.srcColor);
@@ -1260,6 +1267,12 @@ namespace rhi {
 						dst.BlendOpAlpha = ToDX(src.alphaOp);
 						dst.SrcBlendAlpha = ToDX(src.srcAlpha);
 						dst.DestBlendAlpha = ToDX(src.dstAlpha);
+						// Without independent blend only render target 0 is read.
+						if (dst.BlendEnable && (a == 0 || B.bs.independentBlend)) {
+							readsBlendFactor = readsBlendFactor ||
+								DxBlendIsConstant(dst.SrcBlend) || DxBlendIsConstant(dst.DestBlend) ||
+								DxBlendIsConstant(dst.SrcBlendAlpha) || DxBlendIsConstant(dst.DestBlendAlpha);
+						}
 					}
 				} break;
 				case PsoSubobj::DepthStencil: {
@@ -1269,6 +1282,14 @@ namespace rhi {
 					depth.DepthEnable = D.ds.depthEnable;
 					depth.DepthWriteMask = D.ds.depthWrite ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
 					depth.DepthFunc = ToDX(D.ds.depthFunc);
+					depth.StencilEnable = D.ds.stencilEnable;
+					depth.StencilReadMask = D.ds.stencilReadMask;
+					depth.StencilWriteMask = D.ds.stencilWriteMask;
+					auto toDx = [](const StencilFaceState& face) {
+						return D3D12_DEPTH_STENCILOP_DESC{ ToDX(face.failOp), ToDX(face.depthFailOp), ToDX(face.passOp), ToDX(face.func) };
+					};
+					depth.FrontFace = toDx(D.ds.front);
+					depth.BackFace = toDx(D.ds.back);
 				} break;
 				case PsoSubobj::RTVFormats: {
 					hasRTV = true;
@@ -1339,6 +1360,7 @@ namespace rhi {
 				if (hasRTV) sb.push(SO_RtvFormats{ .Value = rtv });
 				if (hasDSV) sb.push(SO_DsvFormat{ .Value = dsv });
 				if (hasSample) sb.push(SO_SampleDesc{ .Value = sample });
+				if (sampleMask != UINT_MAX) sb.push(SO_SampleMask{ .Value = sampleMask });
 				if (hasInputLayout) sb.push(SO_InputLayout{ .Value = inputLayoutDesc });
 			}
 			auto sd = sb.desc();
@@ -1376,7 +1398,10 @@ namespace rhi {
 				RHI_FAIL(ToRHI(hr));
 			}
 
-			auto handle = dimpl->pipelines.alloc(Dx12Pipeline(pso, isCompute, dimpl));
+			Dx12Pipeline pipeline(pso, isCompute, dimpl);
+			pipeline.readsStencilRef = !isCompute && hasDepth && depth.StencilEnable;
+			pipeline.readsBlendFactor = !isCompute && readsBlendFactor;
+			auto handle = dimpl->pipelines.alloc(std::move(pipeline));
 			Pipeline ret(handle);
 			ret.vt = &g_psovt;
 			ret.impl = dimpl;
@@ -2646,6 +2671,14 @@ namespace rhi {
 					out->maxSequenceCount = UINT32_MAX;  // ExecuteIndirect's MaxCommandCount has no device limit
 					if (h->structVersion >= 3)
 						out->countedDraws = true;  // ExecuteIndirect's count buffer is core D3D12
+				} break;
+				case FeatureInfoStructType::FixedFunction: {
+					if (h->structSize < sizeof(FixedFunctionFeatureInfo)) return Result::InvalidArgument;
+					auto* out = reinterpret_cast<FixedFunctionFeatureInfo*>(h);
+					out->dualSourceBlend = true;  // core D3D12
+					out->logicOp = opt0.OutputMergerLogicOp != 0;
+					out->depthClipDisable = true;  // core D3D12
+					out->maxViewports = MAX_VIEWPORTS;
 				} break;
 				default:
 					// Unknown sType: ignore
@@ -8022,6 +8055,10 @@ namespace rhi {
 			l->boundLayout = {};
 			l->boundLayoutPtr = nullptr;
 			l->activeRootCbvShadowStateCount = 0;
+			l->stencilRef = 0;
+			l->stencilRefApplied = false;
+			std::fill(std::begin(l->blendFactor), std::end(l->blendFactor), 1.0f);
+			l->blendFactorApplied = false;
 			for (auto& page : l->rootCbvScratchPages) {
 				page.cursor = 0;
 			}
@@ -8287,6 +8324,14 @@ namespace rhi {
 					return;
 				}
 				l->cl->SetPipelineState(P->pso.Get());
+				if (P->readsStencilRef && !l->stencilRefApplied) {
+					l->cl->OMSetStencilRef(l->stencilRef);
+					l->stencilRefApplied = true;
+				}
+				if (P->readsBlendFactor && !l->blendFactorApplied) {
+					l->cl->OMSetBlendFactor(l->blendFactor);
+					l->blendFactorApplied = true;
+				}
 				#if BASICRHI_ENABLE_RESHAPE
 				if (dev->debugInstrumentation.state.active && P->pso) {
 					::PipelineState* pipelineState = nullptr;
@@ -9828,6 +9873,78 @@ namespace rhi {
 				}
 				l->cl->ExecuteBundle(bundle->cl.Get());
 			}
+			// A bundle's state changes carry back into this list: set the list's values again before they are read.
+			l->stencilRefApplied = false;
+			l->blendFactorApplied = false;
+		}
+
+		static void cl_setStencilRef(CommandList* cl, uint32_t reference) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl) {
+				BreakIfDebugging();
+				return;
+			}
+			l->cl->OMSetStencilRef(reference);
+			l->stencilRef = reference;
+			l->stencilRefApplied = true;
+		}
+
+		static void cl_setViewports(CommandList* cl, Span<const Viewport> viewports) noexcept {
+			if (DxRejectInBundle(cl, "SetViewports")) {
+				return;
+			}
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl || viewports.size == 0) {
+				BreakIfDebugging();
+				return;
+			}
+			if (viewports.size > MAX_VIEWPORTS) {
+				spdlog::error("D3D12 SetViewports: {} viewports, the device takes {}", viewports.size, MAX_VIEWPORTS);
+				if (l->pendingError == Result::Ok) l->pendingError = Result::Unsupported;
+				BreakIfDebugging();
+				return;
+			}
+			std::array<D3D12_VIEWPORT, MAX_VIEWPORTS> native{};
+			for (uint32_t i = 0; i < viewports.size; ++i) {
+				const Viewport& v = viewports.data[i];
+				native[i] = { v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth };
+			}
+			l->cl->RSSetViewports(viewports.size, native.data());
+		}
+
+		static void cl_setScissors(CommandList* cl, Span<const ScissorRect> scissors) noexcept {
+			if (DxRejectInBundle(cl, "SetScissors")) {
+				return;
+			}
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl || scissors.size == 0) {
+				BreakIfDebugging();
+				return;
+			}
+			if (scissors.size > MAX_VIEWPORTS) {
+				spdlog::error("D3D12 SetScissors: {} scissors, the device takes {}", scissors.size, MAX_VIEWPORTS);
+				if (l->pendingError == Result::Ok) l->pendingError = Result::Unsupported;
+				BreakIfDebugging();
+				return;
+			}
+			std::array<D3D12_RECT, MAX_VIEWPORTS> native{};
+			for (uint32_t i = 0; i < scissors.size; ++i) {
+				const ScissorRect& s = scissors.data[i];
+				native[i] = { static_cast<LONG>(s.x), static_cast<LONG>(s.y),
+					static_cast<LONG>(static_cast<int64_t>(s.x) + s.width), static_cast<LONG>(static_cast<int64_t>(s.y) + s.height) };
+			}
+			l->cl->RSSetScissorRects(scissors.size, native.data());
+		}
+
+		static void cl_setBlendFactor(CommandList* cl, const float rgba[4]) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl || !rgba) {
+				BreakIfDebugging();
+				return;
+			}
+			std::copy(rgba, rgba + 4, l->blendFactor);
+			l->cl->OMSetBlendFactor(l->blendFactor);
+			l->blendFactorApplied = true;
 		}
 
 		// ------------------ QueryPool vtable funcs ----------------
@@ -10524,14 +10641,18 @@ namespace rhi {
 		&cl_setDebugInstrumentationContext,
 		&cl_beginTracyGpuZone,
 		&cl_endTracyGpuZone,
-		8u,
+		9u,
 		&cl_endChecked,
 		nullptr,  // beginDebugLabel: PIX markers go through the native list
 		nullptr,  // endDebugLabel
 		nullptr,  // insertDebugLabel
 		nullptr,  // preprocessIndirect: the driver preprocesses inside ExecuteIndirect
 		&cl_beginSecondary,
-		&cl_executeCommands
+		&cl_executeCommands,
+		&cl_setStencilRef,
+		&cl_setBlendFactor,
+		&cl_setViewports,
+		&cl_setScissors
 	};
 	const SwapchainVTable g_scvt = {
 		&sc_count,

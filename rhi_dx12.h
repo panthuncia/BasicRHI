@@ -97,6 +97,8 @@ namespace rhi {
 		bool isCompute = false;
 		bool isRayTracing = false;
 		bool isRayTracingLibrary = false;
+		bool readsStencilRef = false;  // stencil test on: binding it sets the list's stencil reference if not yet set
+		bool readsBlendFactor = false; // a blend reads the constant: binding it sets the list's blend factor if not yet set
 		Dx12Device* dev = nullptr;
 	};
 
@@ -216,6 +218,13 @@ namespace rhi {
 		Dx12PipelineLayout* boundLayoutPtr = nullptr;
 		Dx12Device* dev = nullptr;
 		Dx12Pipeline* boundPipeline = nullptr; // For debug validation
+		// The stencil reference set with SetStencilRef (0 until then). Applied: the list holds it. A list starts
+		// without it, and executed bundles may change it, so the next pipeline that reads it sets it again.
+		uint32_t stencilRef = 0;
+		bool stencilRefApplied = false;
+		// The same for the blend factor (SetBlendFactor; {1, 1, 1, 1} until then).
+		float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		bool blendFactorApplied = false;
 		std::string debugName;
 		std::string instrumentationPassName;
 		std::string instrumentationTechniquePath;
@@ -628,6 +637,7 @@ namespace rhi {
 	using SO_RtvFormats = PsoSubobject<D3D12_RT_FORMAT_ARRAY, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS>;
 	using SO_DsvFormat = PsoSubobject<DXGI_FORMAT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT>;
 	using SO_SampleDesc = PsoSubobject<DXGI_SAMPLE_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC>;
+	using SO_SampleMask = PsoSubobject<UINT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK>;
 	using SO_PrimTopology = PsoSubobject<D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY>;
 	using SO_Flags = PsoSubobject<D3D12_PIPELINE_STATE_FLAGS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS>;
 	using SO_NodeMask = PsoSubobject<UINT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK>;

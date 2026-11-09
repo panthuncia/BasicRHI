@@ -1610,8 +1610,23 @@ namespace rhi {
 
 	enum class FillMode : uint32_t { Solid, Wireframe };
 	enum class CullMode : uint32_t { None, Front, Back };
-	enum class BlendFactor : uint32_t { One, Zero, SrcColor, InvSrcColor, SrcAlpha, InvSrcAlpha, DstColor, InvDstColor, DstAlpha, InvDstAlpha };
+	// Appended values: those before InvDstAlpha are ABI.
+	// BlendFactor/InvBlendFactor read the list's constant (CommandList::SetBlendFactor). SrcAlphaSat is a source factor
+	// only. Src1* read the pixel shader's second output (dual-source blending, render target 0 only; Vulkan needs
+	// FixedFunctionFeatureInfo::dualSourceBlend).
+	enum class BlendFactor : uint32_t {
+		One, Zero, SrcColor, InvSrcColor, SrcAlpha, InvSrcAlpha, DstColor, InvDstColor, DstAlpha, InvDstAlpha,
+		BlendFactor, InvBlendFactor, SrcAlphaSat, Src1Color, InvSrc1Color, Src1Alpha, InvSrc1Alpha
+	};
 	enum class BlendOp : uint32_t { Add, Sub, RevSub, Min, Max };
+	/** @brief A logic op on the render target's integer bits (D3D12_LOGIC_OP order; s = shader output, d = target). */
+	enum class LogicOp : uint8_t {
+		Clear, Set, Copy, CopyInverted, Noop, Invert, And, Nand, Or, Nor, Xor, Equiv,
+		AndReverse,   // s & ~d
+		AndInverted,  // ~s & d
+		OrReverse,    // s | ~d
+		OrInverted    // ~s | d
+	};
 	enum ColorWriteEnable : uint8_t { R = 1, G = 2, B = 4, A = 8, All = 0x0F };
 
 	struct ShaderBinary { const void* data{}; uint32_t size{}; };
@@ -1786,13 +1801,36 @@ namespace rhi {
 		float   depthBiasClamp = 0;
 		float   slopeScaledDepthBias = 0;
 		bool    conservative = false;
+		// Clip against the near and far planes (D3D12 DepthClipEnable). false skips that clip and clamps depth to the
+		// viewport's range instead (Vulkan depthClampEnable); it needs FixedFunctionFeatureInfo::depthClipDisable.
+		bool    depthClip = true;
+		// How many viewports and scissors the pipeline reads (SV_ViewportArrayIndex picks one). Vulkan fixes the count in
+		// the pipeline; D3D12 ignores it. Above 1 needs FixedFunctionFeatureInfo::maxViewports.
+		uint32_t viewportCount = 1;
+	};
+
+	/** @brief What a stencil test does to the stored value (D3D12_STENCIL_OP / VkStencilOp). */
+	enum class StencilOp : uint8_t { Keep, Zero, Replace, IncrSat, DecrSat, Invert, Incr, Decr };
+
+	/** @brief The stencil test and its updates for one face (D3D12_DEPTH_STENCILOP_DESC / VkStencilOpState). */
+	struct StencilFaceState {
+		StencilOp failOp = StencilOp::Keep;       // the stencil test fails
+		StencilOp depthFailOp = StencilOp::Keep;  // the stencil test passes and the depth test fails
+		StencilOp passOp = StencilOp::Keep;       // both tests pass
+		CompareOp func = CompareOp::Always;
 	};
 
 	struct DepthStencilState {
 		bool depthEnable = true;
 		bool depthWrite = true;
 		CompareOp depthFunc = CompareOp::LessEqual;
-		// TODO: stencil
+		// Stencil. Off by default, as D3D12's default desc has it. The reference value is command list state
+		// (CommandList::SetStencilRef). "Front" means what RasterState::frontCCW makes the front face, on every backend.
+		bool stencilEnable = false;
+		uint8_t stencilReadMask = 0xFF;
+		uint8_t stencilWriteMask = 0xFF;
+		StencilFaceState front{};
+		StencilFaceState back{};
 	};
 
 	struct BlendAttachment {
@@ -1810,6 +1848,12 @@ namespace rhi {
 		bool independentBlend = false;
 		uint32_t numAttachments = 1;
 		BlendAttachment attachments[8]{};
+		// A logic op instead of blending, on every attachment (their enable is ignored while it is on). It applies to
+		// integer formats. Needs FixedFunctionFeatureInfo::logicOp.
+		bool logicOpEnable = false;
+		LogicOp logicOp = LogicOp::Noop;
+		// Which samples the draw may write (D3D12 SampleMask, Vulkan pSampleMask). All bits: every sample.
+		uint32_t sampleMask = 0xFFFFFFFFu;
 	};
 
 	struct RenderTargets {
@@ -2019,6 +2063,24 @@ namespace rhi {
 		ClearValue clear{};
 		bool readOnly = false;
 		ResourceHandle resource{};  // Required for LoadOp::DontCare (DiscardResource)
+	};
+
+	// The most viewports and scissors a list sets at once (D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE).
+	inline constexpr uint32_t MAX_VIEWPORTS = 16;
+
+	/**
+	 * @brief A viewport in D3D's convention on every backend: (x, y) is its top-left corner in pixels, y growing
+	 * downwards. The Vulkan backend flips it as BeginPass does, so callers never branch on the backend.
+	 */
+	struct Viewport {
+		float x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
+		float minDepth = 0.0f, maxDepth = 1.0f;
+	};
+
+	/** @brief A scissor rectangle in pixels, top-left origin as Viewport. Parts left of or above 0 are cut off. */
+	struct ScissorRect {
+		int32_t x = 0, y = 0;
+		uint32_t width = 0, height = 0;
 	};
 
 	/** @brief Where a pass's draws are recorded (PassBeginInfo::contents). */
@@ -2935,6 +2997,11 @@ namespace rhi {
 		// abi_version 8: secondary lists (Device::CreateSecondaryCommandList); null where the backend has none.
 		Result (*beginSecondary)(CommandList*, const SecondaryInheritance&) noexcept = nullptr;
 		void (*executeCommands)(CommandList*, Span<CommandList* const>) noexcept = nullptr;
+		// abi_version 9: fixed-function state set while recording (CommandList::SetStencilRef and the calls after it).
+		void (*setStencilRef)(CommandList*, uint32_t reference) noexcept = nullptr;
+		void (*setBlendFactor)(CommandList*, const float rgba[4]) noexcept = nullptr;
+		void (*setViewports)(CommandList*, Span<const Viewport>) noexcept = nullptr;
+		void (*setScissors)(CommandList*, Span<const ScissorRect>) noexcept = nullptr;
 	};
 
 	class CommandList {
@@ -3020,6 +3087,35 @@ namespace rhi {
 		 */
 		void ExecuteCommands(Span<CommandList* const> lists) noexcept {
 			if (SupportsSecondaryLists()) vt->executeCommands(this, lists);
+		}
+		/**
+		 * @brief Sets the stencil reference value that pipelines with DepthStencilState::stencilEnable compare and write.
+		 * Both faces use it, as OMSetStencilRef does. A list (and each secondary) starts at 0, and the value holds across
+		 * pipeline binds, passes and ExecuteCommands until it is set again. Valid inside and outside a pass.
+		 */
+		void SetStencilRef(uint32_t reference) noexcept {
+			if (IsValid() && vt->abi_version >= 9 && vt->setStencilRef) vt->setStencilRef(this, reference);
+		}
+		/**
+		 * @brief Sets the constant that BlendFactor::BlendFactor and InvBlendFactor read, as OMSetBlendFactor does.
+		 * A list (and each secondary) starts at {1, 1, 1, 1}, D3D11's default, and the value holds across pipeline binds,
+		 * passes and ExecuteCommands until it is set again. Valid inside and outside a pass.
+		 */
+		void SetBlendFactor(const float rgba[4]) noexcept {
+			if (IsValid() && vt->abi_version >= 9 && vt->setBlendFactor && rgba) vt->setBlendFactor(this, rgba);
+		}
+		/**
+		 * @brief Sets viewports 0..n-1 (Viewport: D3D's convention on every backend). BeginPass and BeginSecondary set
+		 * viewport 0 to the render area; this replaces it for the draws after it, inside the pass. More than one needs
+		 * FixedFunctionFeatureInfo::maxViewports and pipelines with RasterState::viewportCount to match; more than the
+		 * device supports fails the list. D3D12 bundles cannot set viewports: in a secondary this is Vulkan only.
+		 */
+		void SetViewports(Span<const Viewport> viewports) noexcept {
+			if (IsValid() && vt->abi_version >= 9 && vt->setViewports && viewports.size != 0) vt->setViewports(this, viewports);
+		}
+		/** @brief Sets scissors 0..n-1, as SetViewports sets viewports. Scissoring is always on, on both backends. */
+		void SetScissors(Span<const ScissorRect> scissors) noexcept {
+			if (IsValid() && vt->abi_version >= 9 && vt->setScissors && scissors.size != 0) vt->setScissors(this, scissors);
 		}
 		void ClearUavUint(const UavClearInfo& u, const UavClearUint& v) noexcept;
 		void ClearUavFloat(const UavClearInfo& u, const UavClearFloat& v) noexcept;
