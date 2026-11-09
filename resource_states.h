@@ -263,6 +263,15 @@ namespace rhi {
 		bool needsBuildAS = (access & ResourceAccessType::RaytracingAccelerationStructureWrite) != 0;
 		bool needsPresent = (access & ResourceAccessType::Present) != 0;
 
+		// Acceleration structure memory alone. A build reads and writes it at the build stage. A read can be a build
+		// referring to it, DispatchRays, or a ray query from any shader stage, and the access says nothing of which.
+		constexpr uint64_t kAccelerationStructureAccess = static_cast<uint64_t>(ResourceAccessType::RaytracingAccelerationStructureRead)
+			| static_cast<uint64_t>(ResourceAccessType::RaytracingAccelerationStructureWrite);
+		if ((needsRayTracing || needsBuildAS) && (static_cast<uint64_t>(access) & ~kAccelerationStructureAccess) == 0) {
+			if (needsBuildAS) return ResourceSyncState::BuildRaytracingAccelerationStructure;
+			return ResourceSyncState::BuildRaytracingAccelerationStructure | ResourceSyncState::Raytracing | ResourceSyncState::AllShading;
+		}
+
 		// count how many distinct categories are requested
 		int categoryCount =
 			(int)needsCommon

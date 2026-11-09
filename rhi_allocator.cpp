@@ -7373,9 +7373,11 @@ Synchronized internally with a mutex.
         UINT32 NumCastableFormats, const Format* pCastableFormats,
         ResourceAllocationInfo& outAllocInfo) const
     {
-        if (NumCastableFormats > 0)
+        // The device sizes a resource with castable formats from the list the ResourceDesc carries
+        // (ResourceDesc::castableFormats, GetResourceAllocationInfo3): the list passed here must be the same one.
+        if (NumCastableFormats > 0 && inOutResourceDesc.castableFormats.size != NumCastableFormats)
         {
-            return Result::NotImplemented;
+            return Result::InvalidArgument;
         }
 
         outAllocInfo = GetResourceAllocationInfoNative(inOutResourceDesc);

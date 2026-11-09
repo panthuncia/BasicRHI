@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <future>
 #include <deque>
 #include <queue>
 #include <cstring>
@@ -4853,7 +4854,25 @@ namespace rhi {
 			// Out array
 			std::vector<D3D12_RESOURCE_ALLOCATION_INFO1> dxInfos;
 			dxInfos.resize(resourceCount);
-			impl->pNativeDevice->GetResourceAllocationInfo2(0, resourceCount, descs.data(), dxInfos.data());
+			// A resource that lists castable formats is sized with them (GetResourceAllocationInfo3), as it is created.
+			bool castable = false;
+			for (size_t i = 0; i < resourceCount; ++i) castable = castable || resources[i].castableFormats.size != 0;
+			Microsoft::WRL::ComPtr<ID3D12Device12> device12;
+			if (castable && SUCCEEDED(impl->pNativeDevice.As(&device12))) {
+				std::vector<UINT32> castableCounts(resourceCount);
+				std::vector<std::vector<DXGI_FORMAT>> castableFormats(resourceCount);
+				std::vector<const DXGI_FORMAT*> castableLists(resourceCount);
+				for (size_t i = 0; i < resourceCount; ++i) {
+					for (const auto format : resources[i].castableFormats) castableFormats[i].push_back(ToDxgi(format));
+					castableCounts[i] = static_cast<UINT32>(castableFormats[i].size());
+					castableLists[i] = castableFormats[i].empty() ? nullptr : castableFormats[i].data();
+				}
+				device12->GetResourceAllocationInfo3(0, resourceCount, descs.data(), castableCounts.data(), castableLists.data(),
+					dxInfos.data());
+			}
+			else {
+				impl->pNativeDevice->GetResourceAllocationInfo2(0, resourceCount, descs.data(), dxInfos.data());
+			}
 			// Pack back
 			for (size_t i = 0; i < resourceCount; ++i) {
 				outInfos[i].offset = dxInfos[i].Offset;
@@ -10239,6 +10258,55 @@ namespace rhi {
 		void SlLogMessageCallback(sl::LogType level, const char* message) {
 			//spdlog::info("Streamline Log: {}", message);
 		}
+
+		// Streamline's resources, and DLSS's through it, are allocated here so they get high residency priority: over the
+		// OS budget, video memory otherwise demotes them like anything else, and upscaling from system memory was 14 ms.
+		std::atomic<uint64_t> g_slAllocatedBytes{ 0u };
+		sl::Resource SlAllocateResource(const sl::ResourceAllocationDesc* desc, void* device) {
+			sl::Resource out(desc ? desc->type : sl::ResourceType::eUnknown, nullptr, desc ? desc->state : 0u);
+			auto* d3d = static_cast<ID3D12Device*>(device);
+			if (!desc || !desc->desc || !d3d || (desc->type != sl::ResourceType::eTex2d && desc->type != sl::ResourceType::eBuffer)) {
+				spdlog::error("Streamline asked for an allocation the host can't make (type {})", desc ? static_cast<int>(desc->type) : -1);
+				return out;
+			}
+			D3D12_HEAP_PROPERTIES heap{};
+			heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+			if (desc->heap) heap = *static_cast<const D3D12_HEAP_PROPERTIES*>(desc->heap);
+			const auto& resourceDesc = *static_cast<const D3D12_RESOURCE_DESC*>(desc->desc);
+			ID3D12Resource* resource = nullptr;
+			const HRESULT hr = d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &resourceDesc,
+				static_cast<D3D12_RESOURCE_STATES>(desc->state), nullptr, IID_PPV_ARGS(&resource));
+			if (FAILED(hr) || !resource) {
+				spdlog::error("Streamline allocation failed: {:#x}", static_cast<uint32_t>(hr));
+				return out;
+			}
+			if (heap.Type == D3D12_HEAP_TYPE_DEFAULT) {
+				Microsoft::WRL::ComPtr<ID3D12Device1> device1;
+				if (SUCCEEDED(d3d->QueryInterface(IID_PPV_ARGS(&device1)))) {
+					ID3D12Pageable* pageable = resource;
+					const D3D12_RESIDENCY_PRIORITY priority = D3D12_RESIDENCY_PRIORITY_HIGH;
+					device1->SetResidencyPriority(1u, &pageable, &priority);
+				}
+			}
+			const uint64_t bytes = d3d->GetResourceAllocationInfo(0u, 1u, &resourceDesc).SizeInBytes;
+			const uint64_t total = g_slAllocatedBytes.fetch_add(bytes) + bytes;
+			if (bytes >= (1ull << 20)) {
+				spdlog::info("Streamline allocated {:.1f} MiB ({}x{}), {:.1f} MiB in all", double(bytes) / 1048576.0,
+					resourceDesc.Width, resourceDesc.Height, double(total) / 1048576.0);
+			}
+			out.native = resource;
+			return out;
+		}
+		void SlReleaseResource(sl::Resource* resource, void* device) {
+			if (!resource || !resource->native) return;
+			auto* native = static_cast<ID3D12Resource*>(resource->native);
+			if (auto* d3d = static_cast<ID3D12Device*>(device)) {
+				const D3D12_RESOURCE_DESC resourceDesc = native->GetDesc();
+				g_slAllocatedBytes.fetch_sub(d3d->GetResourceAllocationInfo(0u, 1u, &resourceDesc).SizeInBytes);
+			}
+			native->Release();
+			resource->native = nullptr;
+		}
 		std::wstring GetExePath() {
 			WCHAR buffer[MAX_PATH] = { 0 };
 			GetModuleFileNameW(NULL, buffer, MAX_PATH);
@@ -10274,6 +10342,8 @@ namespace rhi {
 			pref.numPathsToPlugins = 1; // change this if Streamline plugins are not located next to the executable
 			pref.pathToLogsAndData = {}; // change this to enable logging to a file
 			pref.logMessageCallback = SlLogMessageCallback; // highly recommended to track warning/error messages in your callback
+			pref.allocateCallback = SlAllocateResource;
+			pref.releaseCallback = SlReleaseResource;
 			pref.engine = sl::EngineType::eCustom; // If using UE or Unity
 			pref.engineVersion = "0.0.1"; // Optional version
 			pref.projectId = "72a89ee2-1139-4cc5-8daa-d27189bed781"; // Optional project id
@@ -10297,6 +10367,22 @@ namespace rhi {
 			return false;
 		}
 	#endif
+
+		// slInit needs no device, and takes about a second. PrewarmD3D12Streamline starts it early; the next
+		// Streamline device creation takes the result. Both run on the thread that creates the device.
+		std::future<bool>& StreamlinePrewarm() noexcept
+		{
+			static std::future<bool> prewarm;
+			return prewarm;
+		}
+
+		bool TakeOrInitSL() noexcept
+		{
+			if (auto& prewarm = StreamlinePrewarm(); prewarm.valid()) {
+				return prewarm.get();
+			}
+			return InitSL();
+		}
 
 	}
 
@@ -10598,6 +10684,21 @@ namespace rhi {
 		1u
 	};
 
+	void PrewarmD3D12Streamline() noexcept
+	{
+	#if BASICRHI_ENABLE_STREAMLINE
+		auto& prewarm = StreamlinePrewarm();
+		if (prewarm.valid()) {
+			return;
+		}
+		try {
+			prewarm = std::async(std::launch::async, [] { return InitSL(); });
+		} catch (...) {
+			// No thread: device creation initializes Streamline itself.
+		}
+	#endif
+	}
+
 	rhi::Result CreateD3D12Device(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer) noexcept
 	{
 		bool l_enableStreamline = enableStreamlineInterposer;
@@ -10755,13 +10856,19 @@ namespace rhi {
 				DebugInstrumentationDiagnosticSeverity::Warning,
 				"Streamline is disabled while GPU-Reshape instrumentation is active on the same device.");
 			l_enableStreamline = false;
+		#if BASICRHI_ENABLE_STREAMLINE
+			// A prewarmed slInit this device was meant to take is not used.
+			if (auto& prewarm = StreamlinePrewarm(); prewarm.valid() && prewarm.get()) {
+				slShutdown();
+			}
+		#endif
 		}
 
 		// Streamline manual hooking setup
 		if (l_enableStreamline)
 		{
 	#if BASICRHI_ENABLE_STREAMLINE
-			if (!InitSL())
+			if (!TakeOrInitSL())
 			{
 				spdlog::error("Failed to initialize NVIDIA Streamline. DLSS will not be available.");
 				l_enableStreamline = false;

@@ -3775,6 +3775,10 @@ namespace rhi {
 	}
 
 	rhi::Result CreateD3D12Device(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer = false) noexcept; // implemented in rhi_dx12.cpp
+	// Starts Streamline's slInit (about a second, no device needed) on a background thread; the next D3D12 device
+	// created with Streamline takes the result. Call it from the thread that will create the device, and only when
+	// that device will use Streamline. Implemented in rhi_dx12.cpp.
+	void PrewarmD3D12Streamline() noexcept;
 	rhi::Result CreateVulkanDevice(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer = false) noexcept; // implemented in rhi_vulkan.cpp
 
 	namespace vulkan {
