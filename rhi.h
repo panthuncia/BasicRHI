@@ -1788,11 +1788,28 @@ namespace rhi {
 		bool    conservative = false;
 	};
 
+	/** @brief What a stencil test does to the stored value (D3D12_STENCIL_OP / VkStencilOp). */
+	enum class StencilOp : uint8_t { Keep, Zero, Replace, IncrSat, DecrSat, Invert, Incr, Decr };
+
+	/** @brief The stencil test and its updates for one face (D3D12_DEPTH_STENCILOP_DESC / VkStencilOpState). */
+	struct StencilFaceState {
+		StencilOp failOp = StencilOp::Keep;       // the stencil test fails
+		StencilOp depthFailOp = StencilOp::Keep;  // the stencil test passes and the depth test fails
+		StencilOp passOp = StencilOp::Keep;       // both tests pass
+		CompareOp func = CompareOp::Always;
+	};
+
 	struct DepthStencilState {
 		bool depthEnable = true;
 		bool depthWrite = true;
 		CompareOp depthFunc = CompareOp::LessEqual;
-		// TODO: stencil
+		// Stencil. Off by default, as D3D12's default desc has it. The reference value is command list state
+		// (CommandList::SetStencilRef). "Front" means what RasterState::frontCCW makes the front face, on every backend.
+		bool stencilEnable = false;
+		uint8_t stencilReadMask = 0xFF;
+		uint8_t stencilWriteMask = 0xFF;
+		StencilFaceState front{};
+		StencilFaceState back{};
 	};
 
 	struct BlendAttachment {
@@ -2932,6 +2949,8 @@ namespace rhi {
 		// abi_version 8: secondary lists (Device::CreateSecondaryCommandList); null where the backend has none.
 		Result (*beginSecondary)(CommandList*, const SecondaryInheritance&) noexcept = nullptr;
 		void (*executeCommands)(CommandList*, Span<CommandList* const>) noexcept = nullptr;
+		// abi_version 9: fixed-function state set while recording (CommandList::SetStencilRef and the calls after it).
+		void (*setStencilRef)(CommandList*, uint32_t reference) noexcept = nullptr;
 	};
 
 	class CommandList {
@@ -3017,6 +3036,14 @@ namespace rhi {
 		 */
 		void ExecuteCommands(Span<CommandList* const> lists) noexcept {
 			if (SupportsSecondaryLists()) vt->executeCommands(this, lists);
+		}
+		/**
+		 * @brief Sets the stencil reference value that pipelines with DepthStencilState::stencilEnable compare and write.
+		 * Both faces use it, as OMSetStencilRef does. A list (and each secondary) starts at 0, and the value holds across
+		 * pipeline binds, passes and ExecuteCommands until it is set again. Valid inside and outside a pass.
+		 */
+		void SetStencilRef(uint32_t reference) noexcept {
+			if (IsValid() && vt->abi_version >= 9 && vt->setStencilRef) vt->setStencilRef(this, reference);
 		}
 		void ClearUavUint(const UavClearInfo& u, const UavClearUint& v) noexcept;
 		void ClearUavFloat(const UavClearInfo& u, const UavClearFloat& v) noexcept;

@@ -324,6 +324,7 @@ namespace rhi {
 		uint32_t rayTracingStackSize = 0;
 		bool indirectBindable = false;       // created with PipelineFlags_IndirectBindable
 		bool dynamicVertexStride = false;    // vertex input strides are dynamic state
+		bool dynamicStencilReference = false; // the stencil reference is dynamic state (stencil test on)
 		VkShaderStageFlags shaderStages = 0; // stages the pipeline contains
 	};
 
@@ -465,6 +466,10 @@ namespace rhi {
 		bool passActive = false;
 		PipelineLayoutHandle boundLayout{};
 		PipelineHandle boundPipeline{};
+		// The stencil reference set with SetStencilRef (0 until then). Applied: the buffer holds it. A bound pipeline with
+		// the state static, or executed secondaries, lose it, and the next pipeline that has it dynamic sets it again.
+		uint32_t stencilReference = 0;
+		bool stencilReferenceApplied = false;
 		DescriptorHeapHandle boundCbvSrvUavHeap{};
 		DescriptorHeapHandle boundSamplerHeap{};
 		// Diagnostics (DiagnosticDedupeHeapBinds): the heaps the list's last bind emitted; cleared where the binding may be lost.

@@ -97,6 +97,7 @@ namespace rhi {
 		bool isCompute = false;
 		bool isRayTracing = false;
 		bool isRayTracingLibrary = false;
+		bool readsStencilRef = false;  // stencil test on: binding it sets the list's stencil reference if not yet set
 		Dx12Device* dev = nullptr;
 	};
 
@@ -216,6 +217,10 @@ namespace rhi {
 		Dx12PipelineLayout* boundLayoutPtr = nullptr;
 		Dx12Device* dev = nullptr;
 		Dx12Pipeline* boundPipeline = nullptr; // For debug validation
+		// The stencil reference set with SetStencilRef (0 until then). Applied: the list holds it. A list starts
+		// without it, and executed bundles may change it, so the next pipeline that reads it sets it again.
+		uint32_t stencilRef = 0;
+		bool stencilRefApplied = false;
 		std::string debugName;
 		std::string instrumentationPassName;
 		std::string instrumentationTechniquePath;

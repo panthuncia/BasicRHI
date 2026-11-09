@@ -1269,6 +1269,14 @@ namespace rhi {
 					depth.DepthEnable = D.ds.depthEnable;
 					depth.DepthWriteMask = D.ds.depthWrite ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
 					depth.DepthFunc = ToDX(D.ds.depthFunc);
+					depth.StencilEnable = D.ds.stencilEnable;
+					depth.StencilReadMask = D.ds.stencilReadMask;
+					depth.StencilWriteMask = D.ds.stencilWriteMask;
+					auto toDx = [](const StencilFaceState& face) {
+						return D3D12_DEPTH_STENCILOP_DESC{ ToDX(face.failOp), ToDX(face.depthFailOp), ToDX(face.passOp), ToDX(face.func) };
+					};
+					depth.FrontFace = toDx(D.ds.front);
+					depth.BackFace = toDx(D.ds.back);
 				} break;
 				case PsoSubobj::RTVFormats: {
 					hasRTV = true;
@@ -1376,7 +1384,9 @@ namespace rhi {
 				RHI_FAIL(ToRHI(hr));
 			}
 
-			auto handle = dimpl->pipelines.alloc(Dx12Pipeline(pso, isCompute, dimpl));
+			Dx12Pipeline pipeline(pso, isCompute, dimpl);
+			pipeline.readsStencilRef = !isCompute && hasDepth && depth.StencilEnable;
+			auto handle = dimpl->pipelines.alloc(std::move(pipeline));
 			Pipeline ret(handle);
 			ret.vt = &g_psovt;
 			ret.impl = dimpl;
@@ -8022,6 +8032,8 @@ namespace rhi {
 			l->boundLayout = {};
 			l->boundLayoutPtr = nullptr;
 			l->activeRootCbvShadowStateCount = 0;
+			l->stencilRef = 0;
+			l->stencilRefApplied = false;
 			for (auto& page : l->rootCbvScratchPages) {
 				page.cursor = 0;
 			}
@@ -8287,6 +8299,10 @@ namespace rhi {
 					return;
 				}
 				l->cl->SetPipelineState(P->pso.Get());
+				if (P->readsStencilRef && !l->stencilRefApplied) {
+					l->cl->OMSetStencilRef(l->stencilRef);
+					l->stencilRefApplied = true;
+				}
 				#if BASICRHI_ENABLE_RESHAPE
 				if (dev->debugInstrumentation.state.active && P->pso) {
 					::PipelineState* pipelineState = nullptr;
@@ -9828,6 +9844,19 @@ namespace rhi {
 				}
 				l->cl->ExecuteBundle(bundle->cl.Get());
 			}
+			// A bundle's state changes carry back into this list: set the list's values again before they are read.
+			l->stencilRefApplied = false;
+		}
+
+		static void cl_setStencilRef(CommandList* cl, uint32_t reference) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl) {
+				BreakIfDebugging();
+				return;
+			}
+			l->cl->OMSetStencilRef(reference);
+			l->stencilRef = reference;
+			l->stencilRefApplied = true;
 		}
 
 		// ------------------ QueryPool vtable funcs ----------------
@@ -10524,14 +10553,15 @@ namespace rhi {
 		&cl_setDebugInstrumentationContext,
 		&cl_beginTracyGpuZone,
 		&cl_endTracyGpuZone,
-		8u,
+		9u,
 		&cl_endChecked,
 		nullptr,  // beginDebugLabel: PIX markers go through the native list
 		nullptr,  // endDebugLabel
 		nullptr,  // insertDebugLabel
 		nullptr,  // preprocessIndirect: the driver preprocesses inside ExecuteIndirect
 		&cl_beginSecondary,
-		&cl_executeCommands
+		&cl_executeCommands,
+		&cl_setStencilRef
 	};
 	const SwapchainVTable g_scvt = {
 		&sc_count,

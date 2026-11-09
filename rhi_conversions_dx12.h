@@ -223,6 +223,18 @@ namespace rhi {
 		}
 		return B::D3D12_BLEND_ONE;
 	}
+	static inline D3D12_STENCIL_OP ToDX(const StencilOp o) {
+		switch (o) {
+		case StencilOp::Keep: return D3D12_STENCIL_OP_KEEP;
+		case StencilOp::Zero: return D3D12_STENCIL_OP_ZERO;
+		case StencilOp::Replace: return D3D12_STENCIL_OP_REPLACE;
+		case StencilOp::IncrSat: return D3D12_STENCIL_OP_INCR_SAT;
+		case StencilOp::DecrSat: return D3D12_STENCIL_OP_DECR_SAT;
+		case StencilOp::Invert: return D3D12_STENCIL_OP_INVERT;
+		case StencilOp::Incr: return D3D12_STENCIL_OP_INCR;
+		case StencilOp::Decr: return D3D12_STENCIL_OP_DECR;
+		} return D3D12_STENCIL_OP_KEEP;
+	}
 	static inline D3D12_BLEND_OP ToDX(const BlendOp o) {
 		switch (o) {
 		case BlendOp::Add:

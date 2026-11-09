@@ -2280,6 +2280,20 @@ namespace rhi {
 			}
 		}
 
+		static VkStencilOp VkStencilOpForRHI(StencilOp op) noexcept {
+			switch (op) {
+			case StencilOp::Zero: return VK_STENCIL_OP_ZERO;
+			case StencilOp::Replace: return VK_STENCIL_OP_REPLACE;
+			case StencilOp::IncrSat: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+			case StencilOp::DecrSat: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+			case StencilOp::Invert: return VK_STENCIL_OP_INVERT;
+			case StencilOp::Incr: return VK_STENCIL_OP_INCREMENT_AND_WRAP;
+			case StencilOp::Decr: return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+			case StencilOp::Keep:
+			default: return VK_STENCIL_OP_KEEP;
+			}
+		}
+
 		static VkBlendOp VkBlendOpForRHI(BlendOp op) noexcept {
 			switch (op) {
 			case BlendOp::Add: return VK_BLEND_OP_ADD;
@@ -5122,6 +5136,8 @@ namespace rhi {
 			commandListState->passActive = false;
 			commandListState->boundLayout = {};
 			commandListState->boundPipeline = {};
+			commandListState->stencilReference = 0;
+			commandListState->stencilReferenceApplied = false;
 			commandListState->boundCbvSrvUavHeap = {};
 			commandListState->boundSamplerHeap = {};
 			commandListState->emittedCbvSrvUavHeap = {};
@@ -5714,6 +5730,19 @@ namespace rhi {
 			}
 		}
 
+		// D3D12 keeps the stencil reference on the command list, whatever pipeline is bound. Vulkan loses dynamic state
+		// when a pipeline that has it static is bound, so the list keeps the value and sets it again for the next pipeline
+		// that reads it.
+		static void VkApplyFixedFunctionState(VulkanCommandList& commandListState, const VulkanPipeline& pipelineState) noexcept {
+			if (!pipelineState.dynamicStencilReference) {
+				commandListState.stencilReferenceApplied = false;
+			}
+			else if (!commandListState.stencilReferenceApplied) {
+				vkCmdSetStencilReference(commandListState.commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, commandListState.stencilReference);
+				commandListState.stencilReferenceApplied = true;
+			}
+		}
+
 		static void cl_bindPipeline(CommandList* commandList, PipelineHandle pipeline) noexcept {
 			ZoneScopedN("RHI.Vulkan.BindPipeline");
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
@@ -5729,6 +5758,19 @@ namespace rhi {
 
 			VkCmdBindPipelineHooked(commandListState->commandBuffer, pipelineState->bindPoint, pipelineState->pipeline);
 			commandListState->boundPipeline = pipeline;
+			if (pipelineState->bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+				VkApplyFixedFunctionState(*commandListState, *pipelineState);
+			}
+		}
+
+		static void cl_setStencilRef(CommandList* commandList, uint32_t reference) noexcept {
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE) {
+				return;
+			}
+			vkCmdSetStencilReference(commandListState->commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, reference);
+			commandListState->stencilReference = reference;
+			commandListState->stencilReferenceApplied = true;
 		}
 
 		static void cl_setVB(CommandList* commandList, uint32_t startSlot, uint32_t numViews, VertexBufferView* views) noexcept {
@@ -7353,6 +7395,8 @@ namespace rhi {
 			}
 			vkCmdExecuteCommands(commandListState->commandBuffer, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
 			commandListState->boundPipeline = {};
+			// Dynamic state is undefined too: the next pipeline that reads it sets the list's values again.
+			commandListState->stencilReferenceApplied = false;
 			commandListState->emittedCbvSrvUavHeap = {};
 			commandListState->emittedSamplerHeap = {};
 			// Descriptor-buffer model: push constants are undefined too; the list's push data is recorded again before it is read.
@@ -8118,6 +8162,22 @@ namespace rhi {
 				depthStencil.depthTestEnable = depthState.depthEnable ? VK_TRUE : VK_FALSE;
 				depthStencil.depthWriteEnable = depthState.depthWrite ? VK_TRUE : VK_FALSE;
 				depthStencil.depthCompareOp = VkToCompareOp(depthState.depthFunc);
+				if (depthState.stencilEnable) {
+					// The reference is dynamic state (SetStencilRef); the masks are the pipeline's, as in D3D12.
+					auto toVk = [&](const StencilFaceState& face) {
+						VkStencilOpState state{};
+						state.failOp = VkStencilOpForRHI(face.failOp);
+						state.passOp = VkStencilOpForRHI(face.passOp);
+						state.depthFailOp = VkStencilOpForRHI(face.depthFailOp);
+						state.compareOp = VkToCompareOp(face.func);
+						state.compareMask = depthState.stencilReadMask;
+						state.writeMask = depthState.stencilWriteMask;
+						return state;
+					};
+					depthStencil.stencilTestEnable = VK_TRUE;
+					depthStencil.front = toVk(depthState.front);
+					depthStencil.back = toVk(depthState.back);
+				}
 				std::vector<VkPipelineColorBlendAttachmentState> blendAttachments;
 				const uint32_t attachmentCount = (std::max)(renderTargets.count, blendState.numAttachments);
 				blendAttachments.resize(attachmentCount);
@@ -8136,7 +8196,7 @@ namespace rhi {
 				VkPipelineColorBlendStateCreateInfo colorBlend{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
 				colorBlend.attachmentCount = static_cast<uint32_t>(blendAttachments.size());
 				colorBlend.pAttachments = blendAttachments.empty() ? nullptr : blendAttachments.data();
-				std::array<VkDynamicState, 4> dynamicStates = {
+				std::array<VkDynamicState, 6> dynamicStates = {
 					VK_DYNAMIC_STATE_VIEWPORT,
 					VK_DYNAMIC_STATE_SCISSOR,
 					VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
@@ -8145,6 +8205,10 @@ namespace rhi {
 				// Indirect commands bind vertex buffers with their strides (VertexBuffer argument).
 				const bool dynamicVertexStride = !hasMeshShader && !bindings.empty() && (pipelineFlags & PipelineFlags_IndirectBindable) != 0;
 				uint32_t dynamicStateCount = hasMeshShader ? 2u : (dynamicVertexStride ? 4u : 3u);
+				// Command list state in D3D12, so dynamic here. Only pipelines that read it declare it, which keeps
+				// the others as they were.
+				const bool dynamicStencilReference = depthState.stencilEnable;
+				if (dynamicStencilReference) dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
 				VkPipelineDynamicStateCreateInfo dynamicState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
 				dynamicState.dynamicStateCount = dynamicStateCount;
 				dynamicState.pDynamicStates = dynamicStates.data();
@@ -8224,6 +8288,7 @@ namespace rhi {
 				VulkanPipeline graphicsPipelineState{ nativePipeline, nativeLayout, VK_PIPELINE_BIND_POINT_GRAPHICS, layoutHandle, false };
 				graphicsPipelineState.indirectBindable = indirectBindable;
 				graphicsPipelineState.dynamicVertexStride = dynamicVertexStride;
+				graphicsPipelineState.dynamicStencilReference = dynamicStencilReference;
 				for (const VkPipelineShaderStageCreateInfo& stage : shaderStages) {
 					graphicsPipelineState.shaderStages |= stage.stage;
 				}
@@ -11896,14 +11961,15 @@ namespace rhi {
 		&cl_setDebugInstrumentationContext,
 		&cl_beginTracyGpuZone,
 		&cl_endTracyGpuZone,
-		8u,
+		9u,
 		&cl_endChecked,
 		&cl_beginDebugLabel,
 		&cl_endDebugLabel,
 		&cl_insertDebugLabel,
 		&cl_preprocessIndirect,
 		&cl_beginSecondary,
-		&cl_executeCommands
+		&cl_executeCommands,
+		&cl_setStencilRef
 	};
 
 	const SwapchainVTable g_vkscvt = {
