@@ -2178,7 +2178,11 @@ namespace rhi {
 		HostCached, // D3D12: CUSTOM; Vulkan: HOST_CACHED
 		HostVisibleDeviceLocal, // D3D12: GPU_UPLOAD; Vulkan: HOST_VISIBLE + DEVICE_LOCAL
 		GPUUpload = HostVisibleDeviceLocal,
-		Custom // D3D12: CUSTOM; Vulkan: CUSTOM
+		Custom, // D3D12: CUSTOM; Vulkan: CUSTOM
+		// GPU memory in system RAM, for any resource, with no CPU access. Where a device-local resource goes when VRAM is
+		// short. D3D12: CUSTOM, pool L0, CPU page NOT_AVAILABLE. Vulkan: a memory type outside the device-local heaps, which
+		// a UMA device does not have (creation fails there).
+		SystemMemory
 	};
 
 	enum class HeapFlags : uint32_t {
@@ -2966,6 +2970,28 @@ namespace rhi {
 		bool usageAtBudget = false;
 	};
 
+	/** @brief What became of the on-disk pipeline cache when the device opened it. */
+	enum class PipelineCacheLoadResult : uint32_t {
+		Off,         // no cache path: pipelines are compiled every run
+		Empty,       // no file yet: the cache starts empty and is written on save
+		Loaded,      // the file matched this device and driver
+		Stale,       // the file is for another device or driver: it was ignored and is replaced on save
+		Corrupt,     // the file is damaged or truncated: it was ignored and is replaced on save
+		Unsupported, // the backend or driver has no pipeline cache
+	};
+
+	/** @brief Counters of the on-disk pipeline cache (Device::GetPipelineCacheStats). */
+	struct PipelineCacheStats {
+		PipelineCacheLoadResult load = PipelineCacheLoadResult::Off;
+		// Pipelines the cache served without a compile, and those it had to compile. Vulkan counts a hit when the driver
+		// reports one (VK_EXT_pipeline_creation_feedback); a driver that reports nothing counts every pipeline as a miss.
+		uint64_t hits = 0;
+		uint64_t misses = 0;
+		uint64_t loadedBytes = 0; // payload read from the file
+		uint64_t savedBytes = 0;  // payload of the last save
+		uint32_t saves = 0;
+	};
+
 	struct CommandListVTable {
 		void (*end)(CommandList*) noexcept;
 		void (*recycle)(CommandList*, const CommandAllocator& alloc) noexcept;
@@ -3438,6 +3464,10 @@ namespace rhi {
 		Result(*createCommandAllocatorForQueue)(Device*, const Queue&, CommandAllocatorPtr&) noexcept = nullptr;
 		// abi_version 14: secondary command lists (CommandList::BeginSecondary). Null where the backend has none.
 		Result(*createSecondaryCommandList)(Device*, QueueKind, CommandAllocator, CommandListPtr&) noexcept = nullptr;
+		// abi_version 15: the on-disk pipeline cache.
+		Result(*openPipelineCache)(Device*, const char* path) noexcept = nullptr;
+		Result(*savePipelineCache)(Device*) noexcept = nullptr;
+		Result(*getPipelineCacheStats)(const Device*, PipelineCacheStats&) noexcept = nullptr;
 	};
 
 
@@ -3589,6 +3619,27 @@ namespace rhi {
 		Result SetResidencyPriority(const Span<PageableRef>& resources, ResidencyPriority p) const noexcept { return vt->setResidencyPriority(this, resources, p); }
 		Result QueryVideoMemoryInfo(uint32_t nodeIndex, MemorySegmentGroup segmentGroup, VideoMemoryInfo& out) const noexcept {
 			return vt->queryVideoMemoryInfo(this, nodeIndex, segmentGroup, out);
+		}
+		/**
+		 * @brief Opens the on-disk pipeline cache at `path` (null closes it), replacing any open one without saving it.
+		 * Every pipeline created afterwards goes through it. A file for another device or driver, or a damaged one, is
+		 * ignored and replaced on the next save. DeviceCreateInfo::pipelineCachePath opens one at creation; an adopted
+		 * device opens it here. Call it before creating pipelines, not while other threads create them.
+		 */
+		Result OpenPipelineCache(const char* path) noexcept {
+			return vt->abi_version >= 15 && vt->openPipelineCache ? vt->openPipelineCache(this, path) : Result::Unsupported;
+		}
+		/**
+		 * @brief Writes the pipeline cache to its file (a temporary file, then a rename). Safe while other threads create
+		 * pipelines. Does nothing when no pipeline was added since the last load or save. Destroying the device saves too.
+		 */
+		Result SavePipelineCache() noexcept {
+			return vt->abi_version >= 15 && vt->savePipelineCache ? vt->savePipelineCache(this) : Result::Unsupported;
+		}
+		/** @brief The pipeline cache's load result and hit, miss and save counters. */
+		Result GetPipelineCacheStats(PipelineCacheStats& out) const noexcept {
+			out = {};
+			return vt->abi_version >= 15 && vt->getPipelineCacheStats ? vt->getPipelineCacheStats(this, out) : Result::Unsupported;
 		}
 		void CheckDebugMessages() noexcept { if (vt->checkDebugMessages) vt->checkDebugMessages(this); }
 		void Destroy() noexcept { vt->destroyDevice(this); impl = nullptr; vt = nullptr; }
@@ -3818,6 +3869,9 @@ namespace rhi {
 		// application profiles on it: NVIDIA's profile for "DXVK" forces SDR composition, so an HDR host that runs DXVK as a
 		// guest passes "DXVK_HDR".
 		const char* vulkanEngineName = nullptr;
+		// The on-disk pipeline cache's file (UTF-8 path). Null, the default, leaves the cache off. See
+		// Device::OpenPipelineCache.
+		const char* pipelineCachePath = nullptr;
 	};
 
 	// Accepts any blob exposing GetBufferPointer/GetBufferSize (ID3DBlob, IDxcBlob) without

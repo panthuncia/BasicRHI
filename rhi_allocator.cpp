@@ -31,6 +31,8 @@
 #endif
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <algorithm>
 #include <utility>
 #include <cstdlib>
@@ -54,7 +56,7 @@
 #define	SMALL_RESOURCE_PLACEMENT_ALIGNMENT	( 4096 )
 
 namespace rhi::ma {
-    static constexpr UINT HEAP_TYPE_COUNT = 5;
+    static constexpr UINT HEAP_TYPE_COUNT = TotalStatistics::heapTypeCount; // custom pools by rhi::HeapType
     static constexpr UINT STANDARD_HEAP_TYPE_COUNT = 4; // Only DEFAULT, UPLOAD, READBACK, GPU_UPLOAD.
     static constexpr UINT DEFAULT_POOL_MAX_COUNT = STANDARD_HEAP_TYPE_COUNT * 3;
     static const UINT NEW_BLOCK_SIZE_SHIFT_MAX = 3;
@@ -66,9 +68,12 @@ namespace rhi::ma {
         "DEFAULT",
         "UPLOAD",
         "READBACK",
-        "CUSTOM",
+        "HOST_CACHED",
         "GPU_UPLOAD",
+        "CUSTOM",
+        "SYSTEM_MEMORY",
     };
+    static_assert(sizeof(HeapTypeNames) / sizeof(HeapTypeNames[0]) == HEAP_TYPE_COUNT);
     static const char* const StandardHeapTypeNames[] =
     {
         "DEFAULT",
@@ -5599,6 +5604,9 @@ Synchronized internally with a mutex.
         void AddBlock(UINT group, UINT64 blockBytes);
         void RemoveBlock(UINT group, UINT64 blockBytes);
 
+        // For testing: GetBudget reports at most this budget for the group (0: no cap).
+        void SetBudgetLimit(MemorySegmentGroup group, UINT64 bytes) { m_BudgetLimit[static_cast<UINT>(group)] = bytes; }
+
     private:
         D3D12MA_ATOMIC_UINT32 m_BlockCount[static_cast<std::underlying_type_t<MemorySegmentGroup>>(MemorySegmentGroup::Count)] = {};
         D3D12MA_ATOMIC_UINT32 m_AllocationCount[static_cast<std::underlying_type_t<MemorySegmentGroup>>(MemorySegmentGroup::Count)] = {};
@@ -5610,6 +5618,13 @@ Synchronized internally with a mutex.
         UINT64 m_D3D12Usage[static_cast<std::underlying_type_t<MemorySegmentGroup>>(MemorySegmentGroup::Count)] = {};
         UINT64 m_D3D12Budget[static_cast<std::underlying_type_t<MemorySegmentGroup>>(MemorySegmentGroup::Count)] = {};
         UINT64 m_BlockBytesAtD3D12Fetch[static_cast<std::underlying_type_t<MemorySegmentGroup>>(MemorySegmentGroup::Count)] = {};
+        D3D12MA_ATOMIC_UINT64 m_BudgetLimit[static_cast<std::underlying_type_t<MemorySegmentGroup>>(MemorySegmentGroup::Count)] = {};
+
+        UINT64 LimitBudget(UINT group, UINT64 budget) const
+        {
+            const UINT64 limit = m_BudgetLimit[group];
+            return limit != 0 && limit < budget ? limit : budget;
+        }
     };
 
 #ifndef _D3D12MA_CURRENT_BUDGET_DATA_FUNCTIONS
@@ -5636,7 +5651,7 @@ Synchronized internally with a mutex.
                 D3D12Usage + blockBytes - blockBytesAtD3D12Fetch : 0;
         }
         if (outLocalBudget)
-            *outLocalBudget = m_D3D12Budget[static_cast<std::underlying_type_t<MemorySegmentGroup>>(MemorySegmentGroup::Local)];
+            *outLocalBudget = LimitBudget(0, m_D3D12Budget[static_cast<std::underlying_type_t<MemorySegmentGroup>>(MemorySegmentGroup::Local)]);
 
         if (outNonLocalUsage)
         {
@@ -5647,7 +5662,7 @@ Synchronized internally with a mutex.
                 D3D12Usage + blockBytes - blockBytesAtD3D12Fetch : 0;
         }
         if (outNonLocalBudget) {
-            *outNonLocalBudget = m_D3D12Budget[static_cast<std::underlying_type_t<MemorySegmentGroup>>(MemorySegmentGroup::NonLocal)];
+            *outNonLocalBudget = LimitBudget(1, m_D3D12Budget[static_cast<std::underlying_type_t<MemorySegmentGroup>>(MemorySegmentGroup::NonLocal)]);
         }
     }
 
@@ -5948,6 +5963,18 @@ Synchronized internally with a mutex.
         void BuildStatsString(char** ppStatsString, BOOL detailedMap);
         void FreeStatsString(char* pStatsString);
 
+        // VRAM attribution and placement (Allocator::GetOwnerReport, SetPlacementOverride, AllocationFlagSpillable).
+        OwnerMemoryReport* AcquireOwner(const char* owner);
+        void TrackAllocation(Allocation* allocation, OwnerMemoryReport* owner, HeapType heapType, bool spillable, bool spilled);
+        void UntrackAllocation(Allocation* allocation);
+        void SetAllocationOwner(Allocation* allocation, const char* owner, bool overwrite);
+        uint32_t CopyOwnerReport(OwnerMemoryReport* rows, uint32_t capacity);
+        void SetPlacementOverride(const char* owner, PlacementOverride placement);
+        PlacementOverride FindPlacementOverride(const OwnerMemoryReport* owner);
+        // The spill pool (DeviceLocal) or the system-memory pool (SystemMemory), made on first use.
+        Result GetPlacementPool(Allocator* allocator, HeapType heapType, Pool*& outPool);
+        void ReleasePlacementPools();
+
     private:
         using PoolList = IntrusiveLinkedList<PoolListItemTraits>;
 
@@ -5978,6 +6005,20 @@ Synchronized internally with a mutex.
         // Default pools.
         BlockVector* m_BlockVectors[DEFAULT_POOL_MAX_COUNT];
         CommittedAllocationList m_CommittedAllocations[STANDARD_HEAP_TYPE_COUNT];
+
+        // Owner rows by label. Map nodes do not move, so rows and their label strings stay put while the allocator lives.
+        std::mutex m_OwnersMutex;
+        std::unordered_map<std::string, OwnerMemoryReport> m_Owners;
+        std::unordered_map<std::string, PlacementOverride> m_PlacementOverrides;
+        PlacementOverride m_PlacementOverrideAll = PlacementOverride::None;
+        std::atomic<bool> m_HasPlacementOverrides{ false };
+        std::mutex m_PlacementPoolsMutex;
+        Pool* m_SpillPool = nullptr;
+        Pool* m_SystemPool = nullptr;
+
+        OwnerMemoryReport* AcquireOwnerLocked(const char* owner);
+        MemorySegmentGroup HeapTypeToSegment(HeapType heapType) const;
+        void AddToOwner(OwnerMemoryReport& row, const Allocation& allocation, int64_t sign);
 
         /*
         Heuristics that decides whether a resource should better be placed in its own,
@@ -6235,6 +6276,11 @@ Synchronized internally with a mutex.
 
     UINT AllocatorPimpl::HeapPropertiesToMemorySegmentGroup(const HeapProperties& heapProps) const
     {
+        // System memory even where the device reports UMA: Vulkan reports it for any host-visible device-local type,
+        // which a discrete GPU with resizable BAR has.
+        if (heapProps.type == HeapType::SystemMemory) {
+            return static_cast<std::underlying_type_t<MemorySegmentGroup>>(MemorySegmentGroup::NonLocal);
+        }
         if (IsUMA()) {
             return static_cast<std::underlying_type_t<MemorySegmentGroup>>(MemorySegmentGroup::Local);
         }
@@ -6595,26 +6641,19 @@ Synchronized internally with a mutex.
         D3D12MA_ASSERT(outStats.total.unusedRangeCount ==
             outStats.memorySegmentGroup[0].unusedRangeCount + outStats.memorySegmentGroup[1].unusedRangeCount);
 
-        D3D12MA_ASSERT(outStats.total.stats.blockCount ==
-            outStats.heapType[0].stats.blockCount + outStats.heapType[1].stats.blockCount +
-            outStats.heapType[2].stats.blockCount + outStats.heapType[3].stats.blockCount +
-            outStats.heapType[4].stats.blockCount);
-        D3D12MA_ASSERT(outStats.total.stats.allocationCount ==
-            outStats.heapType[0].stats.allocationCount + outStats.heapType[1].stats.allocationCount +
-            outStats.heapType[2].stats.allocationCount + outStats.heapType[3].stats.allocationCount +
-            outStats.heapType[4].stats.allocationCount);
-        D3D12MA_ASSERT(outStats.total.stats.blockBytes ==
-            outStats.heapType[0].stats.blockBytes + outStats.heapType[1].stats.blockBytes +
-            outStats.heapType[2].stats.blockBytes + outStats.heapType[3].stats.blockBytes +
-            outStats.heapType[4].stats.blockBytes);
-        D3D12MA_ASSERT(outStats.total.stats.allocationBytes ==
-            outStats.heapType[0].stats.allocationBytes + outStats.heapType[1].stats.allocationBytes +
-            outStats.heapType[2].stats.allocationBytes + outStats.heapType[3].stats.allocationBytes +
-            outStats.heapType[4].stats.allocationBytes);
-        D3D12MA_ASSERT(outStats.total.unusedRangeCount ==
-            outStats.heapType[0].unusedRangeCount + outStats.heapType[1].unusedRangeCount +
-            outStats.heapType[2].unusedRangeCount + outStats.heapType[3].unusedRangeCount +
-            outStats.heapType[4].unusedRangeCount);
+#ifndef NDEBUG
+        {
+            DetailedStatistics heapTypeSum;
+            ClearDetailedStatistics(heapTypeSum);
+            for (const DetailedStatistics& heapTypeStats : outStats.heapType)
+                AddDetailedStatistics(heapTypeSum, heapTypeStats);
+            D3D12MA_ASSERT(outStats.total.stats.blockCount == heapTypeSum.stats.blockCount);
+            D3D12MA_ASSERT(outStats.total.stats.allocationCount == heapTypeSum.stats.allocationCount);
+            D3D12MA_ASSERT(outStats.total.stats.blockBytes == heapTypeSum.stats.blockBytes);
+            D3D12MA_ASSERT(outStats.total.stats.allocationBytes == heapTypeSum.stats.allocationBytes);
+            D3D12MA_ASSERT(outStats.total.unusedRangeCount == heapTypeSum.unusedRangeCount);
+        }
+#endif
     }
 
     void AllocatorPimpl::GetBudget(Budget* outLocalBudget, Budget* outNonLocalBudget)
@@ -7342,7 +7381,9 @@ Synchronized internally with a mutex.
 
     void AllocatorPimpl::RegisterPool(Pool* pool, HeapType heapType)
     {
-        const UINT heapTypeIndex = (UINT)heapType - 1;
+        // Pools are listed by heap type, the index CalculateStatistics reports them under.
+        const UINT heapTypeIndex = (UINT)heapType;
+        D3D12MA_ASSERT(heapTypeIndex < HEAP_TYPE_COUNT);
 
         MutexLockWrite lock(m_PoolsMutex[heapTypeIndex], m_UseMutex);
         m_Pools[heapTypeIndex].PushBack(pool->m_Pimpl);
@@ -7350,7 +7391,7 @@ Synchronized internally with a mutex.
 
     void AllocatorPimpl::UnregisterPool(Pool* pool, HeapType heapType)
     {
-        const UINT heapTypeIndex = (UINT)heapType - 1;
+        const UINT heapTypeIndex = (UINT)heapType;
 
         MutexLockWrite lock(m_PoolsMutex[heapTypeIndex], m_UseMutex);
         m_Pools[heapTypeIndex].Remove(pool->m_Pimpl);
@@ -7463,6 +7504,168 @@ Synchronized internally with a mutex.
         Budget budget = {};
         GetBudgetForHeapType(budget, heapType);
         return budget.usageBytes + size <= budget.budgetBytes;
+    }
+
+    OwnerMemoryReport* AllocatorPimpl::AcquireOwnerLocked(const char* owner)
+    {
+        const auto [it, inserted] = m_Owners.try_emplace(owner ? owner : "");
+        if (inserted)
+            it->second.owner = it->first.c_str();
+        return &it->second;
+    }
+
+    OwnerMemoryReport* AllocatorPimpl::AcquireOwner(const char* owner)
+    {
+        const std::lock_guard lock(m_OwnersMutex);
+        return AcquireOwnerLocked(owner);
+    }
+
+    MemorySegmentGroup AllocatorPimpl::HeapTypeToSegment(HeapType heapType) const
+    {
+        // As HeapPropertiesToMemorySegmentGroup, without its assert on custom pools' heap types.
+        if (heapType == HeapType::SystemMemory)
+            return MemorySegmentGroup::NonLocal;
+        if (IsUMA() || heapType == HeapType::DeviceLocal || heapType == HeapType::GPUUpload)
+            return MemorySegmentGroup::Local;
+        return MemorySegmentGroup::NonLocal;
+    }
+
+    void AllocatorPimpl::AddToOwner(OwnerMemoryReport& row, const Allocation& allocation, int64_t sign)
+    {
+        const uint64_t bytes = allocation.GetSize();
+        const uint32_t heapIndex = static_cast<uint32_t>(allocation.m_placement.heapType);
+        const uint32_t segmentIndex = static_cast<uint32_t>(allocation.m_placement.segment);
+        auto apply = [sign](auto& counter, auto amount) { counter = sign > 0 ? counter + amount : counter - amount; };
+        apply(row.allocationCount, 1u);
+        apply(row.allocationBytes, bytes);
+        if (heapIndex < TotalStatistics::heapTypeCount)
+        {
+            apply(row.countByHeapType[heapIndex], 1u);
+            apply(row.bytesByHeapType[heapIndex], bytes);
+        }
+        if (segmentIndex < 2)
+            apply(row.bytesBySegment[segmentIndex], bytes);
+        if (allocation.m_placement.spilled)
+        {
+            apply(row.spilledCount, 1u);
+            apply(row.spilledBytes, bytes);
+        }
+    }
+
+    void AllocatorPimpl::TrackAllocation(Allocation* allocation, OwnerMemoryReport* owner, HeapType heapType, bool spillable, bool spilled)
+    {
+        allocation->m_placement.heapType = heapType;
+        allocation->m_placement.segment = HeapTypeToSegment(heapType);
+        allocation->m_placement.spillable = spillable;
+        allocation->m_placement.spilled = spilled;
+        const std::lock_guard lock(m_OwnersMutex);
+        allocation->m_owner = owner;
+        AddToOwner(*owner, *allocation, 1);
+    }
+
+    void AllocatorPimpl::UntrackAllocation(Allocation* allocation)
+    {
+        const std::lock_guard lock(m_OwnersMutex);
+        if (allocation->m_owner)
+            AddToOwner(*allocation->m_owner, *allocation, -1);
+        allocation->m_owner = nullptr;
+    }
+
+    void AllocatorPimpl::SetAllocationOwner(Allocation* allocation, const char* owner, bool overwrite)
+    {
+        const std::lock_guard lock(m_OwnersMutex);
+        if (!allocation->m_owner || (!overwrite && allocation->m_owner->owner[0] != '\0'))
+            return;
+        OwnerMemoryReport* const row = AcquireOwnerLocked(owner);
+        AddToOwner(*allocation->m_owner, *allocation, -1);
+        allocation->m_owner = row;
+        AddToOwner(*row, *allocation, 1);
+    }
+
+    uint32_t AllocatorPimpl::CopyOwnerReport(OwnerMemoryReport* rows, uint32_t capacity)
+    {
+        const std::lock_guard lock(m_OwnersMutex);
+        uint32_t count = 0;
+        for (const auto& entry : m_Owners)
+        {
+            if (entry.second.allocationCount == 0)
+                continue;
+            if (rows && count < capacity)
+                rows[count] = entry.second;
+            ++count;
+        }
+        return count;
+    }
+
+    void AllocatorPimpl::SetPlacementOverride(const char* owner, PlacementOverride placement)
+    {
+        const std::lock_guard lock(m_OwnersMutex);
+        if (!owner)
+            m_PlacementOverrideAll = placement;
+        else if (placement == PlacementOverride::None)
+            m_PlacementOverrides.erase(owner);
+        else
+            m_PlacementOverrides[owner] = placement;
+        m_HasPlacementOverrides = m_PlacementOverrideAll != PlacementOverride::None || !m_PlacementOverrides.empty();
+    }
+
+    PlacementOverride AllocatorPimpl::FindPlacementOverride(const OwnerMemoryReport* owner)
+    {
+        if (!m_HasPlacementOverrides.load(std::memory_order_relaxed))
+            return PlacementOverride::None;
+        const std::lock_guard lock(m_OwnersMutex);
+        if (owner)
+        {
+            const auto it = m_PlacementOverrides.find(owner->owner);
+            if (it != m_PlacementOverrides.end())
+                return it->second;
+        }
+        return m_PlacementOverrideAll;
+    }
+
+    Result AllocatorPimpl::GetPlacementPool(Allocator* allocator, HeapType heapType, Pool*& outPool)
+    {
+        const std::lock_guard lock(m_PlacementPoolsMutex);
+        Pool*& pool = heapType == HeapType::SystemMemory ? m_SystemPool : m_SpillPool;
+        if (!pool)
+        {
+            PoolDesc desc = {};
+            desc.heapType = heapType;
+            if (heapType == HeapType::SystemMemory)
+            {
+                // Committed, so each resource gets a memory type it supports.
+                desc.flags = PoolFlagsAlwaysCommitted;
+                desc.debugName = "rhi::ma system-memory pool";
+            }
+            else
+            {
+                // Low priority: under pressure the driver demotes these blocks before the default pools'.
+                desc.flags = m_MsaaAlwaysCommitted ? PoolFlagsMsaaTexturesAlwaysCommitted : PoolFlagsNone;
+                desc.heapFlags = m_DefaultPoolsNotZeroed ? HeapFlags::CreateNotZeroed : HeapFlags::None;
+                desc.residencyPriority = ResidencyPriorityLow;
+                desc.debugName = "rhi::ma spill pool";
+            }
+            const Result hr = allocator->CreatePool(&desc, &pool);
+            if (Failed(hr))
+            {
+                pool = nullptr;
+                return hr;
+            }
+            pool->SetName(desc.debugName);
+        }
+        outPool = pool;
+        return Result::Ok;
+    }
+
+    void AllocatorPimpl::ReleasePlacementPools()
+    {
+        const std::lock_guard lock(m_PlacementPoolsMutex);
+        for (Pool** pool : { &m_SpillPool, &m_SystemPool })
+        {
+            if (*pool)
+                (*pool)->ReleaseThis();
+            *pool = nullptr;
+        }
     }
 
     void AllocatorPimpl::WriteBudgetToJson(JsonWriter& json, const Budget& budget)
@@ -9049,6 +9252,8 @@ Synchronized internally with a mutex.
     void Allocation::ReleaseThis()
     {
         //SAFE_RELEASE(m_Resource);
+        if (m_owner)
+            m_allocator->UntrackAllocation(this);
 
         switch (m_PackedData.GetType())
         {
@@ -9082,6 +9287,11 @@ Synchronized internally with a mutex.
         m_PackedData.SetResourceDimension(ResourceType::Unknown);
         m_PackedData.SetResourceFlags(ResourceFlags::RF_None);
         m_PackedData.SetTextureLayout(ResourceLayout::Undefined);
+    }
+
+    const char* Allocation::GetOwner() const noexcept
+    {
+        return m_owner ? m_owner->owner : "";
     }
 
     Allocation::~Allocation()
@@ -9309,6 +9519,54 @@ Synchronized internally with a mutex.
     }
 
 
+    // Makes an allocation with its owner label and placement. `allocate(desc, systemMemory)` makes it from `desc`;
+    // systemMemory says the resource itself must be created in HeapType::SystemMemory.
+    template<class AllocateFn>
+    static Result AllocateWithPlacement(Allocator* allocator, AllocatorPimpl* pimpl, const AllocationDesc& desc,
+        Allocation** ppAllocation, AllocateFn&& allocate)
+    {
+        OwnerMemoryReport* const owner = pimpl->AcquireOwner(desc.owner ? desc.owner : CurrentAllocationOwner());
+        const bool placeable = desc.customPool == nullptr && desc.heapType == HeapType::DeviceLocal;
+        const bool spillable = placeable && (desc.flags & AllocationFlagSpillable) != 0;
+        const PlacementOverride forced = placeable ? pimpl->FindPlacementOverride(owner) : PlacementOverride::None;
+        auto finish = [&](Result hr, HeapType heapType, bool spilled) {
+            if (IsOk(hr))
+                pimpl->TrackAllocation(*ppAllocation, owner, heapType, spillable, spilled);
+            return hr;
+        };
+
+        if (forced != PlacementOverride::SystemMemory)
+        {
+            if (!spillable)
+            {
+                const HeapType heapType = desc.customPool ? desc.customPool->GetDesc().heapType : desc.heapType;
+                return finish(allocate(desc, false), heapType, false);
+            }
+            Pool* spillPool = nullptr;
+            Result hr = pimpl->GetPlacementPool(allocator, HeapType::DeviceLocal, spillPool);
+            if (IsOk(hr))
+            {
+                AllocationDesc spillDesc = desc;
+                spillDesc.customPool = spillPool;
+                if (forced != PlacementOverride::DeviceLocal)
+                    spillDesc.flags |= AllocationFlagWithinBudget;
+                hr = allocate(spillDesc, false);
+                if (IsOk(hr) || forced == PlacementOverride::DeviceLocal)
+                    return finish(hr, HeapType::DeviceLocal, false);
+            }
+        }
+
+        // Over budget, out of video memory, or forced: system memory.
+        Pool* systemPool = nullptr;
+        const Result poolResult = pimpl->GetPlacementPool(allocator, HeapType::SystemMemory, systemPool);
+        if (Failed(poolResult))
+            return poolResult;
+        AllocationDesc systemDesc = desc;
+        systemDesc.customPool = systemPool;
+        systemDesc.flags = static_cast<AllocationFlags>(systemDesc.flags & ~AllocationFlagWithinBudget);
+        return finish(allocate(systemDesc, true), HeapType::SystemMemory, true);
+    }
+
     Result Allocator::CreateResource(
         const AllocationDesc* pAllocDesc,
         const ResourceDesc* pResourceDesc,
@@ -9322,12 +9580,16 @@ Synchronized internally with a mutex.
             return Result::InvalidArgument;
         }
         D3D12MA_DEBUG_GLOBAL_MUTEX_LOCK
-            ResourcePtr ptr;
-            return m_Pimpl->CreateResource(
-                pAllocDesc,
-                CreateResourceParams(pResourceDesc, NumCastableFormats, pCastableFormats),
-                outAllocation.Put(),
-                std::move(ptr));
+            Allocation** ppAllocation = outAllocation.Put();
+            return AllocateWithPlacement(this, m_Pimpl, *pAllocDesc, ppAllocation,
+                [&](const AllocationDesc& desc, bool systemMemory) {
+                    ResourceDesc resourceDesc = *pResourceDesc;
+                    if (systemMemory)
+                        resourceDesc.heapType = HeapType::SystemMemory;
+                    return m_Pimpl->CreateResource(&desc,
+                        CreateResourceParams(&resourceDesc, NumCastableFormats, pCastableFormats),
+                        ppAllocation, ResourcePtr{});
+                });
     }
 
     Result Allocator::AllocateMemory(
@@ -9342,7 +9604,31 @@ Synchronized internally with a mutex.
             return Result::InvalidArgument;
         }
         D3D12MA_DEBUG_GLOBAL_MUTEX_LOCK
-            return m_Pimpl->AllocateMemory(&pAllocDesc, &pAllocInfo, ppAllocation);
+            return AllocateWithPlacement(this, m_Pimpl, pAllocDesc, ppAllocation,
+                [&](const AllocationDesc& desc, bool) {
+                    return m_Pimpl->AllocateMemory(&desc, &pAllocInfo, ppAllocation);
+                });
+    }
+
+    uint32_t Allocator::GetOwnerReport(OwnerMemoryReport* rows, uint32_t capacity) const noexcept
+    {
+        return m_Pimpl->CopyOwnerReport(rows, capacity);
+    }
+
+    void Allocator::SetOwner(Allocation* allocation, const char* owner, bool overwrite) noexcept
+    {
+        if (allocation)
+            m_Pimpl->SetAllocationOwner(allocation, owner, overwrite);
+    }
+
+    void Allocator::SetPlacementOverride(const char* owner, PlacementOverride placement) noexcept
+    {
+        m_Pimpl->SetPlacementOverride(owner, placement);
+    }
+
+    void Allocator::SetBudgetLimit(MemorySegmentGroup segmentGroup, uint64_t bytes) noexcept
+    {
+        m_Pimpl->m_Budget.SetBudgetLimit(segmentGroup, bytes);
     }
 
     Result Allocator::CreateAliasingResource(
@@ -9462,7 +9748,36 @@ Synchronized internally with a mutex.
 
     Allocator::~Allocator()
     {
+        m_Pimpl->ReleasePlacementPools();
         D3D12MA_DELETE(m_Pimpl->GetAllocs(), m_Pimpl);
+    }
+
+    namespace
+    {
+        // The calling thread's owner scopes (PushAllocationOwner). Deeper scopes than this are counted but not kept.
+        constexpr uint32_t kMaxOwnerScopeDepth = 32;
+        thread_local const char* t_ownerScopes[kMaxOwnerScopeDepth]{};
+        thread_local uint32_t t_ownerScopeDepth = 0;
+    }
+
+    void PushAllocationOwner(const char* owner) noexcept
+    {
+        if (t_ownerScopeDepth < kMaxOwnerScopeDepth)
+            t_ownerScopes[t_ownerScopeDepth] = owner;
+        ++t_ownerScopeDepth;
+    }
+
+    void PopAllocationOwner() noexcept
+    {
+        if (t_ownerScopeDepth > 0)
+            --t_ownerScopeDepth;
+    }
+
+    const char* CurrentAllocationOwner() noexcept
+    {
+        if (t_ownerScopeDepth == 0)
+            return nullptr;
+        return t_ownerScopes[(std::min)(t_ownerScopeDepth, kMaxOwnerScopeDepth) - 1];
     }
 #endif // _D3D12MA_ALLOCATOR_FUNCTIONS
 
