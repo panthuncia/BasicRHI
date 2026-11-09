@@ -5048,6 +5048,13 @@ namespace rhi {
 			return ToRHI(VkCheckDeviceLost(impl, vkWaitSemaphores(impl->device, &waitInfo, UINT64_MAX), "Device::WaitIdle"));
 		}
 
+		// A whole-device wait: vkDeviceWaitIdle on a device only BasicRHI submits to, its own timelines on one a host owns or a
+		// guest shares (ShareVulkanDevice), whose other submitters vkDeviceWaitIdle would race.
+		static Result VkWaitDeviceIdle(VulkanDevice* impl) noexcept {
+			if (!impl->ownsDevice || impl->sharedQueues) return VkWaitForSubmittedTimelines(impl);
+			return ToRHI(VkDeviceWaitIdleHooked(impl->device));
+		}
+
 		// The queue's progress timeline, made on first use. timelinesMutex is held: allocating can move the timeline pool, so
 		// call it before looking any other timeline up.
 		static VulkanTimeline* VkQueueProgressTimeline(VulkanDevice* impl, VulkanQueueState& queueState) noexcept {
@@ -8211,7 +8218,7 @@ namespace rhi {
 			if (presentMode != swapchainState->presentMode) {
 				// No VK_EXT_swapchain_maintenance1 switch to this mode: it needs a new swapchain.
 				spdlog::info("Vulkan swapchain: vsync {} needs present mode {}; recreating the swapchain", vsync ? "on" : "off", static_cast<int>(presentMode));
-				const Result idleResult = ToRHI(VkDeviceWaitIdleHooked(impl->device));
+				const Result idleResult = VkWaitDeviceIdle(impl);
 				if (idleResult != Result::Ok) {
 					return idleResult;
 				}
@@ -8237,7 +8244,7 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			const Result idleResult = ToRHI(VkDeviceWaitIdleHooked(impl->device));
+			const Result idleResult = VkWaitDeviceIdle(impl);
 			if (idleResult != Result::Ok) {
 				return idleResult;
 			}
@@ -8285,7 +8292,7 @@ namespace rhi {
 			if (colorSpace == swapchainState->colorSpace) return Result::Ok;
 			if (!sc_isColorSpaceSupported(swapchain, colorSpace)) return Result::Unsupported;
 
-			const Result idleResult = ToRHI(VkDeviceWaitIdleHooked(impl->device));
+			const Result idleResult = VkWaitDeviceIdle(impl);
 			if (idleResult != Result::Ok) {
 				return idleResult;
 			}
@@ -9639,7 +9646,7 @@ namespace rhi {
 			if (!impl || impl->device == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::Failed);
 			}
-			if (!impl->ownsDevice) {
+			if (!impl->ownsDevice || impl->sharedQueues) {
 				return VkWaitForSubmittedTimelines(impl);
 			}
 
@@ -9682,7 +9689,7 @@ namespace rhi {
 			swapchainState.presentQueue = VkPrimaryQueueHandleForKind(impl, QueueKind::Graphics);
 			const Result createResult = VkCreateOrResizeSwapchain(impl, swapchainState, width, height, format, bufferCount, allowTearing);
 			if (createResult != Result::Ok) {
-				VkDeviceWaitIdleHooked(impl->device);
+				(void)VkWaitDeviceIdle(impl);
 				VkReleaseSwapchainImageHandles(impl, swapchainState);
 				VkReleaseSwapchainPresentSemaphores(impl, swapchainState);
 				VkReleaseSwapchainAcquireSlots(impl, swapchainState);
@@ -9717,7 +9724,7 @@ namespace rhi {
 			}
 
 			if (impl->device != VK_NULL_HANDLE) {
-				VkDeviceWaitIdleHooked(impl->device);
+				(void)VkWaitDeviceIdle(impl);
 				VkReleaseSwapchainImageHandles(impl, *swapchainState);
 				VkReleaseSwapchainPresentSemaphores(impl, *swapchainState);
 				VkReleaseSwapchainAcquireSlots(impl, *swapchainState);
@@ -12645,7 +12652,7 @@ namespace rhi {
 			return;
 		}
 		if (device != VK_NULL_HANDLE) {
-			if (ownsDevice) VkDeviceWaitIdleHooked(device);
+			if (ownsDevice && !sharedQueues) VkDeviceWaitIdleHooked(device);
 			else VkWaitForSubmittedTimelines(this);
 			if (pipelineCache.cache != VK_NULL_HANDLE) {
 				d_savePipelineCache(&self);
@@ -13953,6 +13960,10 @@ namespace rhi {
 		}
 #endif
 
+		if (ci.vulkanCreateHooks && ci.vulkanCreateHooks->instance) {
+			ci.vulkanCreateHooks->instance(ci.vulkanCreateHooks->user, &instanceCreateInfo);
+		}
+
 		VkInstance instance = VK_NULL_HANDLE;
 		VkResult result = vkCreateInstance(&instanceCreateInfo, nullptr, &instance);
 		if (result != VK_SUCCESS) {
@@ -14398,6 +14409,9 @@ namespace rhi {
 		// (DeviceCreateInfo::descriptorHeapCapacities; a model whose limit is below the minimum is unsupported).
 		vulkan::BindingRequirements bindingRequirements{};
 		bindingRequirements.heapCapacities = ci.descriptorHeapCapacities;
+		bindingRequirements.hostSamplerObjects = ci.vulkanGuestSamplerObjects;
+		bindingRequirements.hostResourceDescriptorBufferBytes = ci.vulkanGuestResourceDescriptorBufferBytes;
+		bindingRequirements.hostSamplerDescriptorBufferBytes = ci.vulkanGuestSamplerDescriptorBufferBytes;
 		const VkBindingModelEvaluation bindingEvaluation = VkEvaluateBindingModels(vkGetInstanceProcAddr, instance, physicalDevice, bindingRequirements);
 		const bool descriptorBufferModelSupported = (bindingEvaluation.report.supportedModels & vulkan::BindingModel_DescriptorBuffer) != 0;
 		const bool descriptorHeapModelAvailable = (bindingEvaluation.report.supportedModels & vulkan::BindingModel_DescriptorHeap) != 0 &&
@@ -14414,6 +14428,15 @@ namespace rhi {
 			}
 		}
 		else if (bindingOverride && std::strcmp(bindingOverride, "heap") == 0) {
+			useDescriptorBufferModel = false;
+		}
+		// The caller's allowed models (DeviceCreateInfo::vulkanBindingModels): a guest that records into the same command buffers
+		// must bind descriptors the same way.
+		if (ci.vulkanBindingModels && !(ci.vulkanBindingModels & vulkan::BindingModel_DescriptorHeap)) {
+			useDescriptorBufferModel = descriptorBufferModelSupported && (ci.vulkanBindingModels & vulkan::BindingModel_DescriptorBuffer);
+			allowDescriptorHeapModel = false;
+		}
+		else if (ci.vulkanBindingModels && !(ci.vulkanBindingModels & vulkan::BindingModel_DescriptorBuffer)) {
 			useDescriptorBufferModel = false;
 		}
 		if (useDescriptorBufferModel) {
@@ -14604,6 +14627,9 @@ namespace rhi {
 		}
 		deviceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(enabledDeviceExtensions.size());
 		deviceCreateInfo.ppEnabledExtensionNames = enabledDeviceExtensions.empty() ? nullptr : enabledDeviceExtensions.data();
+		if (ci.vulkanCreateHooks && ci.vulkanCreateHooks->device) {
+			ci.vulkanCreateHooks->device(ci.vulkanCreateHooks->user, instance, physicalDevice, &deviceCreateInfo);
+		}
 
 		VkDevice device = VK_NULL_HANDLE;
 		result = vkCreateDevice(physicalDevice, &deviceCreateInfo, nullptr, &device);
@@ -15168,6 +15194,28 @@ namespace rhi {
 		BindingModelReport EvaluateBindingModels(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance instance,
 			VkPhysicalDevice physicalDevice, const BindingRequirements& requirements) noexcept {
 			return VkEvaluateBindingModels(getInstanceProcAddr, instance, physicalDevice, requirements).report;
+		}
+
+		Result ShareVulkanDevice(Device device, const QueueSubmissionHooks& hooks) noexcept {
+			if (!device || device.vt != &g_vkdevvt || !device.impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if ((hooks.lock == nullptr) != (hooks.unlock == nullptr)) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			if (!impl->ownsDevice) {
+				// An adopted device has its host's hooks already.
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			impl->submissionHookUser = hooks.user;
+			impl->submissionLock = hooks.lock;
+			impl->submissionUnlock = hooks.unlock;
+			impl->submissionSubmit = hooks.submit;
+			impl->sharedQueues = true;
+			spdlog::info("ShareVulkanDevice: '{}' is shared with a guest API (queue lock {}, submissions {})", impl->physicalDeviceProperties.deviceName,
+				hooks.lock ? "on" : "off", hooks.submit ? "handed to the host" : "direct");
+			return Result::Ok;
 		}
 
 		uint32_t GetBindingModel(Device device) noexcept {

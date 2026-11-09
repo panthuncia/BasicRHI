@@ -168,6 +168,15 @@ namespace rhi::vulkan {
 
     Result AdoptVulkanDevice(const AdoptedVulkanDeviceInfo& info, rhi::DevicePtr& out) noexcept;
 
+    /// Shares a device from CreateVulkanDevice with a guest API that submits to its queues too (DXVK on a host-created
+    /// device). From then on every queue access BasicRHI makes takes hooks.lock, submissions may be handed to hooks.submit,
+    /// and whole-device waits (Device::WaitIdle, swapchain rebuilds, shutdown) wait for BasicRHI's own timelines instead of
+    /// vkDeviceWaitIdle, which would need every queue externally synchronized. Call it before the first submission.
+    /// @param device A device from CreateVulkanDevice.
+    /// @param hooks The guest's queue lock (both lock and unlock, or neither) and optional submission hand-off.
+    /// @return InvalidArgument for another device or half a lock.
+    Result ShareVulkanDevice(rhi::Device device, const QueueSubmissionHooks& hooks) noexcept;
+
     // Which binding models a physical device supports for BasicRHI, from instance-level queries only, so that a host can ask
     // before it creates its device. BASICRHI_VK_LIMITS=base clamps every limit to the Vulkan base-spec minimum (to exercise the
     // fallbacks).
