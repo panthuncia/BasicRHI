@@ -2276,8 +2276,47 @@ namespace rhi {
 			case BlendFactor::InvDstAlpha: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
 			case BlendFactor::DstColor: return VK_BLEND_FACTOR_DST_COLOR;
 			case BlendFactor::InvDstColor: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+			// As alpha factors the constant's alpha is read, as in D3D12.
+			case BlendFactor::BlendFactor: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+			case BlendFactor::InvBlendFactor: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+			case BlendFactor::SrcAlphaSat: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+			case BlendFactor::Src1Color: return VK_BLEND_FACTOR_SRC1_COLOR;
+			case BlendFactor::InvSrc1Color: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+			case BlendFactor::Src1Alpha: return VK_BLEND_FACTOR_SRC1_ALPHA;
+			case BlendFactor::InvSrc1Alpha: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
 			default: return VK_BLEND_FACTOR_ONE;
 			}
+		}
+
+		static VkLogicOp VkLogicOpForRHI(LogicOp op) noexcept {
+			switch (op) {
+			case LogicOp::Clear: return VK_LOGIC_OP_CLEAR;
+			case LogicOp::Set: return VK_LOGIC_OP_SET;
+			case LogicOp::Copy: return VK_LOGIC_OP_COPY;
+			case LogicOp::CopyInverted: return VK_LOGIC_OP_COPY_INVERTED;
+			case LogicOp::Invert: return VK_LOGIC_OP_INVERT;
+			case LogicOp::And: return VK_LOGIC_OP_AND;
+			case LogicOp::Nand: return VK_LOGIC_OP_NAND;
+			case LogicOp::Or: return VK_LOGIC_OP_OR;
+			case LogicOp::Nor: return VK_LOGIC_OP_NOR;
+			case LogicOp::Xor: return VK_LOGIC_OP_XOR;
+			case LogicOp::Equiv: return VK_LOGIC_OP_EQUIVALENT;
+			case LogicOp::AndReverse: return VK_LOGIC_OP_AND_REVERSE;
+			case LogicOp::AndInverted: return VK_LOGIC_OP_AND_INVERTED;
+			case LogicOp::OrReverse: return VK_LOGIC_OP_OR_REVERSE;
+			case LogicOp::OrInverted: return VK_LOGIC_OP_OR_INVERTED;
+			case LogicOp::Noop:
+			default: return VK_LOGIC_OP_NO_OP;
+			}
+		}
+
+		static bool VkBlendFactorIsConstant(BlendFactor factor) noexcept {
+			return factor == BlendFactor::BlendFactor || factor == BlendFactor::InvBlendFactor;
+		}
+
+		static bool VkBlendFactorIsDualSource(BlendFactor factor) noexcept {
+			return factor == BlendFactor::Src1Color || factor == BlendFactor::InvSrc1Color ||
+				factor == BlendFactor::Src1Alpha || factor == BlendFactor::InvSrc1Alpha;
 		}
 
 		static VkStencilOp VkStencilOpForRHI(StencilOp op) noexcept {
@@ -5138,6 +5177,8 @@ namespace rhi {
 			commandListState->boundPipeline = {};
 			commandListState->stencilReference = 0;
 			commandListState->stencilReferenceApplied = false;
+			std::fill(std::begin(commandListState->blendConstants), std::end(commandListState->blendConstants), 1.0f);
+			commandListState->blendConstantsApplied = false;
 			commandListState->boundCbvSrvUavHeap = {};
 			commandListState->boundSamplerHeap = {};
 			commandListState->emittedCbvSrvUavHeap = {};
@@ -5741,6 +5782,13 @@ namespace rhi {
 				vkCmdSetStencilReference(commandListState.commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, commandListState.stencilReference);
 				commandListState.stencilReferenceApplied = true;
 			}
+			if (!pipelineState.dynamicBlendConstants) {
+				commandListState.blendConstantsApplied = false;
+			}
+			else if (!commandListState.blendConstantsApplied) {
+				vkCmdSetBlendConstants(commandListState.commandBuffer, commandListState.blendConstants);
+				commandListState.blendConstantsApplied = true;
+			}
 		}
 
 		static void cl_bindPipeline(CommandList* commandList, PipelineHandle pipeline) noexcept {
@@ -5771,6 +5819,16 @@ namespace rhi {
 			vkCmdSetStencilReference(commandListState->commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, reference);
 			commandListState->stencilReference = reference;
 			commandListState->stencilReferenceApplied = true;
+		}
+
+		static void cl_setBlendFactor(CommandList* commandList, const float rgba[4]) noexcept {
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE || !rgba) {
+				return;
+			}
+			std::copy(rgba, rgba + 4, commandListState->blendConstants);
+			vkCmdSetBlendConstants(commandListState->commandBuffer, commandListState->blendConstants);
+			commandListState->blendConstantsApplied = true;
 		}
 
 		static void cl_setVB(CommandList* commandList, uint32_t startSlot, uint32_t numViews, VertexBufferView* views) noexcept {
@@ -7397,6 +7455,7 @@ namespace rhi {
 			commandListState->boundPipeline = {};
 			// Dynamic state is undefined too: the next pipeline that reads it sets the list's values again.
 			commandListState->stencilReferenceApplied = false;
+			commandListState->blendConstantsApplied = false;
 			commandListState->emittedCbvSrvUavHeap = {};
 			commandListState->emittedSamplerHeap = {};
 			// Descriptor-buffer model: push constants are undefined too; the list's push data is recorded again before it is read.
@@ -8036,6 +8095,20 @@ namespace rhi {
 					spdlog::warn("Vulkan graphics pipeline creation: shader bytecode was not SPIR-V");
 					RHI_FAIL(Result::Unsupported);
 				}
+				// Fixed-function state behind optional core features (FixedFunctionFeatureInfo).
+				if (blendState.logicOpEnable && impl->supportedFeatures.logicOp != VK_TRUE) {
+					spdlog::error("Vulkan graphics pipeline creation: a logic op needs the logicOp feature");
+					RHI_FAIL(Result::Unsupported);
+				}
+				for (uint32_t i = 0; i < blendState.numAttachments && i < 8; ++i) {
+					const BlendAttachment& attachment = blendState.attachments[i];
+					if (attachment.enable && !blendState.logicOpEnable && impl->supportedFeatures.dualSrcBlend != VK_TRUE &&
+						(VkBlendFactorIsDualSource(attachment.srcColor) || VkBlendFactorIsDualSource(attachment.dstColor) ||
+							VkBlendFactorIsDualSource(attachment.srcAlpha) || VkBlendFactorIsDualSource(attachment.dstAlpha))) {
+						spdlog::error("Vulkan graphics pipeline creation: dual-source blending needs the dualSrcBlend feature");
+						RHI_FAIL(Result::Unsupported);
+					}
+				}
 
 				std::vector<VkShaderModule> modules;
 				std::vector<VkPipelineShaderStageCreateInfo> shaderStages;
@@ -8158,6 +8231,11 @@ namespace rhi {
 					multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 				}
 				multisample.alphaToCoverageEnable = blendState.alphaToCoverage ? VK_TRUE : VK_FALSE;
+				// All bits set is Vulkan's default too, so only a real mask is passed.
+				const VkSampleMask sampleMask[2] = { blendState.sampleMask, 0xFFFFFFFFu };
+				if (blendState.sampleMask != 0xFFFFFFFFu) {
+					multisample.pSampleMask = sampleMask;  // two words cover up to 64 samples
+				}
 				VkPipelineDepthStencilStateCreateInfo depthStencil{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
 				depthStencil.depthTestEnable = depthState.depthEnable ? VK_TRUE : VK_FALSE;
 				depthStencil.depthWriteEnable = depthState.depthWrite ? VK_TRUE : VK_FALSE;
@@ -8181,10 +8259,18 @@ namespace rhi {
 				std::vector<VkPipelineColorBlendAttachmentState> blendAttachments;
 				const uint32_t attachmentCount = (std::max)(renderTargets.count, blendState.numAttachments);
 				blendAttachments.resize(attachmentCount);
+				bool dynamicBlendConstants = false;
 				for (uint32_t i = 0; i < attachmentCount; ++i) {
 					const BlendAttachment& src = blendState.attachments[(std::min)(i, blendState.numAttachments ? blendState.numAttachments - 1 : 0)];
 					auto& dst = blendAttachments[i];
-					dst.blendEnable = src.enable ? VK_TRUE : VK_FALSE;
+					// A logic op replaces blending on every attachment.
+					const bool blending = src.enable && !blendState.logicOpEnable;
+					if (blending) {
+						dynamicBlendConstants = dynamicBlendConstants ||
+							VkBlendFactorIsConstant(src.srcColor) || VkBlendFactorIsConstant(src.dstColor) ||
+							VkBlendFactorIsConstant(src.srcAlpha) || VkBlendFactorIsConstant(src.dstAlpha);
+					}
+					dst.blendEnable = blending ? VK_TRUE : VK_FALSE;
 					dst.srcColorBlendFactor = VkBlendFactorForRHI(src.srcColor);
 					dst.dstColorBlendFactor = VkBlendFactorForRHI(src.dstColor);
 					dst.colorBlendOp = VkBlendOpForRHI(src.colorOp);
@@ -8196,6 +8282,10 @@ namespace rhi {
 				VkPipelineColorBlendStateCreateInfo colorBlend{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
 				colorBlend.attachmentCount = static_cast<uint32_t>(blendAttachments.size());
 				colorBlend.pAttachments = blendAttachments.empty() ? nullptr : blendAttachments.data();
+				if (blendState.logicOpEnable) {
+					colorBlend.logicOpEnable = VK_TRUE;
+					colorBlend.logicOp = VkLogicOpForRHI(blendState.logicOp);
+				}
 				std::array<VkDynamicState, 6> dynamicStates = {
 					VK_DYNAMIC_STATE_VIEWPORT,
 					VK_DYNAMIC_STATE_SCISSOR,
@@ -8209,6 +8299,7 @@ namespace rhi {
 				// the others as they were.
 				const bool dynamicStencilReference = depthState.stencilEnable;
 				if (dynamicStencilReference) dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
+				if (dynamicBlendConstants) dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;
 				VkPipelineDynamicStateCreateInfo dynamicState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
 				dynamicState.dynamicStateCount = dynamicStateCount;
 				dynamicState.pDynamicStates = dynamicStates.data();
@@ -8289,6 +8380,7 @@ namespace rhi {
 				graphicsPipelineState.indirectBindable = indirectBindable;
 				graphicsPipelineState.dynamicVertexStride = dynamicVertexStride;
 				graphicsPipelineState.dynamicStencilReference = dynamicStencilReference;
+				graphicsPipelineState.dynamicBlendConstants = dynamicBlendConstants;
 				for (const VkPipelineShaderStageCreateInfo& stage : shaderStages) {
 					graphicsPipelineState.shaderStages |= stage.stage;
 				}
@@ -9134,6 +9226,16 @@ namespace rhi {
 					}
 					if (header->structVersion >= 3)
 						out->countedDraws = impl->drawIndirectCountEnabled && vkCmdDrawIndexedIndirectCount;
+				} break;
+
+				case FeatureInfoStructType::FixedFunction: {
+					if (header->structSize < sizeof(FixedFunctionFeatureInfo)) {
+						RHI_FAIL(Result::InvalidArgument);
+					}
+					// The core features the device was created (or adopted) with.
+					auto* out = reinterpret_cast<FixedFunctionFeatureInfo*>(header);
+					out->dualSourceBlend = impl->supportedFeatures.dualSrcBlend == VK_TRUE;
+					out->logicOp = impl->supportedFeatures.logicOp == VK_TRUE;
 				} break;
 
 				default:
@@ -11969,7 +12071,8 @@ namespace rhi {
 		&cl_preprocessIndirect,
 		&cl_beginSecondary,
 		&cl_executeCommands,
-		&cl_setStencilRef
+		&cl_setStencilRef,
+		&cl_setBlendFactor
 	};
 
 	const SwapchainVTable g_vkscvt = {

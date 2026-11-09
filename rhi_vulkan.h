@@ -325,6 +325,7 @@ namespace rhi {
 		bool indirectBindable = false;       // created with PipelineFlags_IndirectBindable
 		bool dynamicVertexStride = false;    // vertex input strides are dynamic state
 		bool dynamicStencilReference = false; // the stencil reference is dynamic state (stencil test on)
+		bool dynamicBlendConstants = false;  // the blend constants are dynamic state (a blend reads them)
 		VkShaderStageFlags shaderStages = 0; // stages the pipeline contains
 	};
 
@@ -470,6 +471,9 @@ namespace rhi {
 		// the state static, or executed secondaries, lose it, and the next pipeline that has it dynamic sets it again.
 		uint32_t stencilReference = 0;
 		bool stencilReferenceApplied = false;
+		// The same for the blend constants (SetBlendFactor; {1, 1, 1, 1} until then).
+		float blendConstants[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		bool blendConstantsApplied = false;
 		DescriptorHeapHandle boundCbvSrvUavHeap{};
 		DescriptorHeapHandle boundSamplerHeap{};
 		// Diagnostics (DiagnosticDedupeHeapBinds): the heaps the list's last bind emitted; cleared where the binding may be lost.

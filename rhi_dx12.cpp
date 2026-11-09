@@ -1191,6 +1191,8 @@ namespace rhi {
 			D3D12_INPUT_LAYOUT_DESC inputLayoutDesc{ nullptr, 0 };
 
 			bool hasRast = false, hasBlend = false, hasDepth = false, hasRTV = false, hasDSV = false, hasSample = false, hasInputLayout = false, hasPrimitiveTopology = false;
+			UINT sampleMask = UINT_MAX;  // the stream's default when no mask subobject is pushed
+			bool readsBlendFactor = false;
 
 			for (uint32_t i = 0; i < count; i++) {
 				switch (items[i].type) {
@@ -1249,10 +1251,14 @@ namespace rhi {
 					blend = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
 					blend.AlphaToCoverageEnable = B.bs.alphaToCoverage;
 					blend.IndependentBlendEnable = B.bs.independentBlend;
+					sampleMask = B.bs.sampleMask;
 					for (uint32_t a = 0; a < B.bs.numAttachments && a < 8; a++) {
 						const auto& src = B.bs.attachments[a];
 						auto& dst = blend.RenderTarget[a];
-						dst.BlendEnable = src.enable;
+						// A logic op replaces blending on every attachment, as on Vulkan.
+						dst.BlendEnable = src.enable && !B.bs.logicOpEnable;
+						dst.LogicOpEnable = B.bs.logicOpEnable;
+						dst.LogicOp = ToDX(B.bs.logicOp);
 						dst.RenderTargetWriteMask = src.writeMask;
 						dst.BlendOp = ToDX(src.colorOp);
 						dst.SrcBlend = ToDX(src.srcColor);
@@ -1260,6 +1266,12 @@ namespace rhi {
 						dst.BlendOpAlpha = ToDX(src.alphaOp);
 						dst.SrcBlendAlpha = ToDX(src.srcAlpha);
 						dst.DestBlendAlpha = ToDX(src.dstAlpha);
+						// Without independent blend only render target 0 is read.
+						if (dst.BlendEnable && (a == 0 || B.bs.independentBlend)) {
+							readsBlendFactor = readsBlendFactor ||
+								DxBlendIsConstant(dst.SrcBlend) || DxBlendIsConstant(dst.DestBlend) ||
+								DxBlendIsConstant(dst.SrcBlendAlpha) || DxBlendIsConstant(dst.DestBlendAlpha);
+						}
 					}
 				} break;
 				case PsoSubobj::DepthStencil: {
@@ -1347,6 +1359,7 @@ namespace rhi {
 				if (hasRTV) sb.push(SO_RtvFormats{ .Value = rtv });
 				if (hasDSV) sb.push(SO_DsvFormat{ .Value = dsv });
 				if (hasSample) sb.push(SO_SampleDesc{ .Value = sample });
+				if (sampleMask != UINT_MAX) sb.push(SO_SampleMask{ .Value = sampleMask });
 				if (hasInputLayout) sb.push(SO_InputLayout{ .Value = inputLayoutDesc });
 			}
 			auto sd = sb.desc();
@@ -1386,6 +1399,7 @@ namespace rhi {
 
 			Dx12Pipeline pipeline(pso, isCompute, dimpl);
 			pipeline.readsStencilRef = !isCompute && hasDepth && depth.StencilEnable;
+			pipeline.readsBlendFactor = !isCompute && readsBlendFactor;
 			auto handle = dimpl->pipelines.alloc(std::move(pipeline));
 			Pipeline ret(handle);
 			ret.vt = &g_psovt;
@@ -2656,6 +2670,12 @@ namespace rhi {
 					out->maxSequenceCount = UINT32_MAX;  // ExecuteIndirect's MaxCommandCount has no device limit
 					if (h->structVersion >= 3)
 						out->countedDraws = true;  // ExecuteIndirect's count buffer is core D3D12
+				} break;
+				case FeatureInfoStructType::FixedFunction: {
+					if (h->structSize < sizeof(FixedFunctionFeatureInfo)) return Result::InvalidArgument;
+					auto* out = reinterpret_cast<FixedFunctionFeatureInfo*>(h);
+					out->dualSourceBlend = true;  // core D3D12
+					out->logicOp = opt0.OutputMergerLogicOp != 0;
 				} break;
 				default:
 					// Unknown sType: ignore
@@ -8034,6 +8054,8 @@ namespace rhi {
 			l->activeRootCbvShadowStateCount = 0;
 			l->stencilRef = 0;
 			l->stencilRefApplied = false;
+			std::fill(std::begin(l->blendFactor), std::end(l->blendFactor), 1.0f);
+			l->blendFactorApplied = false;
 			for (auto& page : l->rootCbvScratchPages) {
 				page.cursor = 0;
 			}
@@ -8302,6 +8324,10 @@ namespace rhi {
 				if (P->readsStencilRef && !l->stencilRefApplied) {
 					l->cl->OMSetStencilRef(l->stencilRef);
 					l->stencilRefApplied = true;
+				}
+				if (P->readsBlendFactor && !l->blendFactorApplied) {
+					l->cl->OMSetBlendFactor(l->blendFactor);
+					l->blendFactorApplied = true;
 				}
 				#if BASICRHI_ENABLE_RESHAPE
 				if (dev->debugInstrumentation.state.active && P->pso) {
@@ -9846,6 +9872,7 @@ namespace rhi {
 			}
 			// A bundle's state changes carry back into this list: set the list's values again before they are read.
 			l->stencilRefApplied = false;
+			l->blendFactorApplied = false;
 		}
 
 		static void cl_setStencilRef(CommandList* cl, uint32_t reference) noexcept {
@@ -9857,6 +9884,17 @@ namespace rhi {
 			l->cl->OMSetStencilRef(reference);
 			l->stencilRef = reference;
 			l->stencilRefApplied = true;
+		}
+
+		static void cl_setBlendFactor(CommandList* cl, const float rgba[4]) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl || !rgba) {
+				BreakIfDebugging();
+				return;
+			}
+			std::copy(rgba, rgba + 4, l->blendFactor);
+			l->cl->OMSetBlendFactor(l->blendFactor);
+			l->blendFactorApplied = true;
 		}
 
 		// ------------------ QueryPool vtable funcs ----------------
@@ -10561,7 +10599,8 @@ namespace rhi {
 		nullptr,  // preprocessIndirect: the driver preprocesses inside ExecuteIndirect
 		&cl_beginSecondary,
 		&cl_executeCommands,
-		&cl_setStencilRef
+		&cl_setStencilRef,
+		&cl_setBlendFactor
 	};
 	const SwapchainVTable g_scvt = {
 		&sc_count,

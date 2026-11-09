@@ -220,8 +220,35 @@ namespace rhi {
 		case BlendFactor::SrcAlpha:return B::D3D12_BLEND_SRC_ALPHA; case BlendFactor::InvSrcAlpha:return B::D3D12_BLEND_INV_SRC_ALPHA;
 		case BlendFactor::DstColor:return B::D3D12_BLEND_DEST_COLOR; case BlendFactor::InvDstColor:return B::D3D12_BLEND_INV_DEST_COLOR;
 		case BlendFactor::DstAlpha:return B::D3D12_BLEND_DEST_ALPHA; case BlendFactor::InvDstAlpha:return B::D3D12_BLEND_INV_DEST_ALPHA;
+		case BlendFactor::BlendFactor:return B::D3D12_BLEND_BLEND_FACTOR; case BlendFactor::InvBlendFactor:return B::D3D12_BLEND_INV_BLEND_FACTOR;
+		case BlendFactor::SrcAlphaSat:return B::D3D12_BLEND_SRC_ALPHA_SAT;
+		case BlendFactor::Src1Color:return B::D3D12_BLEND_SRC1_COLOR; case BlendFactor::InvSrc1Color:return B::D3D12_BLEND_INV_SRC1_COLOR;
+		case BlendFactor::Src1Alpha:return B::D3D12_BLEND_SRC1_ALPHA; case BlendFactor::InvSrc1Alpha:return B::D3D12_BLEND_INV_SRC1_ALPHA;
 		}
 		return B::D3D12_BLEND_ONE;
+	}
+	static inline bool DxBlendIsConstant(D3D12_BLEND b) {
+		return b == D3D12_BLEND_BLEND_FACTOR || b == D3D12_BLEND_INV_BLEND_FACTOR;
+	}
+	static inline D3D12_LOGIC_OP ToDX(const LogicOp o) {
+		switch (o) {
+		case LogicOp::Clear: return D3D12_LOGIC_OP_CLEAR;
+		case LogicOp::Set: return D3D12_LOGIC_OP_SET;
+		case LogicOp::Copy: return D3D12_LOGIC_OP_COPY;
+		case LogicOp::CopyInverted: return D3D12_LOGIC_OP_COPY_INVERTED;
+		case LogicOp::Noop: return D3D12_LOGIC_OP_NOOP;
+		case LogicOp::Invert: return D3D12_LOGIC_OP_INVERT;
+		case LogicOp::And: return D3D12_LOGIC_OP_AND;
+		case LogicOp::Nand: return D3D12_LOGIC_OP_NAND;
+		case LogicOp::Or: return D3D12_LOGIC_OP_OR;
+		case LogicOp::Nor: return D3D12_LOGIC_OP_NOR;
+		case LogicOp::Xor: return D3D12_LOGIC_OP_XOR;
+		case LogicOp::Equiv: return D3D12_LOGIC_OP_EQUIV;
+		case LogicOp::AndReverse: return D3D12_LOGIC_OP_AND_REVERSE;
+		case LogicOp::AndInverted: return D3D12_LOGIC_OP_AND_INVERTED;
+		case LogicOp::OrReverse: return D3D12_LOGIC_OP_OR_REVERSE;
+		case LogicOp::OrInverted: return D3D12_LOGIC_OP_OR_INVERTED;
+		} return D3D12_LOGIC_OP_NOOP;
 	}
 	static inline D3D12_STENCIL_OP ToDX(const StencilOp o) {
 		switch (o) {

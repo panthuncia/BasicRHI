@@ -12,6 +12,7 @@ enum class FeatureInfoStructType : uint64_t {
 	ResourceAllocation = 8,
 	WorkGraphs = 9,
 	IndirectCommands = 10,
+	FixedFunction = 11,
 };
 
 struct FeatureInfoHeader {
@@ -226,4 +227,12 @@ struct IndirectCommandsFeatureInfo {
     // (structVersion 3) ExecuteIndirect with a count buffer draws the count it reads (Vulkan's drawIndirectCount). Without it, a
     // single-draw signature draws its max count.
     bool countedDraws = false;
+};
+
+// Optional fixed-function pipeline and command list state (D3D11-style state that Vulkan gates behind features).
+struct FixedFunctionFeatureInfo {
+    FeatureInfoHeader header{ FeatureInfoStructType::FixedFunction, nullptr, sizeof(FixedFunctionFeatureInfo), 1 };
+
+    bool dualSourceBlend = false;  // BlendFactor::Src1* (Vulkan dualSrcBlend)
+    bool logicOp = false;          // BlendState::logicOpEnable (D3D12 OutputMergerLogicOp, Vulkan logicOp)
 };
