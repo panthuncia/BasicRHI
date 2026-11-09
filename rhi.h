@@ -1801,6 +1801,9 @@ namespace rhi {
 		float   depthBiasClamp = 0;
 		float   slopeScaledDepthBias = 0;
 		bool    conservative = false;
+		// Clip against the near and far planes (D3D12 DepthClipEnable). false skips that clip and clamps depth to the
+		// viewport's range instead (Vulkan depthClampEnable); it needs FixedFunctionFeatureInfo::depthClipDisable.
+		bool    depthClip = true;
 	};
 
 	/** @brief What a stencil test does to the stored value (D3D12_STENCIL_OP / VkStencilOp). */

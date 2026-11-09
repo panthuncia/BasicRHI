@@ -8096,6 +8096,10 @@ namespace rhi {
 					RHI_FAIL(Result::Unsupported);
 				}
 				// Fixed-function state behind optional core features (FixedFunctionFeatureInfo).
+				if (!rasterState.depthClip && impl->supportedFeatures.depthClamp != VK_TRUE) {
+					spdlog::error("Vulkan graphics pipeline creation: turning depth clip off needs the depthClamp feature");
+					RHI_FAIL(Result::Unsupported);
+				}
 				if (blendState.logicOpEnable && impl->supportedFeatures.logicOp != VK_TRUE) {
 					spdlog::error("Vulkan graphics pipeline creation: a logic op needs the logicOp feature");
 					RHI_FAIL(Result::Unsupported);
@@ -8221,6 +8225,9 @@ namespace rhi {
 				// This is DXVK's mapping too, under the same flip (d3d11_rasterizer.cpp, d3d11_context.cpp).
 				raster.frontFace = rasterState.frontCCW ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
 				raster.lineWidth = 1.0f;
+				// D3D's DepthClipEnable off skips the near and far clip and clamps depth to the viewport range,
+				// which is what depth clamp does.
+				raster.depthClampEnable = rasterState.depthClip ? VK_FALSE : VK_TRUE;
 				raster.depthBiasEnable = (rasterState.depthBias != 0.0f || rasterState.slopeScaledDepthBias != 0.0f) ? VK_TRUE : VK_FALSE;
 				raster.depthBiasConstantFactor = rasterState.depthBias;
 				raster.depthBiasClamp = rasterState.depthBiasClamp;
@@ -9236,6 +9243,7 @@ namespace rhi {
 					auto* out = reinterpret_cast<FixedFunctionFeatureInfo*>(header);
 					out->dualSourceBlend = impl->supportedFeatures.dualSrcBlend == VK_TRUE;
 					out->logicOp = impl->supportedFeatures.logicOp == VK_TRUE;
+					out->depthClipDisable = impl->supportedFeatures.depthClamp == VK_TRUE;
 				} break;
 
 				default:

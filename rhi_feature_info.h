@@ -235,4 +235,5 @@ struct FixedFunctionFeatureInfo {
 
     bool dualSourceBlend = false;  // BlendFactor::Src1* (Vulkan dualSrcBlend)
     bool logicOp = false;          // BlendState::logicOpEnable (D3D12 OutputMergerLogicOp, Vulkan logicOp)
+    bool depthClipDisable = false; // RasterState::depthClip = false (Vulkan depthClamp)
 };

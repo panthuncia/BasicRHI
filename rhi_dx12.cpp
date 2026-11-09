@@ -1244,6 +1244,7 @@ namespace rhi {
 					rast.DepthBias = static_cast<int>(R.rs.depthBias);
 					rast.DepthBiasClamp = R.rs.depthBiasClamp;
 					rast.SlopeScaledDepthBias = R.rs.slopeScaledDepthBias;
+					rast.DepthClipEnable = R.rs.depthClip;
 				} break;
 				case PsoSubobj::Blend: {
 					hasBlend = true;
@@ -2676,6 +2677,7 @@ namespace rhi {
 					auto* out = reinterpret_cast<FixedFunctionFeatureInfo*>(h);
 					out->dualSourceBlend = true;  // core D3D12
 					out->logicOp = opt0.OutputMergerLogicOp != 0;
+					out->depthClipDisable = true;  // core D3D12
 				} break;
 				default:
 					// Unknown sType: ignore
