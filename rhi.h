@@ -2754,9 +2754,48 @@ namespace rhi {
 		QueueHandle queueHandle;
 	};
 
+	// What a present waits for: the queue that produced the frame and the timeline point its last submission signals. The
+	// wait runs on the GPU. The present goes out on that queue, and the next image's acquire is ordered before later work
+	// on it.
 	struct PresentSyncDesc {
 		Queue queue;
 		TimelinePoint wait{};
+	};
+
+	// The colour space a swapchain presents in. Each HDR colour space fixes the image format.
+	enum class SwapchainColorSpace : uint8_t {
+		// SDR: the format given at creation, sRGB transfer, BT.709 primaries. The default.
+		SrgbNonlinear,
+		// HDR10: R10G10B10A2_UNorm, BT.2020 primaries, SMPTE ST 2084 (PQ) transfer.
+		Hdr10St2084,
+		// scRGB: R16G16B16A16_Float, BT.709 primaries, linear. 1.0 is 80 nits.
+		ScRgbLinear,
+	};
+
+	// HDR mastering metadata for the display. Chromaticities are CIE 1931 xy, luminances are in nits. The defaults
+	// describe a BT.2020 1000-nit master.
+	struct HdrMetadata {
+		float redPrimary[2]{ 0.708f, 0.292f };
+		float greenPrimary[2]{ 0.170f, 0.797f };
+		float bluePrimary[2]{ 0.131f, 0.046f };
+		float whitePoint[2]{ 0.3127f, 0.3290f };
+		float maxLuminance = 1000.0f;
+		float minLuminance = 0.001f;
+		float maxContentLightLevel = 1000.0f;
+		float maxFrameAverageLightLevel = 400.0f;
+	};
+
+	// What a swapchain can do on its device and output.
+	struct SwapchainCaps {
+		// Present(vsync = false) may tear: the swapchain was created with allowTearing and the platform supports it.
+		bool tearing = false;
+		// Present can change vsync from one call to the next without recreating the swapchain (D3D12; Vulkan with
+		// VK_EXT_swapchain_maintenance1). Without it, a change recreates the swapchain and Present returns ModeChanged.
+		bool presentModeSwitch = false;
+		// WaitForPresent waits for the display (Vulkan VK_KHR_present_wait). Without it, WaitForPresent is Unsupported.
+		bool presentWait = false;
+		// SetHdrMetadata reaches the display.
+		bool hdrMetadata = false;
 	};
 
 	struct ResourceVTable {
@@ -3063,7 +3102,18 @@ namespace rhi {
 		Result(*present)(Swapchain*, bool vsync, const PresentSyncDesc* sync) noexcept; // Present
 		Result(*resizeBuffers)(Swapchain*, uint32_t bufferCount, uint32_t w, uint32_t h, Format newFormat, uint32_t flags) noexcept;
 		void (*setName)(Swapchain*, const char*) noexcept;
-		uint32_t abi_version = 1;
+		uint32_t abi_version = 2;
+		// abi_version 2. After abi_version, so tables written for version 1 still initialize.
+		SwapchainCaps(*caps)(Swapchain*) noexcept = nullptr;
+		bool (*isColorSpaceSupported)(Swapchain*, SwapchainColorSpace) noexcept = nullptr;
+		Result(*setColorSpace)(Swapchain*, SwapchainColorSpace) noexcept = nullptr;
+		SwapchainColorSpace(*colorSpace)(Swapchain*) noexcept = nullptr;
+		Result(*setHdrMetadata)(Swapchain*, const HdrMetadata&) noexcept = nullptr;
+		Result(*setMaximumFrameLatency)(Swapchain*, uint32_t frames) noexcept = nullptr;
+		Result(*waitForFrameLatency)(Swapchain*, uint64_t timeoutNs) noexcept = nullptr;
+		void* (*frameLatencyWaitableObject)(Swapchain*) noexcept = nullptr;
+		uint64_t(*presentCount)(Swapchain*) noexcept = nullptr;
+		Result(*waitForPresent)(Swapchain*, uint64_t presentId, uint64_t timeoutNs) noexcept = nullptr;
 	};
 
 	class Swapchain {
@@ -3088,7 +3138,64 @@ namespace rhi {
 		inline Result ResizeBuffers(uint32_t bufferCount, uint32_t w, uint32_t h, Format newFmt, uint32_t flags) noexcept {
 			return vt->resizeBuffers ? vt->resizeBuffers(this, bufferCount, w, h, newFmt, flags) : Result::Unsupported;
 		}
+
+		/// What this swapchain can do: tearing, vsync switching, present wait, HDR metadata.
+		SwapchainCaps Caps() noexcept { return Has(vt->caps) ? vt->caps(this) : SwapchainCaps{}; }
+
+		/// Whether the output can show this colour space. Hdr10St2084 or ScRgbLinear supported means the output has HDR on.
+		bool IsColorSpaceSupported(SwapchainColorSpace colorSpace) noexcept {
+			if (colorSpace == SwapchainColorSpace::SrgbNonlinear) return true;
+			return Has(vt->isColorSpaceSupported) && vt->isColorSpaceSupported(this, colorSpace);
+		}
+
+		/// Switches the colour space, and with it the image format (see SwapchainColorSpace). It waits for the GPU and
+		/// rebuilds the images like ResizeBuffers: read Image() again and recreate views afterwards. HDR metadata already
+		/// set is sent again. Returns Unsupported when the output cannot show the colour space.
+		Result SetColorSpace(SwapchainColorSpace colorSpace) noexcept {
+			return Has(vt->setColorSpace) ? vt->setColorSpace(this, colorSpace) : Result::Unsupported;
+		}
+
+		/// The colour space the swapchain presents in.
+		SwapchainColorSpace ColorSpace() noexcept {
+			return Has(vt->colorSpace) ? vt->colorSpace(this) : SwapchainColorSpace::SrgbNonlinear;
+		}
+
+		/// Sends HDR mastering metadata to the display. It is kept and sent again after a resize or colour space change.
+		Result SetHdrMetadata(const HdrMetadata& metadata) noexcept {
+			return Has(vt->setHdrMetadata) ? vt->setHdrMetadata(this, metadata) : Result::Unsupported;
+		}
+
+		/// Limits how many presented frames may be outstanding; frames is at least 1. D3D12:
+		/// IDXGISwapChain2::SetMaximumFrameLatency. Vulkan: Present returns only once no more than this many presented
+		/// frames are unfinished on the GPU. The Vulkan default is 2.
+		Result SetMaximumFrameLatency(uint32_t frames) noexcept {
+			return Has(vt->setMaximumFrameLatency) ? vt->setMaximumFrameLatency(this, frames) : Result::Unsupported;
+		}
+
+		/// Blocks until another frame may start under the latency limit. Call it once per frame before the frame's CPU
+		/// work, or never. D3D12 waits on the frame-latency waitable object. Vulkan waits until the frame that makes room
+		/// has been presented (VK_KHR_present_wait) or, without present wait, has finished on the GPU. Returns WaitTimeout
+		/// when timeoutNs passes first.
+		Result WaitForFrameLatency(uint64_t timeoutNs = UINT64_MAX) noexcept {
+			return Has(vt->waitForFrameLatency) ? vt->waitForFrameLatency(this, timeoutNs) : Result::Unsupported;
+		}
+
+		/// D3D12: the frame-latency waitable object, a HANDLE the swapchain owns (do not close it). Vulkan: nullptr.
+		void* FrameLatencyWaitableObject() noexcept {
+			return Has(vt->frameLatencyWaitableObject) ? vt->frameLatencyWaitableObject(this) : nullptr;
+		}
+
+		/// The number of successful presents. Present N, counting from 1, has present ID N.
+		uint64_t PresentCount() noexcept { return Has(vt->presentCount) ? vt->presentCount(this) : 0; }
+
+		/// Blocks until present presentId has reached the display (Caps().presentWait). Returns WaitTimeout when timeoutNs
+		/// passes first, and Unsupported without present wait.
+		Result WaitForPresent(uint64_t presentId, uint64_t timeoutNs = UINT64_MAX) noexcept {
+			return Has(vt->waitForPresent) ? vt->waitForPresent(this, presentId, timeoutNs) : Result::Unsupported;
+		}
 	private:
+		// A version 2 entry the backend filled in.
+		template<class Fn> bool Has(Fn fn) const noexcept { return vt->abi_version >= 2 && fn != nullptr; }
 		SwapChainHandle handle;
 	};
 
@@ -3604,6 +3711,10 @@ namespace rhi {
 		// exists. They need a preview Agility SDK and Windows Developer Mode. When either is
 		// missing the device is still created and reports the raytracing it does have.
 		bool enablePreviewRayTracing = false;
+		// Vulkan: VkApplicationInfo::pEngineName of the instance BasicRHI creates. Null keeps "BasicRHI". Drivers match
+		// application profiles on it: NVIDIA's profile for "DXVK" forces SDR composition, so an HDR host that runs DXVK as a
+		// guest passes "DXVK_HDR".
+		const char* vulkanEngineName = nullptr;
 	};
 
 	// Accepts any blob exposing GetBufferPointer/GetBufferSize (ID3DBlob, IDxcBlob) without
