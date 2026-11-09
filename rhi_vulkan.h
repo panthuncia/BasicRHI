@@ -769,6 +769,9 @@ namespace rhi {
 		bool ownsDevice = true;
 		// The host destroyed the VkDevice before BasicRHI shut down: skip every vkDestroy*.
 		bool abandoned = false;
+		// ShareVulkanDevice: a device BasicRHI created that a guest API also submits to. Queue access takes the submission hooks
+		// and whole-device waits become waits on BasicRHI's timelines, as on an adopted device; BasicRHI still destroys it.
+		bool sharedQueues = false;
 		void* submissionHookUser = nullptr;
 		void (*submissionLock)(void* user, VkQueue queue) = nullptr;
 		void (*submissionUnlock)(void* user, VkQueue queue) = nullptr;
