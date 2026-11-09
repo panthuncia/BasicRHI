@@ -13801,6 +13801,12 @@ namespace rhi {
 		return Result::Ok;
 	}
 
+	namespace vulkan {
+		namespace {
+			void VkParseEnabledFeatureChain(const void* chain, VkPhysicalDeviceFeatures& core, VkEnabledDeviceState& e) noexcept;
+		}
+	}
+
 	rhi::Result CreateVulkanDevice(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer) noexcept {
 		outPtr = {};
 		bool streamlineInitialized = false;
@@ -14752,6 +14758,14 @@ namespace rhi {
 			enabled.maintenance5 = std::any_of(enabledDeviceExtensions.begin(), enabledDeviceExtensions.end(),
 				[](const char* a_name) { return std::strcmp(a_name, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0; });
 			enabled.memoryBudget = hasMemoryBudgetExtension;
+			// A device hook (a guest API's needs) may enable more than BasicRHI asked for: the create info it left is what the
+			// device has, so its feature structs replace BasicRHI's own.
+			if (ci.vulkanCreateHooks && ci.vulkanCreateHooks->device) {
+				VkPhysicalDeviceFeatures hookedCore{};
+				vulkan::VkParseEnabledFeatureChain(deviceCreateInfo.pNext, hookedCore, enabled);
+				for (uint32_t index = 0; index < deviceCreateInfo.enabledExtensionCount; ++index)
+					enabled.maintenance5 |= std::strcmp(deviceCreateInfo.ppEnabledExtensionNames[index], VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0;
+			}
 			VkApplyEnabledDeviceState(impl.get(), enabled);
 		}
 		impl->validateBarrierTransitions = ci.validateBarrierTransitions;
