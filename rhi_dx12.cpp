@@ -4090,10 +4090,7 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			D3D12_HEAP_PROPERTIES hp{};
-			hp.Type = ToDX(bd.heapType);
-			hp.CreationNodeMask = 1;
-			hp.VisibleNodeMask = 1;
+			const D3D12_HEAP_PROPERTIES hp = ToDxHeapProperties(bd.heapType);
 
 			const auto hf = ToDX(bd.heapFlags);
 
@@ -4143,10 +4140,7 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			D3D12_HEAP_PROPERTIES hp{};
-			hp.Type = ToDX(td.heapType);
-			hp.CreationNodeMask = 1;
-			hp.VisibleNodeMask = 1;
+			const D3D12_HEAP_PROPERTIES hp = ToDxHeapProperties(td.heapType);
 
 			const auto hf = ToDX(td.heapFlags);
 
@@ -4254,12 +4248,7 @@ namespace rhi {
 			if (!impl || !impl->pNativeDevice || hd.sizeBytes == 0) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
-			D3D12_HEAP_PROPERTIES props{};
-			props.Type = ToDX(hd.memory);
-			props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-			props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-			props.CreationNodeMask = 1;
-			props.VisibleNodeMask = 1;
+			const D3D12_HEAP_PROPERTIES props = ToDxHeapProperties(hd.memory);
 
 			D3D12_HEAP_DESC desc{};
 			desc.SizeInBytes = hd.sizeBytes;

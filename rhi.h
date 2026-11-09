@@ -2116,7 +2116,11 @@ namespace rhi {
 		HostCached, // D3D12: CUSTOM; Vulkan: HOST_CACHED
 		HostVisibleDeviceLocal, // D3D12: GPU_UPLOAD; Vulkan: HOST_VISIBLE + DEVICE_LOCAL
 		GPUUpload = HostVisibleDeviceLocal,
-		Custom // D3D12: CUSTOM; Vulkan: CUSTOM
+		Custom, // D3D12: CUSTOM; Vulkan: CUSTOM
+		// GPU memory in system RAM, for any resource, with no CPU access. Where a device-local resource goes when VRAM is
+		// short. D3D12: CUSTOM, pool L0, CPU page NOT_AVAILABLE. Vulkan: a memory type outside the device-local heaps, which
+		// a UMA device does not have (creation fails there).
+		SystemMemory
 	};
 
 	enum class HeapFlags : uint32_t {

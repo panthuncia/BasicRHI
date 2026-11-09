@@ -249,6 +249,22 @@ namespace rhi {
 		}
 	}
 
+	// Heap properties for a heap type on node 0. SystemMemory is a CUSTOM heap in system memory (L0) with no CPU access;
+	// the other types leave the page property and pool to the heap type.
+	inline static D3D12_HEAP_PROPERTIES ToDxHeapProperties(const HeapType m) {
+		D3D12_HEAP_PROPERTIES properties{};
+		properties.Type = ToDX(m);
+		properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+		properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+		if (m == HeapType::SystemMemory) {
+			properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+			properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+		}
+		properties.CreationNodeMask = 1;
+		properties.VisibleNodeMask = 1;
+		return properties;
+	}
+
 	inline static D3D12_RESOURCE_FLAGS ToDX(const ResourceFlags flags) {
 		D3D12_RESOURCE_FLAGS f = D3D12_RESOURCE_FLAG_NONE;
 		if (flags & RF_AllowRenderTarget)

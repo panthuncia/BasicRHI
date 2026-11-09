@@ -3047,6 +3047,31 @@ namespace rhi {
 			return false;
 		}
 
+		// The memory type for a heap type among `memoryTypeBits`. SystemMemory takes a type outside the device-local heaps,
+		// one without host access first, since nothing maps it.
+		static bool VkFindMemoryTypeForHeapType(const VkPhysicalDeviceMemoryProperties& memoryProperties, uint32_t memoryTypeBits,
+			HeapType heapType, uint32_t& memoryTypeIndex) noexcept {
+			if (heapType != HeapType::SystemMemory) {
+				return VkFindMemoryTypeIndex(memoryProperties, memoryTypeBits, VkPreferredMemoryPropertyFlags(heapType),
+					VkRequiredMemoryPropertyFlags(heapType), memoryTypeIndex);
+			}
+			for (const bool allowHostVisible : { false, true }) {
+				for (uint32_t index = 0; index < memoryProperties.memoryTypeCount; ++index) {
+					const VkMemoryType& type = memoryProperties.memoryTypes[index];
+					if ((memoryTypeBits & (1u << index)) == 0 || (type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ||
+						(memoryProperties.memoryHeaps[type.heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+						continue;
+					}
+					if (!allowHostVisible && (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+						continue;
+					}
+					memoryTypeIndex = index;
+					return true;
+				}
+			}
+			return false;
+		}
+
 		static VkShaderStageFlags VkShaderStageFlagsForRHI(ShaderStage stages) noexcept {
 			VkShaderStageFlags flags = 0;
 			const uint32_t bits = static_cast<uint32_t>(stages);
@@ -10656,10 +10681,8 @@ namespace rhi {
 			VkMemoryRequirements memoryRequirements{};
 			vkGetBufferMemoryRequirements(impl->device, buffer, &memoryRequirements);
 
-			const VkMemoryPropertyFlags preferredFlags = VkPreferredMemoryPropertyFlags(desc.heapType);
-			const VkMemoryPropertyFlags requiredFlags = VkRequiredMemoryPropertyFlags(desc.heapType);
 			uint32_t memoryTypeIndex = 0;
-			if (!VkFindMemoryTypeIndex(impl->memoryProperties, memoryRequirements.memoryTypeBits, preferredFlags, requiredFlags, memoryTypeIndex)) {
+			if (!VkFindMemoryTypeForHeapType(impl->memoryProperties, memoryRequirements.memoryTypeBits, desc.heapType, memoryTypeIndex)) {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
@@ -10734,7 +10757,7 @@ namespace rhi {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
 			}
-			if (desc.heapType != HeapType::DeviceLocal) {
+			if (desc.heapType != HeapType::DeviceLocal && desc.heapType != HeapType::SystemMemory) {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
 			}
@@ -10780,11 +10803,7 @@ namespace rhi {
 			vkGetImageMemoryRequirements(impl->device, image, &memoryRequirements);
 
 			uint32_t memoryTypeIndex = 0;
-			if (!VkFindMemoryTypeIndex(impl->memoryProperties,
-				memoryRequirements.memoryTypeBits,
-				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-				memoryTypeIndex)) {
+			if (!VkFindMemoryTypeForHeapType(impl->memoryProperties, memoryRequirements.memoryTypeBits, desc.heapType, memoryTypeIndex)) {
 				vkDestroyImage(impl->device, image, nullptr);
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
@@ -10920,15 +10939,13 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			VkMemoryPropertyFlags preferredFlags = VkPreferredMemoryPropertyFlags(desc.memory);
-			VkMemoryPropertyFlags requiredFlags = VkRequiredMemoryPropertyFlags(desc.memory);
 			uint32_t memoryTypeBits = 0;
 			for (uint32_t index = 0; index < impl->memoryProperties.memoryTypeCount; ++index) {
 				memoryTypeBits |= (1u << index);
 			}
 
 			uint32_t memoryTypeIndex = 0;
-			if (!VkFindMemoryTypeIndex(impl->memoryProperties, memoryTypeBits, preferredFlags, requiredFlags, memoryTypeIndex)) {
+			if (!VkFindMemoryTypeForHeapType(impl->memoryProperties, memoryTypeBits, desc.memory, memoryTypeIndex)) {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
 			}
