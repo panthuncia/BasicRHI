@@ -1804,6 +1804,9 @@ namespace rhi {
 		// Clip against the near and far planes (D3D12 DepthClipEnable). false skips that clip and clamps depth to the
 		// viewport's range instead (Vulkan depthClampEnable); it needs FixedFunctionFeatureInfo::depthClipDisable.
 		bool    depthClip = true;
+		// How many viewports and scissors the pipeline reads (SV_ViewportArrayIndex picks one). Vulkan fixes the count in
+		// the pipeline; D3D12 ignores it. Above 1 needs FixedFunctionFeatureInfo::maxViewports.
+		uint32_t viewportCount = 1;
 	};
 
 	/** @brief What a stencil test does to the stored value (D3D12_STENCIL_OP / VkStencilOp). */
@@ -2060,6 +2063,24 @@ namespace rhi {
 		ClearValue clear{};
 		bool readOnly = false;
 		ResourceHandle resource{};  // Required for LoadOp::DontCare (DiscardResource)
+	};
+
+	// The most viewports and scissors a list sets at once (D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE).
+	inline constexpr uint32_t MAX_VIEWPORTS = 16;
+
+	/**
+	 * @brief A viewport in D3D's convention on every backend: (x, y) is its top-left corner in pixels, y growing
+	 * downwards. The Vulkan backend flips it as BeginPass does, so callers never branch on the backend.
+	 */
+	struct Viewport {
+		float x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
+		float minDepth = 0.0f, maxDepth = 1.0f;
+	};
+
+	/** @brief A scissor rectangle in pixels, top-left origin as Viewport. Parts left of or above 0 are cut off. */
+	struct ScissorRect {
+		int32_t x = 0, y = 0;
+		uint32_t width = 0, height = 0;
 	};
 
 	/** @brief Where a pass's draws are recorded (PassBeginInfo::contents). */
@@ -2976,6 +2997,8 @@ namespace rhi {
 		// abi_version 9: fixed-function state set while recording (CommandList::SetStencilRef and the calls after it).
 		void (*setStencilRef)(CommandList*, uint32_t reference) noexcept = nullptr;
 		void (*setBlendFactor)(CommandList*, const float rgba[4]) noexcept = nullptr;
+		void (*setViewports)(CommandList*, Span<const Viewport>) noexcept = nullptr;
+		void (*setScissors)(CommandList*, Span<const ScissorRect>) noexcept = nullptr;
 	};
 
 	class CommandList {
@@ -3077,6 +3100,19 @@ namespace rhi {
 		 */
 		void SetBlendFactor(const float rgba[4]) noexcept {
 			if (IsValid() && vt->abi_version >= 9 && vt->setBlendFactor && rgba) vt->setBlendFactor(this, rgba);
+		}
+		/**
+		 * @brief Sets viewports 0..n-1 (Viewport: D3D's convention on every backend). BeginPass and BeginSecondary set
+		 * viewport 0 to the render area; this replaces it for the draws after it, inside the pass. More than one needs
+		 * FixedFunctionFeatureInfo::maxViewports and pipelines with RasterState::viewportCount to match; more than the
+		 * device supports fails the list. D3D12 bundles cannot set viewports: in a secondary this is Vulkan only.
+		 */
+		void SetViewports(Span<const Viewport> viewports) noexcept {
+			if (IsValid() && vt->abi_version >= 9 && vt->setViewports && viewports.size != 0) vt->setViewports(this, viewports);
+		}
+		/** @brief Sets scissors 0..n-1, as SetViewports sets viewports. Scissoring is always on, on both backends. */
+		void SetScissors(Span<const ScissorRect> scissors) noexcept {
+			if (IsValid() && vt->abi_version >= 9 && vt->setScissors && scissors.size != 0) vt->setScissors(this, scissors);
 		}
 		void ClearUavUint(const UavClearInfo& u, const UavClearUint& v) noexcept;
 		void ClearUavFloat(const UavClearInfo& u, const UavClearFloat& v) noexcept;

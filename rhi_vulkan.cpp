@@ -5240,6 +5240,27 @@ namespace rhi {
 			commandListState.preprocessBarrierPending = false;
 		}
 
+		// A D3D-convention viewport (top-left origin, y down) as the flipped Vulkan viewport every pass renders with: it
+		// starts at the bottom of the rectangle and grows upwards, which puts the image the same way up as D3D's.
+		static VkViewport VkFlippedViewport(float x, float y, float width, float height, float minDepth, float maxDepth) noexcept {
+			VkViewport viewport{};
+			viewport.x = x;
+			viewport.width = width;
+			viewport.y = y + height;
+			viewport.height = -height;
+			viewport.minDepth = minDepth;
+			viewport.maxDepth = maxDepth;
+			return viewport;
+		}
+
+		// How many viewports and scissors a list may set: 1 without multiViewport.
+		static uint32_t VMAX_VIEWPORTS(const VulkanDevice* impl) noexcept {
+			if (impl->supportedFeatures.multiViewport != VK_TRUE) {
+				return 1;
+			}
+			return (std::min)(impl->physicalDeviceProperties.limits.maxViewports, MAX_VIEWPORTS);
+		}
+
 		static void cl_beginPass(CommandList* commandList, const PassBeginInfo& passInfo) noexcept {
 			ZoneScopedN("RHI.Vulkan.BeginPass");
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
@@ -5353,14 +5374,8 @@ namespace rhi {
 				return;  // only vkCmdExecuteCommands until the pass ends; each secondary sets its own viewport and scissor
 			}
 
-			VkViewport viewport{};
-			viewport.x = static_cast<float>(passInfo.x);
-			viewport.width = static_cast<float>(passInfo.width);
-			// Flipped: the viewport starts at the bottom of the render area and grows upwards.
-			viewport.y = static_cast<float>(passInfo.y + passInfo.height);
-			viewport.height = -static_cast<float>(passInfo.height);
-			viewport.minDepth = passInfo.minDepth;
-			viewport.maxDepth = passInfo.maxDepth;
+			const VkViewport viewport = VkFlippedViewport(static_cast<float>(passInfo.x), static_cast<float>(passInfo.y),
+				static_cast<float>(passInfo.width), static_cast<float>(passInfo.height), passInfo.minDepth, passInfo.maxDepth);
 			vkCmdSetViewport(commandListState->commandBuffer, 0, 1, &viewport);
 
 			VkRect2D scissor{};
@@ -5819,6 +5834,49 @@ namespace rhi {
 			vkCmdSetStencilReference(commandListState->commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, reference);
 			commandListState->stencilReference = reference;
 			commandListState->stencilReferenceApplied = true;
+		}
+
+		static void cl_setViewports(CommandList* commandList, Span<const Viewport> viewports) noexcept {
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!impl || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE || viewports.size == 0) {
+				return;
+			}
+			if (viewports.size > VMAX_VIEWPORTS(impl)) {
+				spdlog::error("Vulkan SetViewports: {} viewports, the device takes {}", viewports.size, VMAX_VIEWPORTS(impl));
+				VkMarkCommandListError(commandListState, Result::Unsupported);
+				return;
+			}
+			std::array<VkViewport, MAX_VIEWPORTS> native{};
+			for (uint32_t i = 0; i < viewports.size; ++i) {
+				const Viewport& v = viewports.data[i];
+				native[i] = VkFlippedViewport(v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth);
+			}
+			vkCmdSetViewport(commandListState->commandBuffer, 0, viewports.size, native.data());
+		}
+
+		static void cl_setScissors(CommandList* commandList, Span<const ScissorRect> scissors) noexcept {
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!impl || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE || scissors.size == 0) {
+				return;
+			}
+			if (scissors.size > VMAX_VIEWPORTS(impl)) {
+				spdlog::error("Vulkan SetScissors: {} scissors, the device takes {}", scissors.size, VMAX_VIEWPORTS(impl));
+				VkMarkCommandListError(commandListState, Result::Unsupported);
+				return;
+			}
+			std::array<VkRect2D, MAX_VIEWPORTS> native{};
+			for (uint32_t i = 0; i < scissors.size; ++i) {
+				const ScissorRect& s = scissors.data[i];
+				// Vulkan takes no negative offsets: cut the part outside the target off, as D3D does.
+				const int64_t cutX = s.x < 0 ? -static_cast<int64_t>(s.x) : 0;
+				const int64_t cutY = s.y < 0 ? -static_cast<int64_t>(s.y) : 0;
+				native[i].offset = { (std::max)(s.x, 0), (std::max)(s.y, 0) };
+				native[i].extent.width = static_cast<uint32_t>((std::max)(int64_t{ 0 }, static_cast<int64_t>(s.width) - cutX));
+				native[i].extent.height = static_cast<uint32_t>((std::max)(int64_t{ 0 }, static_cast<int64_t>(s.height) - cutY));
+			}
+			vkCmdSetScissor(commandListState->commandBuffer, 0, scissors.size, native.data());
 		}
 
 		static void cl_setBlendFactor(CommandList* commandList, const float rgba[4]) noexcept {
@@ -7406,13 +7464,8 @@ namespace rhi {
 			commandListState->passRenderArea.extent = { inheritance.width, inheritance.height };
 
 			// As BeginPass sets them: flipped, the viewport starting at the bottom of the render area.
-			VkViewport viewport{};
-			viewport.x = static_cast<float>(inheritance.x);
-			viewport.width = static_cast<float>(inheritance.width);
-			viewport.y = static_cast<float>(inheritance.y + inheritance.height);
-			viewport.height = -static_cast<float>(inheritance.height);
-			viewport.minDepth = inheritance.minDepth;
-			viewport.maxDepth = inheritance.maxDepth;
+			const VkViewport viewport = VkFlippedViewport(static_cast<float>(inheritance.x), static_cast<float>(inheritance.y),
+				static_cast<float>(inheritance.width), static_cast<float>(inheritance.height), inheritance.minDepth, inheritance.maxDepth);
 			vkCmdSetViewport(commandListState->commandBuffer, 0, 1, &viewport);
 			vkCmdSetScissor(commandListState->commandBuffer, 0, 1, &commandListState->passRenderArea);
 			return Result::Ok;
@@ -8096,6 +8149,10 @@ namespace rhi {
 					RHI_FAIL(Result::Unsupported);
 				}
 				// Fixed-function state behind optional core features (FixedFunctionFeatureInfo).
+				if (rasterState.viewportCount > VMAX_VIEWPORTS(impl)) {
+					spdlog::error("Vulkan graphics pipeline creation: {} viewports, the device takes {}", rasterState.viewportCount, VMAX_VIEWPORTS(impl));
+					RHI_FAIL(Result::Unsupported);
+				}
 				if (!rasterState.depthClip && impl->supportedFeatures.depthClamp != VK_TRUE) {
 					spdlog::error("Vulkan graphics pipeline creation: turning depth clip off needs the depthClamp feature");
 					RHI_FAIL(Result::Unsupported);
@@ -8213,8 +8270,8 @@ namespace rhi {
 				VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
 				inputAssembly.topology = VkPrimitiveTopologyForRHI(primitiveTopology);
 				VkPipelineViewportStateCreateInfo viewportState{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-				viewportState.viewportCount = 1;
-				viewportState.scissorCount = 1;
+				viewportState.viewportCount = (std::max)(rasterState.viewportCount, 1u);
+				viewportState.scissorCount = viewportState.viewportCount;
 				VkPipelineRasterizationStateCreateInfo raster{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
 				raster.polygonMode = VkPolygonModeForRHI(rasterState.fill);
 				raster.cullMode = VkCullModeForRHI(rasterState.cull);
@@ -9244,6 +9301,7 @@ namespace rhi {
 					out->dualSourceBlend = impl->supportedFeatures.dualSrcBlend == VK_TRUE;
 					out->logicOp = impl->supportedFeatures.logicOp == VK_TRUE;
 					out->depthClipDisable = impl->supportedFeatures.depthClamp == VK_TRUE;
+					out->maxViewports = VMAX_VIEWPORTS(impl);
 				} break;
 
 				default:
@@ -12080,7 +12138,9 @@ namespace rhi {
 		&cl_beginSecondary,
 		&cl_executeCommands,
 		&cl_setStencilRef,
-		&cl_setBlendFactor
+		&cl_setBlendFactor,
+		&cl_setViewports,
+		&cl_setScissors
 	};
 
 	const SwapchainVTable g_vkscvt = {

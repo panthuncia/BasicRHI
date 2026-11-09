@@ -2678,6 +2678,7 @@ namespace rhi {
 					out->dualSourceBlend = true;  // core D3D12
 					out->logicOp = opt0.OutputMergerLogicOp != 0;
 					out->depthClipDisable = true;  // core D3D12
+					out->maxViewports = MAX_VIEWPORTS;
 				} break;
 				default:
 					// Unknown sType: ignore
@@ -9888,6 +9889,53 @@ namespace rhi {
 			l->stencilRefApplied = true;
 		}
 
+		static void cl_setViewports(CommandList* cl, Span<const Viewport> viewports) noexcept {
+			if (DxRejectInBundle(cl, "SetViewports")) {
+				return;
+			}
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl || viewports.size == 0) {
+				BreakIfDebugging();
+				return;
+			}
+			if (viewports.size > MAX_VIEWPORTS) {
+				spdlog::error("D3D12 SetViewports: {} viewports, the device takes {}", viewports.size, MAX_VIEWPORTS);
+				if (l->pendingError == Result::Ok) l->pendingError = Result::Unsupported;
+				BreakIfDebugging();
+				return;
+			}
+			std::array<D3D12_VIEWPORT, MAX_VIEWPORTS> native{};
+			for (uint32_t i = 0; i < viewports.size; ++i) {
+				const Viewport& v = viewports.data[i];
+				native[i] = { v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth };
+			}
+			l->cl->RSSetViewports(viewports.size, native.data());
+		}
+
+		static void cl_setScissors(CommandList* cl, Span<const ScissorRect> scissors) noexcept {
+			if (DxRejectInBundle(cl, "SetScissors")) {
+				return;
+			}
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl || scissors.size == 0) {
+				BreakIfDebugging();
+				return;
+			}
+			if (scissors.size > MAX_VIEWPORTS) {
+				spdlog::error("D3D12 SetScissors: {} scissors, the device takes {}", scissors.size, MAX_VIEWPORTS);
+				if (l->pendingError == Result::Ok) l->pendingError = Result::Unsupported;
+				BreakIfDebugging();
+				return;
+			}
+			std::array<D3D12_RECT, MAX_VIEWPORTS> native{};
+			for (uint32_t i = 0; i < scissors.size; ++i) {
+				const ScissorRect& s = scissors.data[i];
+				native[i] = { static_cast<LONG>(s.x), static_cast<LONG>(s.y),
+					static_cast<LONG>(static_cast<int64_t>(s.x) + s.width), static_cast<LONG>(static_cast<int64_t>(s.y) + s.height) };
+			}
+			l->cl->RSSetScissorRects(scissors.size, native.data());
+		}
+
 		static void cl_setBlendFactor(CommandList* cl, const float rgba[4]) noexcept {
 			auto* l = dx12_detail::CL(cl);
 			if (!l || !l->cl || !rgba) {
@@ -10602,7 +10650,9 @@ namespace rhi {
 		&cl_beginSecondary,
 		&cl_executeCommands,
 		&cl_setStencilRef,
-		&cl_setBlendFactor
+		&cl_setBlendFactor,
+		&cl_setViewports,
+		&cl_setScissors
 	};
 	const SwapchainVTable g_scvt = {
 		&sc_count,
