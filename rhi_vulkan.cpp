@@ -15365,7 +15365,9 @@ namespace rhi {
 				impl->registerCheckpoint = info.diagnostics.registerMarker;
 				impl->detailedCheckpoints = info.diagnostics.detailedCommands;
 			}
-			VkPublishSubmissionHooks(impl, info.submissionHooks);
+			if (!VkPublishSubmissionHooks(impl.get(), info.submissionHooks)) {
+				RHI_FAIL(Result::OutOfMemory);
+			}
 			vkGetPhysicalDeviceProperties(info.physicalDevice, &impl->physicalDeviceProperties);
 			vkGetPhysicalDeviceMemoryProperties(info.physicalDevice, &impl->memoryProperties);
 			impl->supportedFeatures = coreFeatures;
