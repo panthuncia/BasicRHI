@@ -520,6 +520,11 @@ namespace rhi {
 		DescriptorHeapHandle emittedCbvSrvUavHeap{};
 		DescriptorHeapHandle emittedSamplerHeap{};
 		VkRect2D passRenderArea{};
+		// The scissors as last set (SetScissors, or the render area by BeginPass and BeginSecondary), and a bit per viewport
+		// last set with no area. Vulkan takes no such viewport: it is set as 1x1 with an empty scissor, and the stored
+		// scissor comes back once the viewport has an area again.
+		std::array<VkRect2D, MAX_VIEWPORTS> scissors{};
+		uint32_t emptyViewportMask = 0;
 		std::vector<ResourceHandle> passColorResources;
 		ResourceHandle passDepthResource{};
 		std::vector<RecordedBarrierBatch> recordedBarrierBatches;

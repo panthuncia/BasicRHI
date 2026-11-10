@@ -5749,6 +5749,8 @@ namespace rhi {
 			commandListState->pushedDataDirty = false;
 			commandListState->spilledDataDirty = false;
 			commandListState->passRenderArea = {};
+			commandListState->scissors = {};
+			commandListState->emptyViewportMask = 0;
 			commandListState->passColorResources.clear();
 			commandListState->passDepthResource = {};
 			commandListState->continuesRendering = false;
@@ -5802,6 +5804,58 @@ namespace rhi {
 			viewport.minDepth = minDepth;
 			viewport.maxDepth = maxDepth;
 			return viewport;
+		}
+
+		// D3D takes a viewport with no area and draws nothing in it. Vulkan needs a positive width and a nonzero height, so
+		// such a viewport is set as 1x1 and its scissor as empty (VkApplyScissors), as DXVK does.
+		static bool VkViewportEmpty(float width, float height) noexcept {
+			return !(width > 0.0f) || !(height > 0.0f);
+		}
+
+		static VkViewport VkFlippedViewportOrPlaceholder(float x, float y, float width, float height, float minDepth, float maxDepth) noexcept {
+			if (VkViewportEmpty(width, height)) {
+				return VkFlippedViewport(0.0f, 0.0f, 1.0f, 1.0f, minDepth, maxDepth);
+			}
+			return VkFlippedViewport(x, y, width, height, minDepth, maxDepth);
+		}
+
+		// A scissor rectangle Vulkan takes: no negative offset (the part outside the target is cut off, as D3D does) and
+		// offset plus extent within int32_t.
+		static VkRect2D VkClampScissor(int64_t x, int64_t y, int64_t width, int64_t height) noexcept {
+			const int64_t cutX = x < 0 ? -x : 0;
+			const int64_t cutY = y < 0 ? -y : 0;
+			const int64_t offsetX = (std::min)((std::max)(x, int64_t{ 0 }), int64_t{ INT32_MAX });
+			const int64_t offsetY = (std::min)((std::max)(y, int64_t{ 0 }), int64_t{ INT32_MAX });
+			VkRect2D rect{};
+			rect.offset = { static_cast<int32_t>(offsetX), static_cast<int32_t>(offsetY) };
+			rect.extent.width = static_cast<uint32_t>((std::clamp)(width - cutX, int64_t{ 0 }, int64_t{ INT32_MAX } - offsetX));
+			rect.extent.height = static_cast<uint32_t>((std::clamp)(height - cutY, int64_t{ 0 }, int64_t{ INT32_MAX } - offsetY));
+			return rect;
+		}
+
+		// Records scissors first..first+count-1 from the list's stored scissors, empty where the viewport is empty.
+		static void VkApplyScissors(VulkanCommandList& commandListState, uint32_t first, uint32_t count) noexcept {
+			std::array<VkRect2D, MAX_VIEWPORTS> native{};
+			for (uint32_t i = 0; i < count; ++i) {
+				const uint32_t index = first + i;
+				native[i] = (commandListState.emptyViewportMask & (1u << index)) != 0 ? VkRect2D{} : commandListState.scissors[index];
+			}
+			vkCmdSetScissor(commandListState.commandBuffer, first, count, native.data());
+		}
+
+		// Viewport 0 and scissor 0 as BeginPass and BeginSecondary set them: the render area.
+		static void VkSetRenderAreaViewport(VulkanCommandList& commandListState, uint32_t x, uint32_t y, uint32_t width, uint32_t height,
+			float minDepth, float maxDepth) noexcept {
+			const VkViewport viewport = VkFlippedViewportOrPlaceholder(static_cast<float>(x), static_cast<float>(y),
+				static_cast<float>(width), static_cast<float>(height), minDepth, maxDepth);
+			vkCmdSetViewport(commandListState.commandBuffer, 0, 1, &viewport);
+			if (VkViewportEmpty(static_cast<float>(width), static_cast<float>(height))) {
+				commandListState.emptyViewportMask |= 1u;
+			} else {
+				commandListState.emptyViewportMask &= ~1u;
+			}
+			commandListState.scissors[0] = VkClampScissor(x, y, width, height);
+			VkApplyScissors(commandListState, 0, 1);
 		}
 
 		// How many viewports and scissors a list may set: 1 without multiViewport.
@@ -5925,14 +5979,8 @@ namespace rhi {
 				return;  // only vkCmdExecuteCommands until the pass ends; each secondary sets its own viewport and scissor
 			}
 
-			const VkViewport viewport = VkFlippedViewport(static_cast<float>(passInfo.x), static_cast<float>(passInfo.y),
-				static_cast<float>(passInfo.width), static_cast<float>(passInfo.height), passInfo.minDepth, passInfo.maxDepth);
-			vkCmdSetViewport(commandListState->commandBuffer, 0, 1, &viewport);
-
-			VkRect2D scissor{};
-			scissor.offset = { static_cast<int32_t>(passInfo.x), static_cast<int32_t>(passInfo.y) };
-			scissor.extent = { passInfo.width, passInfo.height };
-			vkCmdSetScissor(commandListState->commandBuffer, 0, 1, &scissor);
+			VkSetRenderAreaViewport(*commandListState, passInfo.x, passInfo.y, passInfo.width, passInfo.height, passInfo.minDepth,
+				passInfo.maxDepth);
 		}
 
 		static void cl_endPass(CommandList* commandList) noexcept {
@@ -6399,11 +6447,23 @@ namespace rhi {
 				return;
 			}
 			std::array<VkViewport, MAX_VIEWPORTS> native{};
+			uint32_t emptyMask = 0;
 			for (uint32_t i = 0; i < viewports.size; ++i) {
 				const Viewport& v = viewports.data[i];
-				native[i] = VkFlippedViewport(v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth);
+				native[i] = VkFlippedViewportOrPlaceholder(v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth);
+				if (VkViewportEmpty(v.width, v.height)) {
+					emptyMask |= 1u << i;
+				}
 			}
 			vkCmdSetViewport(commandListState->commandBuffer, 0, viewports.size, native.data());
+
+			// Scissors whose viewport became empty, or has an area again, are recorded again.
+			const uint32_t setMask = viewports.size >= 32 ? ~0u : (1u << viewports.size) - 1u;
+			const uint32_t changed = (commandListState->emptyViewportMask ^ emptyMask) & setMask;
+			commandListState->emptyViewportMask = (commandListState->emptyViewportMask & ~setMask) | emptyMask;
+			if (changed != 0) {
+				VkApplyScissors(*commandListState, 0, viewports.size);
+			}
 		}
 
 		static void cl_setScissors(CommandList* commandList, Span<const ScissorRect> scissors) noexcept {
@@ -6417,17 +6477,11 @@ namespace rhi {
 				VkMarkCommandListError(commandListState, Result::Unsupported);
 				return;
 			}
-			std::array<VkRect2D, MAX_VIEWPORTS> native{};
 			for (uint32_t i = 0; i < scissors.size; ++i) {
 				const ScissorRect& s = scissors.data[i];
-				// Vulkan takes no negative offsets: cut the part outside the target off, as D3D does.
-				const int64_t cutX = s.x < 0 ? -static_cast<int64_t>(s.x) : 0;
-				const int64_t cutY = s.y < 0 ? -static_cast<int64_t>(s.y) : 0;
-				native[i].offset = { (std::max)(s.x, 0), (std::max)(s.y, 0) };
-				native[i].extent.width = static_cast<uint32_t>((std::max)(int64_t{ 0 }, static_cast<int64_t>(s.width) - cutX));
-				native[i].extent.height = static_cast<uint32_t>((std::max)(int64_t{ 0 }, static_cast<int64_t>(s.height) - cutY));
+				commandListState->scissors[i] = VkClampScissor(s.x, s.y, s.width, s.height);
 			}
-			vkCmdSetScissor(commandListState->commandBuffer, 0, scissors.size, native.data());
+			VkApplyScissors(*commandListState, 0, scissors.size);
 		}
 
 		static void cl_setBlendFactor(CommandList* commandList, const float rgba[4]) noexcept {
@@ -7992,10 +8046,8 @@ namespace rhi {
 			commandListState->passRenderArea.extent = { inheritance.width, inheritance.height };
 
 			// As BeginPass sets them: flipped, the viewport starting at the bottom of the render area.
-			const VkViewport viewport = VkFlippedViewport(static_cast<float>(inheritance.x), static_cast<float>(inheritance.y),
-				static_cast<float>(inheritance.width), static_cast<float>(inheritance.height), inheritance.minDepth, inheritance.maxDepth);
-			vkCmdSetViewport(commandListState->commandBuffer, 0, 1, &viewport);
-			vkCmdSetScissor(commandListState->commandBuffer, 0, 1, &commandListState->passRenderArea);
+			VkSetRenderAreaViewport(*commandListState, inheritance.x, inheritance.y, inheritance.width, inheritance.height,
+				inheritance.minDepth, inheritance.maxDepth);
 			return Result::Ok;
 		}
 

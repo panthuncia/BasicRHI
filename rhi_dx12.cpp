@@ -10474,8 +10474,10 @@ namespace rhi {
 			std::array<D3D12_RECT, MAX_VIEWPORTS> native{};
 			for (uint32_t i = 0; i < scissors.size; ++i) {
 				const ScissorRect& s = scissors.data[i];
+				// The right and bottom edges stop at INT32_MAX, as on Vulkan, rather than wrapping.
 				native[i] = { static_cast<LONG>(s.x), static_cast<LONG>(s.y),
-					static_cast<LONG>(static_cast<int64_t>(s.x) + s.width), static_cast<LONG>(static_cast<int64_t>(s.y) + s.height) };
+					static_cast<LONG>((std::min)(static_cast<int64_t>(s.x) + s.width, int64_t{ INT32_MAX })),
+					static_cast<LONG>((std::min)(static_cast<int64_t>(s.y) + s.height, int64_t{ INT32_MAX })) };
 			}
 			l->cl->RSSetScissorRects(scissors.size, native.data());
 		}

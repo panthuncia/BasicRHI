@@ -2070,14 +2070,18 @@ namespace rhi {
 
 	/**
 	 * @brief A viewport in D3D's convention on every backend: (x, y) is its top-left corner in pixels, y growing
-	 * downwards. The Vulkan backend flips it as BeginPass does, so callers never branch on the backend.
+	 * downwards. The Vulkan backend flips it as BeginPass does, so callers never branch on the backend. A viewport with
+	 * no width or no height draws nothing, as on D3D (Vulkan sets it as 1x1 with an empty scissor).
 	 */
 	struct Viewport {
 		float x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
 		float minDepth = 0.0f, maxDepth = 1.0f;
 	};
 
-	/** @brief A scissor rectangle in pixels, top-left origin as Viewport. Parts left of or above 0 are cut off. */
+	/**
+	 * @brief A scissor rectangle in pixels, top-left origin as Viewport. Parts left of or above 0 are cut off, and
+	 * parts past INT32_MAX too, so D3D's "no scissor" rectangles of huge extents are valid on Vulkan.
+	 */
 	struct ScissorRect {
 		int32_t x = 0, y = 0;
 		uint32_t width = 0, height = 0;
