@@ -9903,14 +9903,21 @@ namespace rhi {
 				RHI_FAIL(Result::Failed);
 			}
 
+			// UMA means video memory and system memory are the same pool. A discrete GPU with resizable BAR
+			// also has host-visible device-local types, so those do not make a device UMA.
 			bool hasDeviceLocalHeap = false;
-			bool hostVisibleDeviceLocal = false;
+			bool hasHostOnlyHeap = false;
 			bool hostCoherentDeviceLocal = false;
 			for (uint32_t heapIndex = 0; heapIndex < impl->memoryProperties.memoryHeapCount; ++heapIndex) {
 				if ((impl->memoryProperties.memoryHeaps[heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
 					hasDeviceLocalHeap = true;
+				} else {
+					hasHostOnlyHeap = true;
 				}
 			}
+			const VkPhysicalDeviceType deviceType = impl->physicalDeviceProperties.deviceType;
+			const bool uma = deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU
+				|| !hasHostOnlyHeap || !hasDeviceLocalHeap;
 
 			for (uint32_t typeIndex = 0; typeIndex < impl->memoryProperties.memoryTypeCount; ++typeIndex) {
 				const VkMemoryType& type = impl->memoryProperties.memoryTypes[typeIndex];
@@ -9924,9 +9931,6 @@ namespace rhi {
 					continue;
 				}
 
-				if ((type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
-					hostVisibleDeviceLocal = true;
-				}
 				if ((type.propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
 					== (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
 					hostCoherentDeviceLocal = true;
@@ -9959,8 +9963,8 @@ namespace rhi {
 					}
 
 					auto* out = reinterpret_cast<ArchitectureFeatureInfo*>(header);
-					out->uma = hostVisibleDeviceLocal || !hasDeviceLocalHeap;
-					out->cacheCoherentUMA = hostCoherentDeviceLocal;
+					out->uma = uma;
+					out->cacheCoherentUMA = uma && hostCoherentDeviceLocal;
 					out->isolatedMMU = false;
 					out->tileBasedRenderer = false;
 				} break;

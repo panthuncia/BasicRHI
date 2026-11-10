@@ -53,7 +53,10 @@ struct AdapterFeatureInfo {
 struct ArchitectureFeatureInfo {
     FeatureInfoHeader header{ FeatureInfoStructType::Architecture, nullptr, sizeof(ArchitectureFeatureInfo), 1 };
 
+    // Video memory and system memory are one pool (an integrated GPU). A discrete GPU with resizable BAR is not UMA,
+    // even though it has host-visible device-local memory.
     bool uma = false;
+    // UMA, and the CPU's caches are coherent with the GPU. Never true without uma.
     bool cacheCoherentUMA = false;
     bool isolatedMMU = false;
     bool tileBasedRenderer = false;

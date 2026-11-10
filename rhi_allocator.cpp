@@ -6276,8 +6276,8 @@ Synchronized internally with a mutex.
 
     UINT AllocatorPimpl::HeapPropertiesToMemorySegmentGroup(const HeapProperties& heapProps) const
     {
-        // System memory even where the device reports UMA: Vulkan reports it for any host-visible device-local type,
-        // which a discrete GPU with resizable BAR has.
+        // System memory is NonLocal even on a UMA device, so spilled and forced allocations stay apart from video
+        // memory in the budget and in owner reports.
         if (heapProps.type == HeapType::SystemMemory) {
             return static_cast<std::underlying_type_t<MemorySegmentGroup>>(MemorySegmentGroup::NonLocal);
         }
