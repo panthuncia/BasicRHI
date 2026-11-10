@@ -3065,6 +3065,8 @@ namespace rhi {
 					out->logicOp = opt0.OutputMergerLogicOp != 0;
 					out->depthClipDisable = true;  // core D3D12
 					out->maxViewports = MAX_VIEWPORTS;
+					if (h->structVersion >= 2)
+						out->secondaryViewportScissor = false;  // bundles cannot set them (RSSetViewports, RSSetScissorRects)
 				} break;
 				default:
 					// Unknown sType: ignore

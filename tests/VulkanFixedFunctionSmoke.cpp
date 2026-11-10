@@ -49,7 +49,7 @@ int main() {
 	rhi::Device& device = devicePtr.Get();
 
 	FixedFunctionFeatureInfo caps{};
-	if (!Check(device.QueryFeatureInfo(&caps.header), "QueryFeatureInfo") || caps.maxViewports < 1) {
+	if (!Check(device.QueryFeatureInfo(&caps.header), "QueryFeatureInfo") || caps.maxViewports < 1 || !caps.secondaryViewportScissor) {
 		std::fprintf(stderr, "FixedFunctionFeatureInfo: unexpected caps\n");
 		return 1;
 	}

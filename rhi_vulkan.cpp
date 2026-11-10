@@ -10373,6 +10373,8 @@ namespace rhi {
 					out->logicOp = impl->supportedFeatures.logicOp == VK_TRUE;
 					out->depthClipDisable = impl->supportedFeatures.depthClamp == VK_TRUE;
 					out->maxViewports = VMAX_VIEWPORTS(impl);
+					if (header->structVersion >= 2)
+						out->secondaryViewportScissor = true;  // dynamic state in any command buffer
 				} break;
 
 				default:

@@ -234,10 +234,13 @@ struct IndirectCommandsFeatureInfo {
 
 // Optional fixed-function pipeline and command list state (D3D11-style state that Vulkan gates behind features).
 struct FixedFunctionFeatureInfo {
-    FeatureInfoHeader header{ FeatureInfoStructType::FixedFunction, nullptr, sizeof(FixedFunctionFeatureInfo), 1 };
+    FeatureInfoHeader header{ FeatureInfoStructType::FixedFunction, nullptr, sizeof(FixedFunctionFeatureInfo), 2 };
 
     bool dualSourceBlend = false;  // BlendFactor::Src1* (Vulkan dualSrcBlend)
     bool logicOp = false;          // BlendState::logicOpEnable (D3D12 OutputMergerLogicOp, Vulkan logicOp)
     bool depthClipDisable = false; // RasterState::depthClip = false (Vulkan depthClamp)
     uint32_t maxViewports = 1;     // CommandList::SetViewports / SetScissors count (Vulkan multiViewport, at most 16)
+    // (structVersion 2) A secondary list may call SetViewports and SetScissors. Vulkan: true. D3D12: false (bundles inherit
+    // them). Without it, record a pass that needs its own viewports or scissors inline rather than in secondaries.
+    bool secondaryViewportScissor = false;
 };

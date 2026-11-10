@@ -3180,12 +3180,16 @@ namespace rhi {
 		 * @brief Sets viewports 0..n-1 (Viewport: D3D's convention on every backend). BeginPass and BeginSecondary set
 		 * viewport 0 to the render area; this replaces it for the draws after it, inside the pass. More than one needs
 		 * FixedFunctionFeatureInfo::maxViewports and pipelines with RasterState::viewportCount to match; more than the
-		 * device supports fails the list. D3D12 bundles cannot set viewports: in a secondary this is Vulkan only.
+		 * device supports fails the list. D3D12 bundles cannot set viewports: in a secondary this needs
+		 * FixedFunctionFeatureInfo::secondaryViewportScissor (Vulkan only), and fails the list without it.
 		 */
 		void SetViewports(Span<const Viewport> viewports) noexcept {
 			if (IsValid() && vt->abi_version >= 9 && vt->setViewports && viewports.size != 0) vt->setViewports(this, viewports);
 		}
-		/** @brief Sets scissors 0..n-1, as SetViewports sets viewports. Scissoring is always on, on both backends. */
+		/**
+		 * @brief Sets scissors 0..n-1, as SetViewports sets viewports. Scissoring is always on, on both backends. In a
+		 * secondary it needs FixedFunctionFeatureInfo::secondaryViewportScissor, as SetViewports.
+		 */
 		void SetScissors(Span<const ScissorRect> scissors) noexcept {
 			if (IsValid() && vt->abi_version >= 9 && vt->setScissors && scissors.size != 0) vt->setScissors(this, scissors);
 		}

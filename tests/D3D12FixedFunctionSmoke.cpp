@@ -86,7 +86,8 @@ int main() {
 	}
 
 	FixedFunctionFeatureInfo caps{};
-	if (!Check(device.QueryFeatureInfo(&caps.header), "QueryFeatureInfo") || caps.maxViewports < 1 || !caps.dualSourceBlend || !caps.depthClipDisable) {
+	if (!Check(device.QueryFeatureInfo(&caps.header), "QueryFeatureInfo") || caps.maxViewports < 1 || !caps.dualSourceBlend || !caps.depthClipDisable
+		|| caps.secondaryViewportScissor) {
 		std::fprintf(stderr, "FixedFunctionFeatureInfo: unexpected D3D12 caps\n");
 		return 1;
 	}
