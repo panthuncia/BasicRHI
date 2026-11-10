@@ -525,6 +525,9 @@ namespace rhi {
 		// scissor comes back once the viewport has an area again.
 		std::array<VkRect2D, MAX_VIEWPORTS> scissors{};
 		uint32_t emptyViewportMask = 0;
+		// Secondaries were executed inside this list's pass, where only vkCmdExecuteCommands may be recorded: EndPass binds
+		// the placeholder vertex and index buffers.
+		bool placeholderInputBindPending = false;
 		std::vector<ResourceHandle> passColorResources;
 		ResourceHandle passDepthResource{};
 		std::vector<RecordedBarrierBatch> recordedBarrierBatches;
@@ -764,6 +767,11 @@ namespace rhi {
 		// VK_EXT_memory_budget: per-heap budgets and usage for QueryVideoMemoryInfo and QueryMemoryHeapBudgets.
 		bool memoryBudgetEnabled = false;
 		VulkanCrashMarkers crashMarkers;
+		// A small vertex and index buffer that ExecuteCommands binds after secondaries (VkBindPlaceholderInputBuffers).
+		// Created at the first ExecuteCommands; never read.
+		std::once_flag placeholderInputBufferOnce;
+		VkBuffer placeholderInputBuffer = VK_NULL_HANDLE;
+		VkDeviceMemory placeholderInputMemory = VK_NULL_HANDLE;
 		PFN_vkCmdSetCheckpointNV setCheckpoint = nullptr;
 		void* checkpointUser = nullptr;
 		const void* (*registerCheckpoint)(void*, const char*) noexcept = nullptr;

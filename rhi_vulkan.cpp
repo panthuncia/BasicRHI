@@ -2644,6 +2644,70 @@ namespace rhi {
 			markers.enabled = false;
 		}
 
+		static void VkDestroyPlaceholderInputBuffer(VulkanDevice* impl) noexcept {
+			if (impl->device != VK_NULL_HANDLE && !impl->abandoned) {
+				if (impl->placeholderInputBuffer != VK_NULL_HANDLE) vkDestroyBuffer(impl->device, impl->placeholderInputBuffer, nullptr);
+				if (impl->placeholderInputMemory != VK_NULL_HANDLE) vkFreeMemory(impl->device, impl->placeholderInputMemory, nullptr);
+			}
+			impl->placeholderInputBuffer = VK_NULL_HANDLE;
+			impl->placeholderInputMemory = VK_NULL_HANDLE;
+		}
+
+		// The placeholder vertex and index buffer: 256 bytes of any memory, preferably device-local.
+		static void VkCreatePlaceholderInputBuffer(VulkanDevice* impl) noexcept {
+			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
+			VkBufferCreateInfo bufferInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			bufferInfo.size = 256;
+			bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+			bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			VkBuffer buffer = VK_NULL_HANDLE;
+			if (vkCreateBuffer(impl->device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+				spdlog::warn("Vulkan ExecuteCommands: could not create the placeholder input buffer");
+				return;
+			}
+			VkMemoryRequirements requirements{};
+			vkGetBufferMemoryRequirements(impl->device, buffer, &requirements);
+			uint32_t memoryTypeIndex = 0;
+			const bool found =
+				VkFindMemoryTypeIndex(impl->memoryProperties, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, memoryTypeIndex);
+			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+			allocateInfo.allocationSize = requirements.size;
+			allocateInfo.memoryTypeIndex = memoryTypeIndex;
+			VkDeviceMemory memory = VK_NULL_HANDLE;
+			if (!found || vkAllocateMemory(impl->device, &allocateInfo, nullptr, &memory) != VK_SUCCESS) {
+				spdlog::warn("Vulkan ExecuteCommands: could not allocate the placeholder input buffer");
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				return;
+			}
+			if (VkBindBufferMemorySynchronized(impl, buffer, memory, 0) != VK_SUCCESS) {
+				spdlog::warn("Vulkan ExecuteCommands: could not bind the placeholder input buffer");
+				vkFreeMemory(impl->device, memory, nullptr);
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				return;
+			}
+			VkSetObjectName(impl, reinterpret_cast<uint64_t>(buffer), VK_OBJECT_TYPE_BUFFER, "BasicRHI::PlaceholderInput");
+			impl->placeholderInputBuffer = buffer;
+			impl->placeholderInputMemory = memory;
+		}
+
+		// Binds the placeholder buffer as every vertex buffer and as the index buffer. Vulkan leaves a primary's bindings
+		// undefined after vkCmdExecuteCommands, but AMD's Windows driver keeps the ones from before it and drops a later bind
+		// of the same buffer as redundant, so the next draw reads what a secondary bound. Binding something else first makes
+		// the caller's next bind reach the driver.
+		static void VkBindPlaceholderInputBuffers(VulkanDevice* impl, VulkanCommandList& commandListState) noexcept {
+			std::call_once(impl->placeholderInputBufferOnce, [impl] { VkCreatePlaceholderInputBuffer(impl); });
+			if (impl->placeholderInputBuffer == VK_NULL_HANDLE) {
+				return;
+			}
+			constexpr uint32_t kMaxBindings = 32;  // D3D's vertex buffer slots
+			const uint32_t bindingCount = (std::min)(impl->physicalDeviceProperties.limits.maxVertexInputBindings, kMaxBindings);
+			std::array<VkBuffer, kMaxBindings> buffers{};
+			std::array<VkDeviceSize, kMaxBindings> offsets{};
+			buffers.fill(impl->placeholderInputBuffer);
+			vkCmdBindVertexBuffers(commandListState.commandBuffer, 0, bindingCount, buffers.data(), offsets.data());
+			vkCmdBindIndexBuffer(commandListState.commandBuffer, impl->placeholderInputBuffer, 0, VK_INDEX_TYPE_UINT32);
+		}
+
 		// The marker buffer: kSlots pairs of uint32 ids in host-visible, coherent memory, zeroed.
 		static bool VkCreateCrashMarkerBuffer(VulkanDevice* impl) noexcept {
 			VulkanCrashMarkers& markers = impl->crashMarkers;
@@ -5751,6 +5815,7 @@ namespace rhi {
 			commandListState->passRenderArea = {};
 			commandListState->scissors = {};
 			commandListState->emptyViewportMask = 0;
+			commandListState->placeholderInputBindPending = false;
 			commandListState->passColorResources.clear();
 			commandListState->passDepthResource = {};
 			commandListState->continuesRendering = false;
@@ -5995,6 +6060,10 @@ namespace rhi {
 			}
 
 			vkCmdEndRendering(commandListState->commandBuffer);
+			if (commandListState->placeholderInputBindPending) {
+				VkBindPlaceholderInputBuffers(impl, *commandListState);
+				commandListState->placeholderInputBindPending = false;
+			}
 
 			commandListState->passColorResources.clear();
 			commandListState->passDepthResource = {};
@@ -8067,6 +8136,7 @@ namespace rhi {
 			}
 			std::vector<VkCommandBuffer> commandBuffers;
 			commandBuffers.reserve(lists.size);
+			bool continuesOwnersRendering = false;
 			for (uint32_t index = 0; index < lists.size; ++index) {
 				const VulkanCommandList* secondaryState = lists.data[index] ? VkCommandListState(lists.data[index]) : nullptr;
 				if (!secondaryState || !secondaryState->secondary || secondaryState->isRecording || secondaryState->commandBuffer == VK_NULL_HANDLE ||
@@ -8083,6 +8153,7 @@ namespace rhi {
 					return;
 				}
 				commandBuffers.push_back(secondaryState->commandBuffer);
+				continuesOwnersRendering = continuesOwnersRendering || (!commandListState->passActive && secondaryState->continuesRendering);
 			}
 			vkCmdExecuteCommands(commandListState->commandBuffer, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
 			commandListState->boundPipeline = {};
@@ -8093,6 +8164,14 @@ namespace rhi {
 			commandListState->emittedSamplerHeap = {};
 			// Descriptor-buffer model: push constants are undefined too; the list's push data is recorded again before it is read.
 			commandListState->pushedDataDirty = commandListState->spilledDataDirty = VkDescriptorBufferModel(impl);
+			// Placeholder vertex and index buffers, so the caller's next binds reach the driver (VkBindPlaceholderInputBuffers).
+			// Inside the pass only vkCmdExecuteCommands may follow, so EndPass binds them. Secondaries that continue an adopted
+			// buffer's rendering ran inside its owner's pass, which this wrapper does not end: the owner binds its own.
+			if (commandListState->passActive) {
+				commandListState->placeholderInputBindPending = true;
+			} else if (!continuesOwnersRendering) {
+				VkBindPlaceholderInputBuffers(impl, *commandListState);
+			}
 		}
 
 		static void ca_reset(CommandAllocator* allocator) noexcept {
@@ -12702,6 +12781,7 @@ namespace rhi {
 			timelines.clear(); heaps.clear(); queryPools.clear(); allocators.clear(); queues.clear();
 			VkDestroyDescriptorBufferModel(this);
 			VkDestroyCrashMarkers(this);
+			VkDestroyPlaceholderInputBuffer(this);
 			device = VK_NULL_HANDLE;
 			instance = VK_NULL_HANDLE;
 			physicalDevice = VK_NULL_HANDLE;
@@ -12837,6 +12917,7 @@ namespace rhi {
 		// layout.
 		VkDestroyDescriptorBufferModel(this);
 		VkDestroyCrashMarkers(this);
+		VkDestroyPlaceholderInputBuffer(this);
 
 		if (device != VK_NULL_HANDLE) {
 			for (auto& slot : timelines.slots) {

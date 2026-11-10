@@ -3152,7 +3152,10 @@ namespace rhi {
 		 * @brief Executes ended secondary lists, in order: inside a pass begun with PassContents::SecondaryLists (Vulkan; on
 		 * D3D12 inside any pass, as ExecuteBundle), or outside any pass for those recorded without insideRendering. Everything the
 		 * executing list had bound - pipeline, heaps, push data, dynamic state - is undefined afterwards: rebind before recording
-		 * further work on it. A secondary cannot execute secondaries.
+		 * further work on it. A secondary cannot execute secondaries. Vulkan then binds a placeholder buffer as every vertex
+		 * buffer and as the index buffer (after EndPass when executed inside a pass), because some drivers keep the bindings from
+		 * before the secondaries and drop a rebind of the same buffer. Secondaries that continue the rendering of a buffer
+		 * wrapped with AdoptCommandBuffer run in its owner's pass, so binding after them is left to the owner.
 		 */
 		void ExecuteCommands(Span<CommandList* const> lists) noexcept {
 			if (SupportsSecondaryLists()) vt->executeCommands(this, lists);
