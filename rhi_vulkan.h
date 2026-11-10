@@ -791,10 +791,18 @@ namespace rhi {
 		// ShareVulkanDevice: a device BasicRHI created that a guest API also submits to. Queue access takes the submission hooks
 		// and whole-device waits become waits on BasicRHI's timelines, as on an adopted device; BasicRHI still destroys it.
 		bool sharedQueues = false;
-		void* submissionHookUser = nullptr;
-		void (*submissionLock)(void* user, VkQueue queue) = nullptr;
-		void (*submissionUnlock)(void* user, VkQueue queue) = nullptr;
-		VkResult (*submissionSubmit)(void* user, VkQueue queue, const VkSubmitInfo2& submitInfo) = nullptr;
+		// The queue hooks (vulkan::QueueSubmissionHooks), or null. A published set is never changed: ShareVulkanDevice
+		// publishes a new one while other threads may still be inside the old one's lock, so each access reads the pointer
+		// once, and every set ever published lives until the device is destroyed.
+		struct SubmissionHooks {
+			void* user = nullptr;
+			void (*lock)(void* user, VkQueue queue) = nullptr;
+			void (*unlock)(void* user, VkQueue queue) = nullptr;
+			VkResult (*submit)(void* user, VkQueue queue, const VkSubmitInfo2& submitInfo) = nullptr;
+		};
+		std::atomic<const SubmissionHooks*> submissionHooks{ nullptr };
+		std::mutex submissionHooksMutex;
+		std::vector<std::unique_ptr<const SubmissionHooks>> publishedSubmissionHooks;
 		std::vector<VkQueueFamilyProperties> queueFamilyProperties;
 		// AdoptVulkanDevice's spare queues (AdoptedVulkanDeviceInfo::spareQueues) not handed out, and the families of all of
 		// them, which Concurrent resources share with besides the primary queues'.

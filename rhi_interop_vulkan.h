@@ -172,6 +172,9 @@ namespace rhi::vulkan {
     /// device). From then on every queue access BasicRHI makes takes hooks.lock, submissions may be handed to hooks.submit,
     /// and whole-device waits (Device::WaitIdle, swapchain rebuilds, shutdown) wait for BasicRHI's own timelines instead of
     /// vkDeviceWaitIdle, which would need every queue externally synchronized. Call it before the first submission.
+    /// It may be called again, from any thread, to replace the hooks: queue accesses that start afterwards take the new
+    /// ones, and an access already inside the old lock unlocks with the old hooks. The old and new locks must therefore
+    /// guard the same queues (the same guest), or the switch must happen while BasicRHI makes no queue access.
     /// @param device A device from CreateVulkanDevice.
     /// @param hooks The guest's queue lock (both lock and unlock, or neither) and optional submission hand-off.
     /// @return InvalidArgument for another device or half a lock.

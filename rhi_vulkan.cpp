@@ -4039,14 +4039,35 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// Publishes a new set of queue hooks (VulkanDevice::submissionHooks). Accesses already inside the old set finish with
+		// it; the old set stays alive until the device is destroyed.
+		static bool VkPublishSubmissionHooks(VulkanDevice* impl, const vulkan::QueueSubmissionHooks& hooks) noexcept {
+			try {
+				auto published = std::make_unique<VulkanDevice::SubmissionHooks>();
+				published->user = hooks.user;
+				published->lock = hooks.lock;
+				published->unlock = hooks.unlock;
+				published->submit = hooks.submit;
+				const std::lock_guard lock(impl->submissionHooksMutex);
+				impl->publishedSubmissionHooks.push_back(std::move(published));
+				impl->submissionHooks.store(impl->publishedSubmissionHooks.back().get(), std::memory_order_release);
+				return true;
+			} catch (...) {
+				return false;
+			}
+		}
+
+		// Holds the queue hooks' lock. The hooks are read once, so the unlock always matches the lock even when
+		// ShareVulkanDevice publishes new hooks in between.
 		struct VkQueueAccessGuard {
-			VulkanDevice* impl;
+			const VulkanDevice::SubmissionHooks* hooks;
 			VkQueue queue;
-			VkQueueAccessGuard(VulkanDevice* device, VkQueue vkQueue) noexcept : impl(device), queue(vkQueue) {
-				if (impl && impl->submissionLock) impl->submissionLock(impl->submissionHookUser, queue);
+			VkQueueAccessGuard(VulkanDevice* device, VkQueue vkQueue) noexcept
+				: hooks(device ? device->submissionHooks.load(std::memory_order_acquire) : nullptr), queue(vkQueue) {
+				if (hooks && hooks->lock) hooks->lock(hooks->user, queue);
 			}
 			~VkQueueAccessGuard() {
-				if (impl && impl->submissionUnlock) impl->submissionUnlock(impl->submissionHookUser, queue);
+				if (hooks && hooks->unlock) hooks->unlock(hooks->user, queue);
 			}
 			VkQueueAccessGuard(const VkQueueAccessGuard&) = delete;
 			VkQueueAccessGuard& operator=(const VkQueueAccessGuard&) = delete;
@@ -5358,7 +5379,8 @@ namespace rhi {
 			submitInfo.pSignalSemaphores = signalSemaphores.empty() ? nullptr : signalSemaphores.data();
 
 			Result submitResult = Result::Ok;
-			if (impl->submissionSubmit) {
+			const VulkanDevice::SubmissionHooks* hooks = impl->submissionHooks.load(std::memory_order_acquire);
+			if (hooks && hooks->submit) {
 				// The adopting host orders the batch within its own queue stream.
 				std::vector<VkSemaphoreSubmitInfo> waitInfos(waitSemaphores.size(), { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO });
 				for (size_t index = 0; index < waitInfos.size(); ++index) {
@@ -5383,7 +5405,7 @@ namespace rhi {
 				submitInfo2.pCommandBufferInfos = commandBufferInfos.empty() ? nullptr : commandBufferInfos.data();
 				submitInfo2.signalSemaphoreInfoCount = static_cast<uint32_t>(signalInfos.size());
 				submitInfo2.pSignalSemaphoreInfos = signalInfos.empty() ? nullptr : signalInfos.data();
-				submitResult = ToRHI(impl->submissionSubmit(impl->submissionHookUser, queueState->queue, submitInfo2));
+				submitResult = ToRHI(hooks->submit(hooks->user, queueState->queue, submitInfo2));
 			}
 			else {
 				const VkQueueAccessGuard queueAccess(impl, queueState->queue);
@@ -15282,10 +15304,7 @@ namespace rhi {
 				impl->registerCheckpoint = info.diagnostics.registerMarker;
 				impl->detailedCheckpoints = info.diagnostics.detailedCommands;
 			}
-			impl->submissionHookUser = info.submissionHooks.user;
-			impl->submissionLock = info.submissionHooks.lock;
-			impl->submissionUnlock = info.submissionHooks.unlock;
-			impl->submissionSubmit = info.submissionHooks.submit;
+			VkPublishSubmissionHooks(impl, info.submissionHooks);
 			vkGetPhysicalDeviceProperties(info.physicalDevice, &impl->physicalDeviceProperties);
 			vkGetPhysicalDeviceMemoryProperties(info.physicalDevice, &impl->memoryProperties);
 			impl->supportedFeatures = coreFeatures;
@@ -15424,13 +15443,13 @@ namespace rhi {
 				// An adopted device has its host's hooks already.
 				RHI_FAIL(Result::InvalidArgument);
 			}
-			impl->submissionHookUser = hooks.user;
-			impl->submissionLock = hooks.lock;
-			impl->submissionUnlock = hooks.unlock;
-			impl->submissionSubmit = hooks.submit;
+			if (!VkPublishSubmissionHooks(impl, hooks)) {
+				RHI_FAIL(Result::OutOfMemory);
+			}
+			const bool again = impl->sharedQueues;
 			impl->sharedQueues = true;
-			spdlog::info("ShareVulkanDevice: '{}' is shared with a guest API (queue lock {}, submissions {})", impl->physicalDeviceProperties.deviceName,
-				hooks.lock ? "on" : "off", hooks.submit ? "handed to the host" : "direct");
+			spdlog::info("ShareVulkanDevice: '{}' is {} with a guest API (queue lock {}, submissions {})", impl->physicalDeviceProperties.deviceName,
+				again ? "shared again" : "shared", hooks.lock ? "on" : "off", hooks.submit ? "handed to the host" : "direct");
 			return Result::Ok;
 		}
 
