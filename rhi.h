@@ -3271,6 +3271,11 @@ namespace rhi {
 		inline uint32_t CurrentImageIndex() noexcept;
 		//inline ViewHandle RTV(uint32_t i) noexcept;
 		inline ResourceHandle Image(uint32_t i) noexcept;
+		/**
+		 * @brief Presents the current image and acquires the next one. Frame pacing differs by backend. Vulkan: Present
+		 * blocks until no more than SetMaximumFrameLatency presented frames are unfinished on the GPU. D3D12: Present does
+		 * not block for latency; pace with WaitForFrameLatency (or FrameLatencyWaitableObject) before each frame.
+		 */
 		inline Result Present(bool vsync) noexcept;
 		inline Result Present(bool vsync, const PresentSyncDesc& sync) noexcept;
 		inline Result ResizeBuffers(uint32_t bufferCount, uint32_t w, uint32_t h, Format newFmt, uint32_t flags) noexcept {
@@ -3304,8 +3309,8 @@ namespace rhi {
 		}
 
 		/// Limits how many presented frames may be outstanding; frames is at least 1. D3D12:
-		/// IDXGISwapChain2::SetMaximumFrameLatency. Vulkan: Present returns only once no more than this many presented
-		/// frames are unfinished on the GPU. The Vulkan default is 2.
+		/// IDXGISwapChain2::SetMaximumFrameLatency, which only WaitForFrameLatency enforces. Vulkan: Present returns only
+		/// once no more than this many presented frames are unfinished on the GPU. The Vulkan default is 2.
 		Result SetMaximumFrameLatency(uint32_t frames) noexcept {
 			return Has(vt->setMaximumFrameLatency) ? vt->setMaximumFrameLatency(this, frames) : Result::Unsupported;
 		}

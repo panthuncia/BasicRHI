@@ -395,6 +395,11 @@ target_compile_definitions(BasicRHI PUBLIC
 target_compile_definitions(BasicRHI PUBLIC NOMINMAX)
 
 if(BASICRHI_BUILD_TESTS)
+    # Registers the smokes with ctest when BasicRHI is the top-level project. A parent project calls enable_testing()
+    # itself, so nothing changes for one that includes BasicRHI.
+    if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+        enable_testing()
+    endif()
     if(BASICRHI_ENABLE_VULKAN)
         add_executable(BasicRHIVulkanSmoke tests/VulkanSmoke.cpp)
         set_target_properties(BasicRHIVulkanSmoke PROPERTIES OUTPUT_NAME "BasicRHIVulkanSmoke_v2")
