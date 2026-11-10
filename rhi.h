@@ -3899,11 +3899,13 @@ namespace rhi {
 		// Vulkan: a guest API that will share the device (DXVK, through vulkan::ShareVulkanDevice) adds what it needs. Each
 		// callback runs on the creating thread right before vkCreateInstance and vkCreateDevice, with the create info BasicRHI
 		// built (a VkInstanceCreateInfo* and a VkDeviceCreateInfo*). It may append extensions and queues and chain or OR feature
-		// structs; what it points to must live until CreateVulkanDevice returns. Null adds nothing.
+		// structs; what it points to must live until CreateVulkanDevice returns. It returns false to abort: CreateVulkanDevice
+		// then destroys what it created and returns Result::Failed. BasicRHI reads its extension flags and enabled features
+		// from the create infos the callbacks leave, so what a callback adds counts as enabled. Null adds nothing.
 		struct VulkanCreateHooks {
 			void* user = nullptr;
-			void (*instance)(void* user, void* vkInstanceCreateInfo) = nullptr;
-			void (*device)(void* user, void* vkInstance, void* vkPhysicalDevice, void* vkDeviceCreateInfo) = nullptr;
+			bool (*instance)(void* user, void* vkInstanceCreateInfo) = nullptr;
+			bool (*device)(void* user, void* vkInstance, void* vkPhysicalDevice, void* vkDeviceCreateInfo) = nullptr;
 		};
 		const VulkanCreateHooks* vulkanCreateHooks = nullptr;
 		// Vulkan: the binding models BasicRHI may pick from (vulkan::BindingModelBits). 0 allows every one.

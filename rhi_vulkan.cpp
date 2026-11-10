@@ -14028,7 +14028,47 @@ namespace rhi {
 	namespace vulkan {
 		namespace {
 			void VkParseEnabledFeatureChain(const void* chain, VkPhysicalDeviceFeatures& core, VkEnabledDeviceState& e) noexcept;
+			bool VkNameListContains(const char* const* names, uint32_t count, const char* name) noexcept;
 		}
+	}
+
+	// The present extensions as the final create infos enable them, after a create hook may have added or removed some.
+	// allowPresentId is what VkSelectPresentDeviceExtensions was given.
+	static void VkFinalizePresentExtensionState(VkPresentExtensionState& state, const VkInstanceCreateInfo& instanceInfo,
+		const VkDeviceCreateInfo& deviceInfo, bool allowPresentId) noexcept {
+		const auto instanceHas = [&](const char* name) {
+			return vulkan::VkNameListContains(instanceInfo.ppEnabledExtensionNames, instanceInfo.enabledExtensionCount, name);
+		};
+		const auto deviceHas = [&](const char* name) {
+			return vulkan::VkNameListContains(deviceInfo.ppEnabledExtensionNames, deviceInfo.enabledExtensionCount, name);
+		};
+		bool swapchainMaintenance1Feature = false;
+		bool presentIdFeature = false;
+		bool presentWaitFeature = false;
+		for (auto* node = static_cast<const VkBaseInStructure*>(deviceInfo.pNext); node; node = node->pNext) {
+			switch (node->sType) {
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT:
+				swapchainMaintenance1Feature |= reinterpret_cast<const VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT*>(node)->swapchainMaintenance1 == VK_TRUE;
+				break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR:
+				presentIdFeature |= reinterpret_cast<const VkPhysicalDevicePresentIdFeaturesKHR*>(node)->presentId == VK_TRUE;
+				break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR:
+				presentWaitFeature |= reinterpret_cast<const VkPhysicalDevicePresentWaitFeaturesKHR*>(node)->presentWait == VK_TRUE;
+				break;
+			default:
+				break;
+			}
+		}
+		state.swapchainColorSpace = instanceHas(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+		state.surfaceMaintenance1 = instanceHas(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)
+			&& (instanceHas(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME) || instanceHas(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME));
+		// Switchable modes are queried through surface_maintenance1, so the swapchain side is no use without it.
+		state.swapchainMaintenance1 = state.surfaceMaintenance1 && swapchainMaintenance1Feature
+			&& (deviceHas(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) || deviceHas(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME));
+		state.presentId = allowPresentId && presentIdFeature && deviceHas(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+		state.presentWait = state.presentId && presentWaitFeature && deviceHas(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+		state.hdrMetadata = deviceHas(VK_EXT_HDR_METADATA_EXTENSION_NAME);
 	}
 
 	rhi::Result CreateVulkanDevice(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer) noexcept {
@@ -14190,8 +14230,13 @@ namespace rhi {
 		}
 #endif
 
-		if (ci.vulkanCreateHooks && ci.vulkanCreateHooks->instance) {
-			ci.vulkanCreateHooks->instance(ci.vulkanCreateHooks->user, &instanceCreateInfo);
+		if (ci.vulkanCreateHooks && ci.vulkanCreateHooks->instance
+			&& !ci.vulkanCreateHooks->instance(ci.vulkanCreateHooks->user, &instanceCreateInfo)) {
+			spdlog::error("CreateVulkanDevice: the instance create hook failed");
+			if (streamlineInitialized) {
+				VkShutdownStreamline();
+			}
+			RHI_FAIL(Result::Failed);
 		}
 
 		VkInstance instance = VK_NULL_HANDLE;
@@ -14408,6 +14453,8 @@ namespace rhi {
 		}
 
 		const bool enableSwapchainExtension = VkHasDeviceExtension(physicalDevice, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+		// Not under Streamline: an interposer that drops the present ID leaves a present wait waiting forever.
+		const bool allowPresentId = !streamlineInitialized;
 		const bool hasMaintenance5Extension = VkHasDeviceExtension(physicalDevice, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 		const bool hasDescriptorHeapExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
 		const bool hasMeshShaderExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_MESH_SHADER_EXTENSION_NAME);
@@ -14464,7 +14511,7 @@ namespace rhi {
 		}
 		if (enableSwapchainExtension) {
 			enabledDeviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-			VkSelectPresentDeviceExtensions(physicalDevice, !streamlineInitialized, enabledDeviceExtensions, presentExtensions);
+			VkSelectPresentDeviceExtensions(physicalDevice, allowPresentId, enabledDeviceExtensions, presentExtensions);
 		}
 		if (hasMaintenance5Extension && (hasDescriptorHeapExtension || hasDeviceGeneratedCommandsExtension)) {
 			enabledDeviceExtensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
@@ -14857,9 +14904,25 @@ namespace rhi {
 		}
 		deviceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(enabledDeviceExtensions.size());
 		deviceCreateInfo.ppEnabledExtensionNames = enabledDeviceExtensions.empty() ? nullptr : enabledDeviceExtensions.data();
-		if (ci.vulkanCreateHooks && ci.vulkanCreateHooks->device) {
-			ci.vulkanCreateHooks->device(ci.vulkanCreateHooks->user, instance, physicalDevice, &deviceCreateInfo);
+		if (ci.vulkanCreateHooks && ci.vulkanCreateHooks->device
+			&& !ci.vulkanCreateHooks->device(ci.vulkanCreateHooks->user, instance, physicalDevice, &deviceCreateInfo)) {
+			spdlog::error("CreateVulkanDevice: the device create hook failed");
+			vkDestroyInstance(instance, nullptr);
+#if BASICRHI_ENABLE_STREAMLINE
+			if (streamlineInitialized) {
+				VkShutdownStreamline();
+			}
+#endif
+			RHI_FAIL(Result::Failed);
 		}
+		// Every extension flag below follows the final lists, which a hook may have changed.
+		const auto instanceExtensionEnabled = [&](const char* name) {
+			return vulkan::VkNameListContains(instanceCreateInfo.ppEnabledExtensionNames, instanceCreateInfo.enabledExtensionCount, name);
+		};
+		const auto deviceExtensionEnabled = [&](const char* name) {
+			return vulkan::VkNameListContains(deviceCreateInfo.ppEnabledExtensionNames, deviceCreateInfo.enabledExtensionCount, name);
+		};
+		VkFinalizePresentExtensionState(presentExtensions, instanceCreateInfo, deviceCreateInfo, allowPresentId);
 
 		VkDevice device = VK_NULL_HANDLE;
 		result = vkCreateDevice(physicalDevice, &deviceCreateInfo, nullptr, &device);
@@ -14917,9 +14980,7 @@ namespace rhi {
 		auto impl = std::make_shared<VulkanDevice>();
 		impl->selfWeak = impl;
 		impl->instance = instance;
-		impl->debugUtilsEnabled = std::any_of(enabledExtensions.begin(), enabledExtensions.end(), [](const char* name) {
-			return name && std::strcmp(name, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
-		});
+		impl->debugUtilsEnabled = instanceExtensionEnabled(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 		if (ci.enableDebug && vkCreateDebugUtilsMessengerEXT) {
 			VkDebugUtilsMessengerCreateInfoEXT debugInfo{ VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
 			debugInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
@@ -14974,21 +15035,21 @@ namespace rhi {
 #if defined(VK_NV_partitioned_acceleration_structure)
 			enabled.partitionedAccelerationStructure = enabledPartitionedAccelerationStructureFeatures;
 #endif
-			enabled.nvShaderSubgroupPartitioned = hasNvShaderSubgroupPartitionedExtension;
-			enabled.pipelineLibrary = hasPipelineLibraryExtension;
-			enabled.swapchain = enableSwapchainExtension;
-			enabled.externalMemoryWin32 = ci.enableExternalInterop && hasExternalMemoryWin32Extension;
-			enabled.externalSemaphoreWin32 = ci.enableExternalInterop && hasExternalSemaphoreWin32Extension;
-			enabled.maintenance5 = std::any_of(enabledDeviceExtensions.begin(), enabledDeviceExtensions.end(),
-				[](const char* a_name) { return std::strcmp(a_name, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0; });
-			enabled.memoryBudget = hasMemoryBudgetExtension;
+			enabled.nvShaderSubgroupPartitioned = deviceExtensionEnabled(VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
+			enabled.pipelineLibrary = deviceExtensionEnabled(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+			enabled.swapchain = deviceExtensionEnabled(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+#ifdef _WIN32
+			enabled.externalMemoryWin32 = deviceExtensionEnabled(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+			enabled.externalSemaphoreWin32 = deviceExtensionEnabled(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+#endif
+			enabled.maintenance5 = deviceExtensionEnabled(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+			enabled.memoryBudget = deviceExtensionEnabled(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			// A device hook (a guest API's needs) may enable more than BasicRHI asked for: the create info it left is what the
-			// device has, so its feature structs replace BasicRHI's own.
+			// device has, so its feature structs, core features included, replace BasicRHI's own.
 			if (ci.vulkanCreateHooks && ci.vulkanCreateHooks->device) {
-				VkPhysicalDeviceFeatures hookedCore{};
+				VkPhysicalDeviceFeatures hookedCore = deviceCreateInfo.pEnabledFeatures ? *deviceCreateInfo.pEnabledFeatures : VkPhysicalDeviceFeatures{};
 				vulkan::VkParseEnabledFeatureChain(deviceCreateInfo.pNext, hookedCore, enabled);
-				for (uint32_t index = 0; index < deviceCreateInfo.enabledExtensionCount; ++index)
-					enabled.maintenance5 |= std::strcmp(deviceCreateInfo.ppEnabledExtensionNames[index], VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0;
+				impl->supportedFeatures = hookedCore;
 			}
 			VkApplyEnabledDeviceState(impl.get(), enabled);
 		}
