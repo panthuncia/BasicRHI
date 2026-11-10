@@ -304,6 +304,11 @@ namespace rhi {
 		// The queue that presented last. The next acquire's wait goes on it, which orders the acquire before every later
 		// submission there.
 		QueueHandle presentQueue{};
+		// The timeline the acquire batch signals, at acquireValue for the current image (Swapchain::AcquirePoint): other
+		// queues wait on it. Created at the first acquire; none without timeline semaphores.
+		TimelineHandle acquireTimeline{};
+		bool hasAcquireTimeline = false;
+		uint64_t acquireValue = 0;
 		// Presented frames not yet known to have finished: each one's point on its queue's progress timeline.
 		struct PendingFrame {
 			TimelineHandle timeline{};

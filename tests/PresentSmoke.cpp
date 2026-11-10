@@ -108,6 +108,11 @@ namespace {
 		const rhi::CommandList lists[] = { frame.list.Get() };
 		rhi::SubmitDesc submit{};
 		submit.signals = { &signal, 1 };
+		// The image's acquire point: already ordered on the queue that presented last, but what work on another queue
+		// waits on. Waiting on it here checks that the point is valid.
+		if (const rhi::TimelinePoint acquired = c.swapchain.AcquirePoint(); acquired.value != 0) {
+			if (!Ok(c.queue.Wait(acquired), "Queue::Wait(AcquirePoint)")) return false;
+		}
 		if (!Ok(c.queue.Submit(lists, submit), "Queue::Submit")) return false;
 		frame.done = signal.value;
 

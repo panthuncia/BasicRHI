@@ -4167,9 +4167,42 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// The swapchain's acquire timeline (VulkanSwapchain::acquireTimeline), created at the first call. timelinesMutex must be
+		// held: creating it can move the timeline pool.
+		static VulkanTimeline* VkSwapchainAcquireTimeline(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			if (!impl->timelineSemaphoreEnabled) return nullptr;
+			if (swapchain.hasAcquireTimeline) return VkTimelineState(impl, swapchain.acquireTimeline);
+			VkSemaphoreTypeCreateInfo typeInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+			typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+			typeInfo.initialValue = 0;
+			VkSemaphoreCreateInfo createInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+			createInfo.pNext = &typeInfo;
+			VkSemaphore semaphore = VK_NULL_HANDLE;
+			if (vkCreateSemaphore(impl->device, &createInfo, nullptr, &semaphore) != VK_SUCCESS) return nullptr;
+			VkSetObjectName(impl, reinterpret_cast<uint64_t>(semaphore), VK_OBJECT_TYPE_SEMAPHORE, "BasicRHI.SwapchainAcquire");
+			swapchain.acquireTimeline = impl->timelines.alloc(VulkanTimeline{ semaphore, 0 });
+			swapchain.hasAcquireTimeline = true;
+			swapchain.acquireValue = 0;
+			return VkTimelineState(impl, swapchain.acquireTimeline);
+		}
+
+		// Destroys the acquire timeline. The device must be idle.
+		static void VkReleaseSwapchainAcquireTimeline(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			const std::lock_guard timelineLock(impl->timelinesMutex);
+			if (!swapchain.hasAcquireTimeline) return;
+			if (VulkanTimeline* timeline = VkTimelineState(impl, swapchain.acquireTimeline); timeline && timeline->semaphore != VK_NULL_HANDLE) {
+				vkDestroySemaphore(impl->device, timeline->semaphore, nullptr);
+			}
+			impl->timelines.free(swapchain.acquireTimeline);
+			swapchain.acquireTimeline = {};
+			swapchain.hasAcquireTimeline = false;
+			swapchain.acquireValue = 0;
+		}
+
 		// Acquires the next image. The acquire semaphore is waited on the GPU, in a batch on the queue that presented last:
 		// a semaphore wait made by vkQueueSubmit orders every later submission on that queue, so the host does not wait.
-		// The batch also moves an image used for the first time to PRESENT_SRC.
+		// The batch also moves an image used for the first time to PRESENT_SRC, and signals the acquire timeline, which
+		// work on other queues waits on (Swapchain::AcquirePoint).
 		static Result VkAcquireNextSwapchainImage(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
 			if (!impl || impl->device == VK_NULL_HANDLE || swapchain.swapchain == VK_NULL_HANDLE || swapchain.acquireSemaphores.empty()) {
 				RHI_FAIL(Result::InvalidArgument);
@@ -4222,8 +4255,28 @@ namespace rhi {
 			{
 				// timelinesMutex serializes BasicRHI's submissions to a queue (q_submit holds it too).
 				const std::lock_guard timelineLock(impl->timelinesMutex);
-				const VkQueueAccessGuard queueAccess(impl, queueState->queue);
-				submitResult = vkQueueSubmit(queueState->queue, 1, &acquireSubmit, swapchain.acquireFences[slot]);
+				// The timeline arrays cover the binary acquire semaphore too (its value is ignored).
+				VulkanTimeline* acquireTimeline = VkSwapchainAcquireTimeline(impl, swapchain);
+				const uint64_t acquireWaitValue = 0;
+				const uint64_t acquireSignalValue = swapchain.acquireValue + 1;
+				VkTimelineSemaphoreSubmitInfo timelineInfo{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+				timelineInfo.waitSemaphoreValueCount = 1;
+				timelineInfo.pWaitSemaphoreValues = &acquireWaitValue;
+				timelineInfo.signalSemaphoreValueCount = 1;
+				timelineInfo.pSignalSemaphoreValues = &acquireSignalValue;
+				if (acquireTimeline) {
+					acquireSubmit.pNext = &timelineInfo;
+					acquireSubmit.signalSemaphoreCount = 1;
+					acquireSubmit.pSignalSemaphores = &acquireTimeline->semaphore;
+				}
+				{
+					const VkQueueAccessGuard queueAccess(impl, queueState->queue);
+					submitResult = vkQueueSubmit(queueState->queue, 1, &acquireSubmit, swapchain.acquireFences[slot]);
+				}
+				if (submitResult == VK_SUCCESS && acquireTimeline) {
+					swapchain.acquireValue = acquireSignalValue;
+					acquireTimeline->lastSubmittedSignalValue = acquireSignalValue;
+				}
 			}
 			if (submitResult != VK_SUCCESS) {
 				return ToRHI(submitResult);
@@ -8489,6 +8542,14 @@ namespace rhi {
 			return swapchainState ? swapchainState->presentCount : 0;
 		}
 
+		static TimelinePoint sc_acquirePoint(Swapchain* swapchain) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			const VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState || !swapchainState->hasAcquireTimeline) return {};
+			const std::lock_guard timelineLock(impl->timelinesMutex);
+			return TimelinePoint{ swapchainState->acquireTimeline, swapchainState->acquireValue };
+		}
+
 		static Result sc_waitForPresent(Swapchain* swapchain, uint64_t presentId, uint64_t timeoutNs) noexcept {
 			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
 			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
@@ -9859,6 +9920,7 @@ namespace rhi {
 				VkReleaseSwapchainImageHandles(impl, *swapchainState);
 				VkReleaseSwapchainPresentSemaphores(impl, *swapchainState);
 				VkReleaseSwapchainAcquireSlots(impl, *swapchainState);
+				VkReleaseSwapchainAcquireTimeline(impl, *swapchainState);
 				if (swapchainState->swapchain != VK_NULL_HANDLE) {
 					VkDestroySwapchainKHRHooked(impl->device, swapchainState->swapchain, nullptr);
 					swapchainState->swapchain = VK_NULL_HANDLE;
@@ -13165,7 +13227,7 @@ namespace rhi {
 		&sc_present,
 		&sc_resizeBuffers,
 		&sc_setName,
-		2u,
+		3u,
 		&sc_caps,
 		&sc_isColorSpaceSupported,
 		&sc_setColorSpace,
@@ -13175,7 +13237,8 @@ namespace rhi {
 		&sc_waitForFrameLatency,
 		&sc_frameLatencyWaitableObject,
 		&sc_presentCount,
-		&sc_waitForPresent
+		&sc_waitForPresent,
+		&sc_acquirePoint
 	};
 
 	const ResourceVTable g_vkbuf_rvt = {

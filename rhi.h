@@ -2826,7 +2826,7 @@ namespace rhi {
 
 	// What a present waits for: the queue that produced the frame and the timeline point its last submission signals. The
 	// wait runs on the GPU. The present goes out on that queue, and the next image's acquire is ordered before later work
-	// on it.
+	// on it. Work on any other queue that touches the next back buffer waits on Swapchain::AcquirePoint() first.
 	struct PresentSyncDesc {
 		Queue queue;
 		TimelinePoint wait{};
@@ -3246,6 +3246,8 @@ namespace rhi {
 		void* (*frameLatencyWaitableObject)(Swapchain*) noexcept = nullptr;
 		uint64_t(*presentCount)(Swapchain*) noexcept = nullptr;
 		Result(*waitForPresent)(Swapchain*, uint64_t presentId, uint64_t timeoutNs) noexcept = nullptr;
+		// abi_version 3.
+		TimelinePoint(*acquirePoint)(Swapchain*) noexcept = nullptr;
 	};
 
 	class Swapchain {
@@ -3324,6 +3326,17 @@ namespace rhi {
 		/// passes first, and Unsupported without present wait.
 		Result WaitForPresent(uint64_t presentId, uint64_t timeoutNs = UINT64_MAX) noexcept {
 			return Has(vt->waitForPresent) ? vt->waitForPresent(this, presentId, timeoutNs) : Result::Unsupported;
+		}
+
+		/**
+		 * @brief The timeline point reached once the current image (CurrentImageIndex) is acquired: Queue::Wait on it
+		 * before the first work that touches the image on a queue other than the one that presented last. That queue is
+		 * ordered already. Read it again after every Present, ResizeBuffers and SetColorSpace. Vulkan: the acquire's wait
+		 * batch signals it. D3D12: value 0 (nothing to wait on); DXGI orders the back buffer on the swapchain's queue, so
+		 * work on another queue waits on that queue instead.
+		 */
+		TimelinePoint AcquirePoint() noexcept {
+			return vt->abi_version >= 3 && vt->acquirePoint ? vt->acquirePoint(this) : TimelinePoint{};
 		}
 	private:
 		// A version 2 entry the backend filled in.

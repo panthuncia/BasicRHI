@@ -10244,6 +10244,11 @@ namespace rhi {
 		static Result sc_waitForPresent(Swapchain*, uint64_t, uint64_t) noexcept {
 			return Result::Unsupported;
 		}
+
+		// DXGI orders the back buffer on the swapchain's queue: there is no acquire to wait on.
+		static TimelinePoint sc_acquirePoint(Swapchain*) noexcept {
+			return {};
+		}
 		// ---------------- Resource vtable funcs ----------------
 
 		static void buf_map(Resource* r, void** data, uint64_t offset, uint64_t size) noexcept {
@@ -11216,7 +11221,7 @@ namespace rhi {
 		&sc_present,
 		&sc_resizeBuffers,
 		&sc_setName,
-		2u,
+		3u,
 		&sc_caps,
 		&sc_isColorSpaceSupported,
 		&sc_setColorSpace,
@@ -11226,7 +11231,8 @@ namespace rhi {
 		&sc_waitForFrameLatency,
 		&sc_frameLatencyWaitableObject,
 		&sc_presentCount,
-		&sc_waitForPresent };
+		&sc_waitForPresent,
+		&sc_acquirePoint };
 	const ResourceVTable g_buf_rvt = {
 		&buf_map,
 		&buf_unmap,
