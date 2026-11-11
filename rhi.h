@@ -505,6 +505,8 @@ namespace rhi {
 		// Four bytes whose fourth is unused (appended): sampled with alpha one, as in DXGI. The Vulkan backend views them as
 		// B8G8R8A8 with the alpha swizzled to one.
 		B8G8R8X8_Typeless, B8G8R8X8_UNorm, B8G8R8X8_UNorm_sRGB,
+		// One byte of alpha (appended): DXGI's A8_UNORM, Vulkan's VK_FORMAT_A8_UNORM_KHR (VK_KHR_maintenance5).
+		A8_UNorm,
 	};
 
 	constexpr uint32_t FormatByteSize(Format f) noexcept {
@@ -566,7 +568,7 @@ namespace rhi {
 			// 1 byte
 		case Format::R8_Typeless:  case Format::R8_UNorm:
 		case Format::R8_UInt:      case Format::R8_SNorm:
-		case Format::R8_SInt:                                                      return 1;
+		case Format::R8_SInt:  case Format::A8_UNorm:                             return 1;
 
 			// Block-compressed formats: return 0 here (use GetBlockInfo for textures)
 		case Format::BC1_Typeless: case Format::BC1_UNorm: case Format::BC1_UNorm_sRGB:

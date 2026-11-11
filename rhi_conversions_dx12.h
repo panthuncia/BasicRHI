@@ -178,6 +178,7 @@ namespace rhi {
 		case Format::R16_SInt: return DXGI_FORMAT_R16_SINT;
 		case Format::R8_Typeless: return DXGI_FORMAT_R8_TYPELESS;
 		case Format::R8_UNorm: return DXGI_FORMAT_R8_UNORM;
+		case Format::A8_UNorm: return DXGI_FORMAT_A8_UNORM;
 		case Format::R8_UInt: return DXGI_FORMAT_R8_UINT;
 		case Format::R8_SNorm: return DXGI_FORMAT_R8_SNORM;
 		case Format::R8_SInt: return DXGI_FORMAT_R8_SINT;

@@ -760,6 +760,8 @@ namespace rhi {
 				return VK_FORMAT_R8G8_SINT;
 			case Format::R8_UNorm:
 				return VK_FORMAT_R8_UNORM;
+			case Format::A8_UNorm:
+				return VK_FORMAT_A8_UNORM_KHR;
 			case Format::R8_UInt:
 				return VK_FORMAT_R8_UINT;
 			case Format::R8_SNorm:
@@ -911,6 +913,8 @@ namespace rhi {
 				return Format::R8G8_SInt;
 			case VK_FORMAT_R8_UNORM:
 				return Format::R8_UNorm;
+			case VK_FORMAT_A8_UNORM_KHR:
+				return Format::A8_UNorm;
 			case VK_FORMAT_R8_UINT:
 				return Format::R8_UInt;
 			case VK_FORMAT_R8_SNORM:

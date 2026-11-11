@@ -591,7 +591,7 @@ namespace rhi::ma {
         case Format::R8_UInt:
         case Format::R8_SNorm:
         case Format::R8_SInt:
-            //case Format::A8_UNorm: // TODO
+        case Format::A8_UNorm:
             return 8;
         case Format::BC1_Typeless:
         case Format::BC1_UNorm:
