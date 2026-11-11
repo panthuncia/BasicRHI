@@ -15346,7 +15346,9 @@ namespace rhi {
 			enabled.externalSemaphoreWin32 = hasExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
 			enabled.maintenance5 = hasExtension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 #endif
-			enabled.memoryBudget = hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+			// VK_EXT_memory_budget only adds a query struct and has no device commands. Hosts such as DXVK read it without enabling it,
+			// so an adopted device may read it whenever the physical device has it.
+			enabled.memoryBudget = hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) || VkHasDeviceExtension(info.physicalDevice, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 
 			auto impl = std::make_shared<VulkanDevice>();
 			impl->selfWeak = impl;
