@@ -7965,7 +7965,11 @@ namespace rhi {
 			if (!commandListState || !queryPoolState || index >= queryPoolState->count || queryPoolState->type == QueryType::Timestamp) {
 				return;
 			}
-			vkCmdBeginQuery(commandListState->commandBuffer, queryPoolState->pool, index, 0);
+			// An occlusion query counts samples exactly, as D3D12's OCCLUSION and D3D11's do, when the device enabled
+			// occlusionQueryPrecise. Without it the count is only zero or not zero.
+			const VkQueryControlFlags flags = queryPoolState->type == QueryType::Occlusion && impl->supportedFeatures.occlusionQueryPrecise == VK_TRUE ?
+				VK_QUERY_CONTROL_PRECISE_BIT : 0;
+			vkCmdBeginQuery(commandListState->commandBuffer, queryPoolState->pool, index, flags);
 		}
 
 		static void cl_endQuery(CommandList* commandList, QueryPoolHandle queryPool, uint32_t index) noexcept {
@@ -8011,6 +8015,12 @@ namespace rhi {
 				return;
 			}
 			if (!VkLeavePass(commandList, *commandListState)) {
+				return;
+			}
+			// Occlusion queries are begun on graphics lists only, so their reset is a command: it runs again each time a kept
+			// recording is submitted, before the queries it begins. A host reset runs once, at record time.
+			if (queryPoolState->type == QueryType::Occlusion) {
+				vkCmdResetQueryPool(commandListState->commandBuffer, queryPoolState->pool, firstQuery, queryCount);
 				return;
 			}
 			{
