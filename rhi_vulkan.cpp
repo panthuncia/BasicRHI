@@ -819,18 +819,51 @@ namespace rhi {
 			}
 		}
 
-		// Whether VK_FORMAT_D24_UNORM_S8_UINT is no depth attachment on the device (AMD's), so that the D24 family is D32_SFLOAT_S8_UINT
-		// there, as DXVK maps it (VulkanDevice::d24Fallback).
-		static bool VkD24Fallback(VkPhysicalDevice physicalDevice) noexcept {
+		// Whether the device has every one of a_features for a_format, in linear or optimal tiling (DXVK's CheckImageFormatSupport).
+		static bool VkHasFormatFeatures(VkPhysicalDevice physicalDevice, VkFormat a_format, VkFormatFeatureFlags a_features) noexcept {
 			VkFormatProperties properties{};
-			vkGetPhysicalDeviceFormatProperties(physicalDevice, VK_FORMAT_D24_UNORM_S8_UINT, &properties);
-			return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0;
+			vkGetPhysicalDeviceFormatProperties(physicalDevice, a_format, &properties);
+			return (properties.optimalTilingFeatures & a_features) == a_features || (properties.linearTilingFeatures & a_features) == a_features;
 		}
 
-		// The device's format for an image, view or attachment: the D24 family as D32_SFLOAT_S8_UINT where D24S8 is no attachment.
+		// The formats the device stores in another (VulkanDevice::formatRemaps), by the rules of DXVK's format table, so that an image
+		// both make agrees: D24S8 as D32S8 where it is no depth attachment (AMD); A8 as R8, its red read as alpha, where A8 cannot be
+		// sampled, stored and rendered to, or VK_KHR_maintenance5 (which adds the format) is off.
+		static std::vector<VulkanDevice::FormatRemap> VkFormatRemapsFor(VkPhysicalDevice physicalDevice, bool a_maintenance5) {
+			std::vector<VulkanDevice::FormatRemap> remaps;
+			constexpr VkComponentMapping identity{};
+			if (!VkHasFormatFeatures(physicalDevice, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+				remaps.push_back({ VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT, identity });
+			}
+			if (!a_maintenance5 || !VkHasFormatFeatures(physicalDevice, VK_FORMAT_A8_UNORM_KHR,
+				VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
+				remaps.push_back({ VK_FORMAT_A8_UNORM_KHR, VK_FORMAT_R8_UNORM,
+					{ VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R } });
+			}
+			for (const auto& remap : remaps) {
+				spdlog::info("Vulkan: format {} is stored as {}", static_cast<int>(remap.from), static_cast<int>(remap.to));
+			}
+			return remaps;
+		}
+
+		// The device's remap of a Vulkan format, or null when it is stored as itself.
+		static const VulkanDevice::FormatRemap* VkFindFormatRemap(const VulkanDevice* impl, VkFormat a_format) noexcept {
+			if (!impl) {
+				return nullptr;
+			}
+			for (const auto& remap : impl->formatRemaps) {
+				if (remap.from == a_format) {
+					return &remap;
+				}
+			}
+			return nullptr;
+		}
+
+		// The device's format for an image, view or attachment: the format, or the one the device stores it in (formatRemaps).
 		static VkFormat ToVkFormat(const VulkanDevice* impl, Format format) noexcept {
 			const VkFormat converted = ToVkFormat(format);
-			return impl && impl->d24Fallback && converted == VK_FORMAT_D24_UNORM_S8_UINT ? VK_FORMAT_D32_SFLOAT_S8_UINT : converted;
+			const auto* remap = VkFindFormatRemap(impl, converted);
+			return remap ? remap->to : converted;
 		}
 
 		static Format FromVkFormat(VkFormat format) noexcept {
@@ -2077,13 +2110,46 @@ namespace rhi {
 			return { component(0), component(1), component(2), component(3) };
 		}
 
-		// A shader resource view's swizzle: its mapping, with alpha one for a format whose fourth byte is unused (B8G8R8X8, viewed
-		// as B8G8R8A8), as DXGI samples it. a_viewed is the view's format, or the resource's when the view names none.
-		static VkComponentMapping VkSrvComponentMapping(ComponentMapping mapping, Format a_viewed) noexcept {
-			VkComponentMapping components = VkComponentMappingForRHI(mapping);
-			if (a_viewed == Format::B8G8R8X8_UNorm || a_viewed == Format::B8G8R8X8_UNorm_sRGB || a_viewed == Format::B8G8R8X8_Typeless)
-				components.a = VK_COMPONENT_SWIZZLE_ONE;
-			return components;
+		// The swizzle that makes a format's channels from the ones it is stored in: alpha one for a format whose fourth byte is unused
+		// (B8G8R8X8, stored as B8G8R8A8), as DXGI samples it, or the device's remap (formatRemaps: A8 stored as R8). Identity otherwise.
+		static VkComponentMapping VkFormatSwizzle(const VulkanDevice* impl, Format a_format) noexcept {
+			if (a_format == Format::B8G8R8X8_UNorm || a_format == Format::B8G8R8X8_UNorm_sRGB || a_format == Format::B8G8R8X8_Typeless) {
+				return { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_ONE };
+			}
+			const auto* remap = VkFindFormatRemap(impl, ToVkFormat(a_format));
+			return remap ? remap->swizzle : VkComponentMapping{};
+		}
+
+		// Whether a swizzle moves a stored channel to another component (A8 stored as R8 does; B8G8R8X8's constant alpha does not).
+		// A view that cannot swizzle (storage, attachment) would write the wrong channel of such a format.
+		static bool VkSwizzleMovesChannels(const VkComponentMapping& a_swizzle) noexcept {
+			auto moves = [](VkComponentSwizzle a_source, VkComponentSwizzle a_own) {
+				return a_source != VK_COMPONENT_SWIZZLE_IDENTITY && a_source != a_own && a_source != VK_COMPONENT_SWIZZLE_ZERO &&
+					a_source != VK_COMPONENT_SWIZZLE_ONE;
+			};
+			return moves(a_swizzle.r, VK_COMPONENT_SWIZZLE_R) || moves(a_swizzle.g, VK_COMPONENT_SWIZZLE_G) ||
+				moves(a_swizzle.b, VK_COMPONENT_SWIZZLE_B) || moves(a_swizzle.a, VK_COMPONENT_SWIZZLE_A);
+		}
+
+		// A shader resource view's swizzle: its mapping selects from the viewed format's channels, and the format's swizzle
+		// (VkFormatSwizzle) makes those from the stored ones. a_viewed is the view's format, or the resource's when the view names none.
+		static VkComponentMapping VkSrvComponentMapping(const VulkanDevice* impl, ComponentMapping mapping, Format a_viewed) noexcept {
+			const VkComponentMapping view = VkComponentMappingForRHI(mapping);
+			const VkComponentMapping format = VkFormatSwizzle(impl, a_viewed);
+			auto compose = [&](VkComponentSwizzle a_source, VkComponentSwizzle a_own) {
+				const VkComponentSwizzle channel = a_source == VK_COMPONENT_SWIZZLE_IDENTITY ? a_own : a_source;
+				VkComponentSwizzle stored = VK_COMPONENT_SWIZZLE_IDENTITY;
+				switch (channel) {
+				case VK_COMPONENT_SWIZZLE_R: stored = format.r; break;
+				case VK_COMPONENT_SWIZZLE_G: stored = format.g; break;
+				case VK_COMPONENT_SWIZZLE_B: stored = format.b; break;
+				case VK_COMPONENT_SWIZZLE_A: stored = format.a; break;
+				default: return channel;  // a constant
+				}
+				return stored == VK_COMPONENT_SWIZZLE_IDENTITY ? channel : stored;
+			};
+			return { compose(view.r, VK_COMPONENT_SWIZZLE_R), compose(view.g, VK_COMPONENT_SWIZZLE_G), compose(view.b, VK_COMPONENT_SWIZZLE_B),
+				compose(view.a, VK_COMPONENT_SWIZZLE_A) };
 		}
 
 
@@ -8828,6 +8894,62 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// A swizzle in SrvDesc::componentMapping's encoding (VkComponentMappingForRHI's inverse); 0 for identity.
+		static ComponentMapping VkEncodeComponentMapping(const VkComponentMapping& a_mapping) noexcept {
+			auto source = [](VkComponentSwizzle a_swizzle, uint32_t a_own) -> uint32_t {
+				switch (a_swizzle) {
+				case VK_COMPONENT_SWIZZLE_R: return 0;
+				case VK_COMPONENT_SWIZZLE_G: return 1;
+				case VK_COMPONENT_SWIZZLE_B: return 2;
+				case VK_COMPONENT_SWIZZLE_A: return 3;
+				case VK_COMPONENT_SWIZZLE_ZERO: return 4;
+				case VK_COMPONENT_SWIZZLE_ONE: return 5;
+				default: return a_own;
+				}
+			};
+			const uint32_t r = source(a_mapping.r, 0), g = source(a_mapping.g, 1), b = source(a_mapping.b, 2), a = source(a_mapping.a, 3);
+			if (r == 0 && g == 1 && b == 2 && a == 3) {
+				return 0;
+			}
+			return r | (g << 3) | (b << 6) | (a << 9) | (1u << 12);
+		}
+
+		static Result d_queryFormatSupport(const Device* device, Format format, FormatSupport& out) noexcept {
+			const auto* impl = device ? static_cast<const VulkanDevice*>(device->impl) : nullptr;
+			out = {};
+			if (!impl || impl->physicalDevice == VK_NULL_HANDLE) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			const VkFormat stored = ToVkFormat(impl, format);
+			if (stored == VK_FORMAT_UNDEFINED) {
+				return Result::Ok;
+			}
+			const VkComponentMapping swizzle = VkFormatSwizzle(impl, format);
+			const bool moved = VkSwizzleMovesChannels(swizzle);
+			VkFormatProperties properties{};
+			vkGetPhysicalDeviceFormatProperties(impl->physicalDevice, stored, &properties);
+			const VkFormatFeatureFlags features = properties.optimalTilingFeatures;
+			uint32_t usage = FU_None;
+			if (features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) {
+				usage |= FU_ShaderResource;
+			}
+			// Storage and attachment views cannot swizzle (d_createUnorderedAccessView, d_createRenderTargetView).
+			if ((features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && !moved) {
+				usage |= FU_UnorderedAccess;
+			}
+			if ((features & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) && !moved) {
+				usage |= FU_RenderTarget;
+			}
+			if (features & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+				usage |= FU_DepthStencil;
+			}
+			out.usage = usage;
+			out.storedAs = stored != ToVkFormat(format) ? FromVkFormat(stored) : Format::Unknown;
+			out.srvSwizzle = VkEncodeComponentMapping(swizzle);
+			out.backendFormat = static_cast<uint32_t>(stored);
+			return Result::Ok;
+		}
+
 		// Creates one pipeline through the open pipeline cache, if any, and counts the hit or miss. `create` makes the
 		// vkCreate*Pipelines call with the cache it is given.
 		template<class CreateInfo, class CreateFn>
@@ -11303,7 +11425,7 @@ namespace rhi {
 				viewCreateInfo.image = resourceState->image;
 				viewCreateInfo.viewType = viewType;
 				viewCreateInfo.format = viewFormat;
-				viewCreateInfo.components = VkSrvComponentMapping(desc.componentMapping, desc.formatOverride);
+				viewCreateInfo.components = VkSrvComponentMapping(impl, desc.componentMapping, desc.formatOverride != Format::Unknown ? desc.formatOverride : resourceState->rhiFormat);
 				viewCreateInfo.subresourceRange = subresourceRange;
 				return VkCreateBufferModelImageSlot(impl, slot, resource, *resourceState, viewCreateInfo, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
 					resourceState->generalLayoutOnly ? VK_IMAGE_LAYOUT_GENERAL : VkToImageLayout(ResourceLayout::ShaderResource, aspectMask));
@@ -11320,7 +11442,7 @@ namespace rhi {
 				viewCreateInfo.image = resourceState->image;
 				viewCreateInfo.viewType = viewType;
 				viewCreateInfo.format = viewFormat;
-				viewCreateInfo.components = VkSrvComponentMapping(desc.componentMapping, desc.formatOverride);
+				viewCreateInfo.components = VkSrvComponentMapping(impl, desc.componentMapping, desc.formatOverride != Format::Unknown ? desc.formatOverride : resourceState->rhiFormat);
 				viewCreateInfo.subresourceRange = subresourceRange;
 
 				VkImageDescriptorInfoEXT imageInfo{ VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT };
@@ -11374,7 +11496,7 @@ namespace rhi {
 				aspectMask,
 				viewType,
 				{ subresourceRange.baseMipLevel, subresourceRange.levelCount, subresourceRange.baseArrayLayer, subresourceRange.layerCount },
-				VkSrvComponentMapping(desc.componentMapping, desc.formatOverride));
+				VkSrvComponentMapping(impl, desc.componentMapping, desc.formatOverride != Format::Unknown ? desc.formatOverride : resourceState->rhiFormat));
 		}
 
 		static Result d_createUnorderedAccessView(Device* device, DescriptorSlot slot, const ResourceHandle& resource, const UavDesc& desc) noexcept {
@@ -11437,6 +11559,10 @@ namespace rhi {
 			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(impl, desc.formatOverride) : resourceState->format;
 			const VkImageAspectFlags aspectMask = VkAspectMaskForFormat(viewFormat);
 			if (viewType == VK_IMAGE_VIEW_TYPE_MAX_ENUM || viewFormat == VK_FORMAT_UNDEFINED) {
+				RHI_FAIL(Result::Unsupported);
+			}
+			// A storage view cannot swizzle: a format stored with its channels moved (A8 as R8) has no unordered access view.
+			if (VkSwizzleMovesChannels(VkFormatSwizzle(impl, desc.formatOverride != Format::Unknown ? desc.formatOverride : resourceState->rhiFormat))) {
 				RHI_FAIL(Result::Unsupported);
 			}
 
@@ -11629,6 +11755,10 @@ namespace rhi {
 			}
 
 			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(impl, desc.formatOverride) : resource->format;
+			// An attachment cannot swizzle: a format stored with its channels moved (A8 as R8) has no render target view.
+			if (VkSwizzleMovesChannels(VkFormatSwizzle(impl, desc.formatOverride != Format::Unknown ? desc.formatOverride : resource->rhiFormat))) {
+				RHI_FAIL(Result::Unsupported);
+			}
 			const VkImageViewType viewType = VkImageViewTypeForRtv(desc.dimension);
 			return VkCreateImageViewSlot(impl, slot, DescriptorHeapType::RTV, texture, viewFormat, VK_IMAGE_ASPECT_COLOR_BIT, viewType, desc.range);
 		}
@@ -11974,6 +12104,7 @@ namespace rhi {
 			resourceState.image = image;
 			resourceState.memory = memory;
 			resourceState.format = format;
+			resourceState.rhiFormat = desc.texture.format;
 			resourceState.type = desc.type;
 			resourceState.concurrentSharing = concurrentSharing;
 			resourceState.currentLayout = ResourceLayout::Undefined;
@@ -12270,6 +12401,7 @@ namespace rhi {
 			resourceState.memory = heapState->memory;
 			resourceState.memoryOffset = offset;
 			resourceState.format = format;
+			resourceState.rhiFormat = desc.texture.format;
 			resourceState.type = desc.type;
 			resourceState.concurrentSharing = concurrentSharing;
 			resourceState.currentLayout = ResourceLayout::Undefined;
@@ -13169,13 +13301,14 @@ namespace rhi {
 		&d_destroyIndirectPipelineSet,
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
-		15u,
+		16u,
 		&d_createCompletionWait,
 		&d_createCommandAllocatorForQueue,
 		&d_createSecondaryCommandList,
 		&d_openPipelineCache,
 		&d_savePipelineCache,
-		&d_getPipelineCacheStats
+		&d_getPipelineCacheStats,
+		&d_queryFormatSupport
 	};
 
 	const QueueVTable g_vkqvt = {
@@ -13475,6 +13608,7 @@ namespace rhi {
 
 	static void VkApplyEnabledDeviceState(VulkanDevice* impl, const VkEnabledDeviceState& e) noexcept {
 		impl->maintenance5Enabled = e.maintenance5;
+		impl->formatRemaps = VkFormatRemapsFor(impl->physicalDevice, e.maintenance5);
 		impl->memoryBudgetEnabled = e.memoryBudget;
 		impl->pipelineExecutableInfoEnabled = e.pipelineExecutableProperties.pipelineExecutableInfo == VK_TRUE;
 		impl->accelerationStructureFeatures = e.accelerationStructure;
@@ -15006,7 +15140,6 @@ namespace rhi {
 		}
 		impl->physicalDevice = physicalDevice;
 		impl->device = device;
-		impl->d24Fallback = VkD24Fallback(physicalDevice);
 		impl->physicalDeviceProperties = physicalDeviceProperties;
 		impl->memoryProperties = memoryProperties;
 		impl->supportedFeatures = supportedFeatures;
@@ -15365,7 +15498,6 @@ namespace rhi {
 			impl->instance = info.instance;
 			impl->physicalDevice = info.physicalDevice;
 			impl->device = info.device;
-			impl->d24Fallback = VkD24Fallback(info.physicalDevice);
 			impl->ownsInstance = false;
 			impl->ownsDevice = false;
 			impl->debugUtilsEnabled = VkNameListContains(info.enabledInstanceExtensions, info.enabledInstanceExtensionCount, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);

@@ -2998,6 +2998,36 @@ namespace rhi {
 		uint32_t saves = 0;
 	};
 
+	/** @brief What an optimally tiled texture of a format can be used as (FormatSupport::usage). */
+	enum FormatUsage : uint32_t {
+		FU_None = 0,
+		FU_ShaderResource = 1 << 0,
+		FU_UnorderedAccess = 1 << 1,
+		FU_RenderTarget = 1 << 2,
+		FU_DepthStencil = 1 << 3,
+	};
+
+	/**
+	 * @brief How the device stores and reads a format (Device::QueryFormatSupport).
+	 *
+	 * A backend may store a format in another one the device supports, as DXVK does: Vulkan stores DXGI's A8 as R8 where
+	 * VK_FORMAT_A8_UNORM_KHR cannot be sampled, stored and rendered to, and the D24 family as D32S8 where D24S8 is no depth
+	 * attachment. The backend applies the substitute everywhere the format is named (resources, views, attachments, pipelines),
+	 * and its shader resource views add srvSwizzle (also B8G8R8X8's alpha of one), so a shader reads what the format would give.
+	 * Views that cannot swizzle (unordered access, render target) of a format stored with its channels moved are refused.
+	 */
+	struct FormatSupport {
+		// FormatUsage bits: what a texture of the format can be, the substitute and its swizzle included.
+		uint32_t usage = FU_None;
+		// The format it is stored in, or Unknown when it is stored as itself.
+		Format storedAs = Format::Unknown;
+		// The swizzle its shader resource views add, in SrvDesc::componentMapping's encoding (0: none). A view's own mapping
+		// selects from the format's channels; this one then makes those channels from the stored ones.
+		ComponentMapping srvSwizzle = 0;
+		// The backend's value for the stored format (a VkFormat, a DXGI_FORMAT): 0 when the device has none for it.
+		uint32_t backendFormat = 0;
+	};
+
 	struct CommandListVTable {
 		void (*end)(CommandList*) noexcept;
 		void (*recycle)(CommandList*, const CommandAllocator& alloc) noexcept;
@@ -3499,6 +3529,8 @@ namespace rhi {
 		Result(*openPipelineCache)(Device*, const char* path) noexcept = nullptr;
 		Result(*savePipelineCache)(Device*) noexcept = nullptr;
 		Result(*getPipelineCacheStats)(const Device*, PipelineCacheStats&) noexcept = nullptr;
+		// abi_version 16: format support and the formats a backend stores in another.
+		Result(*queryFormatSupport)(const Device*, Format, FormatSupport&) noexcept = nullptr;
 	};
 
 
@@ -3671,6 +3703,14 @@ namespace rhi {
 		Result GetPipelineCacheStats(PipelineCacheStats& out) const noexcept {
 			out = {};
 			return vt->abi_version >= 15 && vt->getPipelineCacheStats ? vt->getPipelineCacheStats(this, out) : Result::Unsupported;
+		}
+		/**
+		 * @brief How the device stores and reads `format` (FormatSupport). Unsupported (out cleared) on an older backend; Ok with
+		 * usage FU_None for a format the device cannot use at all. Any thread.
+		 */
+		Result QueryFormatSupport(Format format, FormatSupport& out) const noexcept {
+			out = {};
+			return vt->abi_version >= 16 && vt->queryFormatSupport ? vt->queryFormatSupport(this, format, out) : Result::Unsupported;
 		}
 		void CheckDebugMessages() noexcept { if (vt->checkDebugMessages) vt->checkDebugMessages(this); }
 		void Destroy() noexcept { vt->destroyDevice(this); impl = nullptr; vt = nullptr; }

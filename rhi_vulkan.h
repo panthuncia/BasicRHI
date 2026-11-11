@@ -188,6 +188,9 @@ namespace rhi {
 		VkDeviceAddress deviceAddress = 0;
 		uint64_t bufferSize = 0;
 		VkFormat format = VK_FORMAT_UNDEFINED;
+		// The format the resource was created with, when its image is stored in another (VulkanDevice::formatRemaps); Unknown for
+		// an imported image.
+		Format rhiFormat = Format::Unknown;
 		ResourceType type = ResourceType::Unknown;
 		ResourceAccessType currentAccess = ResourceAccessType::Common;
 		ResourceLayout currentLayout = ResourceLayout::Undefined;
@@ -687,8 +690,16 @@ namespace rhi {
 		uint64_t droppedValidationMessageCount = 0;
 		VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 		VkDevice device = VK_NULL_HANDLE;
-		// VK_FORMAT_D24_UNORM_S8_UINT is no depth attachment here (AMD): the D24 family is D32_SFLOAT_S8_UINT, as DXVK maps it.
-		bool d24Fallback = false;
+		// The formats this device stores in another (FormatSupport), the rules DXVK's format table uses: VK_FORMAT_D24_UNORM_S8_UINT
+		// as D32_SFLOAT_S8_UINT where it is no depth attachment (AMD), VK_FORMAT_A8_UNORM_KHR as R8 with its red read as alpha where
+		// A8 cannot be sampled, stored and rendered to. Set once at creation (VkApplyEnabledDeviceState); every conversion reads it.
+		struct FormatRemap {
+			VkFormat from = VK_FORMAT_UNDEFINED;
+			VkFormat to = VK_FORMAT_UNDEFINED;
+			// Makes the format's channels from the stored ones (identity: none).
+			VkComponentMapping swizzle{};
+		};
+		std::vector<FormatRemap> formatRemaps;
 		VkPhysicalDeviceProperties physicalDeviceProperties{};
 		VkPhysicalDeviceMemoryProperties memoryProperties{};
 		VkPhysicalDeviceFeatures supportedFeatures{};

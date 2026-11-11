@@ -1523,6 +1523,36 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// D3D12 stores every format as itself.
+		static Result d_queryFormatSupport(const Device* d, Format format, FormatSupport& out) noexcept {
+			const auto* impl = d ? static_cast<const Dx12Device*>(d->impl) : nullptr;
+			out = {};
+			if (!impl || !impl->pNativeDevice) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			D3D12_FEATURE_DATA_FORMAT_SUPPORT support{ ToDxgi(format) };
+			if (support.Format == DXGI_FORMAT_UNKNOWN ||
+				FAILED(impl->pNativeDevice->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))) {
+				return Result::Ok;
+			}
+			uint32_t usage = FU_None;
+			if (support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) {
+				usage |= FU_ShaderResource;
+			}
+			if (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) {
+				usage |= FU_UnorderedAccess;
+			}
+			if (support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) {
+				usage |= FU_RenderTarget;
+			}
+			if (support.Support1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL) {
+				usage |= FU_DepthStencil;
+			}
+			out.usage = usage;
+			out.backendFormat = static_cast<uint32_t>(support.Format);
+			return Result::Ok;
+		}
+
 		static Result d_createPipelineFromStream(Device* d,
 			const PipelineStreamItem* items,
 			uint32_t count,
@@ -11132,13 +11162,14 @@ namespace rhi {
 		&d_destroyIndirectPipelineSet,
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
-		15u,
+		16u,
 		&d_createCompletionWait,
 		&d_createCommandAllocatorForQueue,
 		&d_createSecondaryCommandList,
 		&d_openPipelineCache,
 		&d_savePipelineCache,
-		&d_getPipelineCacheStats
+		&d_getPipelineCacheStats,
+		&d_queryFormatSupport
 	};
 
 	const QueueVTable g_qvt = {
