@@ -4852,6 +4852,12 @@ namespace rhi {
 					timelineState->lastSubmittedSignalValue,
 					reinterpret_cast<uint64_t>(timelineState->semaphore));
 				spdlog::critical("Vulkan poisoned timeline kind={}", timelineState->importedD3D12Fence ? "imported-d3d12-fence" : "native-vulkan");
+				// Windows sets a removed device's fences to UINT64_MAX: on an adopted device this is often the first sign of a lost
+				// device BasicRHI sees, since the host submits. The crash markers say which of BasicRHI's lists were still running.
+				if (impl->crashMarkers.enabled && !impl->crashMarkers.lossReported.exchange(true)) {
+					spdlog::critical("Vulkan timeline(idx={}): the device looks lost (a timeline read UINT64_MAX); its crash markers follow", handle.index);
+					(void)VkDumpCrashMarkers(impl, true);
+				}
 			}
 			return value;
 		}
@@ -15373,6 +15379,13 @@ namespace rhi {
 			vkGetPhysicalDeviceProperties(info.physicalDevice, &impl->physicalDeviceProperties);
 			vkGetPhysicalDeviceMemoryProperties(info.physicalDevice, &impl->memoryProperties);
 			impl->supportedFeatures = coreFeatures;
+			// Native crash markers on an adopted device (BASICRHI_VK_CRASH_MARKERS=1): VK_AMD_buffer_marker markers in BasicRHI's own
+			// lists, when the host enabled the extension (DXVK does under DXVK_DEBUG=hang). The host's markers cover only its own
+			// commands: without these a device lost in the graph's work names no pass.
+			if (const char* value = std::getenv("BASICRHI_VK_CRASH_MARKERS"); value && std::strcmp(value, "1") == 0) {
+				VkInitCrashMarkers(impl.get(), false,
+					VkNameListContains(info.enabledDeviceExtensions, info.enabledDeviceExtensionCount, VK_AMD_BUFFER_MARKER_EXTENSION_NAME), false);
+			}
 			{
 				VkPhysicalDeviceProperties2 properties2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
 				properties2.pNext = &impl->descriptorHeapProperties;
