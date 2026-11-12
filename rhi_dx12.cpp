@@ -715,6 +715,21 @@ namespace rhi {
 		}
 
 		spdlog::error("======== DEVICE REMOVED (reason 0x{:08X}) – DRED Report ========", static_cast<unsigned>(reason));
+		// The host's loss callback once the report is logged, however it ends.
+		struct NotifyOnExit {
+			HRESULT reason;
+			uint64_t faultAddress = 0;
+			~NotifyOnExit() {
+				char where[64]{};
+				std::snprintf(where, sizeof(where), "D3D12 device removed (reason 0x%08X)", static_cast<unsigned>(reason));
+				DeviceLossInfo info;
+				info.backend = "d3d12";
+				info.where = where;
+				info.faultAddress = faultAddress;
+				info.faultKind = faultAddress ? "page fault" : "";
+				NotifyDeviceLoss(info);
+			}
+		} notify{ reason };
 
 		ComPtr<ID3D12DeviceRemovedExtendedData1> pDred;
 		if (FAILED(g_dredDevice->QueryInterface(IID_PPV_ARGS(&pDred)))) {
@@ -793,6 +808,7 @@ namespace rhi {
 		D3D12_DRED_PAGE_FAULT_OUTPUT1 pageFaultOutput{};
 		if (SUCCEEDED(pDred->GetPageFaultAllocationOutput1(&pageFaultOutput))) {
 			if (pageFaultOutput.PageFaultVA != 0) {
+				notify.faultAddress = pageFaultOutput.PageFaultVA;
 				spdlog::error("  GPU Page Fault VA: 0x{:016X}", pageFaultOutput.PageFaultVA);
 
 				auto logAllocList = [](const char* label, const D3D12_DRED_ALLOCATION_NODE1* node) {

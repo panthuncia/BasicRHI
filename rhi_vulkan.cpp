@@ -2937,7 +2937,7 @@ namespace rhi {
 		}
 
 		// VK_EXT_device_fault's report: the description, the faulting address ranges and the vendor's fault codes.
-		static void VkLogDeviceFault(VulkanDevice* impl) noexcept {
+		static void VkLogDeviceFault(VulkanDevice* impl, VkDeviceAddress& firstAddress, const char*& firstKind) noexcept {
 			try {
 				VkDeviceFaultCountsEXT counts{ VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT };
 				if (const VkResult result = vkGetDeviceFaultInfoEXT(impl->device, &counts, nullptr); result != VK_SUCCESS) {
@@ -2962,6 +2962,10 @@ namespace rhi {
 					const VkDeviceAddress lower = address.reportedAddress & ~(precision - 1);
 					spdlog::error("Vulkan device fault:   {} at 0x{:x} (range 0x{:x}..0x{:x})", VkDeviceFaultAddressTypeName(address.addressType),
 						address.reportedAddress, lower, lower + precision - 1);
+					if (!firstAddress && address.reportedAddress) {
+						firstAddress = address.reportedAddress;
+						firstKind = VkDeviceFaultAddressTypeName(address.addressType);
+					}
 				}
 				for (uint32_t i = 0; i < counts.vendorInfoCount && i < vendors.size(); ++i) {
 					spdlog::error("Vulkan device fault:   vendor '{}': code 0x{:x}, data 0x{:x}", vendors[i].description, vendors[i].vendorFaultCode,
@@ -2973,7 +2977,14 @@ namespace rhi {
 
 		// Logs every list's last begun and finished marker and every queue's checkpoints; with deviceLost, the fault report too.
 		// A list whose two ids differ was still on the GPU. Returns the marker lines logged.
-		static uint32_t VkDumpCrashMarkers(VulkanDevice* impl, bool deviceLost) noexcept {
+		// summary, when given, receives the lists still in flight, and the fault's first address and kind (deviceLost only).
+		struct VkLossSummary {
+			std::string inFlight;
+			VkDeviceAddress faultAddress = 0;
+			const char* faultKind = "";
+		};
+
+		static uint32_t VkDumpCrashMarkers(VulkanDevice* impl, bool deviceLost, VkLossSummary* summary = nullptr) noexcept {
 			VulkanCrashMarkers& markers = impl->crashMarkers;
 			if (!markers.enabled) return 0;
 			const auto level = deviceLost ? spdlog::level::err : spdlog::level::info;
@@ -2989,6 +3000,9 @@ namespace rhi {
 						spdlog::log(level, "Vulkan crash markers: list {} '{}' {}: began #{} '{}', finished #{} '{}'", slot,
 							markers.slotNames[slot] ? markers.slotNames[slot] : "", begun != finished ? "IN FLIGHT" : "idle",
 							begun, VkCrashMarkerName(markers, begun), finished, VkCrashMarkerName(markers, finished));
+						if (summary && begun != finished && summary->inFlight.size() < 1500)
+							summary->inFlight += std::format("{}list {} '{}' in flight at #{} '{}'", summary->inFlight.empty() ? "" : "; ", slot,
+								markers.slotNames[slot] ? markers.slotNames[slot] : "", begun, VkCrashMarkerName(markers, begun));
 						++lines;
 					}
 				}
@@ -3010,16 +3024,40 @@ namespace rhi {
 				}
 			} catch (...) {
 			}
-			if (deviceLost && markers.deviceFault) VkLogDeviceFault(impl);
+			if (deviceLost && markers.deviceFault) {
+				VkDeviceAddress address = 0;
+				const char* kind = "";
+				VkLogDeviceFault(impl, address, kind);
+				if (summary) {
+					summary->faultAddress = address;
+					summary->faultKind = kind;
+				}
+			}
 			return lines;
+		}
+
+		// A lost device, once per device: the crash markers logged (when on, and not logged yet), then the host's callback
+		// (rhi::SetDeviceLossCallback) with the fault and the lists in flight.
+		static void VkReportDeviceLoss(VulkanDevice* impl, const char* where, const char* header) noexcept {
+			if (!impl || impl->crashMarkers.lossNotified.exchange(true)) return;
+			VkLossSummary summary;
+			if (impl->crashMarkers.enabled && !impl->crashMarkers.lossReported.exchange(true)) {
+				spdlog::critical("{}: {}; its crash markers follow", where, header);
+				VkDumpCrashMarkers(impl, true, &summary);
+			}
+			DeviceLossInfo info;
+			info.backend = "vulkan";
+			info.where = where;
+			info.faultAddress = summary.faultAddress;
+			info.faultKind = summary.faultKind;
+			info.markers = summary.inFlight.c_str();
+			NotifyDeviceLoss(info);
 		}
 
 		// Logs the crash markers once, at the first VK_ERROR_DEVICE_LOST BasicRHI sees. Returns the result unchanged.
 		static VkResult VkCheckDeviceLost(VulkanDevice* impl, VkResult result, const char* where) noexcept {
-			if (result == VK_ERROR_DEVICE_LOST && impl && impl->crashMarkers.enabled && !impl->crashMarkers.lossReported.exchange(true)) {
-				spdlog::critical("{}: the Vulkan device was lost; its crash markers follow", where);
-				VkDumpCrashMarkers(impl, true);
-			}
+			if (result == VK_ERROR_DEVICE_LOST && impl)
+				VkReportDeviceLoss(impl, where, "the Vulkan device was lost");
 			return result;
 		}
 
@@ -5037,10 +5075,8 @@ namespace rhi {
 				spdlog::critical("Vulkan poisoned timeline kind={}", timelineState->importedD3D12Fence ? "imported-d3d12-fence" : "native-vulkan");
 				// Windows sets a removed device's fences to UINT64_MAX: on an adopted device this is often the first sign of a lost
 				// device BasicRHI sees, since the host submits. The crash markers say which of BasicRHI's lists were still running.
-				if (impl->crashMarkers.enabled && !impl->crashMarkers.lossReported.exchange(true)) {
-					spdlog::critical("Vulkan timeline(idx={}): the device looks lost (a timeline read UINT64_MAX); its crash markers follow", handle.index);
-					(void)VkDumpCrashMarkers(impl, true);
-				}
+				const std::string where = std::format("Vulkan timeline(idx={})", handle.index);
+				VkReportDeviceLoss(impl, where.c_str(), "the device looks lost (a timeline read UINT64_MAX)");
 			}
 			return value;
 		}

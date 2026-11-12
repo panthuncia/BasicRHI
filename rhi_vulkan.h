@@ -666,6 +666,7 @@ namespace rhi {
 		volatile uint32_t* mapped = nullptr;  // kSlots pairs of { begun, finished } marker ids
 		std::atomic<uint32_t> nextSlot{ 0 };
 		std::atomic<bool> lossReported{ false };
+		std::atomic<bool> lossNotified{ false };  // the host's loss callback ran (VkReportDeviceLoss)
 		std::mutex mutex;  // guards everything below
 		uint32_t nextId = 1;
 		std::array<uint32_t, kHistory> historyIds{};

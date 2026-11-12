@@ -4192,4 +4192,32 @@ namespace rhi {
 		return skip;
 	}
 
+	// A lost device, as BasicRHI saw it. The strings live only for the callback's duration.
+	struct DeviceLossInfo {
+		const char* backend = "";      // "vulkan" or "d3d12"
+		const char* where = "";        // the path that saw the loss
+		uint64_t faultAddress = 0;     // VK_EXT_device_fault's first address; 0 when none
+		const char* faultKind = "";    // what the address was ("invalid read", ...); empty when none
+		const char* markers = "";      // the crash markers' summary: the lists still in flight; empty when none
+	};
+	using DeviceLossCallback = void (*)(const DeviceLossInfo&);
+
+	inline std::atomic<DeviceLossCallback>& DeviceLossCallbackSlot() noexcept {
+		static std::atomic<DeviceLossCallback> callback{ nullptr };
+		return callback;
+	}
+
+	// The host's callback for a lost device: called once per device, after BasicRHI logged the loss, from the thread that saw it.
+	inline void SetDeviceLossCallback(DeviceLossCallback callback) noexcept { DeviceLossCallbackSlot().store(callback, std::memory_order_release); }
+
+	// Backends: reports a loss to the host's callback, if any.
+	inline void NotifyDeviceLoss(const DeviceLossInfo& info) noexcept {
+		if (const auto callback = DeviceLossCallbackSlot().load(std::memory_order_acquire)) {
+			try {
+				callback(info);
+			} catch (...) {
+			}
+		}
+	}
+
 }
