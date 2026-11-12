@@ -9257,7 +9257,9 @@ namespace rhi {
 					&& t.beforeLayout == ResourceLayout::Undefined;
 
 				D3D12_TEXTURE_BARRIER tb{};
-				tb.SyncBefore = ToDX(nativeDiscard ? ResourceSyncState::None : t.beforeSync);
+				// A discard keeps its before sync: an aliased texture's first use waits for the memory's previous occupant
+				// (D3D12 allows a sync with NO_ACCESS). A discard with no before sync still waits for nothing.
+				tb.SyncBefore = ToDX(t.beforeSync);
 				tb.SyncAfter = ToDX(t.afterSync);
 				tb.AccessBefore = ToDX(nativeDiscard ? ResourceAccessType::None : t.beforeAccess);
 				tb.AccessAfter = ToDX(t.afterAccess);
