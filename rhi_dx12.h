@@ -220,8 +220,9 @@ namespace rhi {
 		bool open = false;
 		// Its last Close failed: it cannot be executed until it is reset.
 		bool closeFailed = false;
-		// A bundle that BeginSecondary began since its last Reset (Reset alone opens a bundle on D3D12).
-		bool begunSecondary = false;
+		// A recycled bundle's allocator: Recycle leaves a bundle closed, and BeginSecondary resets it onto this one (D3D12's Reset
+		// opens a list, where the RHI's Recycle leaves a secondary not recording).
+		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> pendingReset;
 		// A command a bundle cannot hold was refused; End reports it.
 		Result pendingError = Result::Ok;
 		PipelineLayoutHandle boundLayout{};

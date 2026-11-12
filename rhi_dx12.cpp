@@ -8725,12 +8725,8 @@ namespace rhi {
 				return;
 			a_list.cl->Close();
 			a_list.open = false;
-			// A bundle is open from its Reset (Recycle) on, where a Vulkan secondary does not record until BeginSecondary. One
-			// recycled and never begun held no commands: closing it drops nothing, so it is not reported.
-			const bool begun = !a_list.bundle || a_list.begunSecondary;
-			a_list.begunSecondary = false;
 			static std::atomic_flag logged;
-			if (begun && !logged.test_and_set())
+			if (!logged.test_and_set())
 				spdlog::warn("D3D12: '{}' was reset while it recorded; it was closed first and its commands dropped (logged once)", a_list.debugName);
 		}
 
@@ -8772,6 +8768,18 @@ namespace rhi {
 			// The RHI lets a list be reset while it records (Vulkan resets a recording command buffer). D3D12 resets only a closed
 			// list, so a list still recording is closed first and its commands are dropped.
 			Dx12CloseRecording(*l);
+			// A secondary (a bundle) does not record after Recycle, as on Vulkan: D3D12's Reset would open it, so the Reset waits for
+			// BeginSecondary, which makes it record. Recycle -> not recording, BeginSecondary -> recording, End -> closed.
+			if (l->bundle) {
+				l->pendingReset = resetAllocator;
+				l->closeFailed = false;
+				const auto handle = cl->GetHandle();
+				auto* mutableAllocator = const_cast<Dx12Allocator*>(a);
+				if (std::find_if(mutableAllocator->lists.begin(), mutableAllocator->lists.end(),
+						[&](const CommandListHandle& h) { return h.index == handle.index && h.generation == handle.generation; }) == mutableAllocator->lists.end())
+					mutableAllocator->lists.push_back(handle);
+				return;
+			}
 			const HRESULT resetResult = l->cl->Reset(resetAllocator, nullptr);
 			if (FAILED(resetResult)) {
 				spdlog::error(
@@ -8782,7 +8790,6 @@ namespace rhi {
 			} else {
 				l->open = true;
 				l->closeFailed = false;
-				l->begunSecondary = false;
 				// Reset onto another allocator: that allocator's Reset closes it too.
 				const auto handle = cl->GetHandle();
 				auto* mutableAllocator = const_cast<Dx12Allocator*>(a);
@@ -10759,10 +10766,20 @@ namespace rhi {
 			if (l->pendingError != Result::Ok) {
 				return l->pendingError;  // Recycle failed
 			}
+			// The Reset Recycle left for here (or the first one of a bundle made closed): it opens the bundle.
+			if (!l->open) {
+				ID3D12CommandAllocator* allocator = l->pendingReset ? l->pendingReset.Get() : l->alloc.Get();
+				if (const HRESULT hr = l->cl->Reset(allocator, nullptr); FAILED(hr)) {
+					spdlog::error("D3D12 bundle Reset failed for '{}': HRESULT 0x{:08X}", l->debugName, static_cast<unsigned>(hr));
+					RHI_FAIL(ToRHI(hr));
+				}
+				l->open = true;
+				l->closeFailed = false;
+				l->pendingReset.Reset();
+			}
 			if (inheritance.debugName) {
 				cl_setName(cl, inheritance.debugName);
 			}
-			l->begunSecondary = true;
 			return Result::Ok;
 		}
 
