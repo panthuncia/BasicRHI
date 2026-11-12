@@ -5170,7 +5170,7 @@ namespace rhi {
 			if (vkGetSemaphoreCounterValue(impl->device, timelineState->semaphore, &value) != VK_SUCCESS) {
 				return 0;
 			}
-			if (value == UINT64_MAX && timelineState->lastSubmittedSignalValue != UINT64_MAX) {
+			if (value == UINT64_MAX && timelineState->lastSubmittedSignalValue != UINT64_MAX && !std::atomic_ref<bool>(timelineState->poisonReported).exchange(true)) {
 				const TimelineHandle handle = timeline->GetHandle();
 				spdlog::critical(
 					"Vulkan timeline(idx={}, gen={}) reports completed UINT64_MAX, but BasicRHI highest submitted signal is {}. Raw semaphore={}, suggesting an external signal path or semaphore object corruption.",

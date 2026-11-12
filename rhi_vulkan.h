@@ -405,6 +405,7 @@ namespace rhi {
 		uint64_t lastSubmittedSignalValue = 0;
 		uint64_t integrityCookie = 0x564B54494D454C4Eull;
 		bool importedD3D12Fence = false;
+		bool poisonReported = false;  // the UINT64_MAX read is logged once per timeline (a lost device reads it on every poll)
 		uint32_t activeHostWaits = 0;
 	};
 
