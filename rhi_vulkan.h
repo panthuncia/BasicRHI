@@ -768,7 +768,28 @@ namespace rhi {
 			std::vector<uint32_t> freePairs;
 			uint32_t nextPair = 0;
 			bool loggedFull = false;
+			// Per pair: the range its descriptors were last written with and the buffer's handle. Kept after a release (live false)
+			// so a fault report can name a freed buffer a stale ref still reads.
+			struct PairRecord {
+				uint64_t address = 0;
+				uint64_t range = 0;
+				uint64_t key = 0;
+				bool live = false;
+			};
+			std::vector<PairRecord> pairs;
 		} viewRefs;
+		// The last buffers destroyed with a device address, for the fault report: a read in one is a use after free.
+		struct RetiredBuffer {
+			uint64_t address = 0;
+			uint64_t size = 0;
+			uint64_t key = 0;
+			bool owned = false;
+		};
+		struct RetiredBufferRing {
+			std::mutex mutex;
+			std::array<RetiredBuffer, 4096> entries{};
+			uint64_t next = 0;
+		} retiredBuffers;
 		bool nullDescriptorEnabled = false;  // VK_EXT_robustness2 nullDescriptor: views with no resource
 		bool descriptorHeapCaptureReplayEnabled = false;
 		bool meshShaderEnabled = false;

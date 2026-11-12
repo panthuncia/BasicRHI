@@ -258,6 +258,32 @@ namespace rhi::vulkan {
     };
     Result import_buffer(rhi::Device device, const ImportedBufferDesc& desc, rhi::ResourcePtr& out) noexcept;
 
+    // A check of a buffer view ref (rhi_shader_abi.h, BUFFER_VIEW_REF_*), for diagnostics: what its slot names, what the pair's
+    // descriptors were written with, and whether the heaps hold those bytes. Takes the views mutex: not for hot paths.
+    struct BufferViewRefCheck {
+        uint32_t firstSlot = 0;          // the region's first slot
+        uint32_t slotCount = 0;          // its slots (0: the device has no region)
+        bool inRegion = false;           // the slot is an SRV slot of the region
+        uint32_t pair = 0;
+        bool pairLive = false;           // a buffer holds the pair
+        uint64_t pairKey = 0;            // that buffer's handle (generation << 32 | index), or the last one's
+        uint64_t descriptorAddress = 0;  // what the pair's descriptors were written with (the last buffer's when released)
+        uint64_t descriptorRange = 0;
+        bool resourceGiven = false;      // a resource handle was passed
+        bool resourceLive = false;       // it is a live buffer
+        bool pairIsResource = false;     // the pair is that buffer's
+        uint64_t resourceAddress = 0;    // its device address now
+        uint64_t resourceSize = 0;       // its size
+        uint32_t heaps = 0;              // heaps holding the region
+        uint32_t heapsMismatched = 0;    // of them, those whose bytes for the pair differ from what was written, or of another capacity
+        uint32_t slotZeroNonzero = 0;    // of them, those whose slot 0 is not zeros (a load through a null ref reads it)
+    };
+    bool check_buffer_view_ref(rhi::Device device, uint32_t viewSlot, rhi::ResourceHandle resource, BufferViewRefCheck& out) noexcept;
+
+    // The device address of a host buffer (vkGetBufferDeviceAddress), for diagnostics; 0 without one. The buffer must be alive and
+    // have VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT.
+    uint64_t get_vk_buffer_device_address(rhi::Device device, VkBuffer buffer) noexcept;
+
     // Non-owning wrap of a VkCommandBuffer recorded by the host (an adopted device's), already begun: every recording call
     // works on it, starting with nothing bound (no heaps, layout, pipeline or pass), and records on one thread at a time. End
     // and Recycle are no-ops (End closes only a pass this wrapper began), the RHI never submits it, and destroying the

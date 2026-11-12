@@ -1980,6 +1980,11 @@ namespace rhi {
 			} catch (...) {
 				return;
 			}
+			try {
+				r.pairs.assign(BUFFER_VIEW_REF_PAIRS, {});
+			} catch (...) {
+				return;
+			}
 			impl->shaderVisibleResourceCapacity -= BUFFER_VIEW_REF_SLOTS;
 			r.ready = true;
 			spdlog::info("{}: buffer view refs: {} pairs at heap slot {} (the client's capacity)", caller, BUFFER_VIEW_REF_PAIRS,
@@ -2026,10 +2031,12 @@ namespace rhi {
 				spdlog::warn("Vulkan buffer view refs: a {}-byte buffer's views cover its first {} bytes (maxStorageBufferRange)", resource->bufferSize, maxRange);
 			}
 			std::byte* srv = r.staging.data() + static_cast<size_t>(2 * pair * r.stride);
-			VkWriteViewRefDescriptor(impl, srv, resource->deviceAddress, (std::min)(resource->bufferSize, maxRange));
+			const VkDeviceSize range = (std::min)(resource->bufferSize, maxRange);
+			VkWriteViewRefDescriptor(impl, srv, resource->deviceAddress, range);
 			std::memcpy(srv + r.stride, srv, static_cast<size_t>(r.stride));
 			VkPublishViewRefPair(impl, pair);
 			r.pairByResource.emplace(key, pair);
+			r.pairs[pair] = { resource->deviceAddress, range, key, true };
 			return refAt(pair);
 		}
 
@@ -2050,6 +2057,7 @@ namespace rhi {
 			VkWriteViewRefDescriptor(impl, srv, 0, 0);
 			std::memcpy(srv + r.stride, srv, static_cast<size_t>(r.stride));
 			VkPublishViewRefPair(impl, pair);
+			r.pairs[pair].live = false;  // the address stays: the fault report names the freed buffer
 			r.freePairs.push_back(pair);
 		}
 
@@ -3080,6 +3088,117 @@ namespace rhi {
 			}
 		}
 
+		// What a faulting address is in or next to: the shader-visible heaps, the live buffers below and above it, the buffer view
+		// ref pairs (live or freed) and the recently destroyed buffers. Locks are only tried: a lost device may leave one held.
+		static void VkAttributeFaultAddress(VulkanDevice* impl, VkDeviceAddress a) noexcept {
+			constexpr uint64_t kNear = 1ull << 20;  // "next to": within 1 MiB
+			const auto where = [a](uint64_t base, uint64_t size) {
+				if (a >= base && a - base < size)
+					return std::format("inside, at offset 0x{:x}", a - base);
+				if (a >= base + size)
+					return std::format("0x{:x} bytes past its end", a - (base + size));
+				return std::format("0x{:x} bytes before it", base - a);
+			};
+			const auto nextTo = [a](uint64_t base, uint64_t size) { return a + kNear >= base && a < base + size + kNear; };
+			try {
+				{
+					std::shared_lock lock(impl->descriptorHeaps.mutex, std::try_to_lock);
+					if (!lock.owns_lock()) {
+						spdlog::error("Vulkan fault attribution: the heap registry is locked; heaps not checked");
+					} else {
+						for (size_t i = 0; i < impl->descriptorHeaps.slots.size(); ++i) {
+							const auto& slot = impl->descriptorHeaps.slots[i];
+							const auto& heap = slot.obj;
+							if (!slot.alive || !heap.shaderVisible || heap.deviceAddress == 0)
+								continue;
+							spdlog::error("Vulkan fault attribution: {} heap {}: {} descriptors + {} view ref slots, stride {}, base offset {}, "
+								"bytes [0x{:x}, 0x{:x}): {}", heap.type == DescriptorHeapType::Sampler ? "sampler" : "resource", i, heap.capacity,
+								heap.viewRefSlots, heap.descriptorStride, heap.descriptorBaseOffset, static_cast<uint64_t>(heap.deviceAddress),
+								static_cast<uint64_t>(heap.deviceAddress) + heap.descriptorBytes, where(heap.deviceAddress, heap.descriptorBytes));
+						}
+					}
+				}
+				{
+					std::shared_lock lock(impl->resources.mutex, std::try_to_lock);
+					if (!lock.owns_lock()) {
+						spdlog::error("Vulkan fault attribution: the resource registry is locked; buffers not checked");
+					} else {
+						const VulkanResource* below = nullptr;
+						const VulkanResource* above = nullptr;
+						size_t belowIndex = 0, aboveIndex = 0;
+						uint32_t inside = 0;
+						for (size_t i = 0; i < impl->resources.slots.size(); ++i) {
+							const auto& slot = impl->resources.slots[i];
+							const auto& res = slot.obj;
+							if (!slot.alive || res.type != ResourceType::Buffer || res.deviceAddress == 0)
+								continue;
+							if (a >= res.deviceAddress && a - res.deviceAddress < res.bufferSize && inside++ < 8) {
+								spdlog::error("Vulkan fault attribution: live buffer {} ({}, {} bytes at 0x{:x}): {}", i, res.ownsBuffer ? "owned" : "imported",
+									res.bufferSize, static_cast<uint64_t>(res.deviceAddress), where(res.deviceAddress, res.bufferSize));
+							}
+							if (res.deviceAddress <= a && (!below || res.deviceAddress > below->deviceAddress)) {
+								below = &res;
+								belowIndex = i;
+							}
+							if (res.deviceAddress > a && (!above || res.deviceAddress < above->deviceAddress)) {
+								above = &res;
+								aboveIndex = i;
+							}
+						}
+						if (below)
+							spdlog::error("Vulkan fault attribution: nearest live buffer below: {} ({}, {} bytes at 0x{:x}): {}", belowIndex,
+								below->ownsBuffer ? "owned" : "imported", below->bufferSize, static_cast<uint64_t>(below->deviceAddress),
+								where(below->deviceAddress, below->bufferSize));
+						if (above)
+							spdlog::error("Vulkan fault attribution: nearest live buffer above: {} ({}, {} bytes at 0x{:x}): {}", aboveIndex,
+								above->ownsBuffer ? "owned" : "imported", above->bufferSize, static_cast<uint64_t>(above->deviceAddress),
+								where(above->deviceAddress, above->bufferSize));
+						if (!inside)
+							spdlog::error("Vulkan fault attribution: no live buffer holds the address");
+					}
+				}
+				if (impl->viewRefs.ready) {
+					auto& r = impl->viewRefs;
+					std::shared_lock lock(r.lock, std::try_to_lock);
+					if (!lock.owns_lock()) {
+						spdlog::error("Vulkan fault attribution: the view ref region is locked; pairs not checked");
+					} else {
+						uint32_t logged = 0;
+						for (uint32_t pair = 0; pair < r.pairs.size() && logged < 16; ++pair) {
+							const auto& p = r.pairs[pair];
+							if (p.address == 0 || !nextTo(p.address, p.range))
+								continue;
+							++logged;
+							spdlog::error("Vulkan fault attribution: view ref pair {} (slot {}, {}, buffer {}:{}) covers {} bytes at 0x{:x}: {}", pair,
+								impl->shaderVisibleResourceCapacity + 2 * pair, p.live ? "live" : "FREED", p.key & 0xFFFFFFFFu, p.key >> 32, p.range,
+								p.address, where(p.address, p.range));
+						}
+						if (!logged)
+							spdlog::error("Vulkan fault attribution: no view ref pair (live or freed) covers or neighbours the address");
+					}
+				}
+				{
+					auto& ring = impl->retiredBuffers;
+					std::unique_lock lock(ring.mutex, std::try_to_lock);
+					if (lock.owns_lock()) {
+						uint32_t logged = 0;
+						const uint64_t count = (std::min<uint64_t>)(ring.next, ring.entries.size());
+						for (uint64_t k = 0; k < count && logged < 16; ++k) {
+							const auto& e = ring.entries[(ring.next - 1 - k) % ring.entries.size()];
+							if (!nextTo(e.address, e.size))
+								continue;
+							++logged;
+							spdlog::error("Vulkan fault attribution: destroyed buffer {}:{} ({}, {} bytes at 0x{:x}, {} destructions ago): {}", e.key & 0xFFFFFFFFu,
+								e.key >> 32, e.owned ? "owned" : "imported", e.size, e.address, k, where(e.address, e.size));
+						}
+						if (!logged)
+							spdlog::error("Vulkan fault attribution: none of the last {} destroyed buffers covers or neighbours the address", count);
+					}
+				}
+			} catch (...) {
+			}
+		}
+
 		// VK_EXT_device_fault's report: the description, the faulting address ranges and the vendor's fault codes.
 		static void VkLogDeviceFault(VulkanDevice* impl, VkDeviceAddress& firstAddress, const char*& firstKind) noexcept {
 			try {
@@ -3110,6 +3229,8 @@ namespace rhi {
 						firstAddress = address.reportedAddress;
 						firstKind = VkDeviceFaultAddressTypeName(address.addressType);
 					}
+					if (address.reportedAddress && i < 4)
+						VkAttributeFaultAddress(impl, address.reportedAddress);
 				}
 				for (uint32_t i = 0; i < counts.vendorInfoCount && i < vendors.size(); ++i) {
 					spdlog::error("Vulkan device fault:   vendor '{}': code 0x{:x}, data 0x{:x}", vendors[i].description, vendors[i].vendorFaultCode,
@@ -10132,6 +10253,13 @@ namespace rhi {
 			VkReleaseViewsForResource(impl, handle);
 			VkReleaseViewRef(impl, handle);
 			if (VulkanResource* resource = VkResourceState(impl, handle)) {
+				// A buffer with a device address goes into the fault report's ring: a later read in it is a use after free.
+				if (resource->type == ResourceType::Buffer && resource->deviceAddress != 0) {
+					auto& ring = impl->retiredBuffers;
+					const std::scoped_lock ringLock(ring.mutex);
+					ring.entries[ring.next++ % ring.entries.size()] = { resource->deviceAddress, resource->bufferSize,
+						(uint64_t(handle.generation) << 32) | handle.index, resource->ownsBuffer };
+				}
 				VkDestroyResource(impl, *resource);
 			}
 			impl->resources.free(handle);
@@ -11534,6 +11662,12 @@ namespace rhi {
 				if (VulkanDescriptorHeap* stored = VkDescriptorHeapState(impl, handle)) {
 					stored->mappedData = stored->hostDescriptors.data();
 				}
+			}
+			if (desc.shaderVisible && desc.type == DescriptorHeapType::CbvSrvUav) {
+				const VulkanDescriptorHeap* stored = VkDescriptorHeapState(impl, handle);
+				spdlog::info("Vulkan CreateDescriptorHeap: shader-visible resource heap '{}': {} descriptors + {} view ref slots, bytes [0x{:x}, 0x{:x})",
+					desc.debugName ? desc.debugName : "", desc.capacity, heap.viewRefSlots, stored ? static_cast<uint64_t>(stored->deviceAddress) : 0,
+					stored ? static_cast<uint64_t>(stored->deviceAddress) + stored->descriptorBytes : 0);
 			}
 			if (heap.viewRefSlots != 0) {
 				auto& r = impl->viewRefs;
@@ -16227,6 +16361,67 @@ namespace rhi {
 			if (desc.debugName) VkSetObjectName(impl, reinterpret_cast<uint64_t>(desc.buffer), VK_OBJECT_TYPE_BUFFER, desc.debugName);
 			out = MakeBufferPtr(&device, buffer, impl->selfWeak.lock());
 			return Result::Ok;
+		}
+
+		bool check_buffer_view_ref(Device device, uint32_t viewSlot, ResourceHandle resource, BufferViewRefCheck& out) noexcept {
+			out = {};
+			if (!device || device.vt != &g_vkdevvt || !device.impl)
+				return false;
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			auto& r = impl->viewRefs;
+			if (!r.ready)
+				return true;
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
+			std::shared_lock read(r.lock);
+			out.firstSlot = impl->shaderVisibleResourceCapacity;
+			out.slotCount = BUFFER_VIEW_REF_SLOTS;
+			out.inRegion = viewSlot >= out.firstSlot && viewSlot - out.firstSlot < BUFFER_VIEW_REF_SLOTS && (viewSlot - out.firstSlot) % 2 == 0;
+			if (resource.valid()) {
+				out.resourceGiven = true;
+				if (const VulkanResource* state = VkResourceState(impl, resource); state && state->type == ResourceType::Buffer) {
+					out.resourceLive = true;
+					out.resourceAddress = state->deviceAddress;
+					out.resourceSize = state->bufferSize;
+				}
+			}
+			if (!out.inRegion)
+				return true;
+			out.pair = (viewSlot - out.firstSlot) / 2;
+			const auto& record = r.pairs[out.pair];
+			out.pairLive = record.live;
+			out.pairKey = record.key;
+			out.descriptorAddress = record.address;
+			out.descriptorRange = record.range;
+			out.pairIsResource = out.resourceGiven && record.live && record.key == ((uint64_t(resource.generation) << 32) | resource.index);
+			// What shaders read: each heap's bytes for the pair against what was written.
+			const size_t pairBytes = static_cast<size_t>(2 * r.stride);
+			const std::byte* staged = r.staging.data() + static_cast<size_t>(out.pair) * pairBytes;
+			for (const DescriptorHeapHandle handle : r.heaps) {
+				const VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, handle);
+				if (!heap || !heap->mappedData)
+					continue;
+				++out.heaps;
+				const uint64_t offset = heap->descriptorBaseOffset + (static_cast<uint64_t>(heap->capacity) + 2ull * out.pair) * r.stride;
+				const bool sized = heap->capacity == out.firstSlot && heap->viewRefSlots == BUFFER_VIEW_REF_SLOTS && heap->descriptorStride == r.stride &&
+					offset + pairBytes <= heap->descriptorBytes;
+				if (!sized || std::memcmp(static_cast<const std::byte*>(heap->mappedData) + offset, staged, pairBytes) != 0)
+					++out.heapsMismatched;
+				const std::byte* slotZero = static_cast<const std::byte*>(heap->mappedData) + heap->descriptorBaseOffset;
+				if (std::any_of(slotZero, slotZero + r.stride, [](std::byte b) { return b != std::byte{ 0 }; }))
+					++out.slotZeroNonzero;
+			}
+			return true;
+		}
+
+		uint64_t get_vk_buffer_device_address(Device device, VkBuffer buffer) noexcept {
+			if (!device || device.vt != &g_vkdevvt || !device.impl || buffer == VK_NULL_HANDLE)
+				return 0;
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			if (!impl->bufferDeviceAddressEnabled)
+				return 0;
+			VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+			addressInfo.buffer = buffer;
+			return vkGetBufferDeviceAddress(impl->device, &addressInfo);
 		}
 
 		CommandListPtr AdoptCommandBuffer(Device& device, VkCommandBuffer commandBuffer, QueueKind kind) noexcept {
