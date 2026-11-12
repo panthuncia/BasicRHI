@@ -1536,7 +1536,8 @@ namespace rhi {
 				return Result::Ok;
 			}
 			uint32_t usage = FU_None;
-			if (support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) {
+			// A shader resource view needs loads, not sampling: integer formats are loaded only (D3D11 binds them as SRVs too).
+			if (support.Support1 & (D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_LOAD)) {
 				usage |= FU_ShaderResource;
 			}
 			if (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) {
