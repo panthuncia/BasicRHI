@@ -5831,6 +5831,12 @@ namespace rhi {
 					spdlog::error("D3D12 queue submit rejected a {} command list", listState ? "secondary" : "null");
 					RHI_FAIL(Result::InvalidArgument);
 				}
+				// ExecuteCommandLists on a list that is not closed removes the device: refuse the whole submission, by name.
+				if (auto* listState = dx12_detail::CL(&list); listState->open || listState->closeFailed) {
+					spdlog::error("D3D12 queue submit refused: command list '{}' {}; nothing of this submission runs", listState->debugName,
+						listState->open ? "is still recording (End was not called)" : "failed to close (see its Close error above)");
+					RHI_FAIL(Result::InvalidCall);
+				}
 			}
 #if BASICRHI_ENABLE_TRACY_GPU_PROFILING
 			for (auto& list : lists) {
@@ -8698,6 +8704,7 @@ namespace rhi {
 			}
 			const auto closeResult = w->cl->Close();
 			w->open = false;
+			w->closeFailed = FAILED(closeResult);
 			if (FAILED(closeResult) && w->dev && w->dev->pNativeDevice) {
 				const auto messageCount = Dx12GetInfoQueueMessageCount(w->dev->pNativeDevice.Get());
 				Dx12LogInfoQueueMessagesSince(w->dev->pNativeDevice.Get(),
@@ -8718,8 +8725,12 @@ namespace rhi {
 				return;
 			a_list.cl->Close();
 			a_list.open = false;
+			// A bundle is open from its Reset (Recycle) on, where a Vulkan secondary does not record until BeginSecondary. One
+			// recycled and never begun held no commands: closing it drops nothing, so it is not reported.
+			const bool begun = !a_list.bundle || a_list.begunSecondary;
+			a_list.begunSecondary = false;
 			static std::atomic_flag logged;
-			if (!logged.test_and_set())
+			if (begun && !logged.test_and_set())
 				spdlog::warn("D3D12: '{}' was reset while it recorded; it was closed first and its commands dropped (logged once)", a_list.debugName);
 		}
 
@@ -8770,6 +8781,8 @@ namespace rhi {
 				BreakIfDebugging();
 			} else {
 				l->open = true;
+				l->closeFailed = false;
+				l->begunSecondary = false;
 				// Reset onto another allocator: that allocator's Reset closes it too.
 				const auto handle = cl->GetHandle();
 				auto* mutableAllocator = const_cast<Dx12Allocator*>(a);
@@ -9502,6 +9515,14 @@ namespace rhi {
 			// command lists do not accept the generic COPY_SOURCE/COPY_DEST layouts;
 			// textures copied by a copy queue remain in COMMON.  The access/sync
 			// scopes still describe the ordering of the copy operation.
+			// Enhanced barriers take no access with no sync: a side whose sync is NONE gets NO_ACCESS (a return to Common for no
+			// later user, a first use after nothing), as the debug layer requires.
+			const auto noSyncNoAccess = [](auto& barrier) noexcept {
+				if (barrier.SyncBefore == D3D12_BARRIER_SYNC_NONE)
+					barrier.AccessBefore = D3D12_BARRIER_ACCESS_NO_ACCESS;
+				if (barrier.SyncAfter == D3D12_BARRIER_SYNC_NONE)
+					barrier.AccessAfter = D3D12_BARRIER_ACCESS_NO_ACCESS;
+			};
 			auto textureLayout = [l](ResourceLayout layout) noexcept {
 				if (l->type == D3D12_COMMAND_LIST_TYPE_COPY &&
 					(layout == ResourceLayout::CopySource || layout == ResourceLayout::CopyDest)) {
@@ -9556,6 +9577,7 @@ namespace rhi {
 				tb.pResource = T->res.Get();
 				tb.Subresources = ToDX(t.range);
 				tb.Flags = nativeDiscard ? D3D12_TEXTURE_BARRIER_FLAG_DISCARD : D3D12_TEXTURE_BARRIER_FLAG_NONE;
+				noSyncNoAccess(tb);
 				tex.push_back(tb);
 			}
 
@@ -9595,6 +9617,7 @@ namespace rhi {
 				bb.pResource = B->res.Get();
 				bb.Offset = br.offset;
 				bb.Size = br.size;
+				noSyncNoAccess(bb);
 				buf.push_back(bb);
 			}
 
@@ -9606,6 +9629,7 @@ namespace rhi {
 				gb.SyncAfter = ToDX(g.afterSync);
 				gb.AccessBefore = ToDX(g.beforeAccess);
 				gb.AccessAfter = ToDX(g.afterAccess);
+				noSyncNoAccess(gb);
 				glob.push_back(gb);
 			}
 
@@ -10738,6 +10762,7 @@ namespace rhi {
 			if (inheritance.debugName) {
 				cl_setName(cl, inheritance.debugName);
 			}
+			l->begunSecondary = true;
 			return Result::Ok;
 		}
 

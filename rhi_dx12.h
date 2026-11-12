@@ -218,6 +218,10 @@ namespace rhi {
 		bool bundle = false;
 		// Recording: made open, or reset and not yet closed.
 		bool open = false;
+		// Its last Close failed: it cannot be executed until it is reset.
+		bool closeFailed = false;
+		// A bundle that BeginSecondary began since its last Reset (Reset alone opens a bundle on D3D12).
+		bool begunSecondary = false;
 		// A command a bundle cannot hold was refused; End reports it.
 		Result pendingError = Result::Ok;
 		PipelineLayoutHandle boundLayout{};
