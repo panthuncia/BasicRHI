@@ -45,6 +45,7 @@
 #include <deque>
 #include <queue>
 #include <cstring>
+#include <intrin.h>  // _mm_sfence: the device address table's ordered writes to upload memory
 #include <charconv>
 #include <new>
 #include <atomic>
@@ -1536,7 +1537,8 @@ namespace rhi {
 				return Result::Ok;
 			}
 			uint32_t usage = FU_None;
-			if (support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) {
+			// A shader resource view needs loads, not sampling: integer formats are loaded only (D3D11 binds them as SRVs too).
+			if (support.Support1 & (D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_LOAD)) {
 				usage |= FU_ShaderResource;
 			}
 			if (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) {
@@ -1811,8 +1813,10 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		static void Dx12UnregisterAddress(Dx12Device* impl, ResourceHandle handle) noexcept;
 		static void d_destroyBuffer(DeviceDeletionContext* d, ResourceHandle h) noexcept
 		{
+			Dx12UnregisterAddress(dx12_detail::Dev(d), h);
 			dx12_detail::Dev(d)->resources.free(h);
 		}
 		static void d_destroyTexture(DeviceDeletionContext* d, ResourceHandle h) noexcept
@@ -3304,6 +3308,223 @@ namespace rhi {
 			dx12_detail::Dev(d)->commandSignatures.free(h);
 		}
 
+		// ---- Emulated buffer device addresses (rhi_shader_abi.h, D3D12_DEVICE_ADDRESS_*) ----
+
+		// The page table's slot for a page; Common/DeviceAddress.hlsli computes the same.
+		static uint32_t Dx12AddressPageSlot(uint64_t page) noexcept {
+			const uint32_t mixed = (static_cast<uint32_t>(page) ^ static_cast<uint32_t>(page >> 32)) * 0x9E3779B1u;
+			return mixed >> (32u - 18u);  // log2(D3D12_DEVICE_ADDRESS_PAGE_SLOTS)
+		}
+		static_assert(D3D12_DEVICE_ADDRESS_PAGE_SLOTS == (1u << 18), "Dx12AddressPageSlot's shift");
+
+		static void Dx12RawBufferViews(Dx12Device* impl, ID3D12Resource* resource, uint64_t bytes, bool unordered,
+			D3D12_CPU_DESCRIPTOR_HANDLE srv, D3D12_CPU_DESCRIPTOR_HANDLE uav) noexcept {
+			D3D12_SHADER_RESOURCE_VIEW_DESC s{};
+			s.Format = DXGI_FORMAT_R32_TYPELESS;
+			s.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+			s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			s.Buffer.NumElements = static_cast<UINT>((std::min<uint64_t>)(bytes / 4, UINT32_MAX));
+			s.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+			impl->pNativeDevice->CreateShaderResourceView(resource, &s, srv);
+			D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+			u.Format = DXGI_FORMAT_R32_TYPELESS;
+			u.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+			u.Buffer.NumElements = s.Buffer.NumElements;
+			u.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+			// Without UAV access the slot holds a null view, so every slot of the region is a valid descriptor to copy.
+			impl->pNativeDevice->CreateUnorderedAccessView(unordered ? resource : nullptr, nullptr, &u, uav);
+		}
+
+		/** @brief The tables and the staging heap, at device creation. Without them addresses still work, but no shader can load through one. */
+		static void Dx12InitAddressTable(Dx12Device* impl) noexcept {
+			auto& t = impl->addressTable;
+			const auto upload = [&](uint64_t bytes, Microsoft::WRL::ComPtr<ID3D12Resource>& out, uint8_t*& mapped) {
+				D3D12_HEAP_PROPERTIES heap{};
+				heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+				D3D12_RESOURCE_DESC desc{};
+				desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+				desc.Width = bytes;
+				desc.Height = 1;
+				desc.DepthOrArraySize = 1;
+				desc.MipLevels = 1;
+				desc.Format = DXGI_FORMAT_UNKNOWN;
+				desc.SampleDesc.Count = 1;
+				desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+				if (FAILED(impl->pNativeDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&out))))
+					return false;
+				const D3D12_RANGE none{ 0, 0 };
+				void* data = nullptr;
+				if (FAILED(out->Map(0, &none, &data)) || !data)
+					return false;
+				mapped = static_cast<uint8_t*>(data);
+				std::memset(mapped, 0, static_cast<size_t>(bytes));
+				out->SetName(L"BasicRHI device address table");
+				return true;
+			};
+			const uint64_t entryBytes = uint64_t(D3D12_DEVICE_ADDRESS_ENTRIES) * D3D12_DEVICE_ADDRESS_ENTRY_BYTES;
+			const uint64_t pageBytes = uint64_t(D3D12_DEVICE_ADDRESS_PAGE_SLOTS) * 16;
+			if (!upload(entryBytes, t.entries, t.entriesMapped) || !upload(pageBytes, t.pages, t.pagesMapped)) {
+				spdlog::warn("DX12 device address table: its buffers could not be made; shaders cannot load through device addresses");
+				return;
+			}
+			D3D12_DESCRIPTOR_HEAP_DESC staging{};
+			staging.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+			staging.NumDescriptors = D3D12_DEVICE_ADDRESS_RESERVED_SLOTS;
+			if (FAILED(impl->pNativeDevice->CreateDescriptorHeap(&staging, IID_PPV_ARGS(&t.staging)))) {
+				spdlog::warn("DX12 device address table: its staging heap could not be made; shaders cannot load through device addresses");
+				return;
+			}
+			t.stagingStart = t.staging->GetCPUDescriptorHandleForHeapStart();
+			t.increment = impl->pNativeDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			const auto at = [&](uint32_t slot) {
+				D3D12_CPU_DESCRIPTOR_HANDLE handle = t.stagingStart;
+				handle.ptr += SIZE_T(slot) * t.increment;
+				return handle;
+			};
+			// The two tables (their UAV slots stay unused), then a null view in every entry slot.
+			Dx12RawBufferViews(impl, t.entries.Get(), entryBytes, false, at(0), at(D3D12_DEVICE_ADDRESS_RESERVED_SLOTS - 1));
+			Dx12RawBufferViews(impl, t.pages.Get(), pageBytes, false, at(1), at(D3D12_DEVICE_ADDRESS_RESERVED_SLOTS - 1));
+			for (uint32_t entry = 0; entry < D3D12_DEVICE_ADDRESS_ENTRIES; ++entry)
+				Dx12RawBufferViews(impl, nullptr, 4, false, at(2 + 2 * entry), at(3 + 2 * entry));
+			t.ready = true;
+			spdlog::info("DX12 device address table: {} buffers, {} pages of {} KiB, at heap slot {}", D3D12_DEVICE_ADDRESS_ENTRIES,
+				D3D12_DEVICE_ADDRESS_PAGE_SLOTS, (1u << D3D12_DEVICE_ADDRESS_PAGE_BITS) / 1024, D3D12_DEVICE_ADDRESS_TABLE_SLOT);
+		}
+
+		/** @brief Copies reserved slots [a_first, a_first + a_count) from the staging heap into every full-size heap. Under the write lock. */
+		static void Dx12PublishAddressSlots(Dx12Device* impl, uint32_t a_first, uint32_t a_count) noexcept {
+			auto& t = impl->addressTable;
+			D3D12_CPU_DESCRIPTOR_HANDLE from = t.stagingStart;
+			from.ptr += SIZE_T(a_first) * t.increment;
+			for (const auto& [heap, start] : t.heaps) {
+				D3D12_CPU_DESCRIPTOR_HANDLE to = start;
+				to.ptr += SIZE_T(D3D12_DEVICE_ADDRESS_TABLE_SLOT + a_first) * t.increment;
+				impl->pNativeDevice->CopyDescriptorsSimple(a_count, to, from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			}
+		}
+
+		/**
+		 * @brief Adds a buffer to the tables the first time its address is asked for: an entry with its raw views, and a page slot
+		 * for each page it covers. Readback buffers have no shader views and stay out.
+		 */
+		static void Dx12RegisterAddress(Dx12Device* impl, ResourceHandle handle) noexcept {
+			auto& t = impl->addressTable;
+			if (!impl || !t.ready || !handle.valid())
+				return;
+			const uint64_t key = (uint64_t(handle.generation) << 32) | handle.index;
+			{
+				std::shared_lock read(t.lock);
+				if (t.byResource.find(key) != t.byResource.end())
+					return;
+			}
+			Dx12Resource* resource = impl->resources.get(handle);
+			if (!resource || !resource->res || resource->kind != Dx12ResourceKind::Buffer)
+				return;
+			D3D12_HEAP_PROPERTIES heapProperties{};
+			D3D12_HEAP_FLAGS heapFlags{};
+			if (SUCCEEDED(resource->res->GetHeapProperties(&heapProperties, &heapFlags)) && heapProperties.Type == D3D12_HEAP_TYPE_READBACK)
+				return;
+			const D3D12_RESOURCE_DESC desc = resource->res->GetDesc();
+			const bool unordered = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+			const uint64_t base = resource->res->GetGPUVirtualAddress();
+			const uint64_t size = desc.Width;
+			if (!base || !size)
+				return;
+
+			std::unique_lock write(t.lock);
+			if (t.byResource.find(key) != t.byResource.end())
+				return;
+			uint32_t entry = 0;
+			if (!t.freeEntries.empty()) {
+				entry = t.freeEntries.back();
+				t.freeEntries.pop_back();
+			} else if (t.nextEntry < D3D12_DEVICE_ADDRESS_ENTRIES) {
+				entry = t.nextEntry++;
+			} else {
+				if (!t.loggedFull) {
+					t.loggedFull = true;
+					spdlog::error("DX12 device address table: all {} entries are in use; loads through further buffers' addresses read nothing", D3D12_DEVICE_ADDRESS_ENTRIES);
+				}
+				return;
+			}
+
+			// The entry's views, in the staging heap and then in every full-size heap.
+			D3D12_CPU_DESCRIPTOR_HANDLE srv = t.stagingStart;
+			srv.ptr += SIZE_T(2 + 2 * entry) * t.increment;
+			D3D12_CPU_DESCRIPTOR_HANDLE uav = srv;
+			uav.ptr += t.increment;
+			Dx12RawBufferViews(impl, resource->res.Get(), size, unordered, srv, uav);
+			Dx12PublishAddressSlots(impl, 2 + 2 * entry, 2);
+
+			// The entry, before any page slot names it.
+			const uint32_t words[8] = { static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32), static_cast<uint32_t>(size), static_cast<uint32_t>(size >> 32),
+				D3D12_DEVICE_ADDRESS_TABLE_SLOT + 2 + 2 * entry, unordered ? D3D12_DEVICE_ADDRESS_TABLE_SLOT + 3 + 2 * entry : 0xFFFFFFFFu, 0, 0 };
+			std::memcpy(t.entriesMapped + size_t(entry) * D3D12_DEVICE_ADDRESS_ENTRY_BYTES, words, sizeof(words));
+			_mm_sfence();
+
+			// A page slot for each page: the first empty or removed slot of its probe sequence, entry first, then the page.
+			bool placed = true;
+			const uint64_t firstPage = base >> D3D12_DEVICE_ADDRESS_PAGE_BITS;
+			const uint64_t lastPage = (base + size - 1) >> D3D12_DEVICE_ADDRESS_PAGE_BITS;
+			for (uint64_t page = firstPage; page <= lastPage; ++page) {
+				uint32_t slot = Dx12AddressPageSlot(page);
+				bool found = false;
+				for (uint32_t probe = 0; probe < D3D12_DEVICE_ADDRESS_PROBES; ++probe) {
+					uint32_t* at = reinterpret_cast<uint32_t*>(t.pagesMapped + size_t(slot) * 16);
+					const uint64_t key64 = uint64_t(at[2]) | (uint64_t(at[3]) << 32);
+					if (key64 == 0 || at[0] == 0xFFFFFFFFu) {
+						at[0] = entry;
+						_mm_sfence();
+						at[2] = static_cast<uint32_t>(page);
+						at[3] = static_cast<uint32_t>(page >> 32);
+						found = true;
+						break;
+					}
+					slot = (slot + 1) & (D3D12_DEVICE_ADDRESS_PAGE_SLOTS - 1);
+				}
+				placed = placed && found;
+			}
+			_mm_sfence();
+			if (!placed && !t.loggedFull) {
+				t.loggedFull = true;
+				spdlog::error("DX12 device address table: the page table is full near {:#x}; loads through some addresses read nothing", base);
+			}
+			t.byResource.emplace(key, Dx12AddressTable::Registered{ entry, base, size });
+		}
+
+		/** @brief Takes a destroyed buffer out of the tables: its page slots are marked removed and its entry is free again. */
+		static void Dx12UnregisterAddress(Dx12Device* impl, ResourceHandle handle) noexcept {
+			auto& t = impl->addressTable;
+			if (!impl || !t.ready)
+				return;
+			const uint64_t key = (uint64_t(handle.generation) << 32) | handle.index;
+			std::unique_lock write(t.lock);
+			const auto found = t.byResource.find(key);
+			if (found == t.byResource.end())
+				return;
+			const auto registered = found->second;
+			t.byResource.erase(found);
+			const uint64_t firstPage = registered.base >> D3D12_DEVICE_ADDRESS_PAGE_BITS;
+			const uint64_t lastPage = (registered.base + registered.size - 1) >> D3D12_DEVICE_ADDRESS_PAGE_BITS;
+			for (uint64_t page = firstPage; page <= lastPage; ++page) {
+				uint32_t slot = Dx12AddressPageSlot(page);
+				for (uint32_t probe = 0; probe < D3D12_DEVICE_ADDRESS_PROBES; ++probe) {
+					uint32_t* at = reinterpret_cast<uint32_t*>(t.pagesMapped + size_t(slot) * 16);
+					const uint64_t key64 = uint64_t(at[2]) | (uint64_t(at[3]) << 32);
+					if (key64 == 0)
+						break;
+					if (key64 == page && at[0] == registered.entry) {
+						at[0] = 0xFFFFFFFFu;
+						break;
+					}
+					slot = (slot + 1) & (D3D12_DEVICE_ADDRESS_PAGE_SLOTS - 1);
+				}
+			}
+			std::memset(t.entriesMapped + size_t(registered.entry) * D3D12_DEVICE_ADDRESS_ENTRY_BYTES, 0, D3D12_DEVICE_ADDRESS_ENTRY_BYTES);
+			_mm_sfence();
+			t.freeEntries.push_back(registered.entry);
+		}
+
 		static Result d_createDescriptorHeap(Device* d, const DescriptorHeapDesc& hd, DescriptorHeapPtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 
@@ -3311,10 +3532,32 @@ namespace rhi {
 			desc.Type = ToDX(hd.type);
 			desc.NumDescriptors = hd.capacity;
 			desc.Flags = hd.shaderVisible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+			// A shader-visible resource heap of the device's full capacity also holds the device address table's reserved region,
+			// past the capacity the client indexes (rhi_shader_abi.h).
+			const bool addressRegion = hd.shaderVisible && hd.type == DescriptorHeapType::CbvSrvUav && hd.capacity == D3D12_DEVICE_ADDRESS_TABLE_SLOT &&
+				impl->addressTable.ready;
+			if (addressRegion)
+				desc.NumDescriptors += D3D12_DEVICE_ADDRESS_RESERVED_SLOTS;
 
 			Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
-			if (const auto hr = impl->pNativeDevice->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap)); FAILED(hr)) {
-				RHI_FAIL(ToRHI(hr));
+			HRESULT created = impl->pNativeDevice->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap));
+			bool withRegion = addressRegion && SUCCEEDED(created);
+			if (FAILED(created) && addressRegion) {
+				spdlog::warn("DX12 device address table: a heap of {} descriptors was refused (hr=0x{:08X}); this heap has no address table",
+					desc.NumDescriptors, static_cast<uint32_t>(created));
+				desc.NumDescriptors = hd.capacity;
+				created = impl->pNativeDevice->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap));
+			}
+			if (FAILED(created)) {
+				RHI_FAIL(ToRHI(created));
+			}
+			if (withRegion) {
+				auto& t = impl->addressTable;
+				std::unique_lock write(t.lock);
+				t.heaps.emplace_back(heap.Get(), heap->GetCPUDescriptorHandleForHeapStart());
+				D3D12_CPU_DESCRIPTOR_HANDLE to = heap->GetCPUDescriptorHandleForHeapStart();
+				to.ptr += SIZE_T(D3D12_DEVICE_ADDRESS_TABLE_SLOT) * t.increment;
+				impl->pNativeDevice->CopyDescriptorsSimple(D3D12_DEVICE_ADDRESS_RESERVED_SLOTS, to, t.stagingStart, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 			}
 
 			const auto descriptorSize = impl->pNativeDevice->GetDescriptorHandleIncrementSize(desc.Type);
@@ -3328,7 +3571,13 @@ namespace rhi {
 			return Result::Ok;
 		}
 		static void d_destroyDescriptorHeap(DeviceDeletionContext* d, DescriptorHeapHandle h) noexcept {
-			dx12_detail::Dev(d)->descHeaps.free(h);
+			auto* impl = dx12_detail::Dev(d);
+			if (auto* H = impl->descHeaps.get(h)) {
+				auto& t = impl->addressTable;
+				std::unique_lock write(t.lock);
+				std::erase_if(t.heaps, [&](const auto& entry) { return entry.first == H->heap.Get(); });
+			}
+			impl->descHeaps.free(h);
 		}
 		static bool DxGetDstCpu(Dx12Device* impl, DescriptorSlot s, D3D12_CPU_DESCRIPTOR_HANDLE& out, D3D12_DESCRIPTOR_HEAP_TYPE expect) {
 			auto* H = impl->descHeaps.get(s.heap);
@@ -5053,6 +5302,9 @@ namespace rhi {
 
 		static uint64_t d_getBufferDeviceAddress(Device* d, GpuBufferAddress address) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d ? d->impl : nullptr);
+			// The address may be loaded through in a shader: the buffer joins the device address table (rhi_shader_abi.h).
+			if (impl)
+				Dx12RegisterAddress(impl, address.buffer);
 			return Dx12BufferAddress(impl, address);
 		}
 
@@ -11653,6 +11905,7 @@ namespace rhi {
 		impl->gfxHandle  = makeQ(D3D12_COMMAND_LIST_TYPE_DIRECT,  L"DX12 Graphics Queue");
 		impl->compHandle = makeQ(D3D12_COMMAND_LIST_TYPE_COMPUTE, L"DX12 Compute Queue");
 		impl->copyHandle = makeQ(D3D12_COMMAND_LIST_TYPE_COPY,    L"DX12 Copy Queue");
+		Dx12InitAddressTable(pImpl);
 
 		if (ci.pipelineCachePath) {
 			// A cache that cannot open leaves pipelines uncached; the device still works.
