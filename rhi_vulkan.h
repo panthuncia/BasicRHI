@@ -268,6 +268,8 @@ namespace rhi {
 		VkBufferUsageFlags descriptorBufferUsage = 0;
 		std::vector<std::byte> hostDescriptors;
 		std::vector<VulkanImageViewSlot> imageViewSlots;
+		// A full-capacity shader-visible resource heap's buffer view ref slots, past `capacity` (VulkanDevice::ViewRefRegion).
+		uint32_t viewRefSlots = 0;
 	};
 
 	struct VulkanSwapchain {
@@ -403,6 +405,7 @@ namespace rhi {
 		uint64_t lastSubmittedSignalValue = 0;
 		uint64_t integrityCookie = 0x564B54494D454C4Eull;
 		bool importedD3D12Fence = false;
+		bool poisonReported = false;  // the UINT64_MAX read is logged once per timeline (a lost device reads it on every poll)
 		uint32_t activeHostWaits = 0;
 	};
 
@@ -750,6 +753,22 @@ namespace rhi {
 		uint32_t shaderVisibleResourceCapacity = 0;
 		uint32_t shaderVisibleSamplerCapacity = 0;
 		VulkanDescriptorBufferModel descriptorBuffer;
+		// Buffer view refs (rhi_shader_abi.h, BUFFER_VIEW_REF_*): BUFFER_VIEW_REF_SLOTS slots past shaderVisibleResourceCapacity in
+		// every shader-visible resource heap of that capacity. A pair is two storage buffer descriptors over the buffer's address
+		// range, written once into `staging` and copied into each heap. Heaps and staging under descriptorViewsMutex; the map
+		// also under `lock`, so a ref already made is found without the views mutex.
+		struct ViewRefRegion {
+			std::shared_mutex lock;
+			bool ready = false;
+			uint64_t stride = 0;      // the heaps' descriptor stride
+			uint64_t descriptorSize = 0;  // a storage buffer descriptor's bytes
+			std::vector<std::byte> staging;  // BUFFER_VIEW_REF_SLOTS descriptors, `stride` bytes each
+			std::vector<DescriptorHeapHandle> heaps;
+			std::unordered_map<uint64_t, uint32_t> pairByResource;  // ResourceHandle index and generation -> pair
+			std::vector<uint32_t> freePairs;
+			uint32_t nextPair = 0;
+			bool loggedFull = false;
+		} viewRefs;
 		bool nullDescriptorEnabled = false;  // VK_EXT_robustness2 nullDescriptor: views with no resource
 		bool descriptorHeapCaptureReplayEnabled = false;
 		bool meshShaderEnabled = false;

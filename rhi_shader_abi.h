@@ -14,27 +14,21 @@ inline constexpr uint32_t VULKAN_RESOURCE_DESCRIPTOR_HEAP_BINDING = 1000000;
 inline constexpr uint32_t VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING = 1000001;
 inline constexpr uint32_t VULKAN_COUNTER_DESCRIPTOR_HEAP_BINDING = 1000002;
 
-// D3D12's emulated buffer device addresses (rhi_dx12.cpp, Dx12AddressTable). DXIL has no buffer pointers, so a shader turns
-// an address from Device::GetBufferDeviceAddress into a raw view and an offset through two tables BasicRHI keeps. Their raw
-// views sit in the reserved region of every shader-visible CBV/SRV/UAV heap of the device's full capacity: that region starts
-// at D3D12_DEVICE_ADDRESS_TABLE_SLOT, past the capacity the client indexes.
-// - Slot + 0: the entries, D3D12_DEVICE_ADDRESS_ENTRY_BYTES each: base address (2 words), size (2 words), the raw SRV's heap
-//   slot, the raw UAV's heap slot (a read-only buffer's: the null UAV), 2 unused words.
-// - Slot + 1: the page table, D3D12_DEVICE_ADDRESS_PAGE_SLOTS slots of 16 bytes, open addressing on the address's
-//   D3D12_DEVICE_ADDRESS_PAGE_BITS-bit page: entry index (0xFFFFFFFF: removed), unused, page (2 words; 0: empty). A page may
-//   name several buffers; the shader checks the address against each entry it finds.
-// - Slot + 2 + 2 * entry and + 3 + 2 * entry: an entry's raw SRV and UAV.
-// - Slot + D3D12_DEVICE_ADDRESS_NULL_SLOT and the slot after it: a null raw SRV and UAV, for an address in no buffer. A load
-//   through one reads zeros and a store is dropped (heap slot 0 may hold any kind of view: reading it as a buffer can fault).
-// Common/DeviceAddress.hlsli is the shader side.
-inline constexpr uint32_t D3D12_DEVICE_ADDRESS_TABLE_SLOT = 1000000;
-inline constexpr uint32_t D3D12_DEVICE_ADDRESS_ENTRIES = 16384;
-inline constexpr uint32_t D3D12_DEVICE_ADDRESS_ENTRY_BYTES = 32;
-inline constexpr uint32_t D3D12_DEVICE_ADDRESS_PAGE_BITS = 16;
-inline constexpr uint32_t D3D12_DEVICE_ADDRESS_PAGE_SLOTS = 1u << 18;
-inline constexpr uint32_t D3D12_DEVICE_ADDRESS_PROBES = 64;
-inline constexpr uint32_t D3D12_DEVICE_ADDRESS_NULL_SLOT = 2 + 2 * D3D12_DEVICE_ADDRESS_ENTRIES;
-inline constexpr uint32_t D3D12_DEVICE_ADDRESS_RESERVED_SLOTS = D3D12_DEVICE_ADDRESS_NULL_SLOT + 2;
+// Buffer view refs (Device::GetBufferViewRef): how a shader reaches a buffer without a pointer, the same on D3D12 and Vulkan.
+// A ref is two words, the buffer's view slot and a byte offset into the buffer. The view slot is a heap index in
+// ResourceDescriptorHeap: the buffer's raw SRV (ByteAddressBuffer) is at the slot and its raw UAV (RWByteAddressBuffer) at the
+// slot after it. A buffer without UAV access has a null UAV there: a store through it is dropped.
+// - The pairs live in a reserved region of every shader-visible CBV/SRV/UAV heap of the device's full capacity
+//   (ShaderFeatureInfo::maxShaderVisibleResourceDescriptors), past the slots the client indexes: slots
+//   [capacity, capacity + BUFFER_VIEW_REF_SLOTS). A buffer gets its pair the first time its ref is asked for and gives it back
+//   when it is destroyed (with the device's deferred destruction, so after the frames that may read it).
+// - View slot 0 is never a pair: a ref with view slot 0 names no buffer. Nothing makes a load through it safe; check first.
+// - On Vulkan the pair is two storage buffer descriptors over the buffer's device address range, in either binding model
+//   (VK_EXT_descriptor_heap's heap or the descriptor-buffer model's universal set), so the device reports
+//   BUFFER_VIEW_REF_SLOTS fewer descriptors than it holds.
+// Common/DeviceRef.hlsli is the shader side.
+inline constexpr uint32_t BUFFER_VIEW_REF_PAIRS = 16384;
+inline constexpr uint32_t BUFFER_VIEW_REF_SLOTS = 2 * BUFFER_VIEW_REF_PAIRS;
 
 // The DXC arguments every SPIR-V shader consumed by the Vulkan backend must be compiled with:
 // DX buffer layout, DX SV_Position.w, and ResourceDescriptorHeap/SamplerDescriptorHeap mapped onto the
