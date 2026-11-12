@@ -3061,6 +3061,7 @@ namespace rhi {
 					out->gpuUploadHeapSupported = gpuUploadHeapSupported;
 					out->tightAlignmentSupported = tightAlignmentSupported;
 					out->createNotZeroedHeapSupported = createNotZeroedSupported;
+					out->committedSmallBuffersPacked = true;
 				} break;
 				case FeatureInfoStructType::WorkGraphs: {
 					if (h->structSize < sizeof(WorkGraphFeatureInfo)) return Result::InvalidArgument;

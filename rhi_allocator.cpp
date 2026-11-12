@@ -5880,6 +5880,9 @@ Synchronized internally with a mutex.
         BOOL IsCacheCoherentUMA() const { return m_CacheCoherentUMA; }
         //bool SupportsResourceHeapTier2() const { return m_D3D12Options.ResourceHeapTier >= D3D12_RESOURCE_HEAP_TIER_2; }
         bool IsGPUUploadHeapSupported() const { return m_GPUUploadHeapSupported != FALSE; }
+        // Whether the driver packs small committed resources together (D3D12). Where it does not (Vulkan), a committed resource is a
+        // device allocation of its own, rounded up to the driver's granularity.
+        bool CommittedSmallResourcesPacked() const { return m_CommittedSmallResourcesPacked; }
         bool IsTightAlignmentSupported() const { return m_TightAlignmentSupported != FALSE; }
         bool IsTightAlignmentEnabled() const { return IsTightAlignmentSupported() && m_UseTightAlignment; }
         bool UseMutex() const { return m_UseMutex; }
@@ -5982,6 +5985,7 @@ Synchronized internally with a mutex.
         const bool m_AlwaysCommitted;
         const bool m_MsaaAlwaysCommitted;
         bool m_PreferSmallBuffersCommitted;
+        bool m_CommittedSmallResourcesPacked = true;
         const bool m_UseTightAlignment;
         bool m_DefaultPoolsNotZeroed = false;
 		bool m_UnifiedResourceHeaps = false;
@@ -6165,6 +6169,12 @@ Synchronized internally with a mutex.
 
         // GPU upload heaps (OPTIONS16)
         m_GPUUploadHeapSupported = allocCaps.gpuUploadHeapSupported;
+
+        // Small committed buffers: only worth preferring where the driver packs them (D3D12). On Vulkan each would be an allocation
+        // of its own, many times its size (thousands of engine vertex buffers of a few KiB took 64 KiB or more each).
+        m_CommittedSmallResourcesPacked = allocCaps.committedSmallBuffersPacked;
+        if (!m_CommittedSmallResourcesPacked)
+            m_PreferSmallBuffersCommitted = false;
 
         // Tight alignment
         m_TightAlignmentSupported = allocCaps.tightAlignmentSupported;
@@ -8093,6 +8103,12 @@ Synchronized internally with a mutex.
         {
                 (*ppOutAllocation)->SetResourcePointer(std::move(ptr), createParams.GetResourceDesc());
         }
+        else
+        {
+            // Give the space back, as D3D12MA does: the caller falls back to a committed resource.
+            (*ppOutAllocation)->ReleaseThis();
+            *ppOutAllocation = nullptr;
+        }
         return hr;
     }
 
@@ -8224,7 +8240,10 @@ Synchronized internally with a mutex.
             freeMemory = (budget.usageBytes < budget.budgetBytes) ? (budget.budgetBytes - budget.usageBytes) : 0;
         }
 
-        const bool canExceedFreeMemory = !committedAllowed;
+        // A small allocation where committed resources are not packed (Vulkan) may open a block over budget: committed, it would
+        // be a device allocation of its own, many times its size, and over budget every small resource would become one.
+        constexpr UINT64 kSmallOverBudget = 1ull << 20;
+        const bool canExceedFreeMemory = !committedAllowed || (!m_hAllocator->CommittedSmallResourcesPacked() && size <= kSmallOverBudget);
 
         bool canCreateNewBlock =
             ((allocDesc.flags & AllocationFlagNeverAllocate) == 0) &&

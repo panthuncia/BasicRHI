@@ -198,6 +198,11 @@ struct ResourceAllocationFeatureInfo {
     bool tightAlignmentSupported = false;    // D3D12_TIGHT_ALIGNMENT tier >= 1
 
     bool createNotZeroedHeapSupported = false; // "heap flag create_not_zeroed" proxy (D3D12MA-style)
+
+    // Whether the driver packs small committed buffers together. D3D12 does, so the allocator makes buffers up to 32 KiB
+    // committed (placed ones need 64 KiB alignment). On Vulkan a committed buffer is its own vkAllocateMemory, rounded up to the
+    // driver's allocation granularity, so small buffers are placed in the allocator's blocks instead.
+    bool committedSmallBuffersPacked = false;
 };
 
 struct WorkGraphFeatureInfo {

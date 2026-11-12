@@ -10484,6 +10484,7 @@ namespace rhi {
 					out->gpuUploadHeapSupported = hostCoherentDeviceLocal;
 					out->tightAlignmentSupported = false;
 					out->createNotZeroedHeapSupported = false;
+					out->committedSmallBuffersPacked = false;  // each committed buffer is a vkAllocateMemory of its own
 				} break;
 
 				case FeatureInfoStructType::WorkGraphs: {
@@ -12817,11 +12818,18 @@ namespace rhi {
 				const ResourceDesc& desc = resources[index];
 				VkMemoryRequirements requirements{};
 				if (desc.type == ResourceType::Buffer) {
+					// The buffer as d_createPlacedBuffer makes it (device address usage, queue sharing): the allocator places by these
+					// requirements, and a stricter real one fails the placement and falls back to a committed allocation of its own.
 					VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
 					createInfo.flags = VkBufferDeviceAddressCreateFlags(impl);
 					createInfo.size = desc.buffer.sizeBytes;
 					createInfo.usage = VkBufferUsageForDesc(impl, desc);
-					createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+					if (impl->bufferDeviceAddressEnabled) {
+						createInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+					}
+					uint32_t sharingFamilies[kVkMaxSharingFamilies]{};
+					bool concurrentSharing = false;
+					VkApplyBufferSharing(impl, desc, createInfo, sharingFamilies, concurrentSharing);
 					VkBuffer buffer = VK_NULL_HANDLE;
 					VkResult result = vkCreateBuffer(impl->device, &createInfo, nullptr, &buffer);
 					if (result != VK_SUCCESS) {
