@@ -6768,13 +6768,22 @@ namespace rhi {
 		}
 
 		static void cl_setStencilRef(CommandList* commandList, uint32_t reference) noexcept {
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
-			if (!commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE) {
+			if (!impl || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE) {
 				return;
 			}
-			vkCmdSetStencilReference(commandListState->commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, reference);
 			commandListState->stencilReference = reference;
-			commandListState->stencilReferenceApplied = true;
+			// Only a bound pipeline that declares the state takes it now: setting dynamic state a pipeline has static is invalid
+			// (VUID-vkCmdDraw-None-08608). Otherwise the next pipeline that reads it gets it at its bind.
+			const VulkanPipeline* pipelineState = VkPipelineState(impl, commandListState->boundPipeline);
+			if (pipelineState && pipelineState->bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && pipelineState->dynamicStencilReference) {
+				vkCmdSetStencilReference(commandListState->commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, reference);
+				commandListState->stencilReferenceApplied = true;
+			}
+			else {
+				commandListState->stencilReferenceApplied = false;
+			}
 		}
 
 		static void cl_setViewports(CommandList* commandList, Span<const Viewport> viewports) noexcept {
