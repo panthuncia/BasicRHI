@@ -9866,8 +9866,15 @@ namespace rhi {
 			src.SubresourceIndex = CalcSubresourceFor(*T, r.mip,
 				(T->dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? 0u : r.arraySlice);
 
-			// Full subresource copy (nullptr box) at (x,y,z) inside the texture
-			rec->cl->CopyTextureRegion(&dst, r.x, r.y, r.z, &src, nullptr);
+			// The texture's region at (x, y, z) of the footprint's extent, into the footprint's start: the Vulkan backend's meaning of
+			// the offset (vkCmdCopyImageToBuffer's imageOffset). A full-subresource copy has offset 0 and the subresource's extent.
+			// Clamped to the mip: a block-compressed footprint rounds its extent up to whole blocks, past a small mip's edge.
+			const uint32_t mipWidth = (std::max)(T->tex.w >> r.mip, 1u);
+			const uint32_t mipHeight = (std::max)(T->tex.h >> r.mip, 1u);
+			const uint32_t mipDepth = T->dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? (std::max)(uint32_t(T->tex.depth) >> r.mip, 1u) : 1u;
+			const D3D12_BOX box{ r.x, r.y, r.z, (std::min)(r.x + r.footprint.width, mipWidth), (std::min)(r.y + r.footprint.height, mipHeight),
+				(std::min)(r.z + (std::max)(r.footprint.depth, 1u), mipDepth) };
+			rec->cl->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
 		}
 
 		// buffer -> texture (symmetric)
