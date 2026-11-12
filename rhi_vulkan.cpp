@@ -3202,6 +3202,19 @@ namespace rhi {
 									if (slot.alive && slot.obj.type == ResourceType::Buffer && slot.obj.deviceAddress)
 										visit(slot.obj.deviceAddress, slot.obj.bufferSize, slot.obj.name.data(), slot.obj.ownsBuffer ? "owned" : "imported");
 							});
+							// The slot may be a byte offset or size taken for a ref: every buffer at least that large, by name.
+							uint32_t large = 0;
+							for (size_t i = 0; i < impl->resources.slots.size() && large < 32; ++i) {
+								const auto& slot = impl->resources.slots[i];
+								if (!slot.alive || slot.obj.type != ResourceType::Buffer || slot.obj.bufferSize < faultSlotLo)
+									continue;
+								++large;
+								spdlog::error("Vulkan fault attribution: buffer {} '{}' ({}, {} bytes at 0x{:x}) is at least {} bytes: the slot could be an offset into it",
+									i, slot.obj.name.data(), slot.obj.ownsBuffer ? "owned" : "imported", slot.obj.bufferSize,
+									static_cast<uint64_t>(slot.obj.deviceAddress), faultSlotLo);
+							}
+							if (!large)
+								spdlog::error("Vulkan fault attribution: no live buffer is {} bytes or larger", faultSlotLo);
 						}
 					}
 				}
