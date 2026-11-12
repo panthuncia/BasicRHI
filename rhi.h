@@ -3961,8 +3961,15 @@ namespace rhi {
 		bool enablePreviewRayTracing = false;
 		// Vulkan: native crash markers and fault reports (VK_AMD_buffer_marker, VK_NV_device_diagnostic_checkpoints,
 		// VK_EXT_device_fault, whichever the device has), logged on device loss. BASICRHI_VK_CRASH_MARKERS=1 turns it on
-		// too. Off by default: markers cost a write per command list boundary and debug label. D3D12 ignores it.
+		// too. Off by default: markers cost a write per command list boundary and debug label.
+		// D3D12: turns on DRED auto-breadcrumbs, breadcrumb context and page-fault reports without the debug layer. The
+		// DRED report is logged on device removal. SARP_D3D12_DRED=0 still turns DRED off.
 		bool enableCrashMarkers = false;
+		// D3D12: a borrowed ID3D12DeviceFactory (from ID3D12SDKConfiguration1::CreateDeviceFactory). BasicRHI then creates
+		// the device, the debug layer and the DRED settings through it, instead of through the process's D3D12 runtime.
+		// A DLL host uses it to load an Agility SDK: only an executable can export D3D12SDKVersion. BasicRHI keeps a
+		// reference for the device's lifetime. Null uses the process's runtime.
+		void* d3d12DeviceFactory = nullptr;
 		// Vulkan: VkApplicationInfo::pEngineName of the instance BasicRHI creates. Null keeps "BasicRHI". Drivers match
 		// application profiles on it: NVIDIA's profile for "DXVK" forces SDR composition, so an HDR host that runs DXVK as a
 		// guest passes "DXVK_HDR".

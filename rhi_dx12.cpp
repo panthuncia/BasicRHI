@@ -11330,12 +11330,33 @@ namespace rhi {
 		1u
 	};
 
+	// The runtime's configuration interfaces (debug layer, DRED settings). With a host's device factory they come from
+	// the factory's runtime, else from the process's. CLSIDs from d3d12.h, spelled out so no GUID library is needed.
+	static HRESULT Dx12GetConfigurationInterface(ID3D12DeviceFactory* factory, bool dred, REFIID riid, void** out) noexcept
+	{
+		static constexpr GUID kDebug = { 0xf2352aeb, 0xdd84, 0x49fe, { 0xb9, 0x7b, 0xa9, 0xdc, 0xfd, 0xcc, 0x1b, 0x4f } };
+		static constexpr GUID kDred = { 0x4a75bbc4, 0x9ff4, 0x4ad8, { 0x9f, 0x18, 0xab, 0xae, 0x84, 0xdc, 0x5f, 0xf2 } };
+		if (factory)
+			return factory->GetConfigurationInterface(dred ? kDred : kDebug, riid, out);
+		return D3D12GetDebugInterface(riid, out);
+	}
+
 	rhi::Result CreateD3D12Device(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer) noexcept
 	{
 		bool l_enableStreamline = enableStreamlineInterposer;
 	#if !BASICRHI_ENABLE_STREAMLINE
 		l_enableStreamline = false;
 	#endif
+
+		// The host's Agility SDK factory, when it passed one.
+		ComPtr<ID3D12DeviceFactory> deviceFactory;
+		if (ci.d3d12DeviceFactory) {
+			const HRESULT factoryHr = static_cast<IUnknown*>(ci.d3d12DeviceFactory)->QueryInterface(IID_PPV_ARGS(&deviceFactory));
+			if (FAILED(factoryHr)) {
+				spdlog::error("DX12 device setup: d3d12DeviceFactory is not an ID3D12DeviceFactory hr=0x{:08X}", static_cast<uint32_t>(factoryHr));
+				RHI_FAIL(ToRHI(factoryHr));
+			}
+		}
 
 		// Experimental features apply to devices created afterwards, so this comes first.
 		const bool previewRayTracingEnabled = ci.enablePreviewRayTracing && Dx12EnablePreviewRayTracing();
@@ -11344,7 +11365,7 @@ namespace rhi {
 		if (ci.enableDebug)
 		{
 			ComPtr<ID3D12Debug> dbg;
-			if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
+			if (SUCCEEDED(Dx12GetConfigurationInterface(deviceFactory.Get(), false, IID_PPV_ARGS(&dbg)))) {
 				dbg->EnableDebugLayer(), flags |= DXGI_CREATE_FACTORY_DEBUG;
 				char* gpuValidation = nullptr;
 				size_t gpuValidationLength = 0;
@@ -11366,7 +11387,8 @@ namespace rhi {
 		// DRED auto-breadcrumbs instrument command recording inside the D3D12
 		// runtime. Allow profiling to distinguish that instrumentation from the
 		// native driver path without changing the system-wide d3dconfig state.
-		bool enableDred = ci.enableDebug;
+		// The debug layer and crash markers both ask for DRED.
+		bool enableDred = ci.enableDebug || ci.enableCrashMarkers;
 		char* dredEnvironment = nullptr;
 		size_t dredEnvironmentLength = 0;
 		if (_dupenv_s(&dredEnvironment, &dredEnvironmentLength, "SARP_D3D12_DRED") == 0 && dredEnvironment) {
@@ -11377,7 +11399,7 @@ namespace rhi {
 		std::free(dredEnvironment);
 
 		ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> dredSettings;
-		if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings)))) {
+		if (SUCCEEDED(Dx12GetConfigurationInterface(deviceFactory.Get(), true, IID_PPV_ARGS(&dredSettings)))) {
 			const auto dredEnablement = enableDred
 				? D3D12_DRED_ENABLEMENT_FORCED_ON
 				: D3D12_DRED_ENABLEMENT_FORCED_OFF;
@@ -11389,6 +11411,7 @@ namespace rhi {
 
 		auto impl = std::make_shared<Dx12Device>();
 		impl->selfWeak = impl;
+		impl->deviceFactory = deviceFactory;
 		Dx12Device* pImpl = impl.get();
 		Dx12InitializeDebugInstrumentation(pImpl, ci);
 
@@ -11452,10 +11475,12 @@ namespace rhi {
 			// silent, which hid the validation reason for command-list Close failures.
 			if (ci.enableDebug) {
 				ComPtr<ID3D12Debug> debugController;
-				if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController))))
+				if (SUCCEEDED(Dx12GetConfigurationInterface(deviceFactory.Get(), false, IID_PPV_ARGS(&debugController))))
 					debugController->EnableDebugLayer();
 			}
-			const HRESULT createDeviceHr = D3D12CreateDevice(impl->adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&base));
+			const HRESULT createDeviceHr = deviceFactory ?
+				deviceFactory->CreateDevice(impl->adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&base)) :
+				D3D12CreateDevice(impl->adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&base));
 			if (FAILED(createDeviceHr)) {
 				spdlog::error(
 					"DX12 device setup: D3D12CreateDevice failed for adapter '{}' hr=0x{:08X}",
@@ -11466,6 +11491,9 @@ namespace rhi {
 
 			auto hasDevice10 = base.As(&impl->pNativeDevice);
 			if (FAILED(hasDevice10)) {
+				// Enhanced barriers and the newer interfaces come with ID3D12Device10: an Agility SDK or a recent Windows runtime.
+				spdlog::error("DX12 device setup: the D3D12 runtime has no ID3D12Device10 (needs Agility SDK 1.7 or newer, or a Windows runtime "
+					"with enhanced barriers) hr=0x{:08X}", static_cast<uint32_t>(hasDevice10));
 				RHI_FAIL(ToRHI(hasDevice10));
 			}
 		}

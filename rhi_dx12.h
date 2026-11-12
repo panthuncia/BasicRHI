@@ -567,6 +567,8 @@ namespace rhi {
 
 		Device self{};
 		ComPtr<IDXGIFactory7> pNativeFactory;
+		// The host's Agility SDK device factory (DeviceCreateInfo::d3d12DeviceFactory), kept while the device lives.
+		ComPtr<ID3D12DeviceFactory> deviceFactory;
 		Microsoft::WRL::ComPtr<IDXGIFactory7>  pSLProxyFactory;   // upgraded proxy
 		ComPtr<ID3D12Device10> pNativeDevice;
 		Microsoft::WRL::ComPtr<ID3D12Device>   pSLProxyDevice;// upgraded base iface
