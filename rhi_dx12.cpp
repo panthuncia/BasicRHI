@@ -1670,6 +1670,16 @@ namespace rhi {
 						dst.BlendOpAlpha = ToDX(src.alphaOp);
 						dst.SrcBlendAlpha = ToDX(src.srcAlpha);
 						dst.DestBlendAlpha = ToDX(src.dstAlpha);
+						// MIN and MAX ignore their factors, and the debug layer warns about any but ONE (D3D11 descriptions carry others).
+						const auto ignoresFactors = [](D3D12_BLEND_OP a_op) { return a_op == D3D12_BLEND_OP_MIN || a_op == D3D12_BLEND_OP_MAX; };
+						if (ignoresFactors(dst.BlendOp)) {
+							dst.SrcBlend = D3D12_BLEND_ONE;
+							dst.DestBlend = D3D12_BLEND_ONE;
+						}
+						if (ignoresFactors(dst.BlendOpAlpha)) {
+							dst.SrcBlendAlpha = D3D12_BLEND_ONE;
+							dst.DestBlendAlpha = D3D12_BLEND_ONE;
+						}
 						// Without independent blend only render target 0 is read.
 						if (dst.BlendEnable && (a == 0 || B.bs.independentBlend)) {
 							readsBlendFactor = readsBlendFactor ||
@@ -4348,7 +4358,9 @@ namespace rhi {
 				spdlog::error("DX12 create command list EnsureRootCbvScratchPage failed queue={}", static_cast<int>(q));
 				RHI_FAIL(Result::Failed);
 			}
+			recWithScratch.open = true;  // CreateCommandList opens it
 			const auto h = impl->commandLists.alloc(recWithScratch);
+			const_cast<Dx12Allocator*>(A)->lists.push_back(h);
 
 			CommandList ret{ h };
 			ret.impl = impl;
@@ -4399,6 +4411,7 @@ namespace rhi {
 				RHI_FAIL(Result::Failed);
 			}
 			const auto h = impl->commandLists.alloc(rec);
+			A->lists.push_back(h);
 			CommandList ret{ h };
 			ret.impl = impl;
 			ret.backendState = impl->commandLists.get(h);
@@ -8684,6 +8697,7 @@ namespace rhi {
 				w->tracyGpuZoneStack.pop_back();
 			}
 			const auto closeResult = w->cl->Close();
+			w->open = false;
 			if (FAILED(closeResult) && w->dev && w->dev->pNativeDevice) {
 				const auto messageCount = Dx12GetInfoQueueMessageCount(w->dev->pNativeDevice.Get());
 				Dx12LogInfoQueueMessagesSince(w->dev->pNativeDevice.Get(),
@@ -8698,6 +8712,17 @@ namespace rhi {
 			return ToRHI(closeResult);
 		}
 		static void cl_end(CommandList* cl) noexcept { (void)cl_endChecked(cl); }
+		/** @brief Closes a list that is still recording, so it or its allocator can be reset (its commands are dropped). Logged once. */
+		static void Dx12CloseRecording(Dx12CommandList& a_list) noexcept {
+			if (!a_list.open || !a_list.cl)
+				return;
+			a_list.cl->Close();
+			a_list.open = false;
+			static std::atomic_flag logged;
+			if (!logged.test_and_set())
+				spdlog::warn("D3D12: '{}' was reset while it recorded; it was closed first and its commands dropped (logged once)", a_list.debugName);
+		}
+
 		static void cl_reset(CommandList* cl, const CommandAllocator& ca) noexcept {
 			auto* l = dx12_detail::CL(cl);
 			auto* a = dx12_detail::Alloc(&ca);
@@ -8733,6 +8758,9 @@ namespace rhi {
 				BreakIfDebugging();
 				return;
 			}
+			// The RHI lets a list be reset while it records (Vulkan resets a recording command buffer). D3D12 resets only a closed
+			// list, so a list still recording is closed first and its commands are dropped.
+			Dx12CloseRecording(*l);
 			const HRESULT resetResult = l->cl->Reset(resetAllocator, nullptr);
 			if (FAILED(resetResult)) {
 				spdlog::error(
@@ -8740,6 +8768,14 @@ namespace rhi {
 					l->debugName,
 					static_cast<unsigned>(resetResult));
 				BreakIfDebugging();
+			} else {
+				l->open = true;
+				// Reset onto another allocator: that allocator's Reset closes it too.
+				const auto handle = cl->GetHandle();
+				auto* mutableAllocator = const_cast<Dx12Allocator*>(a);
+				if (std::find_if(mutableAllocator->lists.begin(), mutableAllocator->lists.end(),
+						[&](const CommandListHandle& h) { return h.index == handle.index && h.generation == handle.generation; }) == mutableAllocator->lists.end())
+					mutableAllocator->lists.push_back(handle);
 			}
 		}
 
@@ -10660,6 +10696,17 @@ namespace rhi {
 				return;
 			}
 			auto* A = dx12_detail::Alloc(ca);
+			// D3D12 resets an allocator only while none of its lists records (the RHI does not ask that: Vulkan resets a pool's
+			// recording buffers with it). Close any still recording, and forget the lists that are gone.
+			if (A->dev) {
+				std::erase_if(A->lists, [&](const CommandListHandle& h) {
+					auto* list = A->dev->commandLists.get(h);
+					if (!list)
+						return true;
+					Dx12CloseRecording(*list);
+					return false;
+				});
+			}
 			const HRESULT resetResult = A->alloc->Reset();
 			if (FAILED(resetResult)) {
 				spdlog::error(

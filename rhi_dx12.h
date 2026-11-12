@@ -174,6 +174,9 @@ namespace rhi {
 		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> bundleAlloc;
 		D3D12_COMMAND_LIST_TYPE type{};
 		Dx12Device* dev = nullptr;
+		// The lists recorded from this allocator (made from it or reset onto it). Its Reset closes any of them still recording:
+		// the RHI lets a list be reset while it records, as Vulkan does, and D3D12 resets neither a list nor its allocator then.
+		std::vector<CommandListHandle> lists;
 	};
 	struct Dx12CommandList {
 		struct TracyGpuZoneEvent {
@@ -213,6 +216,8 @@ namespace rhi {
 		D3D12_COMMAND_LIST_TYPE type{};
 		// A secondary, recorded as a bundle (D3D12_COMMAND_LIST_TYPE_BUNDLE) from its allocator's bundleAlloc.
 		bool bundle = false;
+		// Recording: made open, or reset and not yet closed.
+		bool open = false;
 		// A command a bundle cannot hold was refused; End reports it.
 		Result pendingError = Result::Ok;
 		PipelineLayoutHandle boundLayout{};
