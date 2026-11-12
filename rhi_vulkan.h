@@ -838,7 +838,9 @@ namespace rhi {
 		// buffer is not pending then, so the GPU is done with them) and takes ranges from them before allocating, so the memory
 		// is what the lists not yet reset hold, not every page a pooled list ever needed. A page left here for
 		// kPreprocessPoolIdleResets resets (a size the lists outgrew) is freed.
+		// The pool also holds at most kPreprocessPoolIdleBytes: past that, the pages given back longest ago are freed first.
 		static constexpr uint64_t kPreprocessPoolIdleResets = 4096;
+		static constexpr uint64_t kPreprocessPoolIdleBytes = 64ull * 1024ull * 1024ull;
 		struct PooledPreprocessPage {
 			VulkanCommandList::GeneratedCommandsPreprocessPage page;
 			uint64_t returnedAt = 0;  // preprocessPoolResets when it came back
@@ -846,6 +848,20 @@ namespace rhi {
 		std::mutex preprocessPoolMutex;
 		std::vector<PooledPreprocessPage> preprocessPool;
 		uint64_t preprocessPoolResets = 0;
+		uint64_t preprocessPoolBytes = 0;
+		// Emulated root constants' scratch pages no command list holds, kept the same way: a list gives its pages back at its reset
+		// and takes them from here before allocating. So a list that never spills its constants holds no page, and the memory is
+		// what the lists not yet reset hold. Bounded by resets and by bytes like the preprocess pool.
+		static constexpr uint64_t kScratchPoolIdleResets = 4096;
+		static constexpr uint64_t kScratchPoolIdleBytes = 16ull * 1024ull * 1024ull;
+		struct PooledScratchPage {
+			VulkanCommandList::EmulatedRootConstantScratchPage page;
+			uint64_t returnedAt = 0;  // scratchPoolResets when it came back
+		};
+		std::mutex scratchPoolMutex;
+		std::vector<PooledScratchPage> scratchPool;
+		uint64_t scratchPoolResets = 0;
+		uint64_t scratchPoolBytes = 0;
 		struct HostMemoryMapping {
 			void* base = nullptr;
 			uint32_t refCount = 0;

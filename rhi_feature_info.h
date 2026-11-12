@@ -13,6 +13,7 @@ enum class FeatureInfoStructType : uint64_t {
 	WorkGraphs = 9,
 	IndirectCommands = 10,
 	FixedFunction = 11,
+	CommandMemory = 12,
 };
 
 struct FeatureInfoHeader {
@@ -238,6 +239,22 @@ struct IndirectCommandsFeatureInfo {
 };
 
 // Optional fixed-function pipeline and command list state (D3D11-style state that Vulkan gates behind features).
+// Not a capability: what command recording holds now (Device::CommandMemoryStats). Each kind of scratch page is "held" while
+// a list that recorded into it has not been reset, and "pooled" once a reset gave it back to the device for other lists.
+// Zero where a backend does not count it (D3D12).
+struct CommandMemoryFeatureInfo {
+    FeatureInfoHeader header{ FeatureInfoStructType::CommandMemory, nullptr, sizeof(CommandMemoryFeatureInfo), 1 };
+
+    uint64_t commandPools = 0;     // command allocators alive (VkCommandPool)
+    uint64_t commandLists = 0;     // command lists alive (VkCommandBuffer)
+    // Emulated root constants' spilled data (host-visible pages a list pushes its constants into when they do not fit).
+    uint64_t scratchPagesHeld = 0, scratchBytesHeld = 0;
+    uint64_t scratchPagesPooled = 0, scratchBytesPooled = 0;
+    // Device-generated commands' preprocess memory.
+    uint64_t dgcPagesHeld = 0, dgcBytesHeld = 0;
+    uint64_t dgcPagesPooled = 0, dgcBytesPooled = 0;
+};
+
 struct FixedFunctionFeatureInfo {
     FeatureInfoHeader header{ FeatureInfoStructType::FixedFunction, nullptr, sizeof(FixedFunctionFeatureInfo), 2 };
 

@@ -1528,6 +1528,8 @@ namespace rhi {
 		// Pipelines and queries too: driver memory neither DXVK's nor ORG's allocator sees.
 		static std::atomic<int64_t> g_liveCommandPools{ 0 }, g_liveCommandBuffers{ 0 }, g_loggedCommandPools{ 0 };
 		static std::atomic<int64_t> g_livePipelines{ 0 }, g_loggedPipelines{ 0 }, g_liveQueryPools{ 0 }, g_liveQueries{ 0 };
+		// Scratch pages alive, held by lists or pooled (CommandMemoryFeatureInfo): emulated root constants' and DGC preprocess pages.
+		static std::atomic<int64_t> g_scratchPages{ 0 }, g_scratchBytes{ 0 }, g_dgcPages{ 0 }, g_dgcBytes{ 0 };
 		static void LogDriverObjects() noexcept {
 			spdlog::info("BasicRHI Vulkan: {} command pools alive, {} command buffers, {} pipelines, {} query pools ({} queries)",
 				g_liveCommandPools.load(std::memory_order_relaxed), g_liveCommandBuffers.load(std::memory_order_relaxed),
@@ -1587,6 +1589,10 @@ namespace rhi {
 				return;
 			}
 			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
+			if (page.buffer != VK_NULL_HANDLE) {
+				g_scratchPages.fetch_sub(1, std::memory_order_relaxed);
+				g_scratchBytes.fetch_sub(page.capacity, std::memory_order_relaxed);
+			}
 
 			if (page.mappedData != nullptr && page.memory != VK_NULL_HANDLE) {
 				VkUnmapMemorySynchronized(impl, page.memory);
@@ -1604,9 +1610,27 @@ namespace rhi {
 			if (!impl || impl->device == VK_NULL_HANDLE || !impl->bufferDeviceAddressEnabled || minSize == 0) {
 				return false;
 			}
+			const uint64_t alignment = VkEmulatedRootConstantAlignment(impl);
+			// A page another list gave back at its reset: the smallest that holds the data. It starts at offset 0, which is aligned.
+			{
+				std::scoped_lock poolLock(impl->scratchPoolMutex);
+				auto& pool = impl->scratchPool;
+				const uint64_t needed = VkAlignUp(minSize, alignment);
+				auto best = pool.end();
+				for (auto it = pool.begin(); it != pool.end(); ++it)
+					if (it->page.capacity >= needed && (best == pool.end() || it->page.capacity < best->page.capacity)) best = it;
+				if (best != pool.end()) {
+					auto page = best->page;
+					impl->scratchPoolBytes -= page.capacity;
+					*best = pool.back();
+					pool.pop_back();
+					page.cursor = 0;
+					commandListState.emulatedRootConstantScratchPages.push_back(page);
+					return true;
+				}
+			}
 			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
 
-			const uint64_t alignment = VkEmulatedRootConstantAlignment(impl);
 			const uint64_t capacity64 = (std::max<uint64_t>)(VkAlignUp(minSize, alignment), 64ull * 1024ull);
 			if (capacity64 > static_cast<uint64_t>((std::numeric_limits<uint32_t>::max)())) {
 				return false;
@@ -1680,8 +1704,48 @@ namespace rhi {
 			page.deviceAddress = deviceAddress;
 			page.capacity = static_cast<uint32_t>(capacity64);
 			page.cursor = 0;
+			g_scratchPages.fetch_add(1, std::memory_order_relaxed);
+			g_scratchBytes.fetch_add(page.capacity, std::memory_order_relaxed);
 			commandListState.emulatedRootConstantScratchPages.push_back(std::move(page));
 			return true;
+		}
+
+		// At the list's reset (its buffer not pending): its scratch pages go back to the device's pool. Pages the pool has held for
+		// kScratchPoolIdleResets resets, and the oldest ones past kScratchPoolIdleBytes, are freed, outside the pool's lock.
+		static void VkReturnEmulatedRootConstantScratchPages(VulkanDevice* impl, VulkanCommandList& commandListState) noexcept {
+			auto& pages = commandListState.emulatedRootConstantScratchPages;
+			if (pages.empty()) return;
+			std::vector<VulkanCommandList::EmulatedRootConstantScratchPage> idle;
+			{
+				std::scoped_lock poolLock(impl->scratchPoolMutex);
+				const uint64_t now = ++impl->scratchPoolResets;
+				auto& pool = impl->scratchPool;
+				for (auto& page : pages) {
+					page.cursor = 0;
+					impl->scratchPoolBytes += page.capacity;
+					pool.push_back({ page, now });
+				}
+				for (size_t i = 0; i < pool.size();) {
+					if (now - pool[i].returnedAt > VulkanDevice::kScratchPoolIdleResets) {
+						impl->scratchPoolBytes -= pool[i].page.capacity;
+						idle.push_back(pool[i].page);
+						pool[i] = pool.back();
+						pool.pop_back();
+					} else {
+						++i;
+					}
+				}
+				while (impl->scratchPoolBytes > VulkanDevice::kScratchPoolIdleBytes && !pool.empty()) {
+					auto oldest = std::min_element(pool.begin(), pool.end(), [](const auto& a, const auto& b) { return a.returnedAt < b.returnedAt; });
+					impl->scratchPoolBytes -= oldest->page.capacity;
+					idle.push_back(oldest->page);
+					*oldest = pool.back();
+					pool.pop_back();
+				}
+			}
+			pages.clear();
+			for (auto& page : idle)
+				VkDestroyEmulatedRootConstantScratchPage(impl, page);
 		}
 
 		static bool VkAllocateEmulatedRootConstantScratch(
@@ -3661,6 +3725,8 @@ namespace rhi {
 			}
 			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
 			if (page.buffer != VK_NULL_HANDLE) {
+				g_dgcPages.fetch_sub(1, std::memory_order_relaxed);
+				g_dgcBytes.fetch_sub(static_cast<int64_t>(page.capacity), std::memory_order_relaxed);
 				vkDestroyBuffer(impl->device, page.buffer, nullptr);
 			}
 			if (page.memory != VK_NULL_HANDLE) {
@@ -3669,8 +3735,9 @@ namespace rhi {
 			page = {};
 		}
 
-		// At the list's reset (its buffer not pending): its preprocess pages go back to the device's pool; pages the pool has held
-		// for kPreprocessPoolIdleResets resets are freed, outside the pool's lock.
+		// At the list's reset (its buffer not pending): its preprocess pages go back to the device's pool. Pages the pool has held
+		// for kPreprocessPoolIdleResets resets, and the oldest ones past kPreprocessPoolIdleBytes, are freed, outside the pool's
+		// lock.
 		static void VkReturnGeneratedCommandsPreprocessPages(VulkanDevice* impl, VulkanCommandList& commandListState) noexcept {
 			auto& pages = commandListState.generatedCommandsPreprocessPages;
 			std::vector<VulkanCommandList::GeneratedCommandsPreprocessPage> idle;
@@ -3679,17 +3746,26 @@ namespace rhi {
 				const uint64_t now = ++impl->preprocessPoolResets;
 				for (auto& page : pages) {
 					page.cursor = 0;
+					impl->preprocessPoolBytes += page.capacity;
 					impl->preprocessPool.push_back({ page, now });
 				}
 				auto& pool = impl->preprocessPool;
 				for (size_t i = 0; i < pool.size();) {
 					if (now - pool[i].returnedAt > VulkanDevice::kPreprocessPoolIdleResets) {
+						impl->preprocessPoolBytes -= pool[i].page.capacity;
 						idle.push_back(pool[i].page);
 						pool[i] = pool.back();
 						pool.pop_back();
 					} else {
 						++i;
 					}
+				}
+				while (impl->preprocessPoolBytes > VulkanDevice::kPreprocessPoolIdleBytes && !pool.empty()) {
+					auto oldest = std::min_element(pool.begin(), pool.end(), [](const auto& a, const auto& b) { return a.returnedAt < b.returnedAt; });
+					impl->preprocessPoolBytes -= oldest->page.capacity;
+					idle.push_back(oldest->page);
+					*oldest = pool.back();
+					pool.pop_back();
 				}
 			}
 			pages.clear();
@@ -3767,6 +3843,7 @@ namespace rhi {
 				}
 				if (best != pool.end()) {
 					auto page = best->page;
+					impl->preprocessPoolBytes -= page.capacity;
 					*best = pool.back();
 					pool.pop_back();
 					outAddress = page.deviceAddress;
@@ -3832,6 +3909,8 @@ namespace rhi {
 
 			outAddress = page.deviceAddress;
 			outSize = rangeSize;
+			g_dgcPages.fetch_add(1, std::memory_order_relaxed);
+			g_dgcBytes.fetch_add(static_cast<int64_t>(page.capacity), std::memory_order_relaxed);
 			commandListState.generatedCommandsPreprocessPages.push_back(std::move(page));
 			return Result::Ok;
 		}
@@ -5989,9 +6068,7 @@ namespace rhi {
 			commandListState->recordedBarrierBatches.clear();
 			commandListState->recordingTextureStates.clear();
 			commandListState->recordingBufferStates.clear();
-			for (auto& page : commandListState->emulatedRootConstantScratchPages) {
-				page.cursor = 0;
-			}
+			VkReturnEmulatedRootConstantScratchPages(impl, *commandListState);
 			VkReturnGeneratedCommandsPreprocessPages(impl, *commandListState);
 			commandListState->preprocessedIndirect.clear();
 			commandListState->preprocessBarrierPending = false;
@@ -10578,6 +10655,38 @@ namespace rhi {
 						out->countedDraws = impl->drawIndirectCountEnabled && vkCmdDrawIndexedIndirectCount;
 				} break;
 
+				case FeatureInfoStructType::CommandMemory: {
+					if (header->structSize < sizeof(CommandMemoryFeatureInfo)) {
+						RHI_FAIL(Result::InvalidArgument);
+					}
+					// Counted process-wide, the pooled part per device: held is alive minus pooled.
+					auto* out = reinterpret_cast<CommandMemoryFeatureInfo*>(header);
+					const auto count = [](const std::atomic<int64_t>& value) { return static_cast<uint64_t>((std::max<int64_t>)(value.load(std::memory_order_relaxed), 0)); };
+					out->commandPools = count(g_liveCommandPools);
+					out->commandLists = count(g_liveCommandBuffers);
+					auto* mutableImpl = const_cast<VulkanDevice*>(impl);
+					uint64_t scratchPooled = 0, scratchPooledBytes = 0, dgcPooled = 0, dgcPooledBytes = 0;
+					{
+						std::scoped_lock poolLock(mutableImpl->scratchPoolMutex);
+						scratchPooled = mutableImpl->scratchPool.size();
+						scratchPooledBytes = mutableImpl->scratchPoolBytes;
+					}
+					{
+						std::scoped_lock poolLock(mutableImpl->preprocessPoolMutex);
+						dgcPooled = mutableImpl->preprocessPool.size();
+						dgcPooledBytes = mutableImpl->preprocessPoolBytes;
+					}
+					const auto held = [](uint64_t alive, uint64_t pooled) { return alive > pooled ? alive - pooled : 0; };
+					out->scratchPagesPooled = scratchPooled;
+					out->scratchBytesPooled = scratchPooledBytes;
+					out->scratchPagesHeld = held(count(g_scratchPages), scratchPooled);
+					out->scratchBytesHeld = held(count(g_scratchBytes), scratchPooledBytes);
+					out->dgcPagesPooled = dgcPooled;
+					out->dgcBytesPooled = dgcPooledBytes;
+					out->dgcPagesHeld = held(count(g_dgcPages), dgcPooled);
+					out->dgcBytesHeld = held(count(g_dgcBytes), dgcPooledBytes);
+				} break;
+
 				case FeatureInfoStructType::FixedFunction: {
 					if (header->structSize < sizeof(FixedFunctionFeatureInfo)) {
 						RHI_FAIL(Result::InvalidArgument);
@@ -13173,6 +13282,11 @@ namespace rhi {
 		for (auto& pooled : preprocessPool)
 			VkDestroyGeneratedCommandsPreprocessPage(this, pooled.page);
 		preprocessPool.clear();
+		preprocessPoolBytes = 0;
+		for (auto& pooled : scratchPool)
+			VkDestroyEmulatedRootConstantScratchPage(this, pooled.page);
+		scratchPool.clear();
+		scratchPoolBytes = 0;
 
 		for (auto& slot : descriptorHeaps.slots) {
 			if (!slot.alive) {

@@ -3699,6 +3699,13 @@ namespace rhi {
 			vt->getResourceAllocationInfo(this, resourceDescriptions, numResourceDescriptions, outAllocationInfo);
 		}
 		Result QueryFeatureInfo(FeatureInfoHeader* chain) const noexcept { return vt->queryFeatureInfo(this, chain); }
+		// What command recording holds now (CommandMemoryFeatureInfo): lists, allocators and their scratch pages. Zero where
+		// the backend does not count it.
+		CommandMemoryFeatureInfo CommandMemoryStats() const noexcept {
+			CommandMemoryFeatureInfo info{};
+			(void)QueryFeatureInfo(&info.header);
+			return info;
+		}
 		Result SetResidencyPriority(const Span<PageableRef>& resources, ResidencyPriority p) const noexcept { return vt->setResidencyPriority(this, resources, p); }
 		Result QueryVideoMemoryInfo(uint32_t nodeIndex, MemorySegmentGroup segmentGroup, VideoMemoryInfo& out) const noexcept {
 			return vt->queryVideoMemoryInfo(this, nodeIndex, segmentGroup, out);
