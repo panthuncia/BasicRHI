@@ -2591,6 +2591,25 @@ namespace rhi {
 			return VkCommandListState(impl, commandList ? commandList->GetHandle() : CommandListHandle{});
 		}
 
+		// BASICRHI_RELEASE_COMMAND_MEMORY=1: resets hand the driver's command memory back (RELEASE_RESOURCES) instead of keeping it
+		// for the next recording. An attribution switch: it costs the driver's re-allocation at every recording.
+		static bool ReleaseCommandMemoryOnReset() noexcept {
+			static const bool release = [] {
+				char value[8]{};
+				return GetEnvironmentVariableA("BASICRHI_RELEASE_COMMAND_MEMORY", value, sizeof(value)) > 0 && value[0] == '1';
+			}();
+			return release;
+		}
+
+		// Live VkCommandPools and command buffers, for attributing driver command memory (each pool owns its own chunks).
+		static std::atomic<int64_t> g_liveCommandPools{ 0 }, g_liveCommandBuffers{ 0 }, g_loggedCommandPools{ 0 };
+		static void NoteCommandPools(int64_t delta) noexcept {
+			const int64_t live = g_liveCommandPools.fetch_add(delta, std::memory_order_relaxed) + delta;
+			int64_t logged = g_loggedCommandPools.load(std::memory_order_relaxed);
+			if (delta > 0 && live >= logged + 128 && g_loggedCommandPools.compare_exchange_strong(logged, live, std::memory_order_relaxed))
+				spdlog::info("BasicRHI Vulkan: {} command pools alive, {} command buffers", live, g_liveCommandBuffers.load(std::memory_order_relaxed));
+		}
+
 		static Result VkAllocateCommandBuffer(VkDevice device, VkCommandPool pool, VkCommandBufferLevel level, VkCommandBuffer& outCommandBuffer) noexcept {
 			VkCommandBufferAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
 			allocateInfo.commandPool = pool;
@@ -2601,6 +2620,7 @@ namespace rhi {
 			if (result != VK_SUCCESS) {
 				RHI_FAIL(ToRHI(result));
 			}
+			g_liveCommandBuffers.fetch_add(1, std::memory_order_relaxed);
 			return Result::Ok;
 		}
 
@@ -5908,6 +5928,7 @@ namespace rhi {
 					if (VulkanCommandAllocator* oldAllocator = VkAllocatorState(impl, commandListState->allocatorHandle);
 						oldAllocator && oldAllocator->pool != VK_NULL_HANDLE) {
 						vkFreeCommandBuffers(impl->device, oldAllocator->pool, 1, &commandListState->commandBuffer);
+						g_liveCommandBuffers.fetch_sub(1, std::memory_order_relaxed);
 					}
 					commandListState->commandBuffer = VK_NULL_HANDLE;
 				}
@@ -5921,7 +5942,8 @@ namespace rhi {
 				commandListState->commandBuffer = newCommandBuffer;
 			}
 			else {
-				const VkResult resetResult = vkResetCommandBuffer(commandListState->commandBuffer, 0);
+				const VkResult resetResult = vkResetCommandBuffer(commandListState->commandBuffer,
+					ReleaseCommandMemoryOnReset() ? VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT : 0);
 				if (resetResult != VK_SUCCESS) {
 					spdlog::error("Vulkan command list reset failed with VkResult {}", static_cast<int>(resetResult));
 					return;
@@ -8342,7 +8364,8 @@ namespace rhi {
 				return;
 			}
 
-			const VkResult result = vkResetCommandPool(impl->device, allocatorState->pool, 0);
+			const VkResult result = vkResetCommandPool(impl->device, allocatorState->pool,
+				ReleaseCommandMemoryOnReset() ? VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT : 0);
 			if (result != VK_SUCCESS) {
 				spdlog::error("Vulkan command allocator reset failed with VkResult {}", static_cast<int>(result));
 			}
@@ -9849,6 +9872,7 @@ namespace rhi {
 				if (VulkanCommandAllocator* allocatorState = VkAllocatorState(impl, commandListState->allocatorHandle);
 					allocatorState && allocatorState->pool != VK_NULL_HANDLE && impl->device != VK_NULL_HANDLE) {
 					vkFreeCommandBuffers(impl->device, allocatorState->pool, 1, &commandListState->commandBuffer);
+					g_liveCommandBuffers.fetch_sub(1, std::memory_order_relaxed);
 				}
 			}
 
@@ -11831,6 +11855,7 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
+			NoteCommandPools(1);
 			const CommandAllocatorHandle handle = impl->allocators.alloc(VulkanCommandAllocator{ pool, kind, createInfo.queueFamilyIndex });
 			CommandAllocator allocator{ handle };
 			allocator.impl = impl;
@@ -11854,6 +11879,7 @@ namespace rhi {
 
 			if (allocatorState->pool != VK_NULL_HANDLE && impl->device != VK_NULL_HANDLE) {
 				vkDestroyCommandPool(impl->device, allocatorState->pool, nullptr);
+				NoteCommandPools(-1);
 			}
 
 			impl->allocators.free(allocator->GetHandle());
