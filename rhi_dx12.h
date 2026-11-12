@@ -299,6 +299,32 @@ namespace rhi {
 		Dx12Device* dev = nullptr;
 	};
 
+	/**
+	 * @brief Emulated buffer device addresses (rhi_shader_abi.h, D3D12_DEVICE_ADDRESS_*). A buffer joins the tables the first time
+	 * its address is asked for (Device::GetBufferDeviceAddress) and leaves them when it is destroyed. The tables are in upload
+	 * memory the GPU reads directly. Each new entry is written before the page slots that name it, and a page slot's entry before
+	 * its page, so a shader sees either the old state or the new one.
+	 */
+	struct Dx12AddressTable {
+		std::shared_mutex lock;
+		bool ready = false;
+		Microsoft::WRL::ComPtr<ID3D12Resource> entries, pages;
+		uint8_t* entriesMapped = nullptr;
+		uint8_t* pagesMapped = nullptr;
+		// CPU-only heap holding the reserved region's views; copied into each full-size shader-visible heap.
+		Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> staging;
+		D3D12_CPU_DESCRIPTOR_HANDLE stagingStart{};
+		UINT increment = 0;
+		// The full-size shader-visible heaps the region is copied into (their start handles).
+		std::vector<std::pair<ID3D12DescriptorHeap*, D3D12_CPU_DESCRIPTOR_HANDLE>> heaps;
+		// A registered buffer: its entry and the address range its page slots cover.
+		struct Registered { uint32_t entry; uint64_t base; uint64_t size; };
+		std::unordered_map<uint64_t, Registered> byResource;  // ResourceHandle index and generation
+		std::vector<uint32_t> freeEntries;
+		uint32_t nextEntry = 0;
+		bool loggedFull = false;
+	};
+
 	struct Dx12Timeline {
 		struct SignalRecord {
 			uint64_t value = 0;
@@ -578,6 +604,7 @@ namespace rhi {
 		ComPtr<IDXGIAdapter4>  adapter;
 
 		Registry<Dx12Resource> resources;
+		Dx12AddressTable addressTable;
 		Registry<Dx12Sampler> samplers;
 		Registry<Dx12PipelineLayout> pipelineLayouts;
 		Registry<Dx12Pipeline> pipelines;
