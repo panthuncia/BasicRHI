@@ -9585,6 +9585,25 @@ namespace rhi {
 				tb.Subresources = ToDX(t.range);
 				tb.Flags = nativeDiscard ? D3D12_TEXTURE_BARRIER_FLAG_DISCARD : D3D12_TEXTURE_BARRIER_FLAG_NONE;
 				noSyncNoAccess(tb);
+				// The COMMON layout takes shader reads and copies only (a simultaneous-access texture takes any but the attachment
+				// layouts'). An access it cannot take means the texture is used in COMMON where it needs a layout of its own: the bit
+				// is dropped so the barrier is valid, and the first such use is logged with the texture.
+				if (!(T->res->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) {
+					const auto commonAccess = [&](D3D12_BARRIER_LAYOUT layout, D3D12_BARRIER_ACCESS& access, const char* side) {
+						constexpr D3D12_BARRIER_ACCESS allowed = D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_COPY_SOURCE | D3D12_BARRIER_ACCESS_COPY_DEST;
+						if (layout != D3D12_BARRIER_LAYOUT_COMMON || access == D3D12_BARRIER_ACCESS_NO_ACCESS || !(access & ~allowed))
+							return;
+						static std::atomic_flag logged;
+						if (!logged.test_and_set()) {
+							spdlog::error("D3D12 barrier: access {:#x} {} of texture {} is not allowed in the COMMON layout; dropped to {:#x} (the texture needs its own "
+								"layout for that use; logged once)",
+								static_cast<uint32_t>(access), side, static_cast<const void*>(T->res.Get()), static_cast<uint32_t>(access & allowed));
+						}
+						access = static_cast<D3D12_BARRIER_ACCESS>(access & allowed);
+					};
+					commonAccess(tb.LayoutBefore, tb.AccessBefore, "before");
+					commonAccess(tb.LayoutAfter, tb.AccessAfter, "after");
+				}
 				tex.push_back(tb);
 			}
 
@@ -9637,6 +9656,19 @@ namespace rhi {
 				gb.AccessBefore = ToDX(g.beforeAccess);
 				gb.AccessAfter = ToDX(g.afterAccess);
 				noSyncNoAccess(gb);
+				// A global barrier names no texture, so it cannot take the accesses bound to a layout (attachments, resolves, shading
+				// rate): those images are ordered by their own texture barriers. What is left orders buffers, UAVs and copies.
+				const auto globalAccess = [](D3D12_BARRIER_ACCESS& access) {
+					constexpr D3D12_BARRIER_ACCESS layoutBound = D3D12_BARRIER_ACCESS_RENDER_TARGET | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ |
+						D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE | D3D12_BARRIER_ACCESS_RESOLVE_SOURCE | D3D12_BARRIER_ACCESS_RESOLVE_DEST |
+						D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE;
+					if (access == D3D12_BARRIER_ACCESS_NO_ACCESS || !(access & layoutBound))
+						return;
+					const auto kept = static_cast<D3D12_BARRIER_ACCESS>(access & ~layoutBound);
+					access = kept ? kept : D3D12_BARRIER_ACCESS_NO_ACCESS;
+				};
+				globalAccess(gb.AccessBefore);
+				globalAccess(gb.AccessAfter);
 				glob.push_back(gb);
 			}
 
