@@ -187,6 +187,8 @@ namespace rhi {
 		uint32_t mapRefCount = 0;
 		VkDeviceAddress deviceAddress = 0;
 		uint64_t bufferSize = 0;
+		// The buffer's debug name, truncated: the fault report names buffers by it.
+		std::array<char, 48> name{};
 		VkFormat format = VK_FORMAT_UNDEFINED;
 		// The format the resource was created with, when its image is stored in another (VulkanDevice::formatRemaps); Unknown for
 		// an imported image.
@@ -784,6 +786,7 @@ namespace rhi {
 			uint64_t size = 0;
 			uint64_t key = 0;
 			bool owned = false;
+			std::array<char, 48> name{};
 		};
 		struct RetiredBufferRing {
 			std::mutex mutex;

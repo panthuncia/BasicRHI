@@ -3088,6 +3088,36 @@ namespace rhi {
 			}
 		}
 
+		// Keeps a buffer's debug name, truncated, for the fault report.
+		static void VkKeepResourceName(VulkanResource& resource, const char* name) noexcept {
+			resource.name.fill('\0');
+			if (name)
+				std::strncpy(resource.name.data(), name, resource.name.size() - 1);
+		}
+
+		// Buffers holding a device address whose low word is in [a_lo, a_hi]: when a shader takes such an address for a buffer view
+		// ref, the low word becomes the view slot (the high word the offset). a_what names the list.
+		template <class Each>
+		static void VkLogLowWordHolders(uint64_t a_lo, uint64_t a_hi, const char* a_what, Each&& a_each) noexcept {
+			uint32_t logged = 0;
+			a_each([&](uint64_t address, uint64_t size, const char* name, const char* kind) {
+				if (logged >= 16 || size == 0)
+					return;
+				for (uint64_t high = address >> 32; high <= (address + size - 1) >> 32; ++high) {
+					const uint64_t first = (std::max)(address, (high << 32) | a_lo);
+					const uint64_t last = (std::min)(address + size - 1, (high << 32) | a_hi);
+					if (first > last)
+						continue;
+					++logged;
+					spdlog::error("Vulkan fault attribution: {} '{}' ({}, {} bytes at 0x{:x}) holds 0x{:x}, at offset 0x{:x}: read as a ref, slot 0x{:x}, offset {}",
+						a_what, name, kind, size, address, first, first - address, first & 0xFFFFFFFFu, high);
+					break;
+				}
+			});
+			if (!logged)
+				spdlog::error("Vulkan fault attribution: no {} holds an address whose low word is in [0x{:x}, 0x{:x}]", a_what, a_lo, a_hi);
+		}
+
 		// What a faulting address is in or next to: the shader-visible heaps, the live buffers below and above it, the buffer view
 		// ref pairs (live or freed) and the recently destroyed buffers. Locks are only tried: a lost device may leave one held.
 		static void VkAttributeFaultAddress(VulkanDevice* impl, VkDeviceAddress a) noexcept {
@@ -3100,6 +3130,7 @@ namespace rhi {
 				return std::format("0x{:x} bytes before it", base - a);
 			};
 			const auto nextTo = [a](uint64_t base, uint64_t size) { return a + kNear >= base && a < base + size + kNear; };
+			uint64_t faultSlotLo = 0, faultSlotHi = 0;  // the slots a past-the-heap read names, when it is one
 			try {
 				{
 					std::shared_lock lock(impl->descriptorHeaps.mutex, std::try_to_lock);
@@ -3115,6 +3146,16 @@ namespace rhi {
 								"bytes [0x{:x}, 0x{:x}): {}", heap.type == DescriptorHeapType::Sampler ? "sampler" : "resource", i, heap.capacity,
 								heap.viewRefSlots, heap.descriptorStride, heap.descriptorBaseOffset, static_cast<uint64_t>(heap.deviceAddress),
 								static_cast<uint64_t>(heap.deviceAddress) + heap.descriptorBytes, where(heap.deviceAddress, heap.descriptorBytes));
+							// Past a resource heap's end: the slots a shader indexed, over the fault's 4 KiB page.
+							const uint64_t base = heap.deviceAddress + heap.descriptorBaseOffset;
+							if (heap.type == DescriptorHeapType::CbvSrvUav && heap.descriptorStride && a >= base + heap.descriptorBytes &&
+								(a - base) / heap.descriptorStride < (1ull << 32)) {
+								const uint64_t page = a & ~0xFFFull;
+								faultSlotLo = (page - base) / heap.descriptorStride;
+								faultSlotHi = (page + 0xFFF - base) / heap.descriptorStride;
+								spdlog::error("Vulkan fault attribution: read as heap {}'s descriptor, the fault page is slots [0x{:x}, 0x{:x}]", i, faultSlotLo,
+									faultSlotHi);
+							}
 						}
 					}
 				}
@@ -3155,6 +3196,13 @@ namespace rhi {
 								where(above->deviceAddress, above->bufferSize));
 						if (!inside)
 							spdlog::error("Vulkan fault attribution: no live buffer holds the address");
+						if (faultSlotHi) {
+							VkLogLowWordHolders(faultSlotLo, faultSlotHi, "live buffer", [&](auto&& visit) {
+								for (const auto& slot : impl->resources.slots)
+									if (slot.alive && slot.obj.type == ResourceType::Buffer && slot.obj.deviceAddress)
+										visit(slot.obj.deviceAddress, slot.obj.bufferSize, slot.obj.name.data(), slot.obj.ownsBuffer ? "owned" : "imported");
+							});
+						}
 					}
 				}
 				if (impl->viewRefs.ready) {
@@ -3193,6 +3241,14 @@ namespace rhi {
 						}
 						if (!logged)
 							spdlog::error("Vulkan fault attribution: none of the last {} destroyed buffers covers or neighbours the address", count);
+						if (faultSlotHi) {
+							VkLogLowWordHolders(faultSlotLo, faultSlotHi, "destroyed buffer", [&](auto&& visit) {
+								for (uint64_t k = 0; k < count; ++k) {
+									const auto& e = ring.entries[(ring.next - 1 - k) % ring.entries.size()];
+									visit(e.address, e.size, e.name.data(), e.owned ? "owned" : "imported");
+								}
+							});
+						}
 					}
 				}
 			} catch (...) {
@@ -6141,6 +6197,7 @@ namespace rhi {
 			auto* impl = resource ? static_cast<VulkanDevice*>(resource->impl) : nullptr;
 			VulkanResource* resourceState = VkResourceState(impl, resource ? resource->GetHandle() : ResourceHandle{});
 			if (resourceState) {
+				VkKeepResourceName(*resourceState, name);
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(resourceState->buffer), VK_OBJECT_TYPE_BUFFER, name);
 			}
 		}
@@ -10258,7 +10315,7 @@ namespace rhi {
 					auto& ring = impl->retiredBuffers;
 					const std::scoped_lock ringLock(ring.mutex);
 					ring.entries[ring.next++ % ring.entries.size()] = { resource->deviceAddress, resource->bufferSize,
-						(uint64_t(handle.generation) << 32) | handle.index, resource->ownsBuffer };
+						(uint64_t(handle.generation) << 32) | handle.index, resource->ownsBuffer, resource->name };
 				}
 				VkDestroyResource(impl, *resource);
 			}
@@ -12568,6 +12625,7 @@ namespace rhi {
 				resourceState.deviceAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
 			}
 
+			VkKeepResourceName(resourceState, desc.debugName);
 			const ResourceHandle handle = impl->resources.alloc(resourceState);
 			Resource resource{ handle, false };
 			resource.impl = impl;
@@ -12830,6 +12888,7 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			VulkanResource* resource = VkResourceState(impl, handle);
 			if (resource) {
+				VkKeepResourceName(*resource, name);
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(resource->buffer), VK_OBJECT_TYPE_BUFFER, name);
 			}
 		}
@@ -13055,6 +13114,7 @@ namespace rhi {
 				resourceState.deviceAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
 			}
 
+			VkKeepResourceName(resourceState, desc.debugName);
 			const ResourceHandle handle = impl->resources.alloc(resourceState);
 			Resource resource{ handle, false };
 			resource.impl = impl;
@@ -16348,6 +16408,7 @@ namespace rhi {
 			state.concurrentSharing = desc.concurrentSharing;
 			state.ownsBuffer = false;
 			state.ownsMemory = false;
+			VkKeepResourceName(state, desc.debugName);
 			// Bindless buffer descriptors are written from the device address.
 			if (impl->bufferDeviceAddressEnabled && (desc.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
 				VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
