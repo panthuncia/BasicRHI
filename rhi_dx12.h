@@ -220,6 +220,9 @@ namespace rhi {
 		bool open = false;
 		// Its last Close failed: it cannot be executed until it is reset.
 		bool closeFailed = false;
+		// BASICRHI_D3D12_RESET_TRACE=1: the stack of the reset that opened it.
+		std::array<void*, 16> resetStack{};
+		uint16_t resetDepth = 0;
 		// A recycled bundle's allocator: Recycle leaves a bundle closed, and BeginSecondary resets it onto this one (D3D12's Reset
 		// opens a list, where the RHI's Recycle leaves a secondary not recording).
 		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> pendingReset;

@@ -8719,6 +8719,35 @@ namespace rhi {
 			return ToRHI(closeResult);
 		}
 		static void cl_end(CommandList* cl) noexcept { (void)cl_endChecked(cl); }
+		/** @brief BASICRHI_D3D12_RESET_TRACE=1: each list keeps the stack of its last reset, logged with a reset of it while it records. */
+		static bool Dx12ResetTrace() noexcept {
+			static const bool enabled = [] {
+				char* value = nullptr;
+				size_t length = 0;
+				const bool on = _dupenv_s(&value, &length, "BASICRHI_D3D12_RESET_TRACE") == 0 && value && std::strcmp(value, "1") == 0;
+				std::free(value);
+				return on;
+			}();
+			return enabled;
+		}
+
+		/** @brief "module+0xoffset" for a code address. */
+		static std::string Dx12DescribeAddress(void* a_address) noexcept {
+			HMODULE module = nullptr;
+			if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(a_address), &module) || !module)
+				return fmt::format("{}", a_address);
+			char path[MAX_PATH]{};
+			GetModuleFileNameA(module, path, MAX_PATH);
+			const char* name = std::strrchr(path, '\\');
+			return fmt::format("{}+{:#x}", name ? name + 1 : path, reinterpret_cast<uintptr_t>(a_address) - reinterpret_cast<uintptr_t>(module));
+		}
+
+		/** @brief Records the caller's stack as the list's last reset (BASICRHI_D3D12_RESET_TRACE=1). */
+		static void Dx12NoteReset(Dx12CommandList& a_list) noexcept {
+			if (Dx12ResetTrace())
+				a_list.resetDepth = CaptureStackBackTrace(2, static_cast<DWORD>(a_list.resetStack.size()), a_list.resetStack.data(), nullptr);
+		}
+
 		/** @brief Closes a list that is still recording, so it or its allocator can be reset (its commands are dropped). Logged once. */
 		static void Dx12CloseRecording(Dx12CommandList& a_list) noexcept {
 			if (!a_list.open || !a_list.cl)
@@ -8726,8 +8755,12 @@ namespace rhi {
 			a_list.cl->Close();
 			a_list.open = false;
 			static std::atomic_flag logged;
-			if (!logged.test_and_set())
-				spdlog::warn("D3D12: '{}' was reset while it recorded; it was closed first and its commands dropped (logged once)", a_list.debugName);
+			if (!logged.test_and_set()) {
+				spdlog::warn("D3D12: '{}' was reset while it recorded; it was closed first and its commands dropped (logged once{})", a_list.debugName,
+					Dx12ResetTrace() ? "; its previous reset's stack follows" : "; BASICRHI_D3D12_RESET_TRACE=1 logs the stack of the reset that began it");
+				for (uint16_t i = 0; i < a_list.resetDepth; ++i)
+					spdlog::warn("D3D12:   #{} {}", i, Dx12DescribeAddress(a_list.resetStack[i]));
+			}
 		}
 
 		static void cl_reset(CommandList* cl, const CommandAllocator& ca) noexcept {
@@ -8790,6 +8823,7 @@ namespace rhi {
 			} else {
 				l->open = true;
 				l->closeFailed = false;
+				Dx12NoteReset(*l);
 				// Reset onto another allocator: that allocator's Reset closes it too.
 				const auto handle = cl->GetHandle();
 				auto* mutableAllocator = const_cast<Dx12Allocator*>(a);
@@ -9583,6 +9617,13 @@ namespace rhi {
 				tb.LayoutAfter = textureLayout(t.afterLayout);
 				tb.pResource = T->res.Get();
 				tb.Subresources = ToDX(t.range);
+				// A depth-stencil format's stencil is plane 1, with a layout of its own. A barrier on the texture's first plane alone
+				// (the RHI's default range, one plane) moves the depth and leaves the stencil behind, which a stencil test or write
+				// then finds in the old layout. It covers both planes.
+				if (tb.Subresources.FirstPlane == 0 && tb.Subresources.NumPlanes == 1 &&
+					(T->fmt == DXGI_FORMAT_D24_UNORM_S8_UINT || T->fmt == DXGI_FORMAT_R24G8_TYPELESS || T->fmt == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
+						T->fmt == DXGI_FORMAT_R32G8X24_TYPELESS))
+					tb.Subresources.NumPlanes = 2;
 				tb.Flags = nativeDiscard ? D3D12_TEXTURE_BARRIER_FLAG_DISCARD : D3D12_TEXTURE_BARRIER_FLAG_NONE;
 				noSyncNoAccess(tb);
 				// The COMMON layout takes shader reads and copies only (a simultaneous-access texture takes any but the attachment
@@ -10808,6 +10849,7 @@ namespace rhi {
 				l->open = true;
 				l->closeFailed = false;
 				l->pendingReset.Reset();
+				Dx12NoteReset(*l);
 			}
 			if (inheritance.debugName) {
 				cl_setName(cl, inheritance.debugName);
