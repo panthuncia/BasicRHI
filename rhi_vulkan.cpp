@@ -1514,6 +1514,38 @@ namespace rhi {
 			return (value + mask) & ~mask;
 		}
 
+		// BASICRHI_RELEASE_COMMAND_MEMORY=1: resets hand the driver's command memory back (RELEASE_RESOURCES) instead of keeping it
+		// for the next recording. An attribution switch: it costs the driver's re-allocation at every recording.
+		static bool ReleaseCommandMemoryOnReset() noexcept {
+			static const bool release = [] {
+				char value[8]{};
+				return GetEnvironmentVariableA("BASICRHI_RELEASE_COMMAND_MEMORY", value, sizeof(value)) > 0 && value[0] == '1';
+			}();
+			return release;
+		}
+
+		// Live VkCommandPools and command buffers, for attributing driver command memory (each pool owns its own chunks).
+		// Pipelines and queries too: driver memory neither DXVK's nor ORG's allocator sees.
+		static std::atomic<int64_t> g_liveCommandPools{ 0 }, g_liveCommandBuffers{ 0 }, g_loggedCommandPools{ 0 };
+		static std::atomic<int64_t> g_livePipelines{ 0 }, g_loggedPipelines{ 0 }, g_liveQueryPools{ 0 }, g_liveQueries{ 0 };
+		static void LogDriverObjects() noexcept {
+			spdlog::info("BasicRHI Vulkan: {} command pools alive, {} command buffers, {} pipelines, {} query pools ({} queries)",
+				g_liveCommandPools.load(std::memory_order_relaxed), g_liveCommandBuffers.load(std::memory_order_relaxed),
+				g_livePipelines.load(std::memory_order_relaxed), g_liveQueryPools.load(std::memory_order_relaxed), g_liveQueries.load(std::memory_order_relaxed));
+		}
+		static void NoteCommandPools(int64_t delta) noexcept {
+			const int64_t live = g_liveCommandPools.fetch_add(delta, std::memory_order_relaxed) + delta;
+			int64_t logged = g_loggedCommandPools.load(std::memory_order_relaxed);
+			if (delta > 0 && live >= logged + 128 && g_loggedCommandPools.compare_exchange_strong(logged, live, std::memory_order_relaxed))
+				LogDriverObjects();
+		}
+		static void NotePipelines(int64_t delta) noexcept {
+			const int64_t live = g_livePipelines.fetch_add(delta, std::memory_order_relaxed) + delta;
+			int64_t logged = g_loggedPipelines.load(std::memory_order_relaxed);
+			if (delta > 0 && live >= logged + 1024 && g_loggedPipelines.compare_exchange_strong(logged, live, std::memory_order_relaxed))
+				LogDriverObjects();
+		}
+
 		// The graph's memory is read by every pass: under memory pressure, the driver demotes everything else first.
 		static VkResult VkAllocateDeviceMemory(VulkanDevice* impl, const VkMemoryAllocateInfo* info, VkDeviceMemory* memory) noexcept {
 			const VkResult result = vkAllocateMemory(impl->device, info, nullptr, memory);
@@ -2520,6 +2552,7 @@ namespace rhi {
 
 			if (pipeline.pipeline != VK_NULL_HANDLE) {
 				vkDestroyPipeline(impl->device, pipeline.pipeline, nullptr);
+				NotePipelines(-1);
 			}
 			if (pipeline.layout != VK_NULL_HANDLE) {
 				vkDestroyPipelineLayout(impl->device, pipeline.layout, nullptr);
@@ -2589,25 +2622,6 @@ namespace rhi {
 			}
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			return VkCommandListState(impl, commandList ? commandList->GetHandle() : CommandListHandle{});
-		}
-
-		// BASICRHI_RELEASE_COMMAND_MEMORY=1: resets hand the driver's command memory back (RELEASE_RESOURCES) instead of keeping it
-		// for the next recording. An attribution switch: it costs the driver's re-allocation at every recording.
-		static bool ReleaseCommandMemoryOnReset() noexcept {
-			static const bool release = [] {
-				char value[8]{};
-				return GetEnvironmentVariableA("BASICRHI_RELEASE_COMMAND_MEMORY", value, sizeof(value)) > 0 && value[0] == '1';
-			}();
-			return release;
-		}
-
-		// Live VkCommandPools and command buffers, for attributing driver command memory (each pool owns its own chunks).
-		static std::atomic<int64_t> g_liveCommandPools{ 0 }, g_liveCommandBuffers{ 0 }, g_loggedCommandPools{ 0 };
-		static void NoteCommandPools(int64_t delta) noexcept {
-			const int64_t live = g_liveCommandPools.fetch_add(delta, std::memory_order_relaxed) + delta;
-			int64_t logged = g_loggedCommandPools.load(std::memory_order_relaxed);
-			if (delta > 0 && live >= logged + 128 && g_loggedCommandPools.compare_exchange_strong(logged, live, std::memory_order_relaxed))
-				spdlog::info("BasicRHI Vulkan: {} command pools alive, {} command buffers", live, g_liveCommandBuffers.load(std::memory_order_relaxed));
 		}
 
 		static Result VkAllocateCommandBuffer(VkDevice device, VkCommandPool pool, VkCommandBufferLevel level, VkCommandBuffer& outCommandBuffer) noexcept {
@@ -9695,6 +9709,7 @@ namespace rhi {
 					return ToRHI(vkResult);
 				}
 
+				NotePipelines(1);
 				if (captureStatistics) LogPipelineStatistics(impl->device, nativePipeline);
 				if (dumpIsa) DumpPipelineInternalRepresentations(impl->device, nativePipeline, "graphics", nullptr);
 				VulkanPipeline graphicsPipelineState{ nativePipeline, nativeLayout, VK_PIPELINE_BIND_POINT_GRAPHICS, layoutHandle, false };
@@ -9795,6 +9810,7 @@ namespace rhi {
 				spdlog::error("Vulkan compute pipeline creation: vkCreateComputePipelines failed with VkResult {}", static_cast<int>(vkResult));
 				return ToRHI(vkResult);
 			}
+			NotePipelines(1);
 			if (dumpIsa) DumpPipelineInternalRepresentations(impl->device, nativePipeline, "compute", t_pipelineStatisticsLabel ? t_pipelineStatisticsLabel : entryPoint);
 
 			const PipelineHandle handle = impl->pipelines.alloc(VulkanPipeline{
@@ -11838,6 +11854,41 @@ namespace rhi {
 			return VkCreateCommandAllocator(device, impl, queue.GetKind(), VkQueueStateForHandle(impl, queue.GetQueueHandle()), out);
 		}
 
+		// BASICRHI_COMMAND_POOL_PROBE=N: at the first command pool, N more are made and kept for the process's life, each with one
+		// recorded empty primary buffer (BASICRHI_COMMAND_POOL_PROBE_SHARED=1: N buffers in one pool instead). The kernel VRAM
+		// counter's difference against a run without it is the driver's command memory per pool (or per buffer in a shared pool).
+		static void ProbeCommandPools(VkDevice device, uint32_t familyIndex) noexcept {
+			static std::atomic_flag done;
+			if (done.test_and_set()) return;
+			char value[16]{};
+			const uint32_t count = GetEnvironmentVariableA("BASICRHI_COMMAND_POOL_PROBE", value, sizeof(value)) > 0 ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+			if (count == 0) return;
+			char sharedValue[8]{};
+			const bool shared = GetEnvironmentVariableA("BASICRHI_COMMAND_POOL_PROBE_SHARED", sharedValue, sizeof(sharedValue)) > 0 && sharedValue[0] == '1';
+			VkCommandPoolCreateInfo createInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+			createInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+			createInfo.queueFamilyIndex = familyIndex;
+			VkCommandPool sharedPool = VK_NULL_HANDLE;
+			uint32_t made = 0;
+			for (uint32_t i = 0; i < count; ++i) {
+				VkCommandPool pool = sharedPool;
+				if (pool == VK_NULL_HANDLE && vkCreateCommandPool(device, &createInfo, nullptr, &pool) != VK_SUCCESS) break;
+				if (shared) sharedPool = pool;
+				VkCommandBufferAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+				allocateInfo.commandPool = pool;
+				allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+				allocateInfo.commandBufferCount = 1;
+				VkCommandBuffer buffer = VK_NULL_HANDLE;
+				if (vkAllocateCommandBuffers(device, &allocateInfo, &buffer) != VK_SUCCESS) break;
+				VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+				vkBeginCommandBuffer(buffer, &begin);
+				vkEndCommandBuffer(buffer);
+				++made;
+			}
+			spdlog::info("BasicRHI Vulkan: command pool probe made {} recorded buffers in {} (kept for the process's life)", made,
+				shared ? "one shared pool" : "a pool each");
+		}
+
 		static Result VkCreateCommandAllocator(Device* device, VulkanDevice* impl, QueueKind kind, const VulkanQueueState* queueState, CommandAllocatorPtr& out) noexcept {
 			if (!queueState || queueState->familyIndex == kVkInvalidQueueFamily) {
 				out.Reset();
@@ -11856,6 +11907,7 @@ namespace rhi {
 			}
 
 			NoteCommandPools(1);
+			ProbeCommandPools(impl->device, createInfo.queueFamilyIndex);
 			const CommandAllocatorHandle handle = impl->allocators.alloc(VulkanCommandAllocator{ pool, kind, createInfo.queueFamilyIndex });
 			CommandAllocator allocator{ handle };
 			allocator.impl = impl;
@@ -12593,6 +12645,8 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
+			g_liveQueryPools.fetch_add(1, std::memory_order_relaxed);
+			g_liveQueries.fetch_add(desc.count, std::memory_order_relaxed);
 			const QueryPoolHandle handle = impl->queryPools.alloc(VulkanQueryPool{ pool, desc.type, desc.count, requestedStats, vkStats });
 			QueryPool queryPool{ handle };
 			queryPool.impl = impl;
@@ -12609,6 +12663,8 @@ namespace rhi {
 			}
 			if (queryPool->pool != VK_NULL_HANDLE) {
 				vkDestroyQueryPool(impl->device, queryPool->pool, nullptr);
+				g_liveQueryPools.fetch_sub(1, std::memory_order_relaxed);
+				g_liveQueries.fetch_sub(queryPool->count, std::memory_order_relaxed);
 			}
 			impl->queryPools.free(handle);
 		}
