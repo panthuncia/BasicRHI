@@ -78,6 +78,8 @@ namespace rhi::vulkan {
 
     // Called around every host access to an adopted VkQueue. DXVK: IDXGIVkInteropDevice
     // LockSubmissionQueue / ReleaseSubmissionQueue. Both or neither must be set.
+    // On a device BasicRHI owns and shares (ShareVulkanDevice), a null queue means
+    // every queue: BasicRHI holds it around vkDeviceWaitIdle.
     struct QueueSubmissionHooks {
         void* user = nullptr;
         void (*lock)(void* user, VkQueue queue) = nullptr;

@@ -5378,7 +5378,16 @@ namespace rhi {
 		// A whole-device wait: vkDeviceWaitIdle on a device only BasicRHI submits to, its own timelines on one a host owns or a
 		// guest shares (ShareVulkanDevice), whose other submitters vkDeviceWaitIdle would race.
 		static Result VkWaitDeviceIdle(VulkanDevice* impl) noexcept {
-			if (!impl->ownsDevice || impl->sharedQueues) return VkWaitForSubmittedTimelines(impl);
+			if (!impl->ownsDevice) return VkWaitForSubmittedTimelines(impl);
+			if (impl->sharedQueues) {
+				// A device shared with a guest that submits itself under the hooks' lock: the lock (with no queue: every queue)
+				// makes the guest's submissions wait, so the whole device can go idle. Presents count too, which no timeline
+				// wait covers: a swapchain is destroyed only after its presents.
+				const VulkanDevice::SubmissionHooks* hooks = impl->submissionHooks.load(std::memory_order_acquire);
+				if (!hooks || !hooks->lock || hooks->submit) return VkWaitForSubmittedTimelines(impl);
+				const VkQueueAccessGuard queueAccess(impl, VK_NULL_HANDLE);
+				return ToRHI(VkDeviceWaitIdleHooked(impl->device));
+			}
 			return ToRHI(VkDeviceWaitIdleHooked(impl->device));
 		}
 
