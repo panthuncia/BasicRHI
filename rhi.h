@@ -3126,6 +3126,11 @@ namespace rhi {
 		bool SupportsDebugLabels() const noexcept { return IsValid() && vt->abi_version >= 7 && vt->beginDebugLabel && vt->endDebugLabel && vt->insertDebugLabel; }
 		bool SupportsSecondaryLists() const noexcept { return IsValid() && vt->abi_version >= 8 && vt->beginSecondary && vt->executeCommands; }
 		Result EndChecked() noexcept { return SupportsCheckedEnd() ? vt->endChecked(this) : Result::Unsupported; }
+		/**
+		 * @brief Resets the list onto `ca` and, for a primary list, begins it. When `ca` is the allocator the list came
+		 * from, only this list is reset. Several lists can then share one allocator, if it SupportsSharedLists. Any reset,
+		 * recording or free of a list is externally synchronized with every other list of the same allocator.
+		 */
 		void Recycle(const CommandAllocator& ca) noexcept;
 		void BeginPass(const PassBeginInfo& p) noexcept;
 		void EndPass() noexcept;
@@ -3561,6 +3566,9 @@ namespace rhi {
 	struct CommandAllocatorVTable {
 		void (*reset)(CommandAllocator*) noexcept;  // allocator Reset()
 		uint32_t abi_version = 1;
+		// ABI 2.
+		void (*trim)(CommandAllocator*) noexcept = nullptr;
+		bool sharedLists = false;  // see CommandAllocator::SupportsSharedLists
 	};
 
 	class CommandAllocator {
@@ -3577,6 +3585,18 @@ namespace rhi {
 		constexpr bool IsValid() const noexcept { return static_cast<bool>(*this); }
 		constexpr void Reset() noexcept { impl = nullptr; backendState = nullptr; vt = nullptr; } // Naming conflict with vt->reset
 		inline void Recycle() noexcept { vt->reset(this); } // GPU-side reset (allocator->Reset)
+		/**
+		 * @brief Gives memory that the allocator's lists no longer use back to the system. Call it after lists of the
+		 * allocator were reset or freed. Nothing may record, reset or free a list of the allocator at the same time.
+		 * Vulkan: vkTrimCommandPool. D3D12: does nothing.
+		 */
+		inline void Trim() noexcept { if (vt && vt->abi_version >= 2 && vt->trim) vt->trim(this); }
+		/**
+		 * @brief True when one list of the allocator can be reset without resetting the others (CommandList::Recycle with
+		 * this allocator), so many lists can share it. Only one of them may record at a time. Vulkan: true. D3D12: false,
+		 * because a list's reset only adds to its allocator's memory, and only the allocator's own reset frees it.
+		 */
+		bool SupportsSharedLists() const noexcept { return vt && vt->abi_version >= 2 && vt->sharedLists; }
 		const CommandAllocatorHandle& GetHandle() const noexcept { return handle; }
 
 	private:

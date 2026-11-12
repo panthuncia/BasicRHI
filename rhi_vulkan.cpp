@@ -8385,6 +8385,16 @@ namespace rhi {
 			}
 		}
 
+		// The caller holds the pool's external synchronization: no list of it records, resets or is freed meanwhile.
+		static void ca_trim(CommandAllocator* allocator) noexcept {
+			auto* impl = allocator ? static_cast<VulkanDevice*>(allocator->impl) : nullptr;
+			VulkanCommandAllocator* allocatorState = VkAllocatorState(allocator);
+			if (!impl || impl->device == VK_NULL_HANDLE || !allocatorState || allocatorState->pool == VK_NULL_HANDLE || !vkTrimCommandPool) {
+				return;
+			}
+			vkTrimCommandPool(impl->device, allocatorState->pool, 0);
+		}
+
 		static uint32_t sc_count(Swapchain* swapchain) noexcept {
 			if (VulkanSwapchain* swapchainState = VkSwapchainState(swapchain)) {
 				return swapchainState->imageCount;
@@ -13426,7 +13436,9 @@ namespace rhi {
 
 	const CommandAllocatorVTable g_vkcalvt = {
 		&ca_reset,
-		1u
+		2u,
+		&ca_trim,
+		true
 	};
 
 	const CommandListVTable g_vkclvt = {

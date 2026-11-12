@@ -10397,6 +10397,9 @@ namespace rhi {
 		}
 
 		// ------------------ Allocator vtable funcs ----------------
+		// D3D12 has no trim. An allocator's memory is freed by its Reset.
+		static void ca_trim(CommandAllocator*) noexcept {}
+
 		static void ca_reset(CommandAllocator* ca) noexcept {
 			if (!ca || !ca->impl) {
 				BreakIfDebugging();
@@ -11187,7 +11190,9 @@ namespace rhi {
 
 	const CommandAllocatorVTable g_calvt = {
 		&ca_reset,
-		1u
+		2u,
+		&ca_trim,
+		false
 	};
 
 	const CommandListVTable g_clvt = {
