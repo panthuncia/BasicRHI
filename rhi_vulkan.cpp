@@ -6446,7 +6446,11 @@ namespace rhi {
 					&& barrier.afterLayout == ResourceLayout::Common) {
 					continue;
 				}
-				vkBarrier.srcAccessMask = (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire || internalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
+				// A discard that names a before sync follows earlier work on the same memory (an aliased image's previous occupant):
+				// the contents go, but its first use waits for that work and its writes are made available first.
+				const bool orderedDiscard = barrier.discard && barrier.beforeSync != ResourceSyncState::None;
+				vkBarrier.srcAccessMask = orderedDiscard ? VK_ACCESS_MEMORY_WRITE_BIT
+					: (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire || internalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
 				vkBarrier.dstAccessMask = (afterPresent || externalRelease || internalRelease) ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
 				// A simultaneous-access image stays in GENERAL (VkCommandLayout): its passes and descriptors name GENERAL, and so does its owner
 				// (DXVK) between them. Only an undefined first use or a discard leaves GENERAL out of the old layout.
@@ -6461,7 +6465,8 @@ namespace rhi {
 				imageBarriers.push_back(vkBarrier);
 				const bool beforeTransferClear = (barrier.beforeAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
 				const bool afterTransferClear = (barrier.afterAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
-				srcStages |= (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire || internalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (VkStageMaskForSync(barrier.beforeSync) | (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
+				srcStages |= orderedDiscard ? VkStageMaskForSync(barrier.beforeSync)
+					: (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire || internalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (VkStageMaskForSync(barrier.beforeSync) | (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
 				dstStages |= (afterPresent || externalRelease || internalRelease) ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : (VkStageMaskForSync(barrier.afterSync) | (afterTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
 				if (impl->validateBarrierTransitions) {
 					recordedBatch.textures.push_back(VulkanCommandList::RecordedTextureBarrier{
@@ -6501,7 +6506,10 @@ namespace rhi {
 					barrier.afterAccess == ResourceAccessType::Common) {
 					continue;
 				}
-				vkBarrier.srcAccessMask = (barrier.discard || externalAcquire || internalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
+				// As for images: a discard that names a before sync follows the memory's earlier work.
+				const bool orderedDiscard = barrier.discard && barrier.beforeSync != ResourceSyncState::None;
+				vkBarrier.srcAccessMask = orderedDiscard ? VK_ACCESS_MEMORY_WRITE_BIT
+					: (barrier.discard || externalAcquire || internalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
 				vkBarrier.dstAccessMask = (externalRelease || internalRelease) ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
 				// A concurrent resource belongs to no single family: its external transfers name EXTERNAL and IGNORED.
 				const uint32_t externalLocalFamily = resource->concurrentSharing ? VK_QUEUE_FAMILY_IGNORED : recordingFamily;
@@ -6512,7 +6520,8 @@ namespace rhi {
 				vkBarrier.offset = barrier.offset;
 				vkBarrier.size = barrier.size == ~0ull ? VK_WHOLE_SIZE : barrier.size;
 				bufferBarriers.push_back(vkBarrier);
-				srcStages |= (barrier.discard || externalAcquire || internalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VkStageMaskForSync(barrier.beforeSync);
+				srcStages |= orderedDiscard ? VkStageMaskForSync(barrier.beforeSync)
+					: (barrier.discard || externalAcquire || internalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VkStageMaskForSync(barrier.beforeSync);
 				dstStages |= (externalRelease || internalRelease) ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VkStageMaskForSync(barrier.afterSync);
 				if (impl->validateBarrierTransitions) {
 					recordedBatch.buffers.push_back(VulkanCommandList::RecordedBufferBarrier{
