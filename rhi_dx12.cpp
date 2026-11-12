@@ -9588,6 +9588,48 @@ namespace rhi {
 			buf.reserve(b.buffers.size);
 			glob.reserve(b.globals.size);
 
+			// A compute or copy list rejects graphics-only accesses and syncs at Close (E_INVALIDARG; the debug layer's id 1332).
+			// The graph names a resource's next use whatever queue records the barrier (a buffer a later draw reads as vertices),
+			// so the bits this list type cannot take are dropped: the queue that draws orders its own use.
+			const auto listTypeScope = [&](auto& barrier) {
+				D3D12_BARRIER_SYNC syncAllowed = static_cast<D3D12_BARRIER_SYNC>(~0u);
+				D3D12_BARRIER_ACCESS accessAllowed = static_cast<D3D12_BARRIER_ACCESS>(~0u);
+				if (l->type == D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+					syncAllowed = static_cast<D3D12_BARRIER_SYNC>(~(D3D12_BARRIER_SYNC_DRAW | D3D12_BARRIER_SYNC_INDEX_INPUT | D3D12_BARRIER_SYNC_VERTEX_SHADING |
+						D3D12_BARRIER_SYNC_PIXEL_SHADING | D3D12_BARRIER_SYNC_DEPTH_STENCIL | D3D12_BARRIER_SYNC_RENDER_TARGET | D3D12_BARRIER_SYNC_RESOLVE));
+					accessAllowed = static_cast<D3D12_BARRIER_ACCESS>(~(D3D12_BARRIER_ACCESS_VERTEX_BUFFER | D3D12_BARRIER_ACCESS_INDEX_BUFFER |
+						D3D12_BARRIER_ACCESS_RENDER_TARGET | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE |
+						D3D12_BARRIER_ACCESS_STREAM_OUTPUT | D3D12_BARRIER_ACCESS_RESOLVE_SOURCE | D3D12_BARRIER_ACCESS_RESOLVE_DEST |
+						D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE));
+				} else if (l->type == D3D12_COMMAND_LIST_TYPE_COPY) {
+					syncAllowed = static_cast<D3D12_BARRIER_SYNC>(D3D12_BARRIER_SYNC_ALL | D3D12_BARRIER_SYNC_COPY);
+					accessAllowed = static_cast<D3D12_BARRIER_ACCESS>(D3D12_BARRIER_ACCESS_COPY_SOURCE | D3D12_BARRIER_ACCESS_COPY_DEST);
+				} else {
+					return;
+				}
+				const auto scope = [&](D3D12_BARRIER_SYNC& sync, D3D12_BARRIER_ACCESS& access) {
+					const auto before = std::pair{ sync, access };
+					if (sync != D3D12_BARRIER_SYNC_NONE && (sync & ~syncAllowed)) {
+						const auto kept = static_cast<D3D12_BARRIER_SYNC>(sync & syncAllowed);
+						// Nothing left of a graphics-only sync: the list's whole scope stands in for it.
+						sync = kept ? kept : D3D12_BARRIER_SYNC_ALL;
+					}
+					if (access != D3D12_BARRIER_ACCESS_NO_ACCESS && access != D3D12_BARRIER_ACCESS_COMMON && (access & ~accessAllowed)) {
+						const auto kept = static_cast<D3D12_BARRIER_ACCESS>(access & accessAllowed);
+						access = kept ? kept : D3D12_BARRIER_ACCESS_NO_ACCESS;
+					}
+					if (before != std::pair{ sync, access }) {
+						static std::atomic_flag logged;
+						if (!logged.test_and_set())
+							spdlog::warn("D3D12 barrier: sync {:#x} / access {:#x} on a {} list scoped to {:#x} / {:#x} (bits that list type cannot take; logged once)",
+								static_cast<uint32_t>(before.first), static_cast<uint32_t>(before.second), l->type == D3D12_COMMAND_LIST_TYPE_COPY ? "copy" : "compute",
+								static_cast<uint32_t>(sync), static_cast<uint32_t>(access));
+					}
+				};
+				scope(barrier.SyncBefore, barrier.AccessBefore);
+				scope(barrier.SyncAfter, barrier.AccessAfter);
+			};
+
 			// Textures
 			for (uint32_t i = 0; i < b.textures.size; ++i) {
 				const auto& t = b.textures.data[i];
@@ -9628,6 +9670,7 @@ namespace rhi {
 					tb.Subresources.NumPlanes = 2;
 				tb.Flags = nativeDiscard ? D3D12_TEXTURE_BARRIER_FLAG_DISCARD : D3D12_TEXTURE_BARRIER_FLAG_NONE;
 				noSyncNoAccess(tb);
+				listTypeScope(tb);
 				// The COMMON layout takes shader reads and copies only (a simultaneous-access texture takes any but the attachment
 				// layouts'). An access it cannot take means the texture is used in COMMON where it needs a layout of its own: the bit
 				// is dropped so the barrier is valid, and the first such use is logged with the texture.
@@ -9687,6 +9730,7 @@ namespace rhi {
 				bb.Offset = br.offset;
 				bb.Size = br.size;
 				noSyncNoAccess(bb);
+				listTypeScope(bb);
 				buf.push_back(bb);
 			}
 
@@ -9712,6 +9756,7 @@ namespace rhi {
 				};
 				globalAccess(gb.AccessBefore);
 				globalAccess(gb.AccessAfter);
+				listTypeScope(gb);
 				glob.push_back(gb);
 			}
 
