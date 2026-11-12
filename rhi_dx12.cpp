@@ -3391,11 +3391,13 @@ namespace rhi {
 				handle.ptr += SIZE_T(slot) * t.increment;
 				return handle;
 			};
-			// The two tables (their UAV slots stay unused), then a null view in every entry slot.
-			Dx12RawBufferViews(impl, t.entries.Get(), entryBytes, false, at(0), at(D3D12_DEVICE_ADDRESS_RESERVED_SLOTS - 1));
-			Dx12RawBufferViews(impl, t.pages.Get(), pageBytes, false, at(1), at(D3D12_DEVICE_ADDRESS_RESERVED_SLOTS - 1));
+			// The two tables (their UAVs go to the null UAV's slot, written null again below), then a null view in every entry slot
+			// and the null pair a missed address reads.
+			Dx12RawBufferViews(impl, t.entries.Get(), entryBytes, false, at(0), at(D3D12_DEVICE_ADDRESS_NULL_SLOT + 1));
+			Dx12RawBufferViews(impl, t.pages.Get(), pageBytes, false, at(1), at(D3D12_DEVICE_ADDRESS_NULL_SLOT + 1));
 			for (uint32_t entry = 0; entry < D3D12_DEVICE_ADDRESS_ENTRIES; ++entry)
 				Dx12RawBufferViews(impl, nullptr, 4, false, at(2 + 2 * entry), at(3 + 2 * entry));
+			Dx12RawBufferViews(impl, nullptr, 4, false, at(D3D12_DEVICE_ADDRESS_NULL_SLOT), at(D3D12_DEVICE_ADDRESS_NULL_SLOT + 1));
 			t.ready = true;
 			spdlog::info("DX12 device address table: {} buffers, {} pages of {} KiB, at heap slot {}", D3D12_DEVICE_ADDRESS_ENTRIES,
 				D3D12_DEVICE_ADDRESS_PAGE_SLOTS, (1u << D3D12_DEVICE_ADDRESS_PAGE_BITS) / 1024, D3D12_DEVICE_ADDRESS_TABLE_SLOT);
@@ -3468,7 +3470,7 @@ namespace rhi {
 
 			// The entry, before any page slot names it.
 			const uint32_t words[8] = { static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32), static_cast<uint32_t>(size), static_cast<uint32_t>(size >> 32),
-				D3D12_DEVICE_ADDRESS_TABLE_SLOT + 2 + 2 * entry, unordered ? D3D12_DEVICE_ADDRESS_TABLE_SLOT + 3 + 2 * entry : 0xFFFFFFFFu, 0, 0 };
+				D3D12_DEVICE_ADDRESS_TABLE_SLOT + 2 + 2 * entry, unordered ? D3D12_DEVICE_ADDRESS_TABLE_SLOT + 3 + 2 * entry : D3D12_DEVICE_ADDRESS_TABLE_SLOT + D3D12_DEVICE_ADDRESS_NULL_SLOT + 1, 0, 0 };
 			std::memcpy(t.entriesMapped + size_t(entry) * D3D12_DEVICE_ADDRESS_ENTRY_BYTES, words, sizeof(words));
 			_mm_sfence();
 

@@ -19,11 +19,13 @@ inline constexpr uint32_t VULKAN_COUNTER_DESCRIPTOR_HEAP_BINDING = 1000002;
 // views sit in the reserved region of every shader-visible CBV/SRV/UAV heap of the device's full capacity: that region starts
 // at D3D12_DEVICE_ADDRESS_TABLE_SLOT, past the capacity the client indexes.
 // - Slot + 0: the entries, D3D12_DEVICE_ADDRESS_ENTRY_BYTES each: base address (2 words), size (2 words), the raw SRV's heap
-//   slot, the raw UAV's heap slot (0xFFFFFFFF: none), 2 unused words.
+//   slot, the raw UAV's heap slot (a read-only buffer's: the null UAV), 2 unused words.
 // - Slot + 1: the page table, D3D12_DEVICE_ADDRESS_PAGE_SLOTS slots of 16 bytes, open addressing on the address's
 //   D3D12_DEVICE_ADDRESS_PAGE_BITS-bit page: entry index (0xFFFFFFFF: removed), unused, page (2 words; 0: empty). A page may
 //   name several buffers; the shader checks the address against each entry it finds.
 // - Slot + 2 + 2 * entry and + 3 + 2 * entry: an entry's raw SRV and UAV.
+// - Slot + D3D12_DEVICE_ADDRESS_NULL_SLOT and the slot after it: a null raw SRV and UAV, for an address in no buffer. A load
+//   through one reads zeros and a store is dropped (heap slot 0 may hold any kind of view: reading it as a buffer can fault).
 // Common/DeviceAddress.hlsli is the shader side.
 inline constexpr uint32_t D3D12_DEVICE_ADDRESS_TABLE_SLOT = 1000000;
 inline constexpr uint32_t D3D12_DEVICE_ADDRESS_ENTRIES = 16384;
@@ -31,7 +33,8 @@ inline constexpr uint32_t D3D12_DEVICE_ADDRESS_ENTRY_BYTES = 32;
 inline constexpr uint32_t D3D12_DEVICE_ADDRESS_PAGE_BITS = 16;
 inline constexpr uint32_t D3D12_DEVICE_ADDRESS_PAGE_SLOTS = 1u << 18;
 inline constexpr uint32_t D3D12_DEVICE_ADDRESS_PROBES = 64;
-inline constexpr uint32_t D3D12_DEVICE_ADDRESS_RESERVED_SLOTS = 2 + 2 * D3D12_DEVICE_ADDRESS_ENTRIES;
+inline constexpr uint32_t D3D12_DEVICE_ADDRESS_NULL_SLOT = 2 + 2 * D3D12_DEVICE_ADDRESS_ENTRIES;
+inline constexpr uint32_t D3D12_DEVICE_ADDRESS_RESERVED_SLOTS = D3D12_DEVICE_ADDRESS_NULL_SLOT + 2;
 
 // The DXC arguments every SPIR-V shader consumed by the Vulkan backend must be compiled with:
 // DX buffer layout, DX SV_Position.w, and ResourceDescriptorHeap/SamplerDescriptorHeap mapped onto the
