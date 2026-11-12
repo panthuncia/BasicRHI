@@ -313,28 +313,22 @@ namespace rhi {
 	};
 
 	/**
-	 * @brief Emulated buffer device addresses (rhi_shader_abi.h, D3D12_DEVICE_ADDRESS_*). A buffer joins the tables the first time
-	 * its address is asked for (Device::GetBufferDeviceAddress) and leaves them when it is destroyed. The tables are in upload
-	 * memory the GPU reads directly. Each new entry is written before the page slots that name it, and a page slot's entry before
-	 * its page, so a shader sees either the old state or the new one.
+	 * @brief Buffer view refs (rhi_shader_abi.h, BUFFER_VIEW_REF_*). A buffer gets a raw SRV/UAV pair in the reserved region the first
+	 * time its ref is asked for (Device::GetBufferViewRef) and gives it back when it is destroyed. The pairs are written in a CPU-only
+	 * staging heap and copied into every full-size shader-visible heap.
 	 */
-	struct Dx12AddressTable {
+	struct Dx12ViewRefRegion {
 		std::shared_mutex lock;
 		bool ready = false;
-		Microsoft::WRL::ComPtr<ID3D12Resource> entries, pages;
-		uint8_t* entriesMapped = nullptr;
-		uint8_t* pagesMapped = nullptr;
-		// CPU-only heap holding the reserved region's views; copied into each full-size shader-visible heap.
 		Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> staging;
 		D3D12_CPU_DESCRIPTOR_HANDLE stagingStart{};
 		UINT increment = 0;
+		uint32_t firstSlot = 0;  // the region's first heap slot: the full capacity
 		// The full-size shader-visible heaps the region is copied into (their start handles).
 		std::vector<std::pair<ID3D12DescriptorHeap*, D3D12_CPU_DESCRIPTOR_HANDLE>> heaps;
-		// A registered buffer: its entry and the address range its page slots cover.
-		struct Registered { uint32_t entry; uint64_t base; uint64_t size; };
-		std::unordered_map<uint64_t, Registered> byResource;  // ResourceHandle index and generation
-		std::vector<uint32_t> freeEntries;
-		uint32_t nextEntry = 0;
+		std::unordered_map<uint64_t, uint32_t> pairByResource;  // ResourceHandle index and generation -> pair
+		std::vector<uint32_t> freePairs;
+		uint32_t nextPair = 0;
 		bool loggedFull = false;
 	};
 
@@ -617,7 +611,7 @@ namespace rhi {
 		ComPtr<IDXGIAdapter4>  adapter;
 
 		Registry<Dx12Resource> resources;
-		Dx12AddressTable addressTable;
+		Dx12ViewRefRegion viewRefs;
 		Registry<Dx12Sampler> samplers;
 		Registry<Dx12PipelineLayout> pipelineLayouts;
 		Registry<Dx12Pipeline> pipelines;

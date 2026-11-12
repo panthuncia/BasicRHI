@@ -868,6 +868,15 @@ namespace rhi {
 		uint64_t offset{ 0 };
 	};
 
+	// A shader's way to a buffer (rhi_shader_abi.h, BUFFER_VIEW_REF_*): the heap slot of the buffer's raw SRV (its raw UAV is the
+	// slot after it) and a byte offset into the buffer. View slot 0 names no buffer.
+	struct BufferViewRef {
+		uint32_t viewSlot{ 0 };
+		uint32_t byteOffset{ 0 };
+		explicit operator bool() const noexcept { return viewSlot != 0; }
+		bool operator==(const BufferViewRef&) const noexcept = default;
+	};
+
 	struct SrvDesc {
 		SrvDim	dimension{ SrvDim::Undefined };
 		Format	formatOverride{ Format::Unknown }; // textures + typed buffers
@@ -3451,6 +3460,7 @@ namespace rhi {
 		Result(*createAccelerationStructure)(Device*, const AccelerationStructureDesc&, AccelerationStructurePtr&) noexcept;
 		uint64_t(*getAccelerationStructureDeviceAddress)(Device*, AccelerationStructureHandle) noexcept;
 		uint64_t(*getBufferDeviceAddress)(Device*, GpuBufferAddress) noexcept;
+		BufferViewRef(*getBufferViewRef)(Device*, GpuBufferAddress) noexcept;
 		Result(*getRayTracingShaderGroupHandles)(Device*, PipelineHandle, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept;
 		Result(*setRayTracingPipelineStackSize)(Device*, PipelineHandle, uint64_t stackSizeBytes) noexcept;
 		Result(*getRayTracingAccelerationStructureOperationPrebuildInfo)(Device*, const RayTracingRtasOperationInputs&, RayTracingRtasPrebuildInfo*) noexcept;
@@ -3686,6 +3696,10 @@ namespace rhi {
 		void DestroyAccelerationStructure(AccelerationStructureHandle h) noexcept { deletionContext.DestroyAccelerationStructure(h); }
 		uint64_t GetAccelerationStructureDeviceAddress(AccelerationStructureHandle h) noexcept { return vt->getAccelerationStructureDeviceAddress(this, h); }
 		uint64_t GetBufferDeviceAddress(GpuBufferAddress address) noexcept { return vt->getBufferDeviceAddress ? vt->getBufferDeviceAddress(this, address) : 0; }
+		// The buffer's view ref at address.offset (rhi_shader_abi.h, BUFFER_VIEW_REF_*): its raw view pair, made on the first ask and
+		// freed with the buffer. {0, 0} when the buffer has none (no reserved region, the region full, a readback buffer, an offset
+		// past 4 GiB).
+		BufferViewRef GetBufferViewRef(GpuBufferAddress address) noexcept { return vt->getBufferViewRef ? vt->getBufferViewRef(this, address) : BufferViewRef{}; }
 		Result GetRayTracingShaderGroupHandles(PipelineHandle p, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept { return vt->getRayTracingShaderGroupHandles(this, p, firstGroup, groupCount, outData, outDataBytes); }
 		Result SetRayTracingPipelineStackSize(PipelineHandle p, uint64_t stackSizeBytes) noexcept { return vt->setRayTracingPipelineStackSize(this, p, stackSizeBytes); }
 		Result GetRayTracingAccelerationStructureOperationPrebuildInfo(const RayTracingRtasOperationInputs& inputs, RayTracingRtasPrebuildInfo& out) noexcept { return vt->getRayTracingAccelerationStructureOperationPrebuildInfo ? vt->getRayTracingAccelerationStructureOperationPrebuildInfo(this, inputs, &out) : Result::Unsupported; }

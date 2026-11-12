@@ -1909,6 +1909,150 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// ---- Buffer view refs (rhi_shader_abi.h, BUFFER_VIEW_REF_*) ----
+
+		// One storage buffer descriptor over [address, address + size) at dst (the heaps' stride, zeroed first). Address 0 writes
+		// the null descriptor where the device has one, else leaves zeros, which no ref names.
+		static void VkWriteViewRefDescriptor(VulkanDevice* impl, std::byte* dst, VkDeviceAddress address, VkDeviceSize size) noexcept {
+			auto& r = impl->viewRefs;
+			std::memset(dst, 0, static_cast<size_t>(r.stride));
+			if (address == 0 && !impl->nullDescriptorEnabled)
+				return;
+			if (VkDescriptorBufferModel(impl)) {
+				VkDescriptorAddressInfoEXT addressInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT };
+				addressInfo.address = address;
+				addressInfo.range = size;
+				addressInfo.format = VK_FORMAT_UNDEFINED;
+				VkDescriptorGetInfoEXT getInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT };
+				getInfo.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+				getInfo.data.pStorageBuffer = address != 0 ? &addressInfo : nullptr;
+				vkGetDescriptorEXT(impl->device, &getInfo, static_cast<size_t>(r.descriptorSize), dst);
+				return;
+			}
+			VkDeviceAddressRangeEXT addressRange{};
+			addressRange.address = address;
+			addressRange.size = size;
+			VkResourceDescriptorInfoEXT descriptorInfo{ VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT };
+			descriptorInfo.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			if (address != 0)
+				descriptorInfo.data.pAddressRange = &addressRange;
+			VkHostAddressRangeEXT descriptorRange{};
+			descriptorRange.address = dst;
+			descriptorRange.size = static_cast<size_t>(r.stride);
+			vkWriteResourceDescriptorsEXT(impl->device, 1, &descriptorInfo, &descriptorRange);
+		}
+
+		// Copies staging slots [a_first, a_first + a_count) into a heap's region. Under descriptorViewsMutex.
+		static void VkCopyViewRefSlots(VulkanDevice* impl, VulkanDescriptorHeap& heap, uint32_t a_first, uint32_t a_count) noexcept {
+			auto& r = impl->viewRefs;
+			if (!heap.mappedData || heap.viewRefSlots == 0)
+				return;
+			const uint64_t offset = heap.descriptorBaseOffset + (static_cast<uint64_t>(heap.capacity) + a_first) * r.stride;
+			std::memcpy(static_cast<std::byte*>(heap.mappedData) + offset, r.staging.data() + static_cast<size_t>(a_first * r.stride),
+				static_cast<size_t>(a_count * r.stride));
+		}
+
+		// Copies a pair from staging into every full-capacity heap. Under descriptorViewsMutex and the region's write lock.
+		static void VkPublishViewRefPair(VulkanDevice* impl, uint32_t a_pair) noexcept {
+			for (const DescriptorHeapHandle handle : impl->viewRefs.heaps) {
+				if (VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, handle))
+					VkCopyViewRefSlots(impl, *heap, 2 * a_pair, 2);
+			}
+		}
+
+		// Sets the region up once the binding model and its capacity are known: the client's capacity shrinks by the region.
+		static void VkInitViewRefs(VulkanDevice* impl, const char* caller) noexcept {
+			auto& r = impl->viewRefs;
+			if (!impl->bufferDeviceAddressEnabled || !VkBindlessModel(impl) || impl->shaderVisibleResourceCapacity <= 2 * BUFFER_VIEW_REF_SLOTS) {
+				spdlog::warn("{}: no buffer view refs (binding model or capacity {}); shaders cannot reach buffers by ref", caller,
+					impl->shaderVisibleResourceCapacity);
+				return;
+			}
+			r.stride = VkDescriptorHeapStride(impl, DescriptorHeapType::CbvSrvUav);
+			r.descriptorSize = VkDescriptorBufferModel(impl) ? impl->descriptorBuffer.storageBufferSize
+				: static_cast<uint64_t>(impl->descriptorHeapProperties.bufferDescriptorSize);
+			if (r.stride == 0 || r.descriptorSize == 0 || r.descriptorSize > r.stride) {
+				spdlog::warn("{}: no buffer view refs (descriptor stride {}, storage buffer descriptor {} bytes)", caller, r.stride, r.descriptorSize);
+				return;
+			}
+			try {
+				r.staging.assign(static_cast<size_t>(BUFFER_VIEW_REF_SLOTS * r.stride), std::byte{ 0 });
+			} catch (...) {
+				return;
+			}
+			impl->shaderVisibleResourceCapacity -= BUFFER_VIEW_REF_SLOTS;
+			r.ready = true;
+			spdlog::info("{}: buffer view refs: {} pairs at heap slot {} (the client's capacity)", caller, BUFFER_VIEW_REF_PAIRS,
+				impl->shaderVisibleResourceCapacity);
+		}
+
+		// A buffer's pair, made the first time it is asked for. A buffer without a device address has none.
+		static BufferViewRef VkViewRef(VulkanDevice* impl, GpuBufferAddress address) noexcept {
+			if (!impl || !impl->viewRefs.ready || !address.buffer.valid() || address.offset > UINT32_MAX)
+				return {};
+			auto& r = impl->viewRefs;
+			const uint64_t key = (uint64_t(address.buffer.generation) << 32) | address.buffer.index;
+			const uint32_t firstSlot = impl->shaderVisibleResourceCapacity;
+			const auto refAt = [&](uint32_t pair) { return BufferViewRef{ firstSlot + 2 * pair, static_cast<uint32_t>(address.offset) }; };
+			{
+				std::shared_lock read(r.lock);
+				if (const auto found = r.pairByResource.find(key); found != r.pairByResource.end())
+					return refAt(found->second);
+			}
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
+			VulkanResource* resource = VkResourceState(impl, address.buffer);
+			if (!resource || resource->type != ResourceType::Buffer || resource->deviceAddress == 0 || resource->bufferSize == 0)
+				return {};
+			std::unique_lock write(r.lock);
+			if (const auto found = r.pairByResource.find(key); found != r.pairByResource.end())
+				return refAt(found->second);
+			uint32_t pair = 0;
+			if (!r.freePairs.empty()) {
+				pair = r.freePairs.back();
+				r.freePairs.pop_back();
+			} else if (r.nextPair < BUFFER_VIEW_REF_PAIRS) {
+				pair = r.nextPair++;
+			} else {
+				if (!r.loggedFull) {
+					r.loggedFull = true;
+					spdlog::error("Vulkan buffer view refs: all {} pairs are in use; further buffers have no view ref", BUFFER_VIEW_REF_PAIRS);
+				}
+				return {};
+			}
+			// Every buffer BasicRHI makes has storage usage, so the UAV is the same descriptor as the SRV. A storage buffer descriptor covers
+			// at most maxStorageBufferRange bytes: past it a load reads nothing.
+			const VkDeviceSize maxRange = impl->physicalDeviceProperties.limits.maxStorageBufferRange;
+			if (resource->bufferSize > maxRange) {
+				spdlog::warn("Vulkan buffer view refs: a {}-byte buffer's views cover its first {} bytes (maxStorageBufferRange)", resource->bufferSize, maxRange);
+			}
+			std::byte* srv = r.staging.data() + static_cast<size_t>(2 * pair * r.stride);
+			VkWriteViewRefDescriptor(impl, srv, resource->deviceAddress, (std::min)(resource->bufferSize, maxRange));
+			std::memcpy(srv + r.stride, srv, static_cast<size_t>(r.stride));
+			VkPublishViewRefPair(impl, pair);
+			r.pairByResource.emplace(key, pair);
+			return refAt(pair);
+		}
+
+		// A destroyed buffer's pair goes back, null again. The deferred destruction has waited for the frames that read it.
+		static void VkReleaseViewRef(VulkanDevice* impl, ResourceHandle handle) noexcept {
+			if (!impl || !impl->viewRefs.ready || !handle.valid())
+				return;
+			auto& r = impl->viewRefs;
+			const uint64_t key = (uint64_t(handle.generation) << 32) | handle.index;
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
+			std::unique_lock write(r.lock);
+			const auto found = r.pairByResource.find(key);
+			if (found == r.pairByResource.end())
+				return;
+			const uint32_t pair = found->second;
+			r.pairByResource.erase(found);
+			std::byte* srv = r.staging.data() + static_cast<size_t>(2 * pair * r.stride);
+			VkWriteViewRefDescriptor(impl, srv, 0, 0);
+			std::memcpy(srv + r.stride, srv, static_cast<size_t>(r.stride));
+			VkPublishViewRefPair(impl, pair);
+			r.freePairs.push_back(pair);
+		}
+
 		static bool VkIsSpirvBytecode(const ShaderBinary& bytecode) noexcept {
 			static constexpr uint32_t kSpirvMagic = 0x07230203u;
 			if (!bytecode.data || bytecode.size < sizeof(uint32_t) || (bytecode.size % sizeof(uint32_t)) != 0) {
@@ -9950,6 +10094,7 @@ namespace rhi {
 				return;
 			}
 			VkReleaseViewsForResource(impl, handle);
+			VkReleaseViewRef(impl, handle);
 			if (VulkanResource* resource = VkResourceState(impl, handle)) {
 				VkDestroyResource(impl, *resource);
 			}
@@ -11145,7 +11290,7 @@ namespace rhi {
 			const bool samplerHeap = heap.type == DescriptorHeapType::Sampler;
 			heap.descriptorStride = samplerHeap ? model.samplerStride : model.resourceStride;
 			heap.descriptorBaseOffset = samplerHeap ? model.samplerBindingOffset : model.resourceBindingOffset;
-			uint64_t elements = heap.capacity;
+			uint64_t elements = static_cast<uint64_t>(heap.capacity) + heap.viewRefSlots;
 			// d_createDescriptorHeap has checked the capacity against the device's (the universal sets' sizes).
 			if (heap.shaderVisible && samplerHeap) {
 				elements = static_cast<uint64_t>(model.samplerCapacity) + model.staticSamplerCapacity;
@@ -11257,6 +11402,10 @@ namespace rhi {
 				}
 			}
 			heap.imageViewSlots.resize(desc.capacity);
+			// A shader-visible resource heap of the device's full capacity also holds the buffer view refs' region past it.
+			if (desc.shaderVisible && desc.type == DescriptorHeapType::CbvSrvUav && impl->viewRefs.ready && desc.capacity == impl->shaderVisibleResourceCapacity) {
+				heap.viewRefSlots = BUFFER_VIEW_REF_SLOTS;
+			}
 
 			if (VkDescriptorBufferModel(impl) && (desc.type == DescriptorHeapType::CbvSrvUav || desc.type == DescriptorHeapType::Sampler)) {
 				if (const Result result = VkCreateBufferModelHeapBacking(impl, heap); result != Result::Ok) {
@@ -11266,7 +11415,7 @@ namespace rhi {
 			}
 			else if (impl->descriptorHeapEnabled && (desc.type == DescriptorHeapType::CbvSrvUav || desc.type == DescriptorHeapType::Sampler)) {
 				heap.descriptorStride = VkDescriptorHeapStride(impl, desc.type);
-				heap.descriptorBytes = static_cast<uint64_t>(desc.capacity) * heap.descriptorStride;
+				heap.descriptorBytes = (static_cast<uint64_t>(desc.capacity) + heap.viewRefSlots) * heap.descriptorStride;
 				if (desc.type == DescriptorHeapType::Sampler) {
 					heap.reservedRangeSize = (std::max)(
 						static_cast<uint64_t>(impl->descriptorHeapProperties.minSamplerHeapReservedRange),
@@ -11350,6 +11499,13 @@ namespace rhi {
 					stored->mappedData = stored->hostDescriptors.data();
 				}
 			}
+			if (heap.viewRefSlots != 0) {
+				auto& r = impl->viewRefs;
+				std::unique_lock write(r.lock);
+				r.heaps.push_back(handle);
+				if (VulkanDescriptorHeap* stored = VkDescriptorHeapState(impl, handle))
+					VkCopyViewRefSlots(impl, *stored, 0, BUFFER_VIEW_REF_SLOTS);
+			}
 			DescriptorHeap descriptorHeap{ handle };
 			descriptorHeap.impl = impl;
 			descriptorHeap.vt = &g_vkdhvt;
@@ -11370,6 +11526,11 @@ namespace rhi {
 
 			for (VulkanImageViewSlot& slot : heap->imageViewSlots) {
 				VkResetDescriptorSlot(impl, slot);
+			}
+			if (heap->viewRefSlots != 0) {
+				auto& r = impl->viewRefs;
+				std::unique_lock write(r.lock);
+				std::erase_if(r.heaps, [&](DescriptorHeapHandle h) { return h.index == handle.index && h.generation == handle.generation; });
 			}
 			VkDestroyDescriptorHeapBacking(impl, *heap);
 
@@ -12891,6 +13052,10 @@ namespace rhi {
 			return VkBufferAddress(impl, address);
 		}
 
+		static BufferViewRef d_getBufferViewRef(Device* device, GpuBufferAddress address) noexcept {
+			return VkViewRef(device ? static_cast<VulkanDevice*>(device->impl) : nullptr, address);
+		}
+
 		static Result d_getRayTracingAccelerationStructureOperationPrebuildInfo(Device* device, const RayTracingRtasOperationInputs& inputs, RayTracingRtasPrebuildInfo* out) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || !out) {
@@ -13487,6 +13652,7 @@ namespace rhi {
 		&d_createAccelerationStructure,
 		&d_getAccelerationStructureDeviceAddress,
 		&d_getBufferDeviceAddress,
+		&d_getBufferViewRef,
 		&d_getRayTracingShaderGroupHandles,
 		&d_setRayTracingPipelineStackSize,
 		&d_getRayTracingAccelerationStructureOperationPrebuildInfo,
@@ -15523,6 +15689,7 @@ namespace rhi {
 				RHI_FAIL(modelResult);
 			}
 		}
+		VkInitViewRefs(impl.get(), "CreateVulkanDevice");
 		if (ci.pipelineCachePath) {
 			// A cache that cannot open leaves pipelines uncached; the device still works.
 			d_openPipelineCache(&impl->self, ci.pipelineCachePath);
@@ -15873,6 +16040,7 @@ namespace rhi {
 					RHI_FAIL(modelResult);
 				}
 			}
+			VkInitViewRefs(impl.get(), "AdoptVulkanDevice");
 
 			spdlog::info(
 				"AdoptVulkanDevice: adopted '{}' queues[gfx={}:{}, compute={}:{}, copy={}:{}] timelineSemaphore={} bufferDeviceAddress={} descriptorHeap={} dynamicRendering={}",
