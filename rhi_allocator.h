@@ -139,8 +139,8 @@ namespace rhi::ma
 
     struct TotalStatistics
     {
-        // rhi::HeapType currently has 6 logical values (DeviceLocal, HostVisibleCoherent, HostVisibleCached, HostCached, GPUUpload, Custom)
-        static constexpr uint32_t heapTypeCount = 6;
+        // Indexed by rhi::HeapType: DeviceLocal, HostVisibleCoherent, HostVisibleCached, HostCached, GPUUpload, Custom, SystemMemory.
+        static constexpr uint32_t heapTypeCount = 7;
         DetailedStatistics heapType[heapTypeCount]{};
 
         DetailedStatistics memorySegmentGroup[2]{};
@@ -171,6 +171,11 @@ namespace rhi::ma
         AllocationFlagWithinBudget = 0x4,
         AllocationFlagUpperAddress = 0x8,
         AllocationFlagCanAlias = 0x10,
+        /** Device-local memory the application rarely uses: it goes in the spill pool (a low residency priority, so
+        the driver demotes it first), and in system memory when the spill pool would need new device-local memory
+        over budget. Only for allocations of heap type DeviceLocal without a custom pool. Allocation::GetPlacement
+        says where it landed. */
+        AllocationFlagSpillable = 0x20,
 
         AllocationFlagStrategyMinMemory = 0x00010000,
         AllocationFlagStrategyMinTime = 0x00020000,
@@ -248,6 +253,67 @@ namespace rhi::ma
         Pool* customPool = nullptr;
 
         void* privateData = nullptr;
+
+        /** Owner label for the VRAM report (Allocator::GetOwnerReport). Null takes the calling thread's owner scope
+        (PushAllocationOwner). The string is copied. */
+        const char* owner = nullptr;
+    };
+
+    // ---------------- VRAM attribution and placement ----------------
+
+    /// Where an allocation's memory is (Allocation::GetPlacement).
+    struct AllocationPlacement
+    {
+        /// The heap type the memory came from. SystemMemory for a spilled or forced allocation.
+        rhi::HeapType heapType = rhi::HeapType::DeviceLocal;
+        /// Video memory (Local) or system memory (NonLocal). SystemMemory is NonLocal even on a device that reports UMA.
+        rhi::MemorySegmentGroup segment = rhi::MemorySegmentGroup::Local;
+        /// Created with AllocationFlagSpillable.
+        bool spillable = false;
+        /// Asked for device-local memory and got system memory: over budget, or by a placement override.
+        bool spilled = false;
+    };
+
+    /// Forced placement for testing (Allocator::SetPlacementOverride).
+    enum class PlacementOverride : uint32_t
+    {
+        None,         ///< Normal placement.
+        DeviceLocal,  ///< Spillable allocations stay in video memory whatever the budget.
+        SystemMemory, ///< Device-local allocations go to system memory, spillable or not.
+    };
+
+    /// One owner's live allocations (Allocator::GetOwnerReport).
+    struct OwnerMemoryReport
+    {
+        /// The owner label, valid while the allocator lives. "" for allocations made with no owner.
+        const char* owner = "";
+        uint32_t allocationCount = 0;
+        uint64_t allocationBytes = 0;
+        uint32_t countByHeapType[TotalStatistics::heapTypeCount]{};
+        uint64_t bytesByHeapType[TotalStatistics::heapTypeCount]{};
+        /// Indexed by rhi::MemorySegmentGroup: video memory, system memory.
+        uint64_t bytesBySegment[2]{};
+        uint32_t spilledCount = 0;
+        uint64_t spilledBytes = 0;
+    };
+
+    /** \brief Sets the owner label for allocations made on the calling thread until the matching PopAllocationOwner.
+    Scopes nest; the innermost wins. The string must stay valid until the pop (it is copied when an allocation is made).
+    An AllocationDesc::owner overrides it. */
+    void PushAllocationOwner(const char* owner) noexcept;
+    /// Ends the calling thread's innermost owner scope.
+    void PopAllocationOwner() noexcept;
+    /// The calling thread's innermost owner scope, or null.
+    const char* CurrentAllocationOwner() noexcept;
+
+    /// RAII owner scope (PushAllocationOwner / PopAllocationOwner).
+    class AllocationOwnerScope
+    {
+    public:
+        explicit AllocationOwnerScope(const char* owner) noexcept { PushAllocationOwner(owner); }
+        ~AllocationOwnerScope() { PopAllocationOwner(); }
+        AllocationOwnerScope(const AllocationOwnerScope&) = delete;
+        AllocationOwnerScope& operator=(const AllocationOwnerScope&) = delete;
     };
 
     struct PoolDesc
@@ -431,6 +497,11 @@ namespace rhi::ma
 
         void SetName(const char* n) noexcept;
         const char* GetName() const noexcept { return m_name; }
+
+        /// The owner label (AllocationDesc::owner or the creating thread's scope). "" when it has none.
+        const char* GetOwner() const noexcept;
+        /// Where the memory is.
+        AllocationPlacement GetPlacement() const noexcept { return m_placement; }
     protected:
         void ReleaseThis();
     private:
@@ -507,6 +578,9 @@ namespace rhi::ma
         uint64_t m_size;
         uint64_t m_alignment;
         void* m_privateData;
+        // The owner's report row; null for allocations not made through Allocator::CreateResource or AllocateMemory.
+        OwnerMemoryReport* m_owner = nullptr;
+        AllocationPlacement m_placement{};
 
         Allocation(AllocatorPimpl* allocator, UINT64 size, UINT64 alignment);
         virtual ~Allocation();
@@ -681,6 +755,20 @@ namespace rhi::ma
         void BuildStatsString(char** outJson, bool detailedMap) const noexcept;
         void FreeStatsString(char* json) const noexcept;
         void BeginDefragmentation(const DefragmentationDesc* pDesc, DefragmentationContext** ppContext)noexcept;
+
+        /** \brief Copies one row per owner with live allocations, up to `capacity`, and returns the number of owners.
+        Rows are in no particular order; the owner strings stay valid while the allocator lives. */
+        uint32_t GetOwnerReport(OwnerMemoryReport* rows, uint32_t capacity) const noexcept;
+        /** \brief Relabels a live allocation. Without `overwrite`, an allocation that already has an owner keeps it. */
+        void SetOwner(Allocation* allocation, const char* owner, bool overwrite) noexcept;
+        /** \brief For testing: forces the placement of new allocations with this owner label (null: every allocation).
+        A specific owner's override wins over the one for every allocation. PlacementOverride::None removes it. Live
+        allocations do not move. */
+        void SetPlacementOverride(const char* owner, PlacementOverride placement) noexcept;
+        /** \brief For testing: caps the budget the allocator sees for a segment group (0 removes the cap), so the
+        WithinBudget and spillable decisions behave as on a smaller GPU. */
+        void SetBudgetLimit(MemorySegmentGroup segmentGroup, uint64_t bytes) noexcept;
+
         AllocatorPimpl* m_Pimpl{};
 
 		void ReleaseThis(); // TODO: Make AllocatorPtr and make this private

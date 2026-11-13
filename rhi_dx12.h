@@ -1,5 +1,6 @@
 ﻿#pragma once
 #include "rhi.h"
+#include "rhi_pipeline_cache.h"
 #include "rhi_reshape_shared.h"
 #include "rhi_dx12_headers.h"
 
@@ -97,6 +98,8 @@ namespace rhi {
 		bool isCompute = false;
 		bool isRayTracing = false;
 		bool isRayTracingLibrary = false;
+		bool readsStencilRef = false;  // stencil test on: binding it sets the list's stencil reference if not yet set
+		bool readsBlendFactor = false; // a blend reads the constant: binding it sets the list's blend factor if not yet set
 		Dx12Device* dev = nullptr;
 	};
 
@@ -171,6 +174,9 @@ namespace rhi {
 		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> bundleAlloc;
 		D3D12_COMMAND_LIST_TYPE type{};
 		Dx12Device* dev = nullptr;
+		// The lists recorded from this allocator (made from it or reset onto it). Its Reset closes any of them still recording:
+		// the RHI lets a list be reset while it records, as Vulkan does, and D3D12 resets neither a list nor its allocator then.
+		std::vector<CommandListHandle> lists;
 	};
 	struct Dx12CommandList {
 		struct TracyGpuZoneEvent {
@@ -210,12 +216,29 @@ namespace rhi {
 		D3D12_COMMAND_LIST_TYPE type{};
 		// A secondary, recorded as a bundle (D3D12_COMMAND_LIST_TYPE_BUNDLE) from its allocator's bundleAlloc.
 		bool bundle = false;
+		// Recording: made open, or reset and not yet closed.
+		bool open = false;
+		// Its last Close failed: it cannot be executed until it is reset.
+		bool closeFailed = false;
+		// BASICRHI_D3D12_RESET_TRACE=1: the stack of the reset that opened it.
+		std::array<void*, 16> resetStack{};
+		uint16_t resetDepth = 0;
+		// A recycled bundle's allocator: Recycle leaves a bundle closed, and BeginSecondary resets it onto this one (D3D12's Reset
+		// opens a list, where the RHI's Recycle leaves a secondary not recording).
+		Microsoft::WRL::ComPtr<ID3D12CommandAllocator> pendingReset;
 		// A command a bundle cannot hold was refused; End reports it.
 		Result pendingError = Result::Ok;
 		PipelineLayoutHandle boundLayout{};
 		Dx12PipelineLayout* boundLayoutPtr = nullptr;
 		Dx12Device* dev = nullptr;
 		Dx12Pipeline* boundPipeline = nullptr; // For debug validation
+		// The stencil reference set with SetStencilRef (0 until then). Applied: the list holds it. A list starts
+		// without it, and executed bundles may change it, so the next pipeline that reads it sets it again.
+		uint32_t stencilRef = 0;
+		bool stencilRefApplied = false;
+		// The same for the blend factor (SetBlendFactor; {1, 1, 1, 1} until then).
+		float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		bool blendFactorApplied = false;
 		std::string debugName;
 		std::string instrumentationPassName;
 		std::string instrumentationTechniquePath;
@@ -289,6 +312,26 @@ namespace rhi {
 		Dx12Device* dev = nullptr;
 	};
 
+	/**
+	 * @brief Buffer view refs (rhi_shader_abi.h, BUFFER_VIEW_REF_*). A buffer gets a raw SRV/UAV pair in the reserved region the first
+	 * time its ref is asked for (Device::GetBufferViewRef) and gives it back when it is destroyed. The pairs are written in a CPU-only
+	 * staging heap and copied into every full-size shader-visible heap.
+	 */
+	struct Dx12ViewRefRegion {
+		std::shared_mutex lock;
+		bool ready = false;
+		Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> staging;
+		D3D12_CPU_DESCRIPTOR_HANDLE stagingStart{};
+		UINT increment = 0;
+		uint32_t firstSlot = 0;  // the region's first heap slot: the full capacity
+		// The full-size shader-visible heaps the region is copied into (their start handles).
+		std::vector<std::pair<ID3D12DescriptorHeap*, D3D12_CPU_DESCRIPTOR_HANDLE>> heaps;
+		std::unordered_map<uint64_t, uint32_t> pairByResource;  // ResourceHandle index and generation -> pair
+		std::vector<uint32_t> freePairs;
+		uint32_t nextPair = 0;
+		bool loggedFull = false;
+	};
+
 	struct Dx12Timeline {
 		struct SignalRecord {
 			uint64_t value = 0;
@@ -356,6 +399,14 @@ namespace rhi {
 		std::vector<ComPtr<ID3D12Resource>> images;
 		std::vector<ResourceHandle> imageHandles;
 		Dx12Device* dev = nullptr;
+		// The format given at creation or resize, which SrgbNonlinear presents in.
+		Format sdrFormat = Format::Unknown;
+		SwapchainColorSpace colorSpace = SwapchainColorSpace::SrgbNonlinear;
+		bool hasHdrMetadata = false;
+		HdrMetadata hdrMetadata{};
+		// DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT's object. The swapchain owns it; it is closed with the swapchain.
+		HANDLE frameLatencyWaitable = nullptr;
+		uint64_t presentCount = 0;
 	};
 
 	struct Dx12Heap {
@@ -549,6 +600,8 @@ namespace rhi {
 
 		Device self{};
 		ComPtr<IDXGIFactory7> pNativeFactory;
+		// The host's Agility SDK device factory (DeviceCreateInfo::d3d12DeviceFactory), kept while the device lives.
+		ComPtr<ID3D12DeviceFactory> deviceFactory;
 		Microsoft::WRL::ComPtr<IDXGIFactory7>  pSLProxyFactory;   // upgraded proxy
 		ComPtr<ID3D12Device10> pNativeDevice;
 		Microsoft::WRL::ComPtr<ID3D12Device>   pSLProxyDevice;// upgraded base iface
@@ -558,6 +611,7 @@ namespace rhi {
 		ComPtr<IDXGIAdapter4>  adapter;
 
 		Registry<Dx12Resource> resources;
+		Dx12ViewRefRegion viewRefs;
 		Registry<Dx12Sampler> samplers;
 		Registry<Dx12PipelineLayout> pipelineLayouts;
 		Registry<Dx12Pipeline> pipelines;
@@ -578,6 +632,25 @@ namespace rhi {
 
 		bool steamlineInitialized = false;
 		Dx12DebugInstrumentationSession debugInstrumentation;
+
+		// The on-disk pipeline cache (Device::OpenPipelineCache): an ID3D12PipelineLibrary that keys each pipeline by a hash
+		// of its description. Creation reads `library` under a shared lock, so threads create pipelines in parallel. Opening,
+		// closing and saving take it exclusively: Serialize must not race StorePipeline.
+		struct PipelineCacheState {
+			mutable std::shared_mutex mutex;
+			ComPtr<ID3D12PipelineLibrary1> library;
+			// The file's payload: the stored keys, then the serialized library. The library reads its part in place, so the
+			// bytes live as long as the library.
+			std::vector<uint8_t> blob;
+			std::string path;
+			detail::PipelineCacheIdentity identity{};
+			// The keys in the library. A pipeline not stored is not looked up: the debug layer warns about every failed load.
+			std::mutex keysMutex;
+			std::unordered_set<uint64_t> keys;
+			// Two threads must not load the same pipeline at once; a key's stripe serializes that.
+			std::array<std::mutex, 32> keyStripes;
+			detail::PipelineCacheCounters counters;
+		} pipelineCache;
 
 		// lifetime anchor
 		std::weak_ptr<Dx12Device> selfWeak;
@@ -628,6 +701,7 @@ namespace rhi {
 	using SO_RtvFormats = PsoSubobject<D3D12_RT_FORMAT_ARRAY, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS>;
 	using SO_DsvFormat = PsoSubobject<DXGI_FORMAT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT>;
 	using SO_SampleDesc = PsoSubobject<DXGI_SAMPLE_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC>;
+	using SO_SampleMask = PsoSubobject<UINT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK>;
 	using SO_PrimTopology = PsoSubobject<D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY>;
 	using SO_Flags = PsoSubobject<D3D12_PIPELINE_STATE_FLAGS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS>;
 	using SO_NodeMask = PsoSubobject<UINT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK>;

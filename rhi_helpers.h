@@ -228,6 +228,7 @@ namespace rhi {
             case DXGI_FORMAT_R16_SINT: return Format::R16_SInt;
             case DXGI_FORMAT_R8_TYPELESS: return Format::R8_Typeless;
             case DXGI_FORMAT_R8_UNORM: return Format::R8_UNorm;
+            case DXGI_FORMAT_A8_UNORM: return Format::A8_UNorm;
             case DXGI_FORMAT_R8_UINT: return Format::R8_UInt;
             case DXGI_FORMAT_R8_SNORM: return Format::R8_SNorm;
             case DXGI_FORMAT_R8_SINT: return Format::R8_SInt;
@@ -351,6 +352,7 @@ namespace rhi {
             case Format::R8_UInt:
             case Format::R8_SNorm:
             case Format::R8_SInt:
+            case Format::A8_UNorm:
                 return 1;
 
                 // Block-compressed: report the decoded channel count (not bytes-per-block)
@@ -567,7 +569,7 @@ namespace rhi {
             // Uncompressed: bytes-per-pixel
             switch (f) {
             case Format::R8_UNorm: case Format::R8_UInt: case Format::R8_SNorm: case Format::R8_SInt:
-            case Format::R8_Typeless: return 1;
+            case Format::R8_Typeless: case Format::A8_UNorm: return 1;
             case Format::R8G8_UNorm: case Format::R8G8_UInt: case Format::R8G8_SNorm: case Format::R8G8_SInt:
             case Format::R8G8_Typeless: return 2;
                 case Format::R16_UNorm: case Format::R16_UInt: case Format::R16_SNorm: case Format::R16_SInt:

@@ -12,6 +12,8 @@ enum class FeatureInfoStructType : uint64_t {
 	ResourceAllocation = 8,
 	WorkGraphs = 9,
 	IndirectCommands = 10,
+	FixedFunction = 11,
+	CommandMemory = 12,
 };
 
 struct FeatureInfoHeader {
@@ -52,7 +54,10 @@ struct AdapterFeatureInfo {
 struct ArchitectureFeatureInfo {
     FeatureInfoHeader header{ FeatureInfoStructType::Architecture, nullptr, sizeof(ArchitectureFeatureInfo), 1 };
 
+    // Video memory and system memory are one pool (an integrated GPU). A discrete GPU with resizable BAR is not UMA,
+    // even though it has host-visible device-local memory.
     bool uma = false;
+    // UMA, and the CPU's caches are coherent with the GPU. Never true without uma.
     bool cacheCoherentUMA = false;
     bool isolatedMMU = false;
     bool tileBasedRenderer = false;
@@ -194,6 +199,11 @@ struct ResourceAllocationFeatureInfo {
     bool tightAlignmentSupported = false;    // D3D12_TIGHT_ALIGNMENT tier >= 1
 
     bool createNotZeroedHeapSupported = false; // "heap flag create_not_zeroed" proxy (D3D12MA-style)
+
+    // Whether the driver packs small committed buffers together. D3D12 does, so the allocator makes buffers up to 32 KiB
+    // committed (placed ones need 64 KiB alignment). On Vulkan a committed buffer is its own vkAllocateMemory, rounded up to the
+    // driver's allocation granularity, so small buffers are placed in the allocator's blocks instead.
+    bool committedSmallBuffersPacked = false;
 };
 
 struct WorkGraphFeatureInfo {
@@ -209,7 +219,7 @@ struct WorkGraphFeatureInfo {
 };
 
 struct IndirectCommandsFeatureInfo {
-    FeatureInfoHeader header{ FeatureInfoStructType::IndirectCommands, nullptr, sizeof(IndirectCommandsFeatureInfo), 2 };
+    FeatureInfoHeader header{ FeatureInfoStructType::IndirectCommands, nullptr, sizeof(IndirectCommandsFeatureInfo), 3 };
 
     bool constantArguments = false;    // Constant arguments in a command signature
     bool indexBufferArguments = false; // IndexBuffer arguments (D3D12 index buffer view layout)
@@ -223,4 +233,36 @@ struct IndirectCommandsFeatureInfo {
     // of a larger layout's constants in memory, so a command signature whose Constant argument reaches past it is refused.
     // 0: no limit beyond the layout's own.
     uint32_t constantArgumentBytes = 0;
+    // (structVersion 3) ExecuteIndirect with a count buffer draws the count it reads (Vulkan's drawIndirectCount). Without it, a
+    // single-draw signature draws its max count.
+    bool countedDraws = false;
+};
+
+// Optional fixed-function pipeline and command list state (D3D11-style state that Vulkan gates behind features).
+// Not a capability: what command recording holds now (Device::CommandMemoryStats). Each kind of scratch page is "held" while
+// a list that recorded into it has not been reset, and "pooled" once a reset gave it back to the device for other lists.
+// Zero where a backend does not count it (D3D12).
+struct CommandMemoryFeatureInfo {
+    FeatureInfoHeader header{ FeatureInfoStructType::CommandMemory, nullptr, sizeof(CommandMemoryFeatureInfo), 1 };
+
+    uint64_t commandPools = 0;     // command allocators alive (VkCommandPool)
+    uint64_t commandLists = 0;     // command lists alive (VkCommandBuffer)
+    // Emulated root constants' spilled data (host-visible pages a list pushes its constants into when they do not fit).
+    uint64_t scratchPagesHeld = 0, scratchBytesHeld = 0;
+    uint64_t scratchPagesPooled = 0, scratchBytesPooled = 0;
+    // Device-generated commands' preprocess memory.
+    uint64_t dgcPagesHeld = 0, dgcBytesHeld = 0;
+    uint64_t dgcPagesPooled = 0, dgcBytesPooled = 0;
+};
+
+struct FixedFunctionFeatureInfo {
+    FeatureInfoHeader header{ FeatureInfoStructType::FixedFunction, nullptr, sizeof(FixedFunctionFeatureInfo), 2 };
+
+    bool dualSourceBlend = false;  // BlendFactor::Src1* (Vulkan dualSrcBlend)
+    bool logicOp = false;          // BlendState::logicOpEnable (D3D12 OutputMergerLogicOp, Vulkan logicOp)
+    bool depthClipDisable = false; // RasterState::depthClip = false (Vulkan depthClamp)
+    uint32_t maxViewports = 1;     // CommandList::SetViewports / SetScissors count (Vulkan multiViewport, at most 16)
+    // (structVersion 2) A secondary list may call SetViewports and SetScissors. Vulkan: true. D3D12: false (bundles inherit
+    // them). Without it, record a pass that needs its own viewports or scissors inline rather than in secondaries.
+    bool secondaryViewportScissor = false;
 };

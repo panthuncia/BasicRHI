@@ -14,6 +14,22 @@ inline constexpr uint32_t VULKAN_RESOURCE_DESCRIPTOR_HEAP_BINDING = 1000000;
 inline constexpr uint32_t VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING = 1000001;
 inline constexpr uint32_t VULKAN_COUNTER_DESCRIPTOR_HEAP_BINDING = 1000002;
 
+// Buffer view refs (Device::GetBufferViewRef): how a shader reaches a buffer without a pointer, the same on D3D12 and Vulkan.
+// A ref is two words, the buffer's view slot and a byte offset into the buffer. The view slot is a heap index in
+// ResourceDescriptorHeap: the buffer's raw SRV (ByteAddressBuffer) is at the slot and its raw UAV (RWByteAddressBuffer) at the
+// slot after it. A buffer without UAV access has a null UAV there: a store through it is dropped.
+// - The pairs live in a reserved region of every shader-visible CBV/SRV/UAV heap of the device's full capacity
+//   (ShaderFeatureInfo::maxShaderVisibleResourceDescriptors), past the slots the client indexes: slots
+//   [capacity, capacity + BUFFER_VIEW_REF_SLOTS). A buffer gets its pair the first time its ref is asked for and gives it back
+//   when it is destroyed (with the device's deferred destruction, so after the frames that may read it).
+// - View slot 0 is never a pair: a ref with view slot 0 names no buffer. Nothing makes a load through it safe; check first.
+// - On Vulkan the pair is two storage buffer descriptors over the buffer's device address range, in either binding model
+//   (VK_EXT_descriptor_heap's heap or the descriptor-buffer model's universal set), so the device reports
+//   BUFFER_VIEW_REF_SLOTS fewer descriptors than it holds.
+// Common/DeviceRef.hlsli is the shader side.
+inline constexpr uint32_t BUFFER_VIEW_REF_PAIRS = 16384;
+inline constexpr uint32_t BUFFER_VIEW_REF_SLOTS = 2 * BUFFER_VIEW_REF_PAIRS;
+
 // The DXC arguments every SPIR-V shader consumed by the Vulkan backend must be compiled with:
 // DX buffer layout, DX SV_Position.w, and ResourceDescriptorHeap/SamplerDescriptorHeap mapped onto the
 // VK_EXT_descriptor_heap bindings above. Runtime compilers append these; build-time

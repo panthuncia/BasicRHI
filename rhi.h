@@ -505,6 +505,8 @@ namespace rhi {
 		// Four bytes whose fourth is unused (appended): sampled with alpha one, as in DXGI. The Vulkan backend views them as
 		// B8G8R8A8 with the alpha swizzled to one.
 		B8G8R8X8_Typeless, B8G8R8X8_UNorm, B8G8R8X8_UNorm_sRGB,
+		// One byte of alpha (appended): DXGI's A8_UNORM, Vulkan's VK_FORMAT_A8_UNORM_KHR (VK_KHR_maintenance5).
+		A8_UNorm,
 	};
 
 	constexpr uint32_t FormatByteSize(Format f) noexcept {
@@ -566,7 +568,7 @@ namespace rhi {
 			// 1 byte
 		case Format::R8_Typeless:  case Format::R8_UNorm:
 		case Format::R8_UInt:      case Format::R8_SNorm:
-		case Format::R8_SInt:                                                      return 1;
+		case Format::R8_SInt:  case Format::A8_UNorm:                             return 1;
 
 			// Block-compressed formats: return 0 here (use GetBlockInfo for textures)
 		case Format::BC1_Typeless: case Format::BC1_UNorm: case Format::BC1_UNorm_sRGB:
@@ -864,6 +866,15 @@ namespace rhi {
 	struct GpuBufferAddress {
 		ResourceHandle buffer{};
 		uint64_t offset{ 0 };
+	};
+
+	// A shader's way to a buffer (rhi_shader_abi.h, BUFFER_VIEW_REF_*): the heap slot of the buffer's raw SRV (its raw UAV is the
+	// slot after it) and a byte offset into the buffer. View slot 0 names no buffer.
+	struct BufferViewRef {
+		uint32_t viewSlot{ 0 };
+		uint32_t byteOffset{ 0 };
+		explicit operator bool() const noexcept { return viewSlot != 0; }
+		bool operator==(const BufferViewRef&) const noexcept = default;
 	};
 
 	struct SrvDesc {
@@ -1610,8 +1621,23 @@ namespace rhi {
 
 	enum class FillMode : uint32_t { Solid, Wireframe };
 	enum class CullMode : uint32_t { None, Front, Back };
-	enum class BlendFactor : uint32_t { One, Zero, SrcColor, InvSrcColor, SrcAlpha, InvSrcAlpha, DstColor, InvDstColor, DstAlpha, InvDstAlpha };
+	// Appended values: those before InvDstAlpha are ABI.
+	// BlendFactor/InvBlendFactor read the list's constant (CommandList::SetBlendFactor). SrcAlphaSat is a source factor
+	// only. Src1* read the pixel shader's second output (dual-source blending, render target 0 only; Vulkan needs
+	// FixedFunctionFeatureInfo::dualSourceBlend).
+	enum class BlendFactor : uint32_t {
+		One, Zero, SrcColor, InvSrcColor, SrcAlpha, InvSrcAlpha, DstColor, InvDstColor, DstAlpha, InvDstAlpha,
+		BlendFactor, InvBlendFactor, SrcAlphaSat, Src1Color, InvSrc1Color, Src1Alpha, InvSrc1Alpha
+	};
 	enum class BlendOp : uint32_t { Add, Sub, RevSub, Min, Max };
+	/** @brief A logic op on the render target's integer bits (D3D12_LOGIC_OP order; s = shader output, d = target). */
+	enum class LogicOp : uint8_t {
+		Clear, Set, Copy, CopyInverted, Noop, Invert, And, Nand, Or, Nor, Xor, Equiv,
+		AndReverse,   // s & ~d
+		AndInverted,  // ~s & d
+		OrReverse,    // s | ~d
+		OrInverted    // ~s | d
+	};
 	enum ColorWriteEnable : uint8_t { R = 1, G = 2, B = 4, A = 8, All = 0x0F };
 
 	struct ShaderBinary { const void* data{}; uint32_t size{}; };
@@ -1786,13 +1812,36 @@ namespace rhi {
 		float   depthBiasClamp = 0;
 		float   slopeScaledDepthBias = 0;
 		bool    conservative = false;
+		// Clip against the near and far planes (D3D12 DepthClipEnable). false skips that clip and clamps depth to the
+		// viewport's range instead (Vulkan depthClampEnable); it needs FixedFunctionFeatureInfo::depthClipDisable.
+		bool    depthClip = true;
+		// How many viewports and scissors the pipeline reads (SV_ViewportArrayIndex picks one). Vulkan fixes the count in
+		// the pipeline; D3D12 ignores it. Above 1 needs FixedFunctionFeatureInfo::maxViewports.
+		uint32_t viewportCount = 1;
+	};
+
+	/** @brief What a stencil test does to the stored value (D3D12_STENCIL_OP / VkStencilOp). */
+	enum class StencilOp : uint8_t { Keep, Zero, Replace, IncrSat, DecrSat, Invert, Incr, Decr };
+
+	/** @brief The stencil test and its updates for one face (D3D12_DEPTH_STENCILOP_DESC / VkStencilOpState). */
+	struct StencilFaceState {
+		StencilOp failOp = StencilOp::Keep;       // the stencil test fails
+		StencilOp depthFailOp = StencilOp::Keep;  // the stencil test passes and the depth test fails
+		StencilOp passOp = StencilOp::Keep;       // both tests pass
+		CompareOp func = CompareOp::Always;
 	};
 
 	struct DepthStencilState {
 		bool depthEnable = true;
 		bool depthWrite = true;
 		CompareOp depthFunc = CompareOp::LessEqual;
-		// TODO: stencil
+		// Stencil. Off by default, as D3D12's default desc has it. The reference value is command list state
+		// (CommandList::SetStencilRef). "Front" means what RasterState::frontCCW makes the front face, on every backend.
+		bool stencilEnable = false;
+		uint8_t stencilReadMask = 0xFF;
+		uint8_t stencilWriteMask = 0xFF;
+		StencilFaceState front{};
+		StencilFaceState back{};
 	};
 
 	struct BlendAttachment {
@@ -1810,6 +1859,12 @@ namespace rhi {
 		bool independentBlend = false;
 		uint32_t numAttachments = 1;
 		BlendAttachment attachments[8]{};
+		// A logic op instead of blending, on every attachment (their enable is ignored while it is on). It applies to
+		// integer formats. Needs FixedFunctionFeatureInfo::logicOp.
+		bool logicOpEnable = false;
+		LogicOp logicOp = LogicOp::Noop;
+		// Which samples the draw may write (D3D12 SampleMask, Vulkan pSampleMask). All bits: every sample.
+		uint32_t sampleMask = 0xFFFFFFFFu;
 	};
 
 	struct RenderTargets {
@@ -2021,6 +2076,28 @@ namespace rhi {
 		ResourceHandle resource{};  // Required for LoadOp::DontCare (DiscardResource)
 	};
 
+	// The most viewports and scissors a list sets at once (D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE).
+	inline constexpr uint32_t MAX_VIEWPORTS = 16;
+
+	/**
+	 * @brief A viewport in D3D's convention on every backend: (x, y) is its top-left corner in pixels, y growing
+	 * downwards. The Vulkan backend flips it as BeginPass does, so callers never branch on the backend. A viewport with
+	 * no width or no height draws nothing, as on D3D (Vulkan sets it as 1x1 with an empty scissor).
+	 */
+	struct Viewport {
+		float x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
+		float minDepth = 0.0f, maxDepth = 1.0f;
+	};
+
+	/**
+	 * @brief A scissor rectangle in pixels, top-left origin as Viewport. Parts left of or above 0 are cut off, and
+	 * parts past INT32_MAX too, so D3D's "no scissor" rectangles of huge extents are valid on Vulkan.
+	 */
+	struct ScissorRect {
+		int32_t x = 0, y = 0;
+		uint32_t width = 0, height = 0;
+	};
+
 	/** @brief Where a pass's draws are recorded (PassBeginInfo::contents). */
 	enum class PassContents : uint8_t { Inline, SecondaryLists };
 
@@ -2116,7 +2193,11 @@ namespace rhi {
 		HostCached, // D3D12: CUSTOM; Vulkan: HOST_CACHED
 		HostVisibleDeviceLocal, // D3D12: GPU_UPLOAD; Vulkan: HOST_VISIBLE + DEVICE_LOCAL
 		GPUUpload = HostVisibleDeviceLocal,
-		Custom // D3D12: CUSTOM; Vulkan: CUSTOM
+		Custom, // D3D12: CUSTOM; Vulkan: CUSTOM
+		// GPU memory in system RAM, for any resource, with no CPU access. Where a device-local resource goes when VRAM is
+		// short. D3D12: CUSTOM, pool L0, CPU page NOT_AVAILABLE. Vulkan: a memory type outside the device-local heaps, which
+		// a UMA device does not have (creation fails there).
+		SystemMemory
 	};
 
 	enum class HeapFlags : uint32_t {
@@ -2754,9 +2835,48 @@ namespace rhi {
 		QueueHandle queueHandle;
 	};
 
+	// What a present waits for: the queue that produced the frame and the timeline point its last submission signals. The
+	// wait runs on the GPU. The present goes out on that queue, and the next image's acquire is ordered before later work
+	// on it. Work on any other queue that touches the next back buffer waits on Swapchain::AcquirePoint() first.
 	struct PresentSyncDesc {
 		Queue queue;
 		TimelinePoint wait{};
+	};
+
+	// The colour space a swapchain presents in. Each HDR colour space fixes the image format.
+	enum class SwapchainColorSpace : uint8_t {
+		// SDR: the format given at creation, sRGB transfer, BT.709 primaries. The default.
+		SrgbNonlinear,
+		// HDR10: R10G10B10A2_UNorm, BT.2020 primaries, SMPTE ST 2084 (PQ) transfer.
+		Hdr10St2084,
+		// scRGB: R16G16B16A16_Float, BT.709 primaries, linear. 1.0 is 80 nits.
+		ScRgbLinear,
+	};
+
+	// HDR mastering metadata for the display. Chromaticities are CIE 1931 xy, luminances are in nits. The defaults
+	// describe a BT.2020 1000-nit master.
+	struct HdrMetadata {
+		float redPrimary[2]{ 0.708f, 0.292f };
+		float greenPrimary[2]{ 0.170f, 0.797f };
+		float bluePrimary[2]{ 0.131f, 0.046f };
+		float whitePoint[2]{ 0.3127f, 0.3290f };
+		float maxLuminance = 1000.0f;
+		float minLuminance = 0.001f;
+		float maxContentLightLevel = 1000.0f;
+		float maxFrameAverageLightLevel = 400.0f;
+	};
+
+	// What a swapchain can do on its device and output.
+	struct SwapchainCaps {
+		// Present(vsync = false) may tear: the swapchain was created with allowTearing and the platform supports it.
+		bool tearing = false;
+		// Present can change vsync from one call to the next without recreating the swapchain (D3D12; Vulkan with
+		// VK_EXT_swapchain_maintenance1). Without it, a change recreates the swapchain and Present returns ModeChanged.
+		bool presentModeSwitch = false;
+		// WaitForPresent waits for the display (Vulkan VK_KHR_present_wait). Without it, WaitForPresent is Unsupported.
+		bool presentWait = false;
+		// SetHdrMetadata reaches the display.
+		bool hdrMetadata = false;
 	};
 
 	struct ResourceVTable {
@@ -2860,6 +2980,61 @@ namespace rhi {
 		uint64_t currentUsageBytes = 0;            // current usage
 		uint64_t availableForReservationBytes = 0; // how much can be reserved
 		uint64_t currentReservationBytes = 0;      // current reservation level
+		// Vulkan: the usage of a heap in the group reached its budget. AMD's driver clamps usage to the budget, so the real
+		// usage can be higher: usage minus the caller's own allocations is not a reliable count of other memory then.
+		bool usageAtBudget = false;
+	};
+
+	/** @brief What became of the on-disk pipeline cache when the device opened it. */
+	enum class PipelineCacheLoadResult : uint32_t {
+		Off,         // no cache path: pipelines are compiled every run
+		Empty,       // no file yet: the cache starts empty and is written on save
+		Loaded,      // the file matched this device and driver
+		Stale,       // the file is for another device or driver: it was ignored and is replaced on save
+		Corrupt,     // the file is damaged or truncated: it was ignored and is replaced on save
+		Unsupported, // the backend or driver has no pipeline cache
+	};
+
+	/** @brief Counters of the on-disk pipeline cache (Device::GetPipelineCacheStats). */
+	struct PipelineCacheStats {
+		PipelineCacheLoadResult load = PipelineCacheLoadResult::Off;
+		// Pipelines the cache served without a compile, and those it had to compile. Vulkan counts a hit when the driver
+		// reports one (VK_EXT_pipeline_creation_feedback); a driver that reports nothing counts every pipeline as a miss.
+		uint64_t hits = 0;
+		uint64_t misses = 0;
+		uint64_t loadedBytes = 0; // payload read from the file
+		uint64_t savedBytes = 0;  // payload of the last save
+		uint32_t saves = 0;
+	};
+
+	/** @brief What an optimally tiled texture of a format can be used as (FormatSupport::usage). */
+	enum FormatUsage : uint32_t {
+		FU_None = 0,
+		FU_ShaderResource = 1 << 0,
+		FU_UnorderedAccess = 1 << 1,
+		FU_RenderTarget = 1 << 2,
+		FU_DepthStencil = 1 << 3,
+	};
+
+	/**
+	 * @brief How the device stores and reads a format (Device::QueryFormatSupport).
+	 *
+	 * A backend may store a format in another one the device supports, as DXVK does: Vulkan stores DXGI's A8 as R8 where
+	 * VK_FORMAT_A8_UNORM_KHR cannot be sampled, stored and rendered to, and the D24 family as D32S8 where D24S8 is no depth
+	 * attachment. The backend applies the substitute everywhere the format is named (resources, views, attachments, pipelines),
+	 * and its shader resource views add srvSwizzle (also B8G8R8X8's alpha of one), so a shader reads what the format would give.
+	 * Views that cannot swizzle (unordered access, render target) of a format stored with its channels moved are refused.
+	 */
+	struct FormatSupport {
+		// FormatUsage bits: what a texture of the format can be, the substitute and its swizzle included.
+		uint32_t usage = FU_None;
+		// The format it is stored in, or Unknown when it is stored as itself.
+		Format storedAs = Format::Unknown;
+		// The swizzle its shader resource views add, in SrvDesc::componentMapping's encoding (0: none). A view's own mapping
+		// selects from the format's channels; this one then makes those channels from the stored ones.
+		ComponentMapping srvSwizzle = 0;
+		// The backend's value for the stored format (a VkFormat, a DXGI_FORMAT): 0 when the device has none for it.
+		uint32_t backendFormat = 0;
 	};
 
 	struct CommandListVTable {
@@ -2932,6 +3107,11 @@ namespace rhi {
 		// abi_version 8: secondary lists (Device::CreateSecondaryCommandList); null where the backend has none.
 		Result (*beginSecondary)(CommandList*, const SecondaryInheritance&) noexcept = nullptr;
 		void (*executeCommands)(CommandList*, Span<CommandList* const>) noexcept = nullptr;
+		// abi_version 9: fixed-function state set while recording (CommandList::SetStencilRef and the calls after it).
+		void (*setStencilRef)(CommandList*, uint32_t reference) noexcept = nullptr;
+		void (*setBlendFactor)(CommandList*, const float rgba[4]) noexcept = nullptr;
+		void (*setViewports)(CommandList*, Span<const Viewport>) noexcept = nullptr;
+		void (*setScissors)(CommandList*, Span<const ScissorRect>) noexcept = nullptr;
 	};
 
 	class CommandList {
@@ -2955,6 +3135,11 @@ namespace rhi {
 		bool SupportsDebugLabels() const noexcept { return IsValid() && vt->abi_version >= 7 && vt->beginDebugLabel && vt->endDebugLabel && vt->insertDebugLabel; }
 		bool SupportsSecondaryLists() const noexcept { return IsValid() && vt->abi_version >= 8 && vt->beginSecondary && vt->executeCommands; }
 		Result EndChecked() noexcept { return SupportsCheckedEnd() ? vt->endChecked(this) : Result::Unsupported; }
+		/**
+		 * @brief Resets the list onto `ca` and, for a primary list, begins it. When `ca` is the allocator the list came
+		 * from, only this list is reset. Several lists can then share one allocator, if it SupportsSharedLists. Any reset,
+		 * recording or free of a list is externally synchronized with every other list of the same allocator.
+		 */
 		void Recycle(const CommandAllocator& ca) noexcept;
 		void BeginPass(const PassBeginInfo& p) noexcept;
 		void EndPass() noexcept;
@@ -3013,10 +3198,46 @@ namespace rhi {
 		 * @brief Executes ended secondary lists, in order: inside a pass begun with PassContents::SecondaryLists (Vulkan; on
 		 * D3D12 inside any pass, as ExecuteBundle), or outside any pass for those recorded without insideRendering. Everything the
 		 * executing list had bound - pipeline, heaps, push data, dynamic state - is undefined afterwards: rebind before recording
-		 * further work on it. A secondary cannot execute secondaries.
+		 * further work on it. A secondary cannot execute secondaries. Vulkan then binds a placeholder buffer as every vertex
+		 * buffer and as the index buffer (after EndPass when executed inside a pass), because some drivers keep the bindings from
+		 * before the secondaries and drop a rebind of the same buffer. Secondaries that continue the rendering of a buffer
+		 * wrapped with AdoptCommandBuffer run in its owner's pass, so binding after them is left to the owner.
 		 */
 		void ExecuteCommands(Span<CommandList* const> lists) noexcept {
 			if (SupportsSecondaryLists()) vt->executeCommands(this, lists);
+		}
+		/**
+		 * @brief Sets the stencil reference value that pipelines with DepthStencilState::stencilEnable compare and write.
+		 * Both faces use it, as OMSetStencilRef does. A list (and each secondary) starts at 0, and the value holds across
+		 * pipeline binds, passes and ExecuteCommands until it is set again. Valid inside and outside a pass.
+		 */
+		void SetStencilRef(uint32_t reference) noexcept {
+			if (IsValid() && vt->abi_version >= 9 && vt->setStencilRef) vt->setStencilRef(this, reference);
+		}
+		/**
+		 * @brief Sets the constant that BlendFactor::BlendFactor and InvBlendFactor read, as OMSetBlendFactor does.
+		 * A list (and each secondary) starts at {1, 1, 1, 1}, D3D11's default, and the value holds across pipeline binds,
+		 * passes and ExecuteCommands until it is set again. Valid inside and outside a pass.
+		 */
+		void SetBlendFactor(const float rgba[4]) noexcept {
+			if (IsValid() && vt->abi_version >= 9 && vt->setBlendFactor && rgba) vt->setBlendFactor(this, rgba);
+		}
+		/**
+		 * @brief Sets viewports 0..n-1 (Viewport: D3D's convention on every backend). BeginPass and BeginSecondary set
+		 * viewport 0 to the render area; this replaces it for the draws after it, inside the pass. More than one needs
+		 * FixedFunctionFeatureInfo::maxViewports and pipelines with RasterState::viewportCount to match; more than the
+		 * device supports fails the list. D3D12 bundles cannot set viewports: in a secondary this needs
+		 * FixedFunctionFeatureInfo::secondaryViewportScissor (Vulkan only), and fails the list without it.
+		 */
+		void SetViewports(Span<const Viewport> viewports) noexcept {
+			if (IsValid() && vt->abi_version >= 9 && vt->setViewports && viewports.size != 0) vt->setViewports(this, viewports);
+		}
+		/**
+		 * @brief Sets scissors 0..n-1, as SetViewports sets viewports. Scissoring is always on, on both backends. In a
+		 * secondary it needs FixedFunctionFeatureInfo::secondaryViewportScissor, as SetViewports.
+		 */
+		void SetScissors(Span<const ScissorRect> scissors) noexcept {
+			if (IsValid() && vt->abi_version >= 9 && vt->setScissors && scissors.size != 0) vt->setScissors(this, scissors);
 		}
 		void ClearUavUint(const UavClearInfo& u, const UavClearUint& v) noexcept;
 		void ClearUavFloat(const UavClearInfo& u, const UavClearFloat& v) noexcept;
@@ -3063,7 +3284,20 @@ namespace rhi {
 		Result(*present)(Swapchain*, bool vsync, const PresentSyncDesc* sync) noexcept; // Present
 		Result(*resizeBuffers)(Swapchain*, uint32_t bufferCount, uint32_t w, uint32_t h, Format newFormat, uint32_t flags) noexcept;
 		void (*setName)(Swapchain*, const char*) noexcept;
-		uint32_t abi_version = 1;
+		uint32_t abi_version = 2;
+		// abi_version 2. After abi_version, so tables written for version 1 still initialize.
+		SwapchainCaps(*caps)(Swapchain*) noexcept = nullptr;
+		bool (*isColorSpaceSupported)(Swapchain*, SwapchainColorSpace) noexcept = nullptr;
+		Result(*setColorSpace)(Swapchain*, SwapchainColorSpace) noexcept = nullptr;
+		SwapchainColorSpace(*colorSpace)(Swapchain*) noexcept = nullptr;
+		Result(*setHdrMetadata)(Swapchain*, const HdrMetadata&) noexcept = nullptr;
+		Result(*setMaximumFrameLatency)(Swapchain*, uint32_t frames) noexcept = nullptr;
+		Result(*waitForFrameLatency)(Swapchain*, uint64_t timeoutNs) noexcept = nullptr;
+		void* (*frameLatencyWaitableObject)(Swapchain*) noexcept = nullptr;
+		uint64_t(*presentCount)(Swapchain*) noexcept = nullptr;
+		Result(*waitForPresent)(Swapchain*, uint64_t presentId, uint64_t timeoutNs) noexcept = nullptr;
+		// abi_version 3.
+		TimelinePoint(*acquirePoint)(Swapchain*) noexcept = nullptr;
 	};
 
 	class Swapchain {
@@ -3083,12 +3317,85 @@ namespace rhi {
 		inline uint32_t CurrentImageIndex() noexcept;
 		//inline ViewHandle RTV(uint32_t i) noexcept;
 		inline ResourceHandle Image(uint32_t i) noexcept;
+		/**
+		 * @brief Presents the current image and acquires the next one. Frame pacing differs by backend. Vulkan: Present
+		 * blocks until no more than SetMaximumFrameLatency presented frames are unfinished on the GPU. D3D12: Present does
+		 * not block for latency; pace with WaitForFrameLatency (or FrameLatencyWaitableObject) before each frame.
+		 */
 		inline Result Present(bool vsync) noexcept;
 		inline Result Present(bool vsync, const PresentSyncDesc& sync) noexcept;
 		inline Result ResizeBuffers(uint32_t bufferCount, uint32_t w, uint32_t h, Format newFmt, uint32_t flags) noexcept {
 			return vt->resizeBuffers ? vt->resizeBuffers(this, bufferCount, w, h, newFmt, flags) : Result::Unsupported;
 		}
+
+		/// What this swapchain can do: tearing, vsync switching, present wait, HDR metadata.
+		SwapchainCaps Caps() noexcept { return Has(vt->caps) ? vt->caps(this) : SwapchainCaps{}; }
+
+		/// Whether the output can show this colour space. Hdr10St2084 or ScRgbLinear supported means the output has HDR on.
+		bool IsColorSpaceSupported(SwapchainColorSpace colorSpace) noexcept {
+			if (colorSpace == SwapchainColorSpace::SrgbNonlinear) return true;
+			return Has(vt->isColorSpaceSupported) && vt->isColorSpaceSupported(this, colorSpace);
+		}
+
+		/// Switches the colour space, and with it the image format (see SwapchainColorSpace). It waits for the GPU and
+		/// rebuilds the images like ResizeBuffers: read Image() again and recreate views afterwards. HDR metadata already
+		/// set is sent again. Returns Unsupported when the output cannot show the colour space.
+		Result SetColorSpace(SwapchainColorSpace colorSpace) noexcept {
+			return Has(vt->setColorSpace) ? vt->setColorSpace(this, colorSpace) : Result::Unsupported;
+		}
+
+		/// The colour space the swapchain presents in.
+		SwapchainColorSpace ColorSpace() noexcept {
+			return Has(vt->colorSpace) ? vt->colorSpace(this) : SwapchainColorSpace::SrgbNonlinear;
+		}
+
+		/// Sends HDR mastering metadata to the display. It is kept and sent again after a resize or colour space change.
+		Result SetHdrMetadata(const HdrMetadata& metadata) noexcept {
+			return Has(vt->setHdrMetadata) ? vt->setHdrMetadata(this, metadata) : Result::Unsupported;
+		}
+
+		/// Limits how many presented frames may be outstanding; frames is at least 1. D3D12:
+		/// IDXGISwapChain2::SetMaximumFrameLatency, which only WaitForFrameLatency enforces. Vulkan: Present returns only
+		/// once no more than this many presented frames are unfinished on the GPU. The Vulkan default is 2.
+		Result SetMaximumFrameLatency(uint32_t frames) noexcept {
+			return Has(vt->setMaximumFrameLatency) ? vt->setMaximumFrameLatency(this, frames) : Result::Unsupported;
+		}
+
+		/// Blocks until another frame may start under the latency limit. Call it once per frame before the frame's CPU
+		/// work, or never. D3D12 waits on the frame-latency waitable object. Vulkan waits until the frame that makes room
+		/// has been presented (VK_KHR_present_wait) or, without present wait, has finished on the GPU. Returns WaitTimeout
+		/// when timeoutNs passes first.
+		Result WaitForFrameLatency(uint64_t timeoutNs = UINT64_MAX) noexcept {
+			return Has(vt->waitForFrameLatency) ? vt->waitForFrameLatency(this, timeoutNs) : Result::Unsupported;
+		}
+
+		/// D3D12: the frame-latency waitable object, a HANDLE the swapchain owns (do not close it). Vulkan: nullptr.
+		void* FrameLatencyWaitableObject() noexcept {
+			return Has(vt->frameLatencyWaitableObject) ? vt->frameLatencyWaitableObject(this) : nullptr;
+		}
+
+		/// The number of successful presents. Present N, counting from 1, has present ID N.
+		uint64_t PresentCount() noexcept { return Has(vt->presentCount) ? vt->presentCount(this) : 0; }
+
+		/// Blocks until present presentId has reached the display (Caps().presentWait). Returns WaitTimeout when timeoutNs
+		/// passes first, and Unsupported without present wait.
+		Result WaitForPresent(uint64_t presentId, uint64_t timeoutNs = UINT64_MAX) noexcept {
+			return Has(vt->waitForPresent) ? vt->waitForPresent(this, presentId, timeoutNs) : Result::Unsupported;
+		}
+
+		/**
+		 * @brief The timeline point reached once the current image (CurrentImageIndex) is acquired: Queue::Wait on it
+		 * before the first work that touches the image on a queue other than the one that presented last. That queue is
+		 * ordered already. Read it again after every Present, ResizeBuffers and SetColorSpace. Vulkan: the acquire's wait
+		 * batch signals it. D3D12: value 0 (nothing to wait on); DXGI orders the back buffer on the swapchain's queue, so
+		 * work on another queue waits on that queue instead.
+		 */
+		TimelinePoint AcquirePoint() noexcept {
+			return vt->abi_version >= 3 && vt->acquirePoint ? vt->acquirePoint(this) : TimelinePoint{};
+		}
 	private:
+		// A version 2 entry the backend filled in.
+		template<class Fn> bool Has(Fn fn) const noexcept { return vt->abi_version >= 2 && fn != nullptr; }
 		SwapChainHandle handle;
 	};
 
@@ -3153,6 +3460,7 @@ namespace rhi {
 		Result(*createAccelerationStructure)(Device*, const AccelerationStructureDesc&, AccelerationStructurePtr&) noexcept;
 		uint64_t(*getAccelerationStructureDeviceAddress)(Device*, AccelerationStructureHandle) noexcept;
 		uint64_t(*getBufferDeviceAddress)(Device*, GpuBufferAddress) noexcept;
+		BufferViewRef(*getBufferViewRef)(Device*, GpuBufferAddress) noexcept;
 		Result(*getRayTracingShaderGroupHandles)(Device*, PipelineHandle, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept;
 		Result(*setRayTracingPipelineStackSize)(Device*, PipelineHandle, uint64_t stackSizeBytes) noexcept;
 		Result(*getRayTracingAccelerationStructureOperationPrebuildInfo)(Device*, const RayTracingRtasOperationInputs&, RayTracingRtasPrebuildInfo*) noexcept;
@@ -3232,6 +3540,12 @@ namespace rhi {
 		Result(*createCommandAllocatorForQueue)(Device*, const Queue&, CommandAllocatorPtr&) noexcept = nullptr;
 		// abi_version 14: secondary command lists (CommandList::BeginSecondary). Null where the backend has none.
 		Result(*createSecondaryCommandList)(Device*, QueueKind, CommandAllocator, CommandListPtr&) noexcept = nullptr;
+		// abi_version 15: the on-disk pipeline cache.
+		Result(*openPipelineCache)(Device*, const char* path) noexcept = nullptr;
+		Result(*savePipelineCache)(Device*) noexcept = nullptr;
+		Result(*getPipelineCacheStats)(const Device*, PipelineCacheStats&) noexcept = nullptr;
+		// abi_version 16: format support and the formats a backend stores in another.
+		Result(*queryFormatSupport)(const Device*, Format, FormatSupport&) noexcept = nullptr;
 	};
 
 
@@ -3262,6 +3576,9 @@ namespace rhi {
 	struct CommandAllocatorVTable {
 		void (*reset)(CommandAllocator*) noexcept;  // allocator Reset()
 		uint32_t abi_version = 1;
+		// ABI 2.
+		void (*trim)(CommandAllocator*) noexcept = nullptr;
+		bool sharedLists = false;  // see CommandAllocator::SupportsSharedLists
 	};
 
 	class CommandAllocator {
@@ -3278,6 +3595,18 @@ namespace rhi {
 		constexpr bool IsValid() const noexcept { return static_cast<bool>(*this); }
 		constexpr void Reset() noexcept { impl = nullptr; backendState = nullptr; vt = nullptr; } // Naming conflict with vt->reset
 		inline void Recycle() noexcept { vt->reset(this); } // GPU-side reset (allocator->Reset)
+		/**
+		 * @brief Gives memory that the allocator's lists no longer use back to the system. Call it after lists of the
+		 * allocator were reset or freed. Nothing may record, reset or free a list of the allocator at the same time.
+		 * Vulkan: vkTrimCommandPool. D3D12: does nothing.
+		 */
+		inline void Trim() noexcept { if (vt && vt->abi_version >= 2 && vt->trim) vt->trim(this); }
+		/**
+		 * @brief True when one list of the allocator can be reset without resetting the others (CommandList::Recycle with
+		 * this allocator), so many lists can share it. Only one of them may record at a time. Vulkan: true. D3D12: false,
+		 * because a list's reset only adds to its allocator's memory, and only the allocator's own reset frees it.
+		 */
+		bool SupportsSharedLists() const noexcept { return vt && vt->abi_version >= 2 && vt->sharedLists; }
 		const CommandAllocatorHandle& GetHandle() const noexcept { return handle; }
 
 	private:
@@ -3367,6 +3696,10 @@ namespace rhi {
 		void DestroyAccelerationStructure(AccelerationStructureHandle h) noexcept { deletionContext.DestroyAccelerationStructure(h); }
 		uint64_t GetAccelerationStructureDeviceAddress(AccelerationStructureHandle h) noexcept { return vt->getAccelerationStructureDeviceAddress(this, h); }
 		uint64_t GetBufferDeviceAddress(GpuBufferAddress address) noexcept { return vt->getBufferDeviceAddress ? vt->getBufferDeviceAddress(this, address) : 0; }
+		// The buffer's view ref at address.offset (rhi_shader_abi.h, BUFFER_VIEW_REF_*): its raw view pair, made on the first ask and
+		// freed with the buffer. {0, 0} when the buffer has none (no reserved region, the region full, a readback buffer, an offset
+		// past 4 GiB).
+		BufferViewRef GetBufferViewRef(GpuBufferAddress address) noexcept { return vt->getBufferViewRef ? vt->getBufferViewRef(this, address) : BufferViewRef{}; }
 		Result GetRayTracingShaderGroupHandles(PipelineHandle p, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept { return vt->getRayTracingShaderGroupHandles(this, p, firstGroup, groupCount, outData, outDataBytes); }
 		Result SetRayTracingPipelineStackSize(PipelineHandle p, uint64_t stackSizeBytes) noexcept { return vt->setRayTracingPipelineStackSize(this, p, stackSizeBytes); }
 		Result GetRayTracingAccelerationStructureOperationPrebuildInfo(const RayTracingRtasOperationInputs& inputs, RayTracingRtasPrebuildInfo& out) noexcept { return vt->getRayTracingAccelerationStructureOperationPrebuildInfo ? vt->getRayTracingAccelerationStructureOperationPrebuildInfo(this, inputs, &out) : Result::Unsupported; }
@@ -3380,9 +3713,45 @@ namespace rhi {
 			vt->getResourceAllocationInfo(this, resourceDescriptions, numResourceDescriptions, outAllocationInfo);
 		}
 		Result QueryFeatureInfo(FeatureInfoHeader* chain) const noexcept { return vt->queryFeatureInfo(this, chain); }
+		// What command recording holds now (CommandMemoryFeatureInfo): lists, allocators and their scratch pages. Zero where
+		// the backend does not count it.
+		CommandMemoryFeatureInfo CommandMemoryStats() const noexcept {
+			CommandMemoryFeatureInfo info{};
+			(void)QueryFeatureInfo(&info.header);
+			return info;
+		}
 		Result SetResidencyPriority(const Span<PageableRef>& resources, ResidencyPriority p) const noexcept { return vt->setResidencyPriority(this, resources, p); }
 		Result QueryVideoMemoryInfo(uint32_t nodeIndex, MemorySegmentGroup segmentGroup, VideoMemoryInfo& out) const noexcept {
 			return vt->queryVideoMemoryInfo(this, nodeIndex, segmentGroup, out);
+		}
+		/**
+		 * @brief Opens the on-disk pipeline cache at `path` (null closes it), replacing any open one without saving it.
+		 * Every pipeline created afterwards goes through it. A file for another device or driver, or a damaged one, is
+		 * ignored and replaced on the next save. DeviceCreateInfo::pipelineCachePath opens one at creation; an adopted
+		 * device opens it here. Call it before creating pipelines, not while other threads create them.
+		 */
+		Result OpenPipelineCache(const char* path) noexcept {
+			return vt->abi_version >= 15 && vt->openPipelineCache ? vt->openPipelineCache(this, path) : Result::Unsupported;
+		}
+		/**
+		 * @brief Writes the pipeline cache to its file (a temporary file, then a rename). Safe while other threads create
+		 * pipelines. Does nothing when no pipeline was added since the last load or save. Destroying the device saves too.
+		 */
+		Result SavePipelineCache() noexcept {
+			return vt->abi_version >= 15 && vt->savePipelineCache ? vt->savePipelineCache(this) : Result::Unsupported;
+		}
+		/** @brief The pipeline cache's load result and hit, miss and save counters. */
+		Result GetPipelineCacheStats(PipelineCacheStats& out) const noexcept {
+			out = {};
+			return vt->abi_version >= 15 && vt->getPipelineCacheStats ? vt->getPipelineCacheStats(this, out) : Result::Unsupported;
+		}
+		/**
+		 * @brief How the device stores and reads `format` (FormatSupport). Unsupported (out cleared) on an older backend; Ok with
+		 * usage FU_None for a format the device cannot use at all. Any thread.
+		 */
+		Result QueryFormatSupport(Format format, FormatSupport& out) const noexcept {
+			out = {};
+			return vt->abi_version >= 16 && vt->queryFormatSupport ? vt->queryFormatSupport(this, format, out) : Result::Unsupported;
 		}
 		void CheckDebugMessages() noexcept { if (vt->checkDebugMessages) vt->checkDebugMessages(this); }
 		void Destroy() noexcept { vt->destroyDevice(this); impl = nullptr; vt = nullptr; }
@@ -3604,6 +3973,43 @@ namespace rhi {
 		// exists. They need a preview Agility SDK and Windows Developer Mode. When either is
 		// missing the device is still created and reports the raytracing it does have.
 		bool enablePreviewRayTracing = false;
+		// Vulkan: native crash markers and fault reports (VK_AMD_buffer_marker, VK_NV_device_diagnostic_checkpoints,
+		// VK_EXT_device_fault, whichever the device has), logged on device loss. BASICRHI_VK_CRASH_MARKERS=1 turns it on
+		// too. Off by default: markers cost a write per command list boundary and debug label.
+		// D3D12: turns on DRED auto-breadcrumbs, breadcrumb context and page-fault reports without the debug layer. The
+		// DRED report is logged on device removal. SARP_D3D12_DRED=0 still turns DRED off.
+		bool enableCrashMarkers = false;
+		// D3D12: a borrowed ID3D12DeviceFactory (from ID3D12SDKConfiguration1::CreateDeviceFactory). BasicRHI then creates
+		// the device, the debug layer and the DRED settings through it, instead of through the process's D3D12 runtime.
+		// A DLL host uses it to load an Agility SDK: only an executable can export D3D12SDKVersion. BasicRHI keeps a
+		// reference for the device's lifetime. Null uses the process's runtime.
+		void* d3d12DeviceFactory = nullptr;
+		// Vulkan: VkApplicationInfo::pEngineName of the instance BasicRHI creates. Null keeps "BasicRHI". Drivers match
+		// application profiles on it: NVIDIA's profile for "DXVK" forces SDR composition, so an HDR host that runs DXVK as a
+		// guest passes "DXVK_HDR".
+		const char* vulkanEngineName = nullptr;
+		// The on-disk pipeline cache's file (UTF-8 path). Null, the default, leaves the cache off. See
+		// Device::OpenPipelineCache.
+		const char* pipelineCachePath = nullptr;
+		// Vulkan: a guest API that will share the device (DXVK, through vulkan::ShareVulkanDevice) adds what it needs. Each
+		// callback runs on the creating thread right before vkCreateInstance and vkCreateDevice, with the create info BasicRHI
+		// built (a VkInstanceCreateInfo* and a VkDeviceCreateInfo*). It may append extensions and queues and chain or OR feature
+		// structs; what it points to must live until CreateVulkanDevice returns. It returns false to abort: CreateVulkanDevice
+		// then destroys what it created and returns Result::Failed. BasicRHI reads its extension flags and enabled features
+		// from the create infos the callbacks leave, so what a callback adds counts as enabled. Null adds nothing.
+		struct VulkanCreateHooks {
+			void* user = nullptr;
+			bool (*instance)(void* user, void* vkInstanceCreateInfo) = nullptr;
+			bool (*device)(void* user, void* vkInstance, void* vkPhysicalDevice, void* vkDeviceCreateInfo) = nullptr;
+		};
+		const VulkanCreateHooks* vulkanCreateHooks = nullptr;
+		// Vulkan: the binding models BasicRHI may pick from (vulkan::BindingModelBits). 0 allows every one.
+		uint32_t vulkanBindingModels = 0;
+		// Vulkan: what a guest sharing the device takes from its descriptor budgets (vulkan::BindingRequirements' host counts:
+		// DXVK's 2048-sampler pool and its descriptor buffers), so that the two together fit.
+		uint32_t vulkanGuestSamplerObjects = 0;
+		uint64_t vulkanGuestResourceDescriptorBufferBytes = 0;
+		uint64_t vulkanGuestSamplerDescriptorBufferBytes = 0;
 	};
 
 	// Accepts any blob exposing GetBufferPointer/GetBufferSize (ID3DBlob, IDxcBlob) without
@@ -3802,6 +4208,34 @@ namespace rhi {
 	inline std::atomic<bool>& DiagnosticSkipGlobalBarriers() {
 		static std::atomic<bool> skip{ false };
 		return skip;
+	}
+
+	// A lost device, as BasicRHI saw it. The strings live only for the callback's duration.
+	struct DeviceLossInfo {
+		const char* backend = "";      // "vulkan" or "d3d12"
+		const char* where = "";        // the path that saw the loss
+		uint64_t faultAddress = 0;     // VK_EXT_device_fault's first address; 0 when none
+		const char* faultKind = "";    // what the address was ("invalid read", ...); empty when none
+		const char* markers = "";      // the crash markers' summary: the lists still in flight; empty when none
+	};
+	using DeviceLossCallback = void (*)(const DeviceLossInfo&);
+
+	inline std::atomic<DeviceLossCallback>& DeviceLossCallbackSlot() noexcept {
+		static std::atomic<DeviceLossCallback> callback{ nullptr };
+		return callback;
+	}
+
+	// The host's callback for a lost device: called once per device, after BasicRHI logged the loss, from the thread that saw it.
+	inline void SetDeviceLossCallback(DeviceLossCallback callback) noexcept { DeviceLossCallbackSlot().store(callback, std::memory_order_release); }
+
+	// Backends: reports a loss to the host's callback, if any.
+	inline void NotifyDeviceLoss(const DeviceLossInfo& info) noexcept {
+		if (const auto callback = DeviceLossCallbackSlot().load(std::memory_order_acquire)) {
+			try {
+				callback(info);
+			} catch (...) {
+			}
+		}
 	}
 
 }

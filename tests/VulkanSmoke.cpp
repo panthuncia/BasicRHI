@@ -2929,6 +2929,98 @@ namespace {
 	}
 #endif
 
+	// Native crash markers (BASICRHI_VK_CRASH_MARKERS=1): a named list with nested labels, submitted and waited for, must show
+	// in the dump with its markers finished. Skipped when the device runs without them.
+	rhi::Result ValidateCrashMarkers(rhi::Device& device, rhi::Queue& queue) {
+		const rhi::vulkan::CrashDiagnosticsState state = rhi::vulkan::GetCrashDiagnostics(device);
+		std::printf("BasicRHIVulkanSmoke: crash markers: VK_EXT_device_fault %s, VK_AMD_buffer_marker %s, VK_NV_device_diagnostic_checkpoints %s\n",
+			state.deviceFault ? "on" : "off", state.bufferMarkers ? "on" : "off", state.checkpoints ? "on" : "off");
+		if (!state.deviceFault && !state.bufferMarkers && !state.checkpoints) {
+			std::puts("BasicRHIVulkanSmoke: crash marker validation skipped (BASICRHI_VK_CRASH_MARKERS is not 1, or the device has no source)");
+			return rhi::Result::Ok;
+		}
+		rhi::CommandAllocatorPtr allocator;
+		rhi::CommandListPtr list;
+		if (Check(device.CreateCommandAllocator(rhi::QueueKind::Graphics, allocator), "CreateCommandAllocator (crash markers)") != rhi::Result::Ok ||
+			Check(device.CreateCommandList(rhi::QueueKind::Graphics, allocator.Get(), list), "CreateCommandList (crash markers)") != rhi::Result::Ok) {
+			return rhi::Result::Failed;
+		}
+		rhi::CommandList commandList = list.Get();
+		commandList.SetName("CrashMarkerSmoke");
+		if (commandList.SupportsDebugLabels()) {
+			const float color[4] = { 1.0f, 0.5f, 0.0f, 1.0f };
+			commandList.vt->beginDebugLabel(&commandList, color, "Smoke outer pass");
+			commandList.vt->insertDebugLabel(&commandList, color, "Smoke inserted label");
+			commandList.vt->beginDebugLabel(&commandList, color, "Smoke inner pass");
+			commandList.vt->endDebugLabel(&commandList);
+			commandList.vt->endDebugLabel(&commandList);
+		}
+		commandList.End();
+		const rhi::CommandList lists[] = { commandList };
+		if (Check(queue.Submit(lists, {}), "Queue::Submit (crash markers)") != rhi::Result::Ok ||
+			Check(device.WaitIdle(), "Device::WaitIdle (crash markers)") != rhi::Result::Ok) {
+			return rhi::Result::Failed;
+		}
+		const uint32_t lines = rhi::vulkan::DumpCrashDiagnostics(device, false);
+		std::printf("BasicRHIVulkanSmoke: crash marker dump logged %u lines\n", lines);
+		if (state.bufferMarkers && lines == 0) {
+			std::fprintf(stderr, "crash markers: VK_AMD_buffer_marker is on, but the dump found no list markers\n");
+			return rhi::Result::Failed;
+		}
+		std::puts("BasicRHIVulkanSmoke: crash markers OK");
+		return rhi::Result::Ok;
+	}
+
+	// Memory budget: QueryVideoMemoryInfo per segment group and QueryMemoryHeapBudgets per heap. The local budget must be
+	// non-zero, and with VK_EXT_memory_budget the local usage too (the smoke has allocated by now). The segment sums must
+	// match the heaps they group.
+	rhi::Result ValidateMemoryBudget(rhi::Device& device) {
+		rhi::VideoMemoryInfo segments[2]{};
+		const rhi::MemorySegmentGroup groups[2] = { rhi::MemorySegmentGroup::Local, rhi::MemorySegmentGroup::NonLocal };
+		for (uint32_t i = 0; i < 2; ++i) {
+			if (Check(device.QueryVideoMemoryInfo(0, groups[i], segments[i]), "QueryVideoMemoryInfo") != rhi::Result::Ok) {
+				return rhi::Result::Failed;
+			}
+			std::printf("BasicRHIVulkanSmoke: memory %s: budget %llu MiB, usage %llu MiB, available for reservation %llu MiB%s\n",
+				i == 0 ? "local" : "non-local", static_cast<unsigned long long>(segments[i].budgetBytes >> 20),
+				static_cast<unsigned long long>(segments[i].currentUsageBytes >> 20),
+				static_cast<unsigned long long>(segments[i].availableForReservationBytes >> 20),
+				segments[i].usageAtBudget ? " (usage at budget: clamped, not exact)" : "");
+		}
+		rhi::vulkan::MemoryHeapBudget heaps[VK_MAX_MEMORY_HEAPS]{};
+		const uint32_t count = rhi::vulkan::QueryMemoryHeapBudgets(device, heaps, VK_MAX_MEMORY_HEAPS);
+		uint64_t sums[2][2]{};
+		bool hasBudget = false;
+		for (uint32_t i = 0; i < count && i < VK_MAX_MEMORY_HEAPS; ++i) {
+			const rhi::vulkan::MemoryHeapBudget& heap = heaps[i];
+			const bool local = (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+			sums[local ? 0 : 1][0] += heap.budget;
+			sums[local ? 0 : 1][1] += heap.usage;
+			hasBudget = hasBudget || heap.hasBudget;
+			std::printf("    heap %u (%s): size %llu MiB, budget %llu MiB, usage %llu MiB%s%s\n", heap.heapIndex, local ? "device local" : "host",
+				static_cast<unsigned long long>(heap.heapSize >> 20), static_cast<unsigned long long>(heap.budget >> 20),
+				static_cast<unsigned long long>(heap.usage >> 20), heap.hasBudget ? "" : " (no VK_EXT_memory_budget)",
+				heap.usageAtBudget ? " (usage at budget)" : "");
+		}
+		if (count == 0 || segments[0].budgetBytes == 0) {
+			std::fprintf(stderr, "memory budget: %u heaps, local budget %llu\n", count, static_cast<unsigned long long>(segments[0].budgetBytes));
+			return rhi::Result::Failed;
+		}
+		if (hasBudget && segments[0].currentUsageBytes == 0) {
+			std::fprintf(stderr, "memory budget: VK_EXT_memory_budget reports no local usage after the smoke's allocations\n");
+			return rhi::Result::Failed;
+		}
+		// The heaps are queried again, so usage may have moved: only the budgets must match exactly.
+		if (sums[0][0] != segments[0].budgetBytes || sums[1][0] != segments[1].budgetBytes) {
+			std::fprintf(stderr, "memory budget: segment budgets %llu / %llu differ from their heaps' %llu / %llu\n",
+				static_cast<unsigned long long>(segments[0].budgetBytes), static_cast<unsigned long long>(segments[1].budgetBytes),
+				static_cast<unsigned long long>(sums[0][0]), static_cast<unsigned long long>(sums[1][0]));
+			return rhi::Result::Failed;
+		}
+		std::printf("BasicRHIVulkanSmoke: memory budget OK (%u heaps, VK_EXT_memory_budget %s)\n", count, hasBudget ? "on" : "off");
+		return rhi::Result::Ok;
+	}
+
 	// The startup support check (rhi::vulkan::EvaluateBindingModels) on the device's physical device: its own limits must admit
 	// the model the device runs on, and BASICRHI_VK_LIMITS=base (every limit at the Vulkan base-spec minimum, set in-process
 	// for the call) must reject the descriptor-buffer model, with a report line per check.
@@ -3218,6 +3310,14 @@ int main() {
 	}
 
 	if (ValidateHeapCapacities(device.Get()) != rhi::Result::Ok) {
+		return 1;
+	}
+
+	if (ValidateMemoryBudget(device.Get()) != rhi::Result::Ok) {
+		return 1;
+	}
+
+	if (ValidateCrashMarkers(device.Get(), graphicsQueue) != rhi::Result::Ok) {
 		return 1;
 	}
 

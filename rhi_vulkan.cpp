@@ -760,6 +760,8 @@ namespace rhi {
 				return VK_FORMAT_R8G8_SINT;
 			case Format::R8_UNorm:
 				return VK_FORMAT_R8_UNORM;
+			case Format::A8_UNorm:
+				return VK_FORMAT_A8_UNORM_KHR;
 			case Format::R8_UInt:
 				return VK_FORMAT_R8_UINT;
 			case Format::R8_SNorm:
@@ -817,18 +819,51 @@ namespace rhi {
 			}
 		}
 
-		// Whether VK_FORMAT_D24_UNORM_S8_UINT is no depth attachment on the device (AMD's), so that the D24 family is D32_SFLOAT_S8_UINT
-		// there, as DXVK maps it (VulkanDevice::d24Fallback).
-		static bool VkD24Fallback(VkPhysicalDevice physicalDevice) noexcept {
+		// Whether the device has every one of a_features for a_format, in linear or optimal tiling (DXVK's CheckImageFormatSupport).
+		static bool VkHasFormatFeatures(VkPhysicalDevice physicalDevice, VkFormat a_format, VkFormatFeatureFlags a_features) noexcept {
 			VkFormatProperties properties{};
-			vkGetPhysicalDeviceFormatProperties(physicalDevice, VK_FORMAT_D24_UNORM_S8_UINT, &properties);
-			return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0;
+			vkGetPhysicalDeviceFormatProperties(physicalDevice, a_format, &properties);
+			return (properties.optimalTilingFeatures & a_features) == a_features || (properties.linearTilingFeatures & a_features) == a_features;
 		}
 
-		// The device's format for an image, view or attachment: the D24 family as D32_SFLOAT_S8_UINT where D24S8 is no attachment.
+		// The formats the device stores in another (VulkanDevice::formatRemaps), by the rules of DXVK's format table, so that an image
+		// both make agrees: D24S8 as D32S8 where it is no depth attachment (AMD); A8 as R8, its red read as alpha, where A8 cannot be
+		// sampled, stored and rendered to, or VK_KHR_maintenance5 (which adds the format) is off.
+		static std::vector<VulkanDevice::FormatRemap> VkFormatRemapsFor(VkPhysicalDevice physicalDevice, bool a_maintenance5) {
+			std::vector<VulkanDevice::FormatRemap> remaps;
+			constexpr VkComponentMapping identity{};
+			if (!VkHasFormatFeatures(physicalDevice, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+				remaps.push_back({ VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT, identity });
+			}
+			if (!a_maintenance5 || !VkHasFormatFeatures(physicalDevice, VK_FORMAT_A8_UNORM_KHR,
+				VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
+				remaps.push_back({ VK_FORMAT_A8_UNORM_KHR, VK_FORMAT_R8_UNORM,
+					{ VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R } });
+			}
+			for (const auto& remap : remaps) {
+				spdlog::info("Vulkan: format {} is stored as {}", static_cast<int>(remap.from), static_cast<int>(remap.to));
+			}
+			return remaps;
+		}
+
+		// The device's remap of a Vulkan format, or null when it is stored as itself.
+		static const VulkanDevice::FormatRemap* VkFindFormatRemap(const VulkanDevice* impl, VkFormat a_format) noexcept {
+			if (!impl) {
+				return nullptr;
+			}
+			for (const auto& remap : impl->formatRemaps) {
+				if (remap.from == a_format) {
+					return &remap;
+				}
+			}
+			return nullptr;
+		}
+
+		// The device's format for an image, view or attachment: the format, or the one the device stores it in (formatRemaps).
 		static VkFormat ToVkFormat(const VulkanDevice* impl, Format format) noexcept {
 			const VkFormat converted = ToVkFormat(format);
-			return impl && impl->d24Fallback && converted == VK_FORMAT_D24_UNORM_S8_UINT ? VK_FORMAT_D32_SFLOAT_S8_UINT : converted;
+			const auto* remap = VkFindFormatRemap(impl, converted);
+			return remap ? remap->to : converted;
 		}
 
 		static Format FromVkFormat(VkFormat format) noexcept {
@@ -911,6 +946,8 @@ namespace rhi {
 				return Format::R8G8_SInt;
 			case VK_FORMAT_R8_UNORM:
 				return Format::R8_UNorm;
+			case VK_FORMAT_A8_UNORM_KHR:
+				return Format::A8_UNorm;
 			case VK_FORMAT_R8_UINT:
 				return Format::R8_UInt;
 			case VK_FORMAT_R8_SNORM:
@@ -1477,6 +1514,40 @@ namespace rhi {
 			return (value + mask) & ~mask;
 		}
 
+		// BASICRHI_RELEASE_COMMAND_MEMORY=1: resets hand the driver's command memory back (RELEASE_RESOURCES) instead of keeping it
+		// for the next recording. An attribution switch: it costs the driver's re-allocation at every recording.
+		static bool ReleaseCommandMemoryOnReset() noexcept {
+			static const bool release = [] {
+				char value[8]{};
+				return GetEnvironmentVariableA("BASICRHI_RELEASE_COMMAND_MEMORY", value, sizeof(value)) > 0 && value[0] == '1';
+			}();
+			return release;
+		}
+
+		// Live VkCommandPools and command buffers, for attributing driver command memory (each pool owns its own chunks).
+		// Pipelines and queries too: driver memory neither DXVK's nor ORG's allocator sees.
+		static std::atomic<int64_t> g_liveCommandPools{ 0 }, g_liveCommandBuffers{ 0 }, g_loggedCommandPools{ 0 };
+		static std::atomic<int64_t> g_livePipelines{ 0 }, g_loggedPipelines{ 0 }, g_liveQueryPools{ 0 }, g_liveQueries{ 0 };
+		// Scratch pages alive, held by lists or pooled (CommandMemoryFeatureInfo): emulated root constants' and DGC preprocess pages.
+		static std::atomic<int64_t> g_scratchPages{ 0 }, g_scratchBytes{ 0 }, g_dgcPages{ 0 }, g_dgcBytes{ 0 };
+		static void LogDriverObjects() noexcept {
+			spdlog::info("BasicRHI Vulkan: {} command pools alive, {} command buffers, {} pipelines, {} query pools ({} queries)",
+				g_liveCommandPools.load(std::memory_order_relaxed), g_liveCommandBuffers.load(std::memory_order_relaxed),
+				g_livePipelines.load(std::memory_order_relaxed), g_liveQueryPools.load(std::memory_order_relaxed), g_liveQueries.load(std::memory_order_relaxed));
+		}
+		static void NoteCommandPools(int64_t delta) noexcept {
+			const int64_t live = g_liveCommandPools.fetch_add(delta, std::memory_order_relaxed) + delta;
+			int64_t logged = g_loggedCommandPools.load(std::memory_order_relaxed);
+			if (delta > 0 && live >= logged + 128 && g_loggedCommandPools.compare_exchange_strong(logged, live, std::memory_order_relaxed))
+				LogDriverObjects();
+		}
+		static void NotePipelines(int64_t delta) noexcept {
+			const int64_t live = g_livePipelines.fetch_add(delta, std::memory_order_relaxed) + delta;
+			int64_t logged = g_loggedPipelines.load(std::memory_order_relaxed);
+			if (delta > 0 && live >= logged + 1024 && g_loggedPipelines.compare_exchange_strong(logged, live, std::memory_order_relaxed))
+				LogDriverObjects();
+		}
+
 		// The graph's memory is read by every pass: under memory pressure, the driver demotes everything else first.
 		static VkResult VkAllocateDeviceMemory(VulkanDevice* impl, const VkMemoryAllocateInfo* info, VkDeviceMemory* memory) noexcept {
 			const VkResult result = vkAllocateMemory(impl->device, info, nullptr, memory);
@@ -1518,6 +1589,10 @@ namespace rhi {
 				return;
 			}
 			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
+			if (page.buffer != VK_NULL_HANDLE) {
+				g_scratchPages.fetch_sub(1, std::memory_order_relaxed);
+				g_scratchBytes.fetch_sub(page.capacity, std::memory_order_relaxed);
+			}
 
 			if (page.mappedData != nullptr && page.memory != VK_NULL_HANDLE) {
 				VkUnmapMemorySynchronized(impl, page.memory);
@@ -1535,9 +1610,27 @@ namespace rhi {
 			if (!impl || impl->device == VK_NULL_HANDLE || !impl->bufferDeviceAddressEnabled || minSize == 0) {
 				return false;
 			}
+			const uint64_t alignment = VkEmulatedRootConstantAlignment(impl);
+			// A page another list gave back at its reset: the smallest that holds the data. It starts at offset 0, which is aligned.
+			{
+				std::scoped_lock poolLock(impl->scratchPoolMutex);
+				auto& pool = impl->scratchPool;
+				const uint64_t needed = VkAlignUp(minSize, alignment);
+				auto best = pool.end();
+				for (auto it = pool.begin(); it != pool.end(); ++it)
+					if (it->page.capacity >= needed && (best == pool.end() || it->page.capacity < best->page.capacity)) best = it;
+				if (best != pool.end()) {
+					auto page = best->page;
+					impl->scratchPoolBytes -= page.capacity;
+					*best = pool.back();
+					pool.pop_back();
+					page.cursor = 0;
+					commandListState.emulatedRootConstantScratchPages.push_back(page);
+					return true;
+				}
+			}
 			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
 
-			const uint64_t alignment = VkEmulatedRootConstantAlignment(impl);
 			const uint64_t capacity64 = (std::max<uint64_t>)(VkAlignUp(minSize, alignment), 64ull * 1024ull);
 			if (capacity64 > static_cast<uint64_t>((std::numeric_limits<uint32_t>::max)())) {
 				return false;
@@ -1611,8 +1704,48 @@ namespace rhi {
 			page.deviceAddress = deviceAddress;
 			page.capacity = static_cast<uint32_t>(capacity64);
 			page.cursor = 0;
+			g_scratchPages.fetch_add(1, std::memory_order_relaxed);
+			g_scratchBytes.fetch_add(page.capacity, std::memory_order_relaxed);
 			commandListState.emulatedRootConstantScratchPages.push_back(std::move(page));
 			return true;
+		}
+
+		// At the list's reset (its buffer not pending): its scratch pages go back to the device's pool. Pages the pool has held for
+		// kScratchPoolIdleResets resets, and the oldest ones past kScratchPoolIdleBytes, are freed, outside the pool's lock.
+		static void VkReturnEmulatedRootConstantScratchPages(VulkanDevice* impl, VulkanCommandList& commandListState) noexcept {
+			auto& pages = commandListState.emulatedRootConstantScratchPages;
+			if (pages.empty()) return;
+			std::vector<VulkanCommandList::EmulatedRootConstantScratchPage> idle;
+			{
+				std::scoped_lock poolLock(impl->scratchPoolMutex);
+				const uint64_t now = ++impl->scratchPoolResets;
+				auto& pool = impl->scratchPool;
+				for (auto& page : pages) {
+					page.cursor = 0;
+					impl->scratchPoolBytes += page.capacity;
+					pool.push_back({ page, now });
+				}
+				for (size_t i = 0; i < pool.size();) {
+					if (now - pool[i].returnedAt > VulkanDevice::kScratchPoolIdleResets) {
+						impl->scratchPoolBytes -= pool[i].page.capacity;
+						idle.push_back(pool[i].page);
+						pool[i] = pool.back();
+						pool.pop_back();
+					} else {
+						++i;
+					}
+				}
+				while (impl->scratchPoolBytes > VulkanDevice::kScratchPoolIdleBytes && !pool.empty()) {
+					auto oldest = std::min_element(pool.begin(), pool.end(), [](const auto& a, const auto& b) { return a.returnedAt < b.returnedAt; });
+					impl->scratchPoolBytes -= oldest->page.capacity;
+					idle.push_back(oldest->page);
+					*oldest = pool.back();
+					pool.pop_back();
+				}
+			}
+			pages.clear();
+			for (auto& page : idle)
+				VkDestroyEmulatedRootConstantScratchPage(impl, page);
 		}
 
 		static bool VkAllocateEmulatedRootConstantScratch(
@@ -1774,6 +1907,158 @@ namespace rhi {
 			std::memset(slotAddress, 0, static_cast<size_t>(heap.descriptorStride));
 			vkGetDescriptorEXT(impl->device, &info, dataSize, slotAddress);
 			return Result::Ok;
+		}
+
+		// ---- Buffer view refs (rhi_shader_abi.h, BUFFER_VIEW_REF_*) ----
+
+		// One storage buffer descriptor over [address, address + size) at dst (the heaps' stride, zeroed first). Address 0 writes
+		// the null descriptor where the device has one, else leaves zeros, which no ref names.
+		static void VkWriteViewRefDescriptor(VulkanDevice* impl, std::byte* dst, VkDeviceAddress address, VkDeviceSize size) noexcept {
+			auto& r = impl->viewRefs;
+			std::memset(dst, 0, static_cast<size_t>(r.stride));
+			if (address == 0 && !impl->nullDescriptorEnabled)
+				return;
+			if (VkDescriptorBufferModel(impl)) {
+				VkDescriptorAddressInfoEXT addressInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT };
+				addressInfo.address = address;
+				addressInfo.range = size;
+				addressInfo.format = VK_FORMAT_UNDEFINED;
+				VkDescriptorGetInfoEXT getInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT };
+				getInfo.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+				getInfo.data.pStorageBuffer = address != 0 ? &addressInfo : nullptr;
+				vkGetDescriptorEXT(impl->device, &getInfo, static_cast<size_t>(r.descriptorSize), dst);
+				return;
+			}
+			VkDeviceAddressRangeEXT addressRange{};
+			addressRange.address = address;
+			addressRange.size = size;
+			VkResourceDescriptorInfoEXT descriptorInfo{ VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT };
+			descriptorInfo.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			if (address != 0)
+				descriptorInfo.data.pAddressRange = &addressRange;
+			VkHostAddressRangeEXT descriptorRange{};
+			descriptorRange.address = dst;
+			descriptorRange.size = static_cast<size_t>(r.stride);
+			vkWriteResourceDescriptorsEXT(impl->device, 1, &descriptorInfo, &descriptorRange);
+		}
+
+		// Copies staging slots [a_first, a_first + a_count) into a heap's region. Under descriptorViewsMutex.
+		static void VkCopyViewRefSlots(VulkanDevice* impl, VulkanDescriptorHeap& heap, uint32_t a_first, uint32_t a_count) noexcept {
+			auto& r = impl->viewRefs;
+			if (!heap.mappedData || heap.viewRefSlots == 0)
+				return;
+			const uint64_t offset = heap.descriptorBaseOffset + (static_cast<uint64_t>(heap.capacity) + a_first) * r.stride;
+			std::memcpy(static_cast<std::byte*>(heap.mappedData) + offset, r.staging.data() + static_cast<size_t>(a_first * r.stride),
+				static_cast<size_t>(a_count * r.stride));
+		}
+
+		// Copies a pair from staging into every full-capacity heap. Under descriptorViewsMutex and the region's write lock.
+		static void VkPublishViewRefPair(VulkanDevice* impl, uint32_t a_pair) noexcept {
+			for (const DescriptorHeapHandle handle : impl->viewRefs.heaps) {
+				if (VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, handle))
+					VkCopyViewRefSlots(impl, *heap, 2 * a_pair, 2);
+			}
+		}
+
+		// Sets the region up once the binding model and its capacity are known: the client's capacity shrinks by the region.
+		static void VkInitViewRefs(VulkanDevice* impl, const char* caller) noexcept {
+			auto& r = impl->viewRefs;
+			if (!impl->bufferDeviceAddressEnabled || !VkBindlessModel(impl) || impl->shaderVisibleResourceCapacity <= 2 * BUFFER_VIEW_REF_SLOTS) {
+				spdlog::warn("{}: no buffer view refs (binding model or capacity {}); shaders cannot reach buffers by ref", caller,
+					impl->shaderVisibleResourceCapacity);
+				return;
+			}
+			r.stride = VkDescriptorHeapStride(impl, DescriptorHeapType::CbvSrvUav);
+			r.descriptorSize = VkDescriptorBufferModel(impl) ? impl->descriptorBuffer.storageBufferSize
+				: static_cast<uint64_t>(impl->descriptorHeapProperties.bufferDescriptorSize);
+			if (r.stride == 0 || r.descriptorSize == 0 || r.descriptorSize > r.stride) {
+				spdlog::warn("{}: no buffer view refs (descriptor stride {}, storage buffer descriptor {} bytes)", caller, r.stride, r.descriptorSize);
+				return;
+			}
+			try {
+				r.staging.assign(static_cast<size_t>(BUFFER_VIEW_REF_SLOTS * r.stride), std::byte{ 0 });
+			} catch (...) {
+				return;
+			}
+			try {
+				r.pairs.assign(BUFFER_VIEW_REF_PAIRS, {});
+			} catch (...) {
+				return;
+			}
+			impl->shaderVisibleResourceCapacity -= BUFFER_VIEW_REF_SLOTS;
+			r.ready = true;
+			spdlog::info("{}: buffer view refs: {} pairs at heap slot {} (the client's capacity)", caller, BUFFER_VIEW_REF_PAIRS,
+				impl->shaderVisibleResourceCapacity);
+		}
+
+		// A buffer's pair, made the first time it is asked for. A buffer without a device address has none.
+		static BufferViewRef VkViewRef(VulkanDevice* impl, GpuBufferAddress address) noexcept {
+			if (!impl || !impl->viewRefs.ready || !address.buffer.valid() || address.offset > UINT32_MAX)
+				return {};
+			auto& r = impl->viewRefs;
+			const uint64_t key = (uint64_t(address.buffer.generation) << 32) | address.buffer.index;
+			const uint32_t firstSlot = impl->shaderVisibleResourceCapacity;
+			const auto refAt = [&](uint32_t pair) { return BufferViewRef{ firstSlot + 2 * pair, static_cast<uint32_t>(address.offset) }; };
+			{
+				std::shared_lock read(r.lock);
+				if (const auto found = r.pairByResource.find(key); found != r.pairByResource.end())
+					return refAt(found->second);
+			}
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
+			VulkanResource* resource = VkResourceState(impl, address.buffer);
+			if (!resource || resource->type != ResourceType::Buffer || resource->deviceAddress == 0 || resource->bufferSize == 0)
+				return {};
+			std::unique_lock write(r.lock);
+			if (const auto found = r.pairByResource.find(key); found != r.pairByResource.end())
+				return refAt(found->second);
+			uint32_t pair = 0;
+			if (!r.freePairs.empty()) {
+				pair = r.freePairs.back();
+				r.freePairs.pop_back();
+			} else if (r.nextPair < BUFFER_VIEW_REF_PAIRS) {
+				pair = r.nextPair++;
+			} else {
+				if (!r.loggedFull) {
+					r.loggedFull = true;
+					spdlog::error("Vulkan buffer view refs: all {} pairs are in use; further buffers have no view ref", BUFFER_VIEW_REF_PAIRS);
+				}
+				return {};
+			}
+			// Every buffer BasicRHI makes has storage usage, so the UAV is the same descriptor as the SRV. A storage buffer descriptor covers
+			// at most maxStorageBufferRange bytes: past it a load reads nothing.
+			const VkDeviceSize maxRange = impl->physicalDeviceProperties.limits.maxStorageBufferRange;
+			if (resource->bufferSize > maxRange) {
+				spdlog::warn("Vulkan buffer view refs: a {}-byte buffer's views cover its first {} bytes (maxStorageBufferRange)", resource->bufferSize, maxRange);
+			}
+			std::byte* srv = r.staging.data() + static_cast<size_t>(2 * pair * r.stride);
+			const VkDeviceSize range = (std::min)(resource->bufferSize, maxRange);
+			VkWriteViewRefDescriptor(impl, srv, resource->deviceAddress, range);
+			std::memcpy(srv + r.stride, srv, static_cast<size_t>(r.stride));
+			VkPublishViewRefPair(impl, pair);
+			r.pairByResource.emplace(key, pair);
+			r.pairs[pair] = { resource->deviceAddress, range, key, true };
+			return refAt(pair);
+		}
+
+		// A destroyed buffer's pair goes back, null again. The deferred destruction has waited for the frames that read it.
+		static void VkReleaseViewRef(VulkanDevice* impl, ResourceHandle handle) noexcept {
+			if (!impl || !impl->viewRefs.ready || !handle.valid())
+				return;
+			auto& r = impl->viewRefs;
+			const uint64_t key = (uint64_t(handle.generation) << 32) | handle.index;
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
+			std::unique_lock write(r.lock);
+			const auto found = r.pairByResource.find(key);
+			if (found == r.pairByResource.end())
+				return;
+			const uint32_t pair = found->second;
+			r.pairByResource.erase(found);
+			std::byte* srv = r.staging.data() + static_cast<size_t>(2 * pair * r.stride);
+			VkWriteViewRefDescriptor(impl, srv, 0, 0);
+			std::memcpy(srv + r.stride, srv, static_cast<size_t>(r.stride));
+			VkPublishViewRefPair(impl, pair);
+			r.pairs[pair].live = false;  // the address stays: the fault report names the freed buffer
+			r.freePairs.push_back(pair);
 		}
 
 		static bool VkIsSpirvBytecode(const ShaderBinary& bytecode) noexcept {
@@ -2073,13 +2358,46 @@ namespace rhi {
 			return { component(0), component(1), component(2), component(3) };
 		}
 
-		// A shader resource view's swizzle: its mapping, with alpha one for a format whose fourth byte is unused (B8G8R8X8, viewed
-		// as B8G8R8A8), as DXGI samples it. a_viewed is the view's format, or the resource's when the view names none.
-		static VkComponentMapping VkSrvComponentMapping(ComponentMapping mapping, Format a_viewed) noexcept {
-			VkComponentMapping components = VkComponentMappingForRHI(mapping);
-			if (a_viewed == Format::B8G8R8X8_UNorm || a_viewed == Format::B8G8R8X8_UNorm_sRGB || a_viewed == Format::B8G8R8X8_Typeless)
-				components.a = VK_COMPONENT_SWIZZLE_ONE;
-			return components;
+		// The swizzle that makes a format's channels from the ones it is stored in: alpha one for a format whose fourth byte is unused
+		// (B8G8R8X8, stored as B8G8R8A8), as DXGI samples it, or the device's remap (formatRemaps: A8 stored as R8). Identity otherwise.
+		static VkComponentMapping VkFormatSwizzle(const VulkanDevice* impl, Format a_format) noexcept {
+			if (a_format == Format::B8G8R8X8_UNorm || a_format == Format::B8G8R8X8_UNorm_sRGB || a_format == Format::B8G8R8X8_Typeless) {
+				return { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_ONE };
+			}
+			const auto* remap = VkFindFormatRemap(impl, ToVkFormat(a_format));
+			return remap ? remap->swizzle : VkComponentMapping{};
+		}
+
+		// Whether a swizzle moves a stored channel to another component (A8 stored as R8 does; B8G8R8X8's constant alpha does not).
+		// A view that cannot swizzle (storage, attachment) would write the wrong channel of such a format.
+		static bool VkSwizzleMovesChannels(const VkComponentMapping& a_swizzle) noexcept {
+			auto moves = [](VkComponentSwizzle a_source, VkComponentSwizzle a_own) {
+				return a_source != VK_COMPONENT_SWIZZLE_IDENTITY && a_source != a_own && a_source != VK_COMPONENT_SWIZZLE_ZERO &&
+					a_source != VK_COMPONENT_SWIZZLE_ONE;
+			};
+			return moves(a_swizzle.r, VK_COMPONENT_SWIZZLE_R) || moves(a_swizzle.g, VK_COMPONENT_SWIZZLE_G) ||
+				moves(a_swizzle.b, VK_COMPONENT_SWIZZLE_B) || moves(a_swizzle.a, VK_COMPONENT_SWIZZLE_A);
+		}
+
+		// A shader resource view's swizzle: its mapping selects from the viewed format's channels, and the format's swizzle
+		// (VkFormatSwizzle) makes those from the stored ones. a_viewed is the view's format, or the resource's when the view names none.
+		static VkComponentMapping VkSrvComponentMapping(const VulkanDevice* impl, ComponentMapping mapping, Format a_viewed) noexcept {
+			const VkComponentMapping view = VkComponentMappingForRHI(mapping);
+			const VkComponentMapping format = VkFormatSwizzle(impl, a_viewed);
+			auto compose = [&](VkComponentSwizzle a_source, VkComponentSwizzle a_own) {
+				const VkComponentSwizzle channel = a_source == VK_COMPONENT_SWIZZLE_IDENTITY ? a_own : a_source;
+				VkComponentSwizzle stored = VK_COMPONENT_SWIZZLE_IDENTITY;
+				switch (channel) {
+				case VK_COMPONENT_SWIZZLE_R: stored = format.r; break;
+				case VK_COMPONENT_SWIZZLE_G: stored = format.g; break;
+				case VK_COMPONENT_SWIZZLE_B: stored = format.b; break;
+				case VK_COMPONENT_SWIZZLE_A: stored = format.a; break;
+				default: return channel;  // a constant
+				}
+				return stored == VK_COMPONENT_SWIZZLE_IDENTITY ? channel : stored;
+			};
+			return { compose(view.r, VK_COMPONENT_SWIZZLE_R), compose(view.g, VK_COMPONENT_SWIZZLE_G), compose(view.b, VK_COMPONENT_SWIZZLE_B),
+				compose(view.a, VK_COMPONENT_SWIZZLE_A) };
 		}
 
 
@@ -2276,7 +2594,60 @@ namespace rhi {
 			case BlendFactor::InvDstAlpha: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
 			case BlendFactor::DstColor: return VK_BLEND_FACTOR_DST_COLOR;
 			case BlendFactor::InvDstColor: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+			// As alpha factors the constant's alpha is read, as in D3D12.
+			case BlendFactor::BlendFactor: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+			case BlendFactor::InvBlendFactor: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+			case BlendFactor::SrcAlphaSat: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+			case BlendFactor::Src1Color: return VK_BLEND_FACTOR_SRC1_COLOR;
+			case BlendFactor::InvSrc1Color: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+			case BlendFactor::Src1Alpha: return VK_BLEND_FACTOR_SRC1_ALPHA;
+			case BlendFactor::InvSrc1Alpha: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
 			default: return VK_BLEND_FACTOR_ONE;
+			}
+		}
+
+		static VkLogicOp VkLogicOpForRHI(LogicOp op) noexcept {
+			switch (op) {
+			case LogicOp::Clear: return VK_LOGIC_OP_CLEAR;
+			case LogicOp::Set: return VK_LOGIC_OP_SET;
+			case LogicOp::Copy: return VK_LOGIC_OP_COPY;
+			case LogicOp::CopyInverted: return VK_LOGIC_OP_COPY_INVERTED;
+			case LogicOp::Invert: return VK_LOGIC_OP_INVERT;
+			case LogicOp::And: return VK_LOGIC_OP_AND;
+			case LogicOp::Nand: return VK_LOGIC_OP_NAND;
+			case LogicOp::Or: return VK_LOGIC_OP_OR;
+			case LogicOp::Nor: return VK_LOGIC_OP_NOR;
+			case LogicOp::Xor: return VK_LOGIC_OP_XOR;
+			case LogicOp::Equiv: return VK_LOGIC_OP_EQUIVALENT;
+			case LogicOp::AndReverse: return VK_LOGIC_OP_AND_REVERSE;
+			case LogicOp::AndInverted: return VK_LOGIC_OP_AND_INVERTED;
+			case LogicOp::OrReverse: return VK_LOGIC_OP_OR_REVERSE;
+			case LogicOp::OrInverted: return VK_LOGIC_OP_OR_INVERTED;
+			case LogicOp::Noop:
+			default: return VK_LOGIC_OP_NO_OP;
+			}
+		}
+
+		static bool VkBlendFactorIsConstant(BlendFactor factor) noexcept {
+			return factor == BlendFactor::BlendFactor || factor == BlendFactor::InvBlendFactor;
+		}
+
+		static bool VkBlendFactorIsDualSource(BlendFactor factor) noexcept {
+			return factor == BlendFactor::Src1Color || factor == BlendFactor::InvSrc1Color ||
+				factor == BlendFactor::Src1Alpha || factor == BlendFactor::InvSrc1Alpha;
+		}
+
+		static VkStencilOp VkStencilOpForRHI(StencilOp op) noexcept {
+			switch (op) {
+			case StencilOp::Zero: return VK_STENCIL_OP_ZERO;
+			case StencilOp::Replace: return VK_STENCIL_OP_REPLACE;
+			case StencilOp::IncrSat: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+			case StencilOp::DecrSat: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+			case StencilOp::Invert: return VK_STENCIL_OP_INVERT;
+			case StencilOp::Incr: return VK_STENCIL_OP_INCREMENT_AND_WRAP;
+			case StencilOp::Decr: return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+			case StencilOp::Keep:
+			default: return VK_STENCIL_OP_KEEP;
 			}
 		}
 
@@ -2397,6 +2768,7 @@ namespace rhi {
 
 			if (pipeline.pipeline != VK_NULL_HANDLE) {
 				vkDestroyPipeline(impl->device, pipeline.pipeline, nullptr);
+				NotePipelines(-1);
 			}
 			if (pipeline.layout != VK_NULL_HANDLE) {
 				vkDestroyPipelineLayout(impl->device, pipeline.layout, nullptr);
@@ -2478,7 +2850,549 @@ namespace rhi {
 			if (result != VK_SUCCESS) {
 				RHI_FAIL(ToRHI(result));
 			}
+			g_liveCommandBuffers.fetch_add(1, std::memory_order_relaxed);
 			return Result::Ok;
+		}
+
+		// ---------------------------------------------------------------------------------------------------------------------
+		// Native crash markers (VulkanCrashMarkers).
+
+		// DeviceCreateInfo::enableCrashMarkers, or BASICRHI_VK_CRASH_MARKERS=1.
+		static bool VkCrashMarkersRequested(const DeviceCreateInfo& ci) noexcept {
+			if (ci.enableCrashMarkers) return true;
+			const char* value = std::getenv("BASICRHI_VK_CRASH_MARKERS");
+			return value && std::strcmp(value, "1") == 0;
+		}
+
+		// A new marker id for the name, remembered in the history with the interned name. Ids start at 1: 0 means none.
+		static uint32_t VkRegisterCrashMarker(VulkanCrashMarkers& markers, std::string_view name, const char** interned = nullptr) noexcept {
+			try {
+				const std::lock_guard lock(markers.mutex);
+				const char* stored = markers.names.emplace(name.empty() ? std::string_view("(unnamed)") : name).first->c_str();
+				uint32_t id = markers.nextId++;
+				if (id == 0) id = markers.nextId++;
+				markers.historyIds[id % VulkanCrashMarkers::kHistory] = id;
+				markers.historyNames[id % VulkanCrashMarkers::kHistory] = stored;
+				if (interned) *interned = stored;
+				return id;
+			} catch (...) {
+				return 0;
+			}
+		}
+
+		// The name of a marker id. markers.mutex is held.
+		static const char* VkCrashMarkerName(const VulkanCrashMarkers& markers, uint32_t id) noexcept {
+			if (id == 0) return "(none)";
+			const uint32_t index = id % VulkanCrashMarkers::kHistory;
+			return markers.historyIds[index] == id && markers.historyNames[index] ? markers.historyNames[index] : "(overwritten)";
+		}
+
+		// The list's slot pair, given at its first use.
+		static uint32_t VkCrashMarkerSlot(VulkanCrashMarkers& markers, VulkanCommandList& list) noexcept {
+			if (list.crashMarkerSlot == UINT32_MAX) {
+				list.crashMarkerSlot = markers.nextSlot.fetch_add(1, std::memory_order_relaxed) % VulkanCrashMarkers::kSlots;
+			}
+			return list.crashMarkerSlot;
+		}
+
+		// Records a marker into the list: the slot pair's begun (top of pipe) and finished (bottom of pipe) ids, and an NV
+		// checkpoint whose marker is the id.
+		static void VkWriteCrashMarker(VulkanDevice* impl, VulkanCommandList& list, std::string_view name, const char** interned = nullptr) noexcept {
+			VulkanCrashMarkers& markers = impl->crashMarkers;
+			if (!markers.enabled || list.commandBuffer == VK_NULL_HANDLE) return;
+			const uint32_t id = VkRegisterCrashMarker(markers, name, interned);
+			if (id == 0) return;
+			if (markers.bufferMarkers) {
+				const VkDeviceSize offset = static_cast<VkDeviceSize>(VkCrashMarkerSlot(markers, list)) * 2 * sizeof(uint32_t);
+				vkCmdWriteBufferMarkerAMD(list.commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, markers.buffer, offset, id);
+				vkCmdWriteBufferMarkerAMD(list.commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, markers.buffer, offset + sizeof(uint32_t), id);
+			}
+			if (markers.checkpoints) {
+				vkCmdSetCheckpointNV(list.commandBuffer, reinterpret_cast<const void*>(static_cast<uintptr_t>(id)));
+			}
+		}
+
+		// Names the list's slot after the list (SetName), for the dump.
+		static void VkNameCrashMarkerSlot(VulkanDevice* impl, VulkanCommandList& list, const char* name) noexcept {
+			VulkanCrashMarkers& markers = impl->crashMarkers;
+			if (!markers.enabled || !markers.bufferMarkers || !name) return;
+			try {
+				const uint32_t slot = VkCrashMarkerSlot(markers, list);
+				const std::lock_guard lock(markers.mutex);
+				markers.slotNames[slot] = markers.names.emplace(name).first->c_str();
+			} catch (...) {
+			}
+		}
+
+		// A debug label's marker, for the host's checkpoint callbacks (adopted devices) and the native markers. depthChange is
+		// +1 for a label's begin, -1 for its end and 0 for an inserted label.
+		static void VkLabelCheckpoint(CommandList* commandList, const char* name, int depthChange) noexcept {
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* state = VkCommandListState(commandList);
+			if (!impl || !state || !state->commandBuffer) return;
+			if (impl->setCheckpoint && impl->registerCheckpoint) {
+				if (const void* marker = impl->registerCheckpoint(impl->checkpointUser, depthChange < 0 ? "ORG pass end" : name))
+					impl->setCheckpoint(state->commandBuffer, const_cast<void*>(marker));
+			}
+			if (!impl->crashMarkers.enabled || !state->isRecording) return;
+			try {
+				if (depthChange < 0) {
+					const char* open = state->crashLabelStack.empty() ? "(unmatched label)" : state->crashLabelStack.back();
+					if (!state->crashLabelStack.empty()) state->crashLabelStack.pop_back();
+					VkWriteCrashMarker(impl, *state, std::string("end: ") + open);
+				} else {
+					const char* interned = nullptr;
+					VkWriteCrashMarker(impl, *state, name ? name : "", &interned);
+					if (depthChange > 0) state->crashLabelStack.push_back(interned ? interned : "(unnamed)");
+				}
+			} catch (...) {
+			}
+		}
+
+		static void VkDestroyCrashMarkers(VulkanDevice* impl) noexcept {
+			VulkanCrashMarkers& markers = impl->crashMarkers;
+			if (impl->device != VK_NULL_HANDLE && !impl->abandoned) {
+				if (markers.buffer != VK_NULL_HANDLE) vkDestroyBuffer(impl->device, markers.buffer, nullptr);
+				if (markers.memory != VK_NULL_HANDLE) vkFreeMemory(impl->device, markers.memory, nullptr);
+			}
+			markers.buffer = VK_NULL_HANDLE;
+			markers.memory = VK_NULL_HANDLE;
+			markers.mapped = nullptr;
+			markers.bufferMarkers = false;
+			markers.checkpoints = false;
+			markers.deviceFault = false;
+			markers.enabled = false;
+		}
+
+		static void VkDestroyPlaceholderInputBuffer(VulkanDevice* impl) noexcept {
+			if (impl->device != VK_NULL_HANDLE && !impl->abandoned) {
+				if (impl->placeholderInputBuffer != VK_NULL_HANDLE) vkDestroyBuffer(impl->device, impl->placeholderInputBuffer, nullptr);
+				if (impl->placeholderInputMemory != VK_NULL_HANDLE) vkFreeMemory(impl->device, impl->placeholderInputMemory, nullptr);
+			}
+			impl->placeholderInputBuffer = VK_NULL_HANDLE;
+			impl->placeholderInputMemory = VK_NULL_HANDLE;
+		}
+
+		// The placeholder vertex and index buffer: 256 bytes of any memory, preferably device-local.
+		static void VkCreatePlaceholderInputBuffer(VulkanDevice* impl) noexcept {
+			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
+			VkBufferCreateInfo bufferInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			bufferInfo.size = 256;
+			bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+			bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			VkBuffer buffer = VK_NULL_HANDLE;
+			if (vkCreateBuffer(impl->device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+				spdlog::warn("Vulkan ExecuteCommands: could not create the placeholder input buffer");
+				return;
+			}
+			VkMemoryRequirements requirements{};
+			vkGetBufferMemoryRequirements(impl->device, buffer, &requirements);
+			uint32_t memoryTypeIndex = 0;
+			const bool found =
+				VkFindMemoryTypeIndex(impl->memoryProperties, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, memoryTypeIndex);
+			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+			allocateInfo.allocationSize = requirements.size;
+			allocateInfo.memoryTypeIndex = memoryTypeIndex;
+			VkDeviceMemory memory = VK_NULL_HANDLE;
+			if (!found || vkAllocateMemory(impl->device, &allocateInfo, nullptr, &memory) != VK_SUCCESS) {
+				spdlog::warn("Vulkan ExecuteCommands: could not allocate the placeholder input buffer");
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				return;
+			}
+			if (VkBindBufferMemorySynchronized(impl, buffer, memory, 0) != VK_SUCCESS) {
+				spdlog::warn("Vulkan ExecuteCommands: could not bind the placeholder input buffer");
+				vkFreeMemory(impl->device, memory, nullptr);
+				vkDestroyBuffer(impl->device, buffer, nullptr);
+				return;
+			}
+			VkSetObjectName(impl, reinterpret_cast<uint64_t>(buffer), VK_OBJECT_TYPE_BUFFER, "BasicRHI::PlaceholderInput");
+			impl->placeholderInputBuffer = buffer;
+			impl->placeholderInputMemory = memory;
+		}
+
+		// Binds the placeholder buffer as every vertex buffer and as the index buffer. Vulkan leaves a primary's bindings
+		// undefined after vkCmdExecuteCommands, but AMD's Windows driver keeps the ones from before it and drops a later bind
+		// of the same buffer as redundant, so the next draw reads what a secondary bound. Binding something else first makes
+		// the caller's next bind reach the driver.
+		static void VkBindPlaceholderInputBuffers(VulkanDevice* impl, VulkanCommandList& commandListState) noexcept {
+			std::call_once(impl->placeholderInputBufferOnce, [impl] { VkCreatePlaceholderInputBuffer(impl); });
+			if (impl->placeholderInputBuffer == VK_NULL_HANDLE) {
+				return;
+			}
+			constexpr uint32_t kMaxBindings = 32;  // D3D's vertex buffer slots
+			const uint32_t bindingCount = (std::min)(impl->physicalDeviceProperties.limits.maxVertexInputBindings, kMaxBindings);
+			std::array<VkBuffer, kMaxBindings> buffers{};
+			std::array<VkDeviceSize, kMaxBindings> offsets{};
+			buffers.fill(impl->placeholderInputBuffer);
+			vkCmdBindVertexBuffers(commandListState.commandBuffer, 0, bindingCount, buffers.data(), offsets.data());
+			vkCmdBindIndexBuffer(commandListState.commandBuffer, impl->placeholderInputBuffer, 0, VK_INDEX_TYPE_UINT32);
+		}
+
+		// The marker buffer: kSlots pairs of uint32 ids in host-visible, coherent memory, zeroed.
+		static bool VkCreateCrashMarkerBuffer(VulkanDevice* impl) noexcept {
+			VulkanCrashMarkers& markers = impl->crashMarkers;
+			const VkDeviceSize size = VkDeviceSize(VulkanCrashMarkers::kSlots) * 2 * sizeof(uint32_t);
+			VkBufferCreateInfo bufferInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			bufferInfo.size = size;
+			bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+			bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+			if (vkCreateBuffer(impl->device, &bufferInfo, nullptr, &markers.buffer) != VK_SUCCESS) return false;
+			VkMemoryRequirements requirements{};
+			vkGetBufferMemoryRequirements(impl->device, markers.buffer, &requirements);
+			uint32_t memoryTypeIndex = 0;
+			const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+			if (!VkFindMemoryTypeIndex(impl->memoryProperties, requirements.memoryTypeBits, required, required, memoryTypeIndex)) return false;
+			VkMemoryAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+			allocateInfo.allocationSize = requirements.size;
+			allocateInfo.memoryTypeIndex = memoryTypeIndex;
+			void* mapped = nullptr;
+			if (vkAllocateMemory(impl->device, &allocateInfo, nullptr, &markers.memory) != VK_SUCCESS ||
+				vkBindBufferMemory(impl->device, markers.buffer, markers.memory, 0) != VK_SUCCESS ||
+				vkMapMemory(impl->device, markers.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+				return false;
+			}
+			std::memset(mapped, 0, static_cast<size_t>(size));
+			markers.mapped = static_cast<volatile uint32_t*>(mapped);
+			VkSetObjectName(impl, reinterpret_cast<uint64_t>(markers.buffer), VK_OBJECT_TYPE_BUFFER, "BasicRHI::CrashMarkers");
+			return true;
+		}
+
+		// Turns on the sources CreateVulkanDevice enabled, once the device exists. A source without its entry points stays off.
+		static void VkInitCrashMarkers(VulkanDevice* impl, bool deviceFault, bool bufferMarkers, bool checkpoints) noexcept {
+			VulkanCrashMarkers& markers = impl->crashMarkers;
+			const bool fault = deviceFault && vkGetDeviceFaultInfoEXT != nullptr;
+			const bool nv = checkpoints && vkCmdSetCheckpointNV != nullptr && vkGetQueueCheckpointDataNV != nullptr;
+			markers.bufferMarkers = bufferMarkers && vkCmdWriteBufferMarkerAMD != nullptr;
+			if (markers.bufferMarkers && !VkCreateCrashMarkerBuffer(impl)) {
+				spdlog::warn("CreateVulkanDevice: could not create the crash marker buffer; VK_AMD_buffer_marker markers are off");
+				VkDestroyCrashMarkers(impl);
+			}
+			markers.deviceFault = fault;
+			markers.checkpoints = nv;
+			markers.enabled = markers.deviceFault || markers.bufferMarkers || markers.checkpoints;
+			spdlog::info("CreateVulkanDevice: crash markers {}: VK_EXT_device_fault {}, VK_AMD_buffer_marker {}, VK_NV_device_diagnostic_checkpoints {}",
+				markers.enabled ? "on" : "requested, but the device has no source", markers.deviceFault ? "on" : "off",
+				markers.bufferMarkers ? "on" : "off", markers.checkpoints ? "on" : "off");
+		}
+
+		static const char* VkDeviceFaultAddressTypeName(VkDeviceFaultAddressTypeEXT type) noexcept {
+			switch (type) {
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: return "none";
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: return "invalid read";
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: return "invalid write";
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: return "invalid execute";
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "instruction pointer (unknown)";
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "instruction pointer (invalid)";
+			case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: return "instruction pointer (fault)";
+			default: return "unknown";
+			}
+		}
+
+		// Keeps a buffer's debug name, truncated, for the fault report.
+		static void VkKeepResourceName(VulkanResource& resource, const char* name) noexcept {
+			resource.name.fill('\0');
+			if (name)
+				std::strncpy(resource.name.data(), name, resource.name.size() - 1);
+		}
+
+		// Buffers holding a device address whose low word is in [a_lo, a_hi]: when a shader takes such an address for a buffer view
+		// ref, the low word becomes the view slot (the high word the offset). a_what names the list.
+		template <class Each>
+		static void VkLogLowWordHolders(uint64_t a_lo, uint64_t a_hi, const char* a_what, Each&& a_each) noexcept {
+			uint32_t logged = 0;
+			a_each([&](uint64_t address, uint64_t size, const char* name, const char* kind) {
+				if (logged >= 16 || size == 0)
+					return;
+				for (uint64_t high = address >> 32; high <= (address + size - 1) >> 32; ++high) {
+					const uint64_t first = (std::max)(address, (high << 32) | a_lo);
+					const uint64_t last = (std::min)(address + size - 1, (high << 32) | a_hi);
+					if (first > last)
+						continue;
+					++logged;
+					spdlog::error("Vulkan fault attribution: {} '{}' ({}, {} bytes at 0x{:x}) holds 0x{:x}, at offset 0x{:x}: read as a ref, slot 0x{:x}, offset {}",
+						a_what, name, kind, size, address, first, first - address, first & 0xFFFFFFFFu, high);
+					break;
+				}
+			});
+			if (!logged)
+				spdlog::error("Vulkan fault attribution: no {} holds an address whose low word is in [0x{:x}, 0x{:x}]", a_what, a_lo, a_hi);
+		}
+
+		// What a faulting address is in or next to: the shader-visible heaps, the live buffers below and above it, the buffer view
+		// ref pairs (live or freed) and the recently destroyed buffers. Locks are only tried: a lost device may leave one held.
+		static void VkAttributeFaultAddress(VulkanDevice* impl, VkDeviceAddress a) noexcept {
+			constexpr uint64_t kNear = 1ull << 20;  // "next to": within 1 MiB
+			const auto where = [a](uint64_t base, uint64_t size) {
+				if (a >= base && a - base < size)
+					return std::format("inside, at offset 0x{:x}", a - base);
+				if (a >= base + size)
+					return std::format("0x{:x} bytes past its end", a - (base + size));
+				return std::format("0x{:x} bytes before it", base - a);
+			};
+			const auto nextTo = [a](uint64_t base, uint64_t size) { return a + kNear >= base && a < base + size + kNear; };
+			uint64_t faultSlotLo = 0, faultSlotHi = 0;  // the slots a past-the-heap read names, when it is one
+			try {
+				{
+					std::shared_lock lock(impl->descriptorHeaps.mutex, std::try_to_lock);
+					if (!lock.owns_lock()) {
+						spdlog::error("Vulkan fault attribution: the heap registry is locked; heaps not checked");
+					} else {
+						for (size_t i = 0; i < impl->descriptorHeaps.slots.size(); ++i) {
+							const auto& slot = impl->descriptorHeaps.slots[i];
+							const auto& heap = slot.obj;
+							if (!slot.alive || !heap.shaderVisible || heap.deviceAddress == 0)
+								continue;
+							spdlog::error("Vulkan fault attribution: {} heap {}: {} descriptors + {} view ref slots, stride {}, base offset {}, "
+								"bytes [0x{:x}, 0x{:x}): {}", heap.type == DescriptorHeapType::Sampler ? "sampler" : "resource", i, heap.capacity,
+								heap.viewRefSlots, heap.descriptorStride, heap.descriptorBaseOffset, static_cast<uint64_t>(heap.deviceAddress),
+								static_cast<uint64_t>(heap.deviceAddress) + heap.descriptorBytes, where(heap.deviceAddress, heap.descriptorBytes));
+							// Past a resource heap's end: the slots a shader indexed, over the fault's 4 KiB page.
+							const uint64_t base = heap.deviceAddress + heap.descriptorBaseOffset;
+							if (heap.type == DescriptorHeapType::CbvSrvUav && heap.descriptorStride && a >= base + heap.descriptorBytes &&
+								(a - base) / heap.descriptorStride < (1ull << 32)) {
+								const uint64_t page = a & ~0xFFFull;
+								faultSlotLo = (page - base) / heap.descriptorStride;
+								faultSlotHi = (page + 0xFFF - base) / heap.descriptorStride;
+								spdlog::error("Vulkan fault attribution: read as heap {}'s descriptor, the fault page is slots [0x{:x}, 0x{:x}]", i, faultSlotLo,
+									faultSlotHi);
+							}
+						}
+					}
+				}
+				{
+					std::shared_lock lock(impl->resources.mutex, std::try_to_lock);
+					if (!lock.owns_lock()) {
+						spdlog::error("Vulkan fault attribution: the resource registry is locked; buffers not checked");
+					} else {
+						const VulkanResource* below = nullptr;
+						const VulkanResource* above = nullptr;
+						size_t belowIndex = 0, aboveIndex = 0;
+						uint32_t inside = 0;
+						for (size_t i = 0; i < impl->resources.slots.size(); ++i) {
+							const auto& slot = impl->resources.slots[i];
+							const auto& res = slot.obj;
+							if (!slot.alive || res.type != ResourceType::Buffer || res.deviceAddress == 0)
+								continue;
+							if (a >= res.deviceAddress && a - res.deviceAddress < res.bufferSize && inside++ < 8) {
+								spdlog::error("Vulkan fault attribution: live buffer {} ({}, {} bytes at 0x{:x}): {}", i, res.ownsBuffer ? "owned" : "imported",
+									res.bufferSize, static_cast<uint64_t>(res.deviceAddress), where(res.deviceAddress, res.bufferSize));
+							}
+							if (res.deviceAddress <= a && (!below || res.deviceAddress > below->deviceAddress)) {
+								below = &res;
+								belowIndex = i;
+							}
+							if (res.deviceAddress > a && (!above || res.deviceAddress < above->deviceAddress)) {
+								above = &res;
+								aboveIndex = i;
+							}
+						}
+						if (below)
+							spdlog::error("Vulkan fault attribution: nearest live buffer below: {} ({}, {} bytes at 0x{:x}): {}", belowIndex,
+								below->ownsBuffer ? "owned" : "imported", below->bufferSize, static_cast<uint64_t>(below->deviceAddress),
+								where(below->deviceAddress, below->bufferSize));
+						if (above)
+							spdlog::error("Vulkan fault attribution: nearest live buffer above: {} ({}, {} bytes at 0x{:x}): {}", aboveIndex,
+								above->ownsBuffer ? "owned" : "imported", above->bufferSize, static_cast<uint64_t>(above->deviceAddress),
+								where(above->deviceAddress, above->bufferSize));
+						if (!inside)
+							spdlog::error("Vulkan fault attribution: no live buffer holds the address");
+						if (faultSlotHi) {
+							VkLogLowWordHolders(faultSlotLo, faultSlotHi, "live buffer", [&](auto&& visit) {
+								for (const auto& slot : impl->resources.slots)
+									if (slot.alive && slot.obj.type == ResourceType::Buffer && slot.obj.deviceAddress)
+										visit(slot.obj.deviceAddress, slot.obj.bufferSize, slot.obj.name.data(), slot.obj.ownsBuffer ? "owned" : "imported");
+							});
+							// The slot may be a byte offset or size taken for a ref: every buffer at least that large, by name.
+							uint32_t large = 0;
+							for (size_t i = 0; i < impl->resources.slots.size() && large < 32; ++i) {
+								const auto& slot = impl->resources.slots[i];
+								if (!slot.alive || slot.obj.type != ResourceType::Buffer || slot.obj.bufferSize < faultSlotLo)
+									continue;
+								++large;
+								spdlog::error("Vulkan fault attribution: buffer {} '{}' ({}, {} bytes at 0x{:x}) is at least {} bytes: the slot could be an offset into it",
+									i, slot.obj.name.data(), slot.obj.ownsBuffer ? "owned" : "imported", slot.obj.bufferSize,
+									static_cast<uint64_t>(slot.obj.deviceAddress), faultSlotLo);
+							}
+							if (!large)
+								spdlog::error("Vulkan fault attribution: no live buffer is {} bytes or larger", faultSlotLo);
+						}
+					}
+				}
+				if (impl->viewRefs.ready) {
+					auto& r = impl->viewRefs;
+					std::shared_lock lock(r.lock, std::try_to_lock);
+					if (!lock.owns_lock()) {
+						spdlog::error("Vulkan fault attribution: the view ref region is locked; pairs not checked");
+					} else {
+						uint32_t logged = 0;
+						for (uint32_t pair = 0; pair < r.pairs.size() && logged < 16; ++pair) {
+							const auto& p = r.pairs[pair];
+							if (p.address == 0 || !nextTo(p.address, p.range))
+								continue;
+							++logged;
+							spdlog::error("Vulkan fault attribution: view ref pair {} (slot {}, {}, buffer {}:{}) covers {} bytes at 0x{:x}: {}", pair,
+								impl->shaderVisibleResourceCapacity + 2 * pair, p.live ? "live" : "FREED", p.key & 0xFFFFFFFFu, p.key >> 32, p.range,
+								p.address, where(p.address, p.range));
+						}
+						if (!logged)
+							spdlog::error("Vulkan fault attribution: no view ref pair (live or freed) covers or neighbours the address");
+					}
+				}
+				{
+					auto& ring = impl->retiredBuffers;
+					std::unique_lock lock(ring.mutex, std::try_to_lock);
+					if (lock.owns_lock()) {
+						uint32_t logged = 0;
+						const uint64_t count = (std::min<uint64_t>)(ring.next, ring.entries.size());
+						for (uint64_t k = 0; k < count && logged < 16; ++k) {
+							const auto& e = ring.entries[(ring.next - 1 - k) % ring.entries.size()];
+							if (!nextTo(e.address, e.size))
+								continue;
+							++logged;
+							spdlog::error("Vulkan fault attribution: destroyed buffer {}:{} ({}, {} bytes at 0x{:x}, {} destructions ago): {}", e.key & 0xFFFFFFFFu,
+								e.key >> 32, e.owned ? "owned" : "imported", e.size, e.address, k, where(e.address, e.size));
+						}
+						if (!logged)
+							spdlog::error("Vulkan fault attribution: none of the last {} destroyed buffers covers or neighbours the address", count);
+						if (faultSlotHi) {
+							VkLogLowWordHolders(faultSlotLo, faultSlotHi, "destroyed buffer", [&](auto&& visit) {
+								for (uint64_t k = 0; k < count; ++k) {
+									const auto& e = ring.entries[(ring.next - 1 - k) % ring.entries.size()];
+									visit(e.address, e.size, e.name.data(), e.owned ? "owned" : "imported");
+								}
+							});
+						}
+					}
+				}
+			} catch (...) {
+			}
+		}
+
+		// VK_EXT_device_fault's report: the description, the faulting address ranges and the vendor's fault codes.
+		static void VkLogDeviceFault(VulkanDevice* impl, VkDeviceAddress& firstAddress, const char*& firstKind) noexcept {
+			try {
+				VkDeviceFaultCountsEXT counts{ VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT };
+				if (const VkResult result = vkGetDeviceFaultInfoEXT(impl->device, &counts, nullptr); result != VK_SUCCESS) {
+					spdlog::error("Vulkan device fault: vkGetDeviceFaultInfoEXT (counts) failed ({})", static_cast<int>(result));
+					return;
+				}
+				std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+				std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+				counts.vendorBinarySize = 0;  // the vendor binary dump is not enabled
+				VkDeviceFaultInfoEXT info{ VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT };
+				info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+				info.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
+				const VkResult result = vkGetDeviceFaultInfoEXT(impl->device, &counts, &info);
+				if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+					spdlog::error("Vulkan device fault: vkGetDeviceFaultInfoEXT failed ({})", static_cast<int>(result));
+					return;
+				}
+				spdlog::error("Vulkan device fault: '{}', {} addresses, {} vendor records", info.description, counts.addressInfoCount, counts.vendorInfoCount);
+				for (uint32_t i = 0; i < counts.addressInfoCount && i < addresses.size(); ++i) {
+					const VkDeviceFaultAddressInfoEXT& address = addresses[i];
+					const VkDeviceSize precision = address.addressPrecision ? address.addressPrecision : 1;
+					const VkDeviceAddress lower = address.reportedAddress & ~(precision - 1);
+					spdlog::error("Vulkan device fault:   {} at 0x{:x} (range 0x{:x}..0x{:x})", VkDeviceFaultAddressTypeName(address.addressType),
+						address.reportedAddress, lower, lower + precision - 1);
+					if (!firstAddress && address.reportedAddress) {
+						firstAddress = address.reportedAddress;
+						firstKind = VkDeviceFaultAddressTypeName(address.addressType);
+					}
+					if (address.reportedAddress && i < 4)
+						VkAttributeFaultAddress(impl, address.reportedAddress);
+				}
+				for (uint32_t i = 0; i < counts.vendorInfoCount && i < vendors.size(); ++i) {
+					spdlog::error("Vulkan device fault:   vendor '{}': code 0x{:x}, data 0x{:x}", vendors[i].description, vendors[i].vendorFaultCode,
+						vendors[i].vendorFaultData);
+				}
+			} catch (...) {
+			}
+		}
+
+		// Logs every list's last begun and finished marker and every queue's checkpoints; with deviceLost, the fault report too.
+		// A list whose two ids differ was still on the GPU. Returns the marker lines logged.
+		// summary, when given, receives the lists still in flight, and the fault's first address and kind (deviceLost only).
+		struct VkLossSummary {
+			std::string inFlight;
+			VkDeviceAddress faultAddress = 0;
+			const char* faultKind = "";
+		};
+
+		static uint32_t VkDumpCrashMarkers(VulkanDevice* impl, bool deviceLost, VkLossSummary* summary = nullptr) noexcept {
+			VulkanCrashMarkers& markers = impl->crashMarkers;
+			if (!markers.enabled) return 0;
+			const auto level = deviceLost ? spdlog::level::err : spdlog::level::info;
+			uint32_t lines = 0;
+			try {
+				if (markers.bufferMarkers && markers.mapped) {
+					const uint32_t used = (std::min)(markers.nextSlot.load(std::memory_order_relaxed), VulkanCrashMarkers::kSlots);
+					const std::lock_guard lock(markers.mutex);
+					for (uint32_t slot = 0; slot < used; ++slot) {
+						const uint32_t begun = markers.mapped[slot * 2];
+						const uint32_t finished = markers.mapped[slot * 2 + 1];
+						if (begun == 0 && finished == 0) continue;
+						spdlog::log(level, "Vulkan crash markers: list {} '{}' {}: began #{} '{}', finished #{} '{}'", slot,
+							markers.slotNames[slot] ? markers.slotNames[slot] : "", begun != finished ? "IN FLIGHT" : "idle",
+							begun, VkCrashMarkerName(markers, begun), finished, VkCrashMarkerName(markers, finished));
+						if (summary && begun != finished && summary->inFlight.size() < 1500)
+							summary->inFlight += std::format("{}list {} '{}' in flight at #{} '{}'", summary->inFlight.empty() ? "" : "; ", slot,
+								markers.slotNames[slot] ? markers.slotNames[slot] : "", begun, VkCrashMarkerName(markers, begun));
+						++lines;
+					}
+				}
+				if (markers.checkpoints) {
+					for (auto& slot : impl->queues.slots) {
+						if (!slot.alive || slot.obj.queue == VK_NULL_HANDLE) continue;
+						uint32_t count = 0;
+						vkGetQueueCheckpointDataNV(slot.obj.queue, &count, nullptr);
+						std::vector<VkCheckpointDataNV> data(count, { VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV });
+						if (count) vkGetQueueCheckpointDataNV(slot.obj.queue, &count, data.data());
+						const std::lock_guard lock(markers.mutex);
+						for (uint32_t i = 0; i < count; ++i) {
+							const uint32_t id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker));
+							spdlog::log(level, "Vulkan crash markers: queue family {} index {}: checkpoint #{} '{}' at stage 0x{:x}", slot.obj.familyIndex,
+								slot.obj.queueIndex, id, VkCrashMarkerName(markers, id), static_cast<uint32_t>(data[i].stage));
+							++lines;
+						}
+					}
+				}
+			} catch (...) {
+			}
+			if (deviceLost && markers.deviceFault) {
+				VkDeviceAddress address = 0;
+				const char* kind = "";
+				VkLogDeviceFault(impl, address, kind);
+				if (summary) {
+					summary->faultAddress = address;
+					summary->faultKind = kind;
+				}
+			}
+			return lines;
+		}
+
+		// A lost device, once per device: the crash markers logged (when on, and not logged yet), then the host's callback
+		// (rhi::SetDeviceLossCallback) with the fault and the lists in flight.
+		static void VkReportDeviceLoss(VulkanDevice* impl, const char* where, const char* header) noexcept {
+			if (!impl || impl->crashMarkers.lossNotified.exchange(true)) return;
+			VkLossSummary summary;
+			if (impl->crashMarkers.enabled && !impl->crashMarkers.lossReported.exchange(true)) {
+				spdlog::critical("{}: {}; its crash markers follow", where, header);
+				VkDumpCrashMarkers(impl, true, &summary);
+			}
+			DeviceLossInfo info;
+			info.backend = "vulkan";
+			info.where = where;
+			info.faultAddress = summary.faultAddress;
+			info.faultKind = summary.faultKind;
+			info.markers = summary.inFlight.c_str();
+			NotifyDeviceLoss(info);
+		}
+
+		// Logs the crash markers once, at the first VK_ERROR_DEVICE_LOST BasicRHI sees. Returns the result unchanged.
+		static VkResult VkCheckDeviceLost(VulkanDevice* impl, VkResult result, const char* where) noexcept {
+			if (result == VK_ERROR_DEVICE_LOST && impl)
+				VkReportDeviceLoss(impl, where, "the Vulkan device was lost");
+			return result;
 		}
 
 		static Result VkAllocatePrimaryCommandBuffer(VkDevice device, VkCommandPool pool, VkCommandBuffer& outCommandBuffer) noexcept {
@@ -3047,6 +3961,31 @@ namespace rhi {
 			return false;
 		}
 
+		// The memory type for a heap type among `memoryTypeBits`. SystemMemory takes a type outside the device-local heaps,
+		// one without host access first, since nothing maps it.
+		static bool VkFindMemoryTypeForHeapType(const VkPhysicalDeviceMemoryProperties& memoryProperties, uint32_t memoryTypeBits,
+			HeapType heapType, uint32_t& memoryTypeIndex) noexcept {
+			if (heapType != HeapType::SystemMemory) {
+				return VkFindMemoryTypeIndex(memoryProperties, memoryTypeBits, VkPreferredMemoryPropertyFlags(heapType),
+					VkRequiredMemoryPropertyFlags(heapType), memoryTypeIndex);
+			}
+			for (const bool allowHostVisible : { false, true }) {
+				for (uint32_t index = 0; index < memoryProperties.memoryTypeCount; ++index) {
+					const VkMemoryType& type = memoryProperties.memoryTypes[index];
+					if ((memoryTypeBits & (1u << index)) == 0 || (type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ||
+						(memoryProperties.memoryHeaps[type.heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+						continue;
+					}
+					if (!allowHostVisible && (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+						continue;
+					}
+					memoryTypeIndex = index;
+					return true;
+				}
+			}
+			return false;
+		}
+
 		static VkShaderStageFlags VkShaderStageFlagsForRHI(ShaderStage stages) noexcept {
 			VkShaderStageFlags flags = 0;
 			const uint32_t bits = static_cast<uint32_t>(stages);
@@ -3158,6 +4097,8 @@ namespace rhi {
 			}
 			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
 			if (page.buffer != VK_NULL_HANDLE) {
+				g_dgcPages.fetch_sub(1, std::memory_order_relaxed);
+				g_dgcBytes.fetch_sub(static_cast<int64_t>(page.capacity), std::memory_order_relaxed);
 				vkDestroyBuffer(impl->device, page.buffer, nullptr);
 			}
 			if (page.memory != VK_NULL_HANDLE) {
@@ -3166,8 +4107,9 @@ namespace rhi {
 			page = {};
 		}
 
-		// At the list's reset (its buffer not pending): its preprocess pages go back to the device's pool; pages the pool has held
-		// for kPreprocessPoolIdleResets resets are freed, outside the pool's lock.
+		// At the list's reset (its buffer not pending): its preprocess pages go back to the device's pool. Pages the pool has held
+		// for kPreprocessPoolIdleResets resets, and the oldest ones past kPreprocessPoolIdleBytes, are freed, outside the pool's
+		// lock.
 		static void VkReturnGeneratedCommandsPreprocessPages(VulkanDevice* impl, VulkanCommandList& commandListState) noexcept {
 			auto& pages = commandListState.generatedCommandsPreprocessPages;
 			std::vector<VulkanCommandList::GeneratedCommandsPreprocessPage> idle;
@@ -3176,17 +4118,26 @@ namespace rhi {
 				const uint64_t now = ++impl->preprocessPoolResets;
 				for (auto& page : pages) {
 					page.cursor = 0;
+					impl->preprocessPoolBytes += page.capacity;
 					impl->preprocessPool.push_back({ page, now });
 				}
 				auto& pool = impl->preprocessPool;
 				for (size_t i = 0; i < pool.size();) {
 					if (now - pool[i].returnedAt > VulkanDevice::kPreprocessPoolIdleResets) {
+						impl->preprocessPoolBytes -= pool[i].page.capacity;
 						idle.push_back(pool[i].page);
 						pool[i] = pool.back();
 						pool.pop_back();
 					} else {
 						++i;
 					}
+				}
+				while (impl->preprocessPoolBytes > VulkanDevice::kPreprocessPoolIdleBytes && !pool.empty()) {
+					auto oldest = std::min_element(pool.begin(), pool.end(), [](const auto& a, const auto& b) { return a.returnedAt < b.returnedAt; });
+					impl->preprocessPoolBytes -= oldest->page.capacity;
+					idle.push_back(oldest->page);
+					*oldest = pool.back();
+					pool.pop_back();
 				}
 			}
 			pages.clear();
@@ -3264,6 +4215,7 @@ namespace rhi {
 				}
 				if (best != pool.end()) {
 					auto page = best->page;
+					impl->preprocessPoolBytes -= page.capacity;
 					*best = pool.back();
 					pool.pop_back();
 					outAddress = page.deviceAddress;
@@ -3329,6 +4281,8 @@ namespace rhi {
 
 			outAddress = page.deviceAddress;
 			outSize = rangeSize;
+			g_dgcPages.fetch_add(1, std::memory_order_relaxed);
+			g_dgcBytes.fetch_add(static_cast<int64_t>(page.capacity), std::memory_order_relaxed);
 			commandListState.generatedCommandsPreprocessPages.push_back(std::move(page));
 			return Result::Ok;
 		}
@@ -3354,7 +4308,8 @@ namespace rhi {
 			case ResourceLayout::GenericRead:
 			case ResourceLayout::DirectGenericRead:
 			case ResourceLayout::ComputeGenericRead:
-				return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+				return (aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0
+					? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 			case ResourceLayout::RenderTarget:
 				return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 			case ResourceLayout::RenderTargetClear:
@@ -3372,7 +4327,10 @@ namespace rhi {
 			case ResourceLayout::ShaderResource:
 			case ResourceLayout::DirectShaderResource:
 			case ResourceLayout::ComputeShaderResource:
-				return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+				// Read-only depth is one layout, sampled or tested: the one an imported host depth buffer rests in, and the one a
+				// pass that both samples it and tests against it needs.
+				return (aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0
+					? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 			case ResourceLayout::CopyDest:
 			case ResourceLayout::DirectCopyDest:
 			case ResourceLayout::ComputeCopyDest:
@@ -3636,50 +4594,282 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// Publishes a new set of queue hooks (VulkanDevice::submissionHooks). Accesses already inside the old set finish with
+		// it; the old set stays alive until the device is destroyed.
+		static bool VkPublishSubmissionHooks(VulkanDevice* impl, const vulkan::QueueSubmissionHooks& hooks) noexcept {
+			try {
+				auto published = std::make_unique<VulkanDevice::SubmissionHooks>();
+				published->user = hooks.user;
+				published->lock = hooks.lock;
+				published->unlock = hooks.unlock;
+				published->submit = hooks.submit;
+				const std::lock_guard lock(impl->submissionHooksMutex);
+				impl->publishedSubmissionHooks.push_back(std::move(published));
+				impl->submissionHooks.store(impl->publishedSubmissionHooks.back().get(), std::memory_order_release);
+				return true;
+			} catch (...) {
+				return false;
+			}
+		}
+
+		// Holds the queue hooks' lock. The hooks are read once, so the unlock always matches the lock even when
+		// ShareVulkanDevice publishes new hooks in between.
+		struct VkQueueAccessGuard {
+			const VulkanDevice::SubmissionHooks* hooks;
+			VkQueue queue;
+			VkQueueAccessGuard(VulkanDevice* device, VkQueue vkQueue) noexcept
+				: hooks(device ? device->submissionHooks.load(std::memory_order_acquire) : nullptr), queue(vkQueue) {
+				if (hooks && hooks->lock) hooks->lock(hooks->user, queue);
+			}
+			~VkQueueAccessGuard() {
+				if (hooks && hooks->unlock) hooks->unlock(hooks->user, queue);
+			}
+			VkQueueAccessGuard(const VkQueueAccessGuard&) = delete;
+			VkQueueAccessGuard& operator=(const VkQueueAccessGuard&) = delete;
+		};
+
+		// Waits for every acquire slot's batch, so their semaphores and command buffers are free.
+		static Result VkWaitSwapchainAcquireSlots(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			for (size_t slot = 0; slot < swapchain.acquireFences.size(); ++slot) {
+				if (!swapchain.acquireFencePending[slot]) continue;
+				VkResult result = vkWaitForFences(impl->device, 1, &swapchain.acquireFences[slot], VK_TRUE, UINT64_MAX);
+				if (result == VK_SUCCESS) result = vkResetFences(impl->device, 1, &swapchain.acquireFences[slot]);
+				if (result != VK_SUCCESS) return ToRHI(result);
+				swapchain.acquireFencePending[slot] = 0;
+			}
+			return Result::Ok;
+		}
+
+		// Destroys the acquire slots and their command pool. Their batches must be done (the device is idle).
+		static void VkReleaseSwapchainAcquireSlots(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			if (impl && impl->device != VK_NULL_HANDLE) {
+				for (VkSemaphore semaphore : swapchain.acquireSemaphores) {
+					if (semaphore != VK_NULL_HANDLE) vkDestroySemaphore(impl->device, semaphore, nullptr);
+				}
+				for (VkFence fence : swapchain.acquireFences) {
+					if (fence != VK_NULL_HANDLE) vkDestroyFence(impl->device, fence, nullptr);
+				}
+				if (swapchain.acquireCommandPool != VK_NULL_HANDLE) vkDestroyCommandPool(impl->device, swapchain.acquireCommandPool, nullptr);
+			}
+			swapchain.acquireSemaphores.clear();
+			swapchain.acquireFences.clear();
+			swapchain.acquireFencePending.clear();
+			swapchain.acquireCommandBuffers.clear();
+			swapchain.acquireCommandPool = VK_NULL_HANDLE;
+			swapchain.acquireCommandPoolFamily = 0xFFFFFFFFu;
+			swapchain.nextAcquireSlot = 0;
+		}
+
+		// One acquire slot more than there are images: an acquire never has to wait for the slot of the image it is about to
+		// get. Kept across a recreation that leaves the image count alone.
+		static Result VkCreateSwapchainAcquireSlots(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			const uint32_t slotCount = swapchain.imageCount + 1;
+			if (swapchain.acquireSemaphores.size() == slotCount) {
+				return VkWaitSwapchainAcquireSlots(impl, swapchain);
+			}
+			if (const Result waitResult = VkWaitSwapchainAcquireSlots(impl, swapchain); waitResult != Result::Ok) return waitResult;
+			VkReleaseSwapchainAcquireSlots(impl, swapchain);
+			swapchain.acquireSemaphores.assign(slotCount, VK_NULL_HANDLE);
+			swapchain.acquireFences.assign(slotCount, VK_NULL_HANDLE);
+			swapchain.acquireFencePending.assign(slotCount, 0);
+			swapchain.acquireCommandBuffers.assign(slotCount, VK_NULL_HANDLE);
+			for (uint32_t slot = 0; slot < slotCount; ++slot) {
+				VkSemaphoreCreateInfo semaphoreInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+				VkResult result = vkCreateSemaphore(impl->device, &semaphoreInfo, nullptr, &swapchain.acquireSemaphores[slot]);
+				if (result == VK_SUCCESS) {
+					VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+					result = vkCreateFence(impl->device, &fenceInfo, nullptr, &swapchain.acquireFences[slot]);
+				}
+				if (result != VK_SUCCESS) {
+					VkReleaseSwapchainAcquireSlots(impl, swapchain);
+					return ToRHI(result);
+				}
+				VkSetObjectName(impl, reinterpret_cast<uint64_t>(swapchain.acquireSemaphores[slot]), VK_OBJECT_TYPE_SEMAPHORE,
+					std::format("Swapchain Acquire Semaphore {}", slot).c_str());
+			}
+			return Result::Ok;
+		}
+
+		// Records, into the slot's command buffer, the move of a never-used image from UNDEFINED to PRESENT_SRC.
+		static Result VkRecordSwapchainInitialLayout(VulkanDevice* impl, VulkanSwapchain& swapchain, uint32_t familyIndex, uint32_t slot,
+			uint32_t imageIndex, VkCommandBuffer& out) noexcept {
+			out = VK_NULL_HANDLE;
+			if (swapchain.acquireCommandPool != VK_NULL_HANDLE && swapchain.acquireCommandPoolFamily != familyIndex) {
+				// The present queue moved to another family: the pool goes once no slot's command buffer is in flight.
+				if (const Result waitResult = VkWaitSwapchainAcquireSlots(impl, swapchain); waitResult != Result::Ok) return waitResult;
+				vkDestroyCommandPool(impl->device, swapchain.acquireCommandPool, nullptr);
+				swapchain.acquireCommandPool = VK_NULL_HANDLE;
+				std::fill(swapchain.acquireCommandBuffers.begin(), swapchain.acquireCommandBuffers.end(), VK_NULL_HANDLE);
+			}
+			if (swapchain.acquireCommandPool == VK_NULL_HANDLE) {
+				VkCommandPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+				poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+				poolInfo.queueFamilyIndex = familyIndex;
+				const VkResult result = vkCreateCommandPool(impl->device, &poolInfo, nullptr, &swapchain.acquireCommandPool);
+				if (result != VK_SUCCESS) return ToRHI(result);
+				swapchain.acquireCommandPoolFamily = familyIndex;
+			}
+			VkCommandBuffer& commandBuffer = swapchain.acquireCommandBuffers[slot];
+			if (commandBuffer == VK_NULL_HANDLE) {
+				VkCommandBufferAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+				allocateInfo.commandPool = swapchain.acquireCommandPool;
+				allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+				allocateInfo.commandBufferCount = 1;
+				const VkResult result = vkAllocateCommandBuffers(impl->device, &allocateInfo, &commandBuffer);
+				if (result != VK_SUCCESS) {
+					commandBuffer = VK_NULL_HANDLE;
+					return ToRHI(result);
+				}
+				VkSetObjectName(impl, reinterpret_cast<uint64_t>(commandBuffer), VK_OBJECT_TYPE_COMMAND_BUFFER,
+					std::format("Swapchain Initial Layout {}", slot).c_str());
+			}
+			VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+			beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+			VkResult result = vkBeginCommandBuffer(commandBuffer, &beginInfo);
+			if (result != VK_SUCCESS) return ToRHI(result);
+			VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+			barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.image = swapchain.images[imageIndex];
+			barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+			// Source ALL_COMMANDS chains to the acquire semaphore's wait stage.
+			vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+			result = vkEndCommandBuffer(commandBuffer);
+			if (result != VK_SUCCESS) return ToRHI(result);
+			out = commandBuffer;
+			return Result::Ok;
+		}
+
+		// The swapchain's acquire timeline (VulkanSwapchain::acquireTimeline), created at the first call. timelinesMutex must be
+		// held: creating it can move the timeline pool.
+		static VulkanTimeline* VkSwapchainAcquireTimeline(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			if (!impl->timelineSemaphoreEnabled) return nullptr;
+			if (swapchain.hasAcquireTimeline) return VkTimelineState(impl, swapchain.acquireTimeline);
+			VkSemaphoreTypeCreateInfo typeInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+			typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+			typeInfo.initialValue = 0;
+			VkSemaphoreCreateInfo createInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+			createInfo.pNext = &typeInfo;
+			VkSemaphore semaphore = VK_NULL_HANDLE;
+			if (vkCreateSemaphore(impl->device, &createInfo, nullptr, &semaphore) != VK_SUCCESS) return nullptr;
+			VkSetObjectName(impl, reinterpret_cast<uint64_t>(semaphore), VK_OBJECT_TYPE_SEMAPHORE, "BasicRHI.SwapchainAcquire");
+			swapchain.acquireTimeline = impl->timelines.alloc(VulkanTimeline{ semaphore, 0 });
+			swapchain.hasAcquireTimeline = true;
+			swapchain.acquireValue = 0;
+			return VkTimelineState(impl, swapchain.acquireTimeline);
+		}
+
+		// Destroys the acquire timeline. The device must be idle.
+		static void VkReleaseSwapchainAcquireTimeline(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			const std::lock_guard timelineLock(impl->timelinesMutex);
+			if (!swapchain.hasAcquireTimeline) return;
+			if (VulkanTimeline* timeline = VkTimelineState(impl, swapchain.acquireTimeline); timeline && timeline->semaphore != VK_NULL_HANDLE) {
+				vkDestroySemaphore(impl->device, timeline->semaphore, nullptr);
+			}
+			impl->timelines.free(swapchain.acquireTimeline);
+			swapchain.acquireTimeline = {};
+			swapchain.hasAcquireTimeline = false;
+			swapchain.acquireValue = 0;
+		}
+
+		// Acquires the next image. The acquire semaphore is waited on the GPU, in a batch on the queue that presented last:
+		// a semaphore wait made by vkQueueSubmit orders every later submission on that queue, so the host does not wait.
+		// The batch also moves an image used for the first time to PRESENT_SRC, and signals the acquire timeline, which
+		// work on other queues waits on (Swapchain::AcquirePoint).
 		static Result VkAcquireNextSwapchainImage(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
-			if (!impl || impl->device == VK_NULL_HANDLE || swapchain.swapchain == VK_NULL_HANDLE ||
-				swapchain.acquireSemaphore == VK_NULL_HANDLE || swapchain.acquireFence == VK_NULL_HANDLE) {
+			if (!impl || impl->device == VK_NULL_HANDLE || swapchain.swapchain == VK_NULL_HANDLE || swapchain.acquireSemaphores.empty()) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			VkResult result = vkResetFences(impl->device, 1, &swapchain.acquireFence);
-			if (result != VK_SUCCESS) {
-				return ToRHI(result);
+			const uint32_t slot = swapchain.nextAcquireSlot;
+			if (swapchain.acquireFencePending[slot]) {
+				// Normally long done: the slot was last used imageCount + 1 acquires ago.
+				VkResult result = vkWaitForFences(impl->device, 1, &swapchain.acquireFences[slot], VK_TRUE, UINT64_MAX);
+				if (result == VK_SUCCESS) result = vkResetFences(impl->device, 1, &swapchain.acquireFences[slot]);
+				if (result != VK_SUCCESS) return ToRHI(result);
+				swapchain.acquireFencePending[slot] = 0;
 			}
 
 			uint32_t imageIndex = 0;
-			result = VkAcquireNextImageKHRHooked(
+			const VkResult result = VkAcquireNextImageKHRHooked(
 				impl->device,
 				swapchain.swapchain,
 				UINT64_MAX,
-				swapchain.acquireSemaphore,
+				swapchain.acquireSemaphores[slot],
 				VK_NULL_HANDLE,
 				&imageIndex);
 			if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
 				return ToRHI(result);
 			}
 
-			const VulkanQueueState* graphicsQueueState = VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
-			if (!graphicsQueueState || graphicsQueueState->queue == VK_NULL_HANDLE) {
+			VulkanQueueState* queueState = VkQueueStateForHandle(impl, swapchain.presentQueue);
+			if (!queueState || queueState->queue == VK_NULL_HANDLE) {
+				queueState = VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
+			}
+			if (!queueState || queueState->queue == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::Failed);
 			}
+
+			VkCommandBuffer initialLayout = VK_NULL_HANDLE;
+			const bool needsInitialLayout = imageIndex < swapchain.imageNeedsInitialLayout.size() && swapchain.imageNeedsInitialLayout[imageIndex];
+			if (needsInitialLayout) {
+				const Result recordResult = VkRecordSwapchainInitialLayout(impl, swapchain, queueState->familyIndex, slot, imageIndex, initialLayout);
+				if (recordResult != Result::Ok) return recordResult;
+			}
+
 			const VkPipelineStageFlags acquireWaitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 			VkSubmitInfo acquireSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
 			acquireSubmit.waitSemaphoreCount = 1;
-			acquireSubmit.pWaitSemaphores = &swapchain.acquireSemaphore;
+			acquireSubmit.pWaitSemaphores = &swapchain.acquireSemaphores[slot];
 			acquireSubmit.pWaitDstStageMask = &acquireWaitStage;
-			const VkResult submitResult = vkQueueSubmit(graphicsQueueState->queue, 1, &acquireSubmit, swapchain.acquireFence);
+			acquireSubmit.commandBufferCount = initialLayout != VK_NULL_HANDLE ? 1u : 0u;
+			acquireSubmit.pCommandBuffers = initialLayout != VK_NULL_HANDLE ? &initialLayout : nullptr;
+			VkResult submitResult = VK_SUCCESS;
+			{
+				// timelinesMutex serializes BasicRHI's submissions to a queue (q_submit holds it too).
+				const std::lock_guard timelineLock(impl->timelinesMutex);
+				// The timeline arrays cover the binary acquire semaphore too (its value is ignored).
+				VulkanTimeline* acquireTimeline = VkSwapchainAcquireTimeline(impl, swapchain);
+				const uint64_t acquireWaitValue = 0;
+				const uint64_t acquireSignalValue = swapchain.acquireValue + 1;
+				VkTimelineSemaphoreSubmitInfo timelineInfo{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+				timelineInfo.waitSemaphoreValueCount = 1;
+				timelineInfo.pWaitSemaphoreValues = &acquireWaitValue;
+				timelineInfo.signalSemaphoreValueCount = 1;
+				timelineInfo.pSignalSemaphoreValues = &acquireSignalValue;
+				if (acquireTimeline) {
+					acquireSubmit.pNext = &timelineInfo;
+					acquireSubmit.signalSemaphoreCount = 1;
+					acquireSubmit.pSignalSemaphores = &acquireTimeline->semaphore;
+				}
+				{
+					const VkQueueAccessGuard queueAccess(impl, queueState->queue);
+					submitResult = vkQueueSubmit(queueState->queue, 1, &acquireSubmit, swapchain.acquireFences[slot]);
+				}
+				if (submitResult == VK_SUCCESS && acquireTimeline) {
+					swapchain.acquireValue = acquireSignalValue;
+					acquireTimeline->lastSubmittedSignalValue = acquireSignalValue;
+				}
+			}
 			if (submitResult != VK_SUCCESS) {
 				return ToRHI(submitResult);
 			}
+			swapchain.acquireFencePending[slot] = 1;
+			swapchain.nextAcquireSlot = (slot + 1) % static_cast<uint32_t>(swapchain.acquireSemaphores.size());
 
-			const VkResult waitResult = vkWaitForFences(impl->device, 1, &swapchain.acquireFence, VK_TRUE, UINT64_MAX);
-			if (waitResult != VK_SUCCESS) {
-				return ToRHI(waitResult);
+			if (needsInitialLayout) {
+				swapchain.imageNeedsInitialLayout[imageIndex] = 0;
+				if (VulkanResource* resource = VkResourceState(impl, swapchain.imageHandles[imageIndex])) {
+					resource->currentLayout = ResourceLayout::Present;
+					resource->currentAccess = ResourceAccessType::Present;
+				}
 			}
 
 			swapchain.currentImageIndex = imageIndex;
-			spdlog::info(
+			spdlog::debug(
 				"Vulkan swapchain acquire: swapchain=0x{:x} imageIndex={} image=0x{:x}",
 				reinterpret_cast<uint64_t>(swapchain.swapchain),
 				imageIndex,
@@ -3689,40 +4879,122 @@ namespace rhi {
 			return ToRHI(result);
 		}
 
-		static VkSurfaceFormatKHR VkChooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& surfaceFormats, Format requestedFormat) noexcept {
-			const VkFormat requestedVkFormat = ToVkFormat(requestedFormat);
-			if (requestedVkFormat != VK_FORMAT_UNDEFINED) {
-				for (const VkSurfaceFormatKHR& format : surfaceFormats) {
-					if (format.format == requestedVkFormat) {
-						return format;
-					}
-				}
-			}
-
-			for (const VkSurfaceFormatKHR& format : surfaceFormats) {
-				if (format.format == VK_FORMAT_B8G8R8A8_UNORM || format.format == VK_FORMAT_R8G8B8A8_UNORM) {
-					return format;
-				}
-			}
-
-			return surfaceFormats.empty() ? VkSurfaceFormatKHR{ VK_FORMAT_UNDEFINED, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR } : surfaceFormats.front();
+		static bool VkHasPresentMode(const std::vector<VkPresentModeKHR>& modes, VkPresentModeKHR mode) noexcept {
+			return std::find(modes.begin(), modes.end(), mode) != modes.end();
 		}
 
-		static VkPresentModeKHR VkChoosePresentMode(const std::vector<VkPresentModeKHR>& presentModes, bool allowTearing) noexcept {
-			if (allowTearing) {
-				for (VkPresentModeKHR mode : presentModes) {
-					if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
-						return mode;
+		// The surface format of a colour space. SrgbNonlinear takes the requested format (then any 8-bit UNORM) in the sRGB
+		// colour space; the HDR colour spaces need their own format and colour space exactly.
+		static bool VkChooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& surfaceFormats, SwapchainColorSpace colorSpace,
+			Format requestedFormat, VkSurfaceFormatKHR& out) noexcept {
+			auto find = [&](VkFormat format, VkColorSpaceKHR space) {
+				for (const VkSurfaceFormatKHR& candidate : surfaceFormats) {
+					if (candidate.format == format && candidate.colorSpace == space) {
+						out = candidate;
+						return true;
 					}
 				}
-				for (VkPresentModeKHR mode : presentModes) {
-					if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
-						return mode;
-					}
-				}
+				return false;
+			};
+			switch (colorSpace) {
+			case SwapchainColorSpace::Hdr10St2084:
+				return find(ToVkFormat(Format::R10G10B10A2_UNorm), VK_COLOR_SPACE_HDR10_ST2084_EXT);
+			case SwapchainColorSpace::ScRgbLinear:
+				return find(ToVkFormat(Format::R16G16B16A16_Float), VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT);
+			case SwapchainColorSpace::SrgbNonlinear:
+				break;
 			}
 
+			const VkFormat requestedVkFormat = ToVkFormat(requestedFormat);
+			if (requestedVkFormat != VK_FORMAT_UNDEFINED && find(requestedVkFormat, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)) return true;
+			if (find(VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) || find(VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)) {
+				return true;
+			}
+			// No sRGB entry: take the requested format in any colour space, as before colour spaces were chosen.
+			for (const VkSurfaceFormatKHR& format : surfaceFormats) {
+				if (format.format == requestedVkFormat) {
+					out = format;
+					return true;
+				}
+			}
+			if (surfaceFormats.empty()) return false;
+			out = surfaceFormats.front();
+			return true;
+		}
+
+		static Result VkQuerySurfaceFormats(VulkanDevice* impl, VkSurfaceKHR surface, std::vector<VkSurfaceFormatKHR>& out) noexcept {
+			uint32_t formatCount = 0;
+			VkResult result = vkGetPhysicalDeviceSurfaceFormatsKHR(impl->physicalDevice, surface, &formatCount, nullptr);
+			if (result != VK_SUCCESS || formatCount == 0) {
+				return result != VK_SUCCESS ? ToRHI(result) : Result::Unsupported;
+			}
+			out.resize(formatCount);
+			result = vkGetPhysicalDeviceSurfaceFormatsKHR(impl->physicalDevice, surface, &formatCount, out.data());
+			out.resize(formatCount);
+			return ToRHI(result);
+		}
+
+		// The present mode for a vsync choice. Vsync on is FIFO. Vsync off tears (IMMEDIATE) when the swapchain allows
+		// tearing, and otherwise is MAILBOX where the swapchain already uses it or can switch to it in a present; failing
+		// those it stays FIFO.
+		static VkPresentModeKHR VkPresentModeForVsync(const VulkanSwapchain& swapchain, bool vsync) noexcept {
+			if (vsync) return VK_PRESENT_MODE_FIFO_KHR;
+			if (swapchain.allowTearing) {
+				if (VkHasPresentMode(swapchain.surfacePresentModes, VK_PRESENT_MODE_IMMEDIATE_KHR)) return VK_PRESENT_MODE_IMMEDIATE_KHR;
+				if (VkHasPresentMode(swapchain.surfacePresentModes, VK_PRESENT_MODE_MAILBOX_KHR)) return VK_PRESENT_MODE_MAILBOX_KHR;
+				return VK_PRESENT_MODE_FIFO_KHR;
+			}
+			if (swapchain.presentMode == VK_PRESENT_MODE_MAILBOX_KHR || VkHasPresentMode(swapchain.switchablePresentModes, VK_PRESENT_MODE_MAILBOX_KHR)) {
+				return VK_PRESENT_MODE_MAILBOX_KHR;
+			}
 			return VK_PRESENT_MODE_FIFO_KHR;
+		}
+
+		// VK_EXT_surface_maintenance1: the modes a swapchain created with presentMode can switch to in a present, and the
+		// largest minImageCount among them. Empty when the device cannot switch.
+		static void VkQuerySwitchablePresentModes(VulkanDevice* impl, VkSurfaceKHR surface, VkPresentModeKHR presentMode,
+			std::vector<VkPresentModeKHR>& out, uint32_t& minImageCount) noexcept {
+			out.clear();
+			if (!impl->swapchainMaintenance1Enabled || !impl->surfaceMaintenance1Enabled) return;
+			auto query = [&](VkPresentModeKHR mode, VkSurfacePresentModeCompatibilityEXT* compatibility, VkSurfaceCapabilitiesKHR& capabilities) {
+				VkSurfacePresentModeEXT modeInfo{ VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT };
+				modeInfo.presentMode = mode;
+				VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR };
+				surfaceInfo.pNext = &modeInfo;
+				surfaceInfo.surface = surface;
+				VkSurfaceCapabilities2KHR capabilities2{ VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR };
+				capabilities2.pNext = compatibility;
+				const VkResult result = vkGetPhysicalDeviceSurfaceCapabilities2KHR(impl->physicalDevice, &surfaceInfo, &capabilities2);
+				capabilities = capabilities2.surfaceCapabilities;
+				return result == VK_SUCCESS;
+			};
+			VkSurfacePresentModeCompatibilityEXT compatibility{ VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT };
+			VkSurfaceCapabilitiesKHR capabilities{};
+			if (!query(presentMode, &compatibility, capabilities) || compatibility.presentModeCount == 0) return;
+			std::vector<VkPresentModeKHR> modes(compatibility.presentModeCount);
+			compatibility.pPresentModes = modes.data();
+			if (!query(presentMode, &compatibility, capabilities)) return;
+			modes.resize(compatibility.presentModeCount);
+			if (modes.size() < 2) return;
+			for (VkPresentModeKHR mode : modes) {
+				if (query(mode, nullptr, capabilities)) minImageCount = (std::max)(minImageCount, capabilities.minImageCount);
+			}
+			out = std::move(modes);
+		}
+
+		static void VkApplyHdrMetadata(VulkanDevice* impl, VulkanSwapchain& swapchain) noexcept {
+			if (!impl->hdrMetadataEnabled || !swapchain.hasHdrMetadata || swapchain.colorSpace == SwapchainColorSpace::SrgbNonlinear) return;
+			const HdrMetadata& m = swapchain.hdrMetadata;
+			VkHdrMetadataEXT metadata{ VK_STRUCTURE_TYPE_HDR_METADATA_EXT };
+			metadata.displayPrimaryRed = { m.redPrimary[0], m.redPrimary[1] };
+			metadata.displayPrimaryGreen = { m.greenPrimary[0], m.greenPrimary[1] };
+			metadata.displayPrimaryBlue = { m.bluePrimary[0], m.bluePrimary[1] };
+			metadata.whitePoint = { m.whitePoint[0], m.whitePoint[1] };
+			metadata.maxLuminance = m.maxLuminance;
+			metadata.minLuminance = m.minLuminance;
+			metadata.maxContentLightLevel = m.maxContentLightLevel;
+			metadata.maxFrameAverageLightLevel = m.maxFrameAverageLightLevel;
+			vkSetHdrMetadataEXT(impl->device, 1, &swapchain.swapchain, &metadata);
 		}
 
 		static uint32_t VkClampSwapchainImageCount(const VkSurfaceCapabilitiesKHR& capabilities, uint32_t requestedCount) noexcept {
@@ -3782,9 +5054,12 @@ namespace rhi {
 			}
 
 			swapchain.imageCount = imageCount;
+			swapchain.imageNeedsInitialLayout.assign(imageCount, 1);
 			return Result::Ok;
 		}
 
+		// Creates the swapchain, or replaces it (resize, colour space, present mode). A replacement must find the device
+		// idle. The first creation picks the present mode from allowTearing; later ones keep swapchain.presentMode.
 		static Result VkCreateOrResizeSwapchain(VulkanDevice* impl, VulkanSwapchain& swapchain, uint32_t width, uint32_t height, Format requestedFormat, uint32_t bufferCount, bool allowTearing) noexcept {
 			if (!impl || impl->device == VK_NULL_HANDLE || impl->physicalDevice == VK_NULL_HANDLE || swapchain.surface == VK_NULL_HANDLE || !impl->swapchainExtensionEnabled) {
 				RHI_FAIL(Result::Unsupported);
@@ -3809,16 +5084,9 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
-			uint32_t formatCount = 0;
-			result = vkGetPhysicalDeviceSurfaceFormatsKHR(impl->physicalDevice, swapchain.surface, &formatCount, nullptr);
-			if (result != VK_SUCCESS || formatCount == 0) {
-				return ToRHI(result);
-			}
-
-			std::vector<VkSurfaceFormatKHR> surfaceFormats(formatCount);
-			result = vkGetPhysicalDeviceSurfaceFormatsKHR(impl->physicalDevice, swapchain.surface, &formatCount, surfaceFormats.data());
-			if (result != VK_SUCCESS) {
-				return ToRHI(result);
+			std::vector<VkSurfaceFormatKHR> surfaceFormats;
+			if (const Result formatsResult = VkQuerySurfaceFormats(impl, swapchain.surface, surfaceFormats); formatsResult != Result::Ok) {
+				return formatsResult;
 			}
 
 			uint32_t presentModeCount = 0;
@@ -3833,19 +5101,48 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
-			const VkSurfaceFormatKHR surfaceFormat = VkChooseSurfaceFormat(surfaceFormats, requestedFormat);
-			if (surfaceFormat.format == VK_FORMAT_UNDEFINED) {
+			VkSurfaceFormatKHR surfaceFormat{ VK_FORMAT_UNDEFINED, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+			if (!VkChooseSurfaceFormat(surfaceFormats, swapchain.colorSpace, requestedFormat, surfaceFormat) || surfaceFormat.format == VK_FORMAT_UNDEFINED) {
 				RHI_FAIL(Result::Unsupported);
 			}
 
+			swapchain.allowTearing = allowTearing;
+			swapchain.surfacePresentModes = presentModes;
+			VkPresentModeKHR presentMode = swapchain.presentMode;
+			if (swapchain.swapchain == VK_NULL_HANDLE) {
+				// Vsync off is the likelier first present when tearing is allowed (it keeps the mode creation used to pick).
+				presentMode = VkPresentModeForVsync(swapchain, !allowTearing);
+			}
+			if (!VkHasPresentMode(presentModes, presentMode)) {
+				presentMode = VK_PRESENT_MODE_FIFO_KHR;
+			}
+
 			const VkExtent2D extent = VkChooseSwapchainExtent(capabilities, width, height);
-			const uint32_t imageCount = VkClampSwapchainImageCount(capabilities, bufferCount);
-			const VkPresentModeKHR presentMode = VkChoosePresentMode(presentModes, allowTearing);
+			std::vector<VkPresentModeKHR> switchableModes;
+			uint32_t switchableMinImageCount = 0;
+			VkQuerySwitchablePresentModes(impl, swapchain.surface, presentMode, switchableModes, switchableMinImageCount);
+			const uint32_t imageCount = (std::max)(VkClampSwapchainImageCount(capabilities, bufferCount),
+				capabilities.maxImageCount != 0 ? (std::min)(switchableMinImageCount, capabilities.maxImageCount) : switchableMinImageCount);
 
 			std::vector<ResourceHandle> oldImageHandles = std::move(swapchain.imageHandles);
 			std::vector<VkImage> oldImages = std::move(swapchain.images);
 			std::vector<VkSemaphore> oldPresentWaitSemaphores = std::move(swapchain.presentWaitSemaphores);
+			std::vector<uint8_t> oldNeedsInitialLayout = std::move(swapchain.imageNeedsInitialLayout);
+			const uint32_t oldImageCount = swapchain.imageCount;
 			VkSwapchainKHR oldSwapchain = swapchain.swapchain;
+			auto restoreOld = [&](VkSwapchainKHR newSwapchain) {
+				if (newSwapchain != VK_NULL_HANDLE) {
+					VkReleaseSwapchainImageHandles(impl, swapchain);
+					VkReleaseSwapchainPresentSemaphores(impl, swapchain);
+					VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
+				}
+				swapchain.swapchain = oldSwapchain;
+				swapchain.imageHandles = std::move(oldImageHandles);
+				swapchain.images = std::move(oldImages);
+				swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
+				swapchain.imageNeedsInitialLayout = std::move(oldNeedsInitialLayout);
+				swapchain.imageCount = oldImageCount;
+			};
 
 			VkSwapchainCreateInfoKHR createInfo{ VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
 			createInfo.surface = swapchain.surface;
@@ -3861,72 +5158,45 @@ namespace rhi {
 			createInfo.presentMode = presentMode;
 			createInfo.clipped = VK_TRUE;
 			createInfo.oldSwapchain = oldSwapchain;
+			VkSwapchainPresentModesCreateInfoEXT presentModesInfo{ VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT };
+			if (!switchableModes.empty()) {
+				presentModesInfo.presentModeCount = static_cast<uint32_t>(switchableModes.size());
+				presentModesInfo.pPresentModes = switchableModes.data();
+				createInfo.pNext = &presentModesInfo;
+			}
 
 			VkSwapchainKHR newSwapchain = VK_NULL_HANDLE;
 			result = VkCreateSwapchainKHRHooked(impl->device, &createInfo, nullptr, &newSwapchain);
 			if (result != VK_SUCCESS) {
-				swapchain.imageHandles = std::move(oldImageHandles);
-				swapchain.images = std::move(oldImages);
-				swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
-				swapchain.swapchain = oldSwapchain;
+				restoreOld(VK_NULL_HANDLE);
 				return ToRHI(result);
 			}
 
 			swapchain.swapchain = newSwapchain;
 			swapchain.format = surfaceFormat.format;
 			swapchain.rhiFormat = FromVkFormat(surfaceFormat.format);
+			swapchain.sdrFormat = requestedFormat;
 			swapchain.width = extent.width;
 			swapchain.height = extent.height;
-			swapchain.allowTearing = allowTearing;
-
-			if (swapchain.acquireFence == VK_NULL_HANDLE) {
-				VkFenceCreateInfo fenceCreateInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-				result = vkCreateFence(impl->device, &fenceCreateInfo, nullptr, &swapchain.acquireFence);
-				if (result != VK_SUCCESS) {
-					VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
-					swapchain.swapchain = oldSwapchain;
-					swapchain.imageHandles = std::move(oldImageHandles);
-					swapchain.images = std::move(oldImages);
-					swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
-					return ToRHI(result);
-				}
-			}
-			if (swapchain.acquireSemaphore == VK_NULL_HANDLE) {
-				VkSemaphoreCreateInfo semaphoreCreateInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-				result = vkCreateSemaphore(impl->device, &semaphoreCreateInfo, nullptr, &swapchain.acquireSemaphore);
-				if (result != VK_SUCCESS) {
-					VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
-					swapchain.swapchain = oldSwapchain;
-					swapchain.imageHandles = std::move(oldImageHandles);
-					swapchain.images = std::move(oldImages);
-					swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
-					return ToRHI(result);
-				}
-				VkSetObjectName(impl, reinterpret_cast<uint64_t>(swapchain.acquireSemaphore), VK_OBJECT_TYPE_SEMAPHORE, "Swapchain Acquire Semaphore");
-			}
+			swapchain.presentMode = presentMode;
+			swapchain.switchablePresentModes = std::move(switchableModes);
 
 			const Result populateResult = VkPopulateSwapchainImages(impl, swapchain);
 			if (populateResult != Result::Ok) {
-				VkReleaseSwapchainImageHandles(impl, swapchain);
-				VkReleaseSwapchainPresentSemaphores(impl, swapchain);
-				VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
-				swapchain.swapchain = oldSwapchain;
-				swapchain.imageHandles = std::move(oldImageHandles);
-				swapchain.images = std::move(oldImages);
-				swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
+				restoreOld(newSwapchain);
 				return populateResult;
 			}
 
 			const Result semaphoreResult = VkCreateSwapchainPresentSemaphores(impl, swapchain);
 			if (semaphoreResult != Result::Ok) {
-				VkReleaseSwapchainImageHandles(impl, swapchain);
-				VkReleaseSwapchainPresentSemaphores(impl, swapchain);
-				VkDestroySwapchainKHRHooked(impl->device, newSwapchain, nullptr);
-				swapchain.swapchain = oldSwapchain;
-				swapchain.imageHandles = std::move(oldImageHandles);
-				swapchain.images = std::move(oldImages);
-				swapchain.presentWaitSemaphores = std::move(oldPresentWaitSemaphores);
+				restoreOld(newSwapchain);
 				return semaphoreResult;
+			}
+
+			const Result slotsResult = VkCreateSwapchainAcquireSlots(impl, swapchain);
+			if (slotsResult != Result::Ok) {
+				restoreOld(newSwapchain);
+				return slotsResult;
 			}
 
 			for (const ResourceHandle handle : oldImageHandles) {
@@ -3945,6 +5215,10 @@ namespace rhi {
 				VkDestroySwapchainKHRHooked(impl->device, oldSwapchain, nullptr);
 			}
 
+			VkApplyHdrMetadata(impl, swapchain);
+			spdlog::info("Vulkan swapchain: {}x{} images={} format={} colorSpace={} presentMode={} switchableModes={}",
+				extent.width, extent.height, swapchain.imageCount, static_cast<int>(surfaceFormat.format), static_cast<int>(surfaceFormat.colorSpace),
+				static_cast<int>(presentMode), swapchain.switchablePresentModes.size());
 			return VkAcquireNextSwapchainImage(impl, swapchain);
 		}
 
@@ -3966,6 +5240,34 @@ namespace rhi {
 				}
 			}
 			return total;
+		}
+
+		// Every heap's budget and usage: VK_EXT_memory_budget's when it is enabled, otherwise the heap's size as its budget and
+		// no usage. Writes up to capacity heaps and returns the heap count.
+		static uint32_t VkQueryHeapBudgets(const VulkanDevice& impl, vulkan::MemoryHeapBudget* out, uint32_t capacity) noexcept {
+			VkPhysicalDeviceMemoryBudgetPropertiesEXT budgetProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+			VkPhysicalDeviceMemoryProperties2 properties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2 };
+			const bool hasBudget = impl.memoryBudgetEnabled && vkGetPhysicalDeviceMemoryProperties2 != nullptr;
+			if (hasBudget) {
+				properties.pNext = &budgetProperties;
+				vkGetPhysicalDeviceMemoryProperties2(impl.physicalDevice, &properties);
+			} else {
+				properties.memoryProperties = impl.memoryProperties;
+			}
+			const VkPhysicalDeviceMemoryProperties& memory = properties.memoryProperties;
+			const uint32_t count = (std::min)(memory.memoryHeapCount, static_cast<uint32_t>(VK_MAX_MEMORY_HEAPS));
+			for (uint32_t heapIndex = 0; out && heapIndex < (std::min)(count, capacity); ++heapIndex) {
+				vulkan::MemoryHeapBudget& heap = out[heapIndex];
+				heap = {};
+				heap.heapIndex = heapIndex;
+				heap.flags = memory.memoryHeaps[heapIndex].flags;
+				heap.heapSize = memory.memoryHeaps[heapIndex].size;
+				heap.hasBudget = hasBudget;
+				heap.budget = hasBudget ? budgetProperties.heapBudget[heapIndex] : heap.heapSize;
+				heap.usage = hasBudget ? budgetProperties.heapUsage[heapIndex] : 0;
+				heap.usageAtBudget = hasBudget && heap.budget != 0 && heap.usage >= heap.budget;
+			}
+			return count;
 		}
 
 		static QueryResultInfo qp_getQueryResultInfo(QueryPool* qp) noexcept {
@@ -4096,7 +5398,7 @@ namespace rhi {
 			if (vkGetSemaphoreCounterValue(impl->device, timelineState->semaphore, &value) != VK_SUCCESS) {
 				return 0;
 			}
-			if (value == UINT64_MAX && timelineState->lastSubmittedSignalValue != UINT64_MAX) {
+			if (value == UINT64_MAX && timelineState->lastSubmittedSignalValue != UINT64_MAX && !std::atomic_ref<bool>(timelineState->poisonReported).exchange(true)) {
 				const TimelineHandle handle = timeline->GetHandle();
 				spdlog::critical(
 					"Vulkan timeline(idx={}, gen={}) reports completed UINT64_MAX, but BasicRHI highest submitted signal is {}. Raw semaphore={}, suggesting an external signal path or semaphore object corruption.",
@@ -4105,6 +5407,10 @@ namespace rhi {
 					timelineState->lastSubmittedSignalValue,
 					reinterpret_cast<uint64_t>(timelineState->semaphore));
 				spdlog::critical("Vulkan poisoned timeline kind={}", timelineState->importedD3D12Fence ? "imported-d3d12-fence" : "native-vulkan");
+				// Windows sets a removed device's fences to UINT64_MAX: on an adopted device this is often the first sign of a lost
+				// device BasicRHI sees, since the host submits. The crash markers say which of BasicRHI's lists were still running.
+				const std::string where = std::format("Vulkan timeline(idx={})", handle.index);
+				VkReportDeviceLoss(impl, where.c_str(), "the device looks lost (a timeline read UINT64_MAX)");
 			}
 			return value;
 		}
@@ -4142,7 +5448,7 @@ namespace rhi {
 				}
 			}
 			impl->timelinesCondition.notify_all();
-			return ToRHI(waitResult);
+			return ToRHI(VkCheckDeviceLost(impl, waitResult, "Timeline::HostWait"));
 		}
 
 		class VulkanCompletionWait final : public CompletionWait {
@@ -4196,7 +5502,7 @@ namespace rhi {
 					info.semaphoreCount = points.size + 1;
 					info.pSemaphores = semaphores.data();
 					info.pValues = values.data();
-					result = ToRHI(vkWaitSemaphores(m_device->device, &info, UINT64_MAX));
+					result = ToRHI(VkCheckDeviceLost(m_device, vkWaitSemaphores(m_device->device, &info, UINT64_MAX), "CompletionWait::Wait"));
 					std::lock_guard lock(m_mutex);
 					m_waiting = false;
 				}
@@ -4415,19 +5721,6 @@ namespace rhi {
 
 		// Brackets host access to a VkQueue with the adopting host's submission lock
 		// (AdoptVulkanDevice). A no-op for devices BasicRHI created itself.
-		struct VkQueueAccessGuard {
-			VulkanDevice* impl;
-			VkQueue queue;
-			VkQueueAccessGuard(VulkanDevice* device, VkQueue vkQueue) noexcept : impl(device), queue(vkQueue) {
-				if (impl && impl->submissionLock) impl->submissionLock(impl->submissionHookUser, queue);
-			}
-			~VkQueueAccessGuard() {
-				if (impl && impl->submissionUnlock) impl->submissionUnlock(impl->submissionHookUser, queue);
-			}
-			VkQueueAccessGuard(const VkQueueAccessGuard&) = delete;
-			VkQueueAccessGuard& operator=(const VkQueueAccessGuard&) = delete;
-		};
-
 		// Host-waits for everything BasicRHI submitted (its timelines' last signalled
 		// values). Used instead of vkDeviceWaitIdle on adopted devices, whose queues
 		// the host keeps submitting to and whose whole-device wait would need every
@@ -4449,7 +5742,23 @@ namespace rhi {
 			waitInfo.semaphoreCount = static_cast<uint32_t>(semaphores.size());
 			waitInfo.pSemaphores = semaphores.data();
 			waitInfo.pValues = values.data();
-			return ToRHI(vkWaitSemaphores(impl->device, &waitInfo, UINT64_MAX));
+			return ToRHI(VkCheckDeviceLost(impl, vkWaitSemaphores(impl->device, &waitInfo, UINT64_MAX), "Device::WaitIdle"));
+		}
+
+		// A whole-device wait: vkDeviceWaitIdle on a device only BasicRHI submits to, its own timelines on one a host owns or a
+		// guest shares (ShareVulkanDevice), whose other submitters vkDeviceWaitIdle would race.
+		static Result VkWaitDeviceIdle(VulkanDevice* impl) noexcept {
+			if (!impl->ownsDevice) return VkWaitForSubmittedTimelines(impl);
+			if (impl->sharedQueues) {
+				// A device shared with a guest that submits itself under the hooks' lock: the lock (with no queue: every queue)
+				// makes the guest's submissions wait, so the whole device can go idle. Presents count too, which no timeline
+				// wait covers: a swapchain is destroyed only after its presents.
+				const VulkanDevice::SubmissionHooks* hooks = impl->submissionHooks.load(std::memory_order_acquire);
+				if (!hooks || !hooks->lock || hooks->submit) return VkWaitForSubmittedTimelines(impl);
+				const VkQueueAccessGuard queueAccess(impl, VK_NULL_HANDLE);
+				return ToRHI(VkDeviceWaitIdleHooked(impl->device));
+			}
+			return ToRHI(VkDeviceWaitIdleHooked(impl->device));
 		}
 
 		// The queue's progress timeline, made on first use. timelinesMutex is held: allocating can move the timeline pool, so
@@ -4638,7 +5947,8 @@ namespace rhi {
 			submitInfo.pSignalSemaphores = signalSemaphores.empty() ? nullptr : signalSemaphores.data();
 
 			Result submitResult = Result::Ok;
-			if (impl->submissionSubmit) {
+			const VulkanDevice::SubmissionHooks* hooks = impl->submissionHooks.load(std::memory_order_acquire);
+			if (hooks && hooks->submit) {
 				// The adopting host orders the batch within its own queue stream.
 				std::vector<VkSemaphoreSubmitInfo> waitInfos(waitSemaphores.size(), { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO });
 				for (size_t index = 0; index < waitInfos.size(); ++index) {
@@ -4663,11 +5973,11 @@ namespace rhi {
 				submitInfo2.pCommandBufferInfos = commandBufferInfos.empty() ? nullptr : commandBufferInfos.data();
 				submitInfo2.signalSemaphoreInfoCount = static_cast<uint32_t>(signalInfos.size());
 				submitInfo2.pSignalSemaphoreInfos = signalInfos.empty() ? nullptr : signalInfos.data();
-				submitResult = ToRHI(impl->submissionSubmit(impl->submissionHookUser, queueState->queue, submitInfo2));
+				submitResult = ToRHI(hooks->submit(hooks->user, queueState->queue, submitInfo2));
 			}
 			else {
 				const VkQueueAccessGuard queueAccess(impl, queueState->queue);
-				submitResult = ToRHI(vkQueueSubmit(queueState->queue, 1, &submitInfo, VK_NULL_HANDLE));
+				submitResult = ToRHI(VkCheckDeviceLost(impl, vkQueueSubmit(queueState->queue, 1, &submitInfo, VK_NULL_HANDLE), "Queue::Submit"));
 			}
 			if (submitResult == Result::Ok) {
 				for (uint32_t index = 0; index < lists.size; ++index) {
@@ -4900,6 +6210,7 @@ namespace rhi {
 			auto* impl = resource ? static_cast<VulkanDevice*>(resource->impl) : nullptr;
 			VulkanResource* resourceState = VkResourceState(impl, resource ? resource->GetHandle() : ResourceHandle{});
 			if (resourceState) {
+				VkKeepResourceName(*resourceState, name);
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(resourceState->buffer), VK_OBJECT_TYPE_BUFFER, name);
 			}
 		}
@@ -4976,6 +6287,9 @@ namespace rhi {
 				return commandListState->pendingError;
 			}
 
+			if (auto* impl = static_cast<VulkanDevice*>(commandList->impl); impl && impl->crashMarkers.enabled) {
+				VkWriteCrashMarker(impl, *commandListState, "command list end");
+			}
 			const VkResult result = vkEndCommandBuffer(commandListState->commandBuffer);
 			if (result != VK_SUCCESS) {
 				spdlog::error("Vulkan command list end failed with VkResult {}", static_cast<int>(result));
@@ -5087,6 +6401,7 @@ namespace rhi {
 					if (VulkanCommandAllocator* oldAllocator = VkAllocatorState(impl, commandListState->allocatorHandle);
 						oldAllocator && oldAllocator->pool != VK_NULL_HANDLE) {
 						vkFreeCommandBuffers(impl->device, oldAllocator->pool, 1, &commandListState->commandBuffer);
+						g_liveCommandBuffers.fetch_sub(1, std::memory_order_relaxed);
 					}
 					commandListState->commandBuffer = VK_NULL_HANDLE;
 				}
@@ -5100,7 +6415,8 @@ namespace rhi {
 				commandListState->commandBuffer = newCommandBuffer;
 			}
 			else {
-				const VkResult resetResult = vkResetCommandBuffer(commandListState->commandBuffer, 0);
+				const VkResult resetResult = vkResetCommandBuffer(commandListState->commandBuffer,
+					ReleaseCommandMemoryOnReset() ? VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT : 0);
 				if (resetResult != VK_SUCCESS) {
 					spdlog::error("Vulkan command list reset failed with VkResult {}", static_cast<int>(resetResult));
 					return;
@@ -5114,10 +6430,16 @@ namespace rhi {
 				spdlog::error("Vulkan command list reset failed to begin recording");
 				return;
 			}
+			commandListState->crashLabelStack.clear();
+			if (!commandListState->secondary) VkWriteCrashMarker(impl, *commandListState, "command list begin");
 
 			commandListState->passActive = false;
 			commandListState->boundLayout = {};
 			commandListState->boundPipeline = {};
+			commandListState->stencilReference = 0;
+			commandListState->stencilReferenceApplied = false;
+			std::fill(std::begin(commandListState->blendConstants), std::end(commandListState->blendConstants), 1.0f);
+			commandListState->blendConstantsApplied = false;
 			commandListState->boundCbvSrvUavHeap = {};
 			commandListState->boundSamplerHeap = {};
 			commandListState->emittedCbvSrvUavHeap = {};
@@ -5126,9 +6448,7 @@ namespace rhi {
 			commandListState->recordedBarrierBatches.clear();
 			commandListState->recordingTextureStates.clear();
 			commandListState->recordingBufferStates.clear();
-			for (auto& page : commandListState->emulatedRootConstantScratchPages) {
-				page.cursor = 0;
-			}
+			VkReturnEmulatedRootConstantScratchPages(impl, *commandListState);
 			VkReturnGeneratedCommandsPreprocessPages(impl, *commandListState);
 			commandListState->preprocessedIndirect.clear();
 			commandListState->preprocessBarrierPending = false;
@@ -5137,6 +6457,9 @@ namespace rhi {
 			commandListState->pushedDataDirty = false;
 			commandListState->spilledDataDirty = false;
 			commandListState->passRenderArea = {};
+			commandListState->scissors = {};
+			commandListState->emptyViewportMask = 0;
+			commandListState->placeholderInputBindPending = false;
 			commandListState->passColorResources.clear();
 			commandListState->passDepthResource = {};
 			commandListState->continuesRendering = false;
@@ -5177,6 +6500,79 @@ namespace rhi {
 			vkCmdPipelineBarrier(commandListState.commandBuffer, VK_PIPELINE_STAGE_COMMAND_PREPROCESS_BIT_EXT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1,
 				&barrier, 0, nullptr, 0, nullptr);
 			commandListState.preprocessBarrierPending = false;
+		}
+
+		// A D3D-convention viewport (top-left origin, y down) as the flipped Vulkan viewport every pass renders with: it
+		// starts at the bottom of the rectangle and grows upwards, which puts the image the same way up as D3D's.
+		static VkViewport VkFlippedViewport(float x, float y, float width, float height, float minDepth, float maxDepth) noexcept {
+			VkViewport viewport{};
+			viewport.x = x;
+			viewport.width = width;
+			viewport.y = y + height;
+			viewport.height = -height;
+			viewport.minDepth = minDepth;
+			viewport.maxDepth = maxDepth;
+			return viewport;
+		}
+
+		// D3D takes a viewport with no area and draws nothing in it. Vulkan needs a positive width and a nonzero height, so
+		// such a viewport is set as 1x1 and its scissor as empty (VkApplyScissors), as DXVK does.
+		static bool VkViewportEmpty(float width, float height) noexcept {
+			return !(width > 0.0f) || !(height > 0.0f);
+		}
+
+		static VkViewport VkFlippedViewportOrPlaceholder(float x, float y, float width, float height, float minDepth, float maxDepth) noexcept {
+			if (VkViewportEmpty(width, height)) {
+				return VkFlippedViewport(0.0f, 0.0f, 1.0f, 1.0f, minDepth, maxDepth);
+			}
+			return VkFlippedViewport(x, y, width, height, minDepth, maxDepth);
+		}
+
+		// A scissor rectangle Vulkan takes: no negative offset (the part outside the target is cut off, as D3D does) and
+		// offset plus extent within int32_t.
+		static VkRect2D VkClampScissor(int64_t x, int64_t y, int64_t width, int64_t height) noexcept {
+			const int64_t cutX = x < 0 ? -x : 0;
+			const int64_t cutY = y < 0 ? -y : 0;
+			const int64_t offsetX = (std::min)((std::max)(x, int64_t{ 0 }), int64_t{ INT32_MAX });
+			const int64_t offsetY = (std::min)((std::max)(y, int64_t{ 0 }), int64_t{ INT32_MAX });
+			VkRect2D rect{};
+			rect.offset = { static_cast<int32_t>(offsetX), static_cast<int32_t>(offsetY) };
+			rect.extent.width = static_cast<uint32_t>((std::clamp)(width - cutX, int64_t{ 0 }, int64_t{ INT32_MAX } - offsetX));
+			rect.extent.height = static_cast<uint32_t>((std::clamp)(height - cutY, int64_t{ 0 }, int64_t{ INT32_MAX } - offsetY));
+			return rect;
+		}
+
+		// Records scissors first..first+count-1 from the list's stored scissors, empty where the viewport is empty.
+		static void VkApplyScissors(VulkanCommandList& commandListState, uint32_t first, uint32_t count) noexcept {
+			std::array<VkRect2D, MAX_VIEWPORTS> native{};
+			for (uint32_t i = 0; i < count; ++i) {
+				const uint32_t index = first + i;
+				native[i] = (commandListState.emptyViewportMask & (1u << index)) != 0 ? VkRect2D{} : commandListState.scissors[index];
+			}
+			vkCmdSetScissor(commandListState.commandBuffer, first, count, native.data());
+		}
+
+		// Viewport 0 and scissor 0 as BeginPass and BeginSecondary set them: the render area.
+		static void VkSetRenderAreaViewport(VulkanCommandList& commandListState, uint32_t x, uint32_t y, uint32_t width, uint32_t height,
+			float minDepth, float maxDepth) noexcept {
+			const VkViewport viewport = VkFlippedViewportOrPlaceholder(static_cast<float>(x), static_cast<float>(y),
+				static_cast<float>(width), static_cast<float>(height), minDepth, maxDepth);
+			vkCmdSetViewport(commandListState.commandBuffer, 0, 1, &viewport);
+			if (VkViewportEmpty(static_cast<float>(width), static_cast<float>(height))) {
+				commandListState.emptyViewportMask |= 1u;
+			} else {
+				commandListState.emptyViewportMask &= ~1u;
+			}
+			commandListState.scissors[0] = VkClampScissor(x, y, width, height);
+			VkApplyScissors(commandListState, 0, 1);
+		}
+
+		// How many viewports and scissors a list may set: 1 without multiViewport.
+		static uint32_t VMAX_VIEWPORTS(const VulkanDevice* impl) noexcept {
+			if (impl->supportedFeatures.multiViewport != VK_TRUE) {
+				return 1;
+			}
+			return (std::min)(impl->physicalDeviceProperties.limits.maxViewports, MAX_VIEWPORTS);
 		}
 
 		static void cl_beginPass(CommandList* commandList, const PassBeginInfo& passInfo) noexcept {
@@ -5292,20 +6688,8 @@ namespace rhi {
 				return;  // only vkCmdExecuteCommands until the pass ends; each secondary sets its own viewport and scissor
 			}
 
-			VkViewport viewport{};
-			viewport.x = static_cast<float>(passInfo.x);
-			viewport.width = static_cast<float>(passInfo.width);
-			// Flipped: the viewport starts at the bottom of the render area and grows upwards.
-			viewport.y = static_cast<float>(passInfo.y + passInfo.height);
-			viewport.height = -static_cast<float>(passInfo.height);
-			viewport.minDepth = passInfo.minDepth;
-			viewport.maxDepth = passInfo.maxDepth;
-			vkCmdSetViewport(commandListState->commandBuffer, 0, 1, &viewport);
-
-			VkRect2D scissor{};
-			scissor.offset = { static_cast<int32_t>(passInfo.x), static_cast<int32_t>(passInfo.y) };
-			scissor.extent = { passInfo.width, passInfo.height };
-			vkCmdSetScissor(commandListState->commandBuffer, 0, 1, &scissor);
+			VkSetRenderAreaViewport(*commandListState, passInfo.x, passInfo.y, passInfo.width, passInfo.height, passInfo.minDepth,
+				passInfo.maxDepth);
 		}
 
 		static void cl_endPass(CommandList* commandList) noexcept {
@@ -5320,6 +6704,10 @@ namespace rhi {
 			}
 
 			vkCmdEndRendering(commandListState->commandBuffer);
+			if (commandListState->placeholderInputBindPending) {
+				VkBindPlaceholderInputBuffers(impl, *commandListState);
+				commandListState->placeholderInputBindPending = false;
+			}
 
 			commandListState->passColorResources.clear();
 			commandListState->passDepthResource = {};
@@ -5438,7 +6826,11 @@ namespace rhi {
 					&& barrier.afterLayout == ResourceLayout::Common) {
 					continue;
 				}
-				vkBarrier.srcAccessMask = (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire || internalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
+				// A discard that names a before sync follows earlier work on the same memory (an aliased image's previous occupant):
+				// the contents go, but its first use waits for that work and its writes are made available first.
+				const bool orderedDiscard = barrier.discard && barrier.beforeSync != ResourceSyncState::None;
+				vkBarrier.srcAccessMask = orderedDiscard ? VK_ACCESS_MEMORY_WRITE_BIT
+					: (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire || internalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
 				vkBarrier.dstAccessMask = (afterPresent || externalRelease || internalRelease) ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
 				// A simultaneous-access image stays in GENERAL (VkCommandLayout): its passes and descriptors name GENERAL, and so does its owner
 				// (DXVK) between them. Only an undefined first use or a discard leaves GENERAL out of the old layout.
@@ -5453,7 +6845,8 @@ namespace rhi {
 				imageBarriers.push_back(vkBarrier);
 				const bool beforeTransferClear = (barrier.beforeAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
 				const bool afterTransferClear = (barrier.afterAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
-				srcStages |= (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire || internalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (VkStageMaskForSync(barrier.beforeSync) | (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
+				srcStages |= orderedDiscard ? VkStageMaskForSync(barrier.beforeSync)
+					: (barrier.discard || firstUseFromUndefined || beforePresent || externalAcquire || internalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : (VkStageMaskForSync(barrier.beforeSync) | (beforeTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
 				dstStages |= (afterPresent || externalRelease || internalRelease) ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : (VkStageMaskForSync(barrier.afterSync) | (afterTransferClear ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0));
 				if (impl->validateBarrierTransitions) {
 					recordedBatch.textures.push_back(VulkanCommandList::RecordedTextureBarrier{
@@ -5493,7 +6886,10 @@ namespace rhi {
 					barrier.afterAccess == ResourceAccessType::Common) {
 					continue;
 				}
-				vkBarrier.srcAccessMask = (barrier.discard || externalAcquire || internalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
+				// As for images: a discard that names a before sync follows the memory's earlier work.
+				const bool orderedDiscard = barrier.discard && barrier.beforeSync != ResourceSyncState::None;
+				vkBarrier.srcAccessMask = orderedDiscard ? VK_ACCESS_MEMORY_WRITE_BIT
+					: (barrier.discard || externalAcquire || internalAcquire) ? 0 : VkAccessMaskForAccess(barrier.beforeAccess);
 				vkBarrier.dstAccessMask = (externalRelease || internalRelease) ? 0 : VkAccessMaskForAccess(barrier.afterAccess);
 				// A concurrent resource belongs to no single family: its external transfers name EXTERNAL and IGNORED.
 				const uint32_t externalLocalFamily = resource->concurrentSharing ? VK_QUEUE_FAMILY_IGNORED : recordingFamily;
@@ -5504,7 +6900,8 @@ namespace rhi {
 				vkBarrier.offset = barrier.offset;
 				vkBarrier.size = barrier.size == ~0ull ? VK_WHOLE_SIZE : barrier.size;
 				bufferBarriers.push_back(vkBarrier);
-				srcStages |= (barrier.discard || externalAcquire || internalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VkStageMaskForSync(barrier.beforeSync);
+				srcStages |= orderedDiscard ? VkStageMaskForSync(barrier.beforeSync)
+					: (barrier.discard || externalAcquire || internalAcquire) ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VkStageMaskForSync(barrier.beforeSync);
 				dstStages |= (externalRelease || internalRelease) ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VkStageMaskForSync(barrier.afterSync);
 				if (impl->validateBarrierTransitions) {
 					recordedBatch.buffers.push_back(VulkanCommandList::RecordedBufferBarrier{
@@ -5656,9 +7053,9 @@ namespace rhi {
 		// preprocess and runs the execution, so the scratch lives as long as both, whatever becomes of stateList) with that
 		// address at the layout's spillAddressOffset. Pushed whole onto stateList now and onto the executing list before the
 		// execution, so both see identical push constants.
-		static_assert(VulkanDescriptorBufferModel::kPushConstantBytes == sizeof(VulkanCommandList::PreprocessedIndirect::pushConstants));
+		static_assert(VulkanDescriptorBufferModel::kMaxPushConstantBytes == sizeof(VulkanCommandList::PreprocessedIndirect::pushConstants));
 		static bool VkBufferModelPreprocessPushConstants(VulkanDevice* impl, VulkanCommandList& stateList, VulkanCommandList& a_scratchList,
-			std::array<uint8_t, VulkanDescriptorBufferModel::kPushConstantBytes>& outImage) noexcept {
+			std::array<uint8_t, VulkanDescriptorBufferModel::kMaxPushConstantBytes>& outImage) noexcept {
 			outImage.fill(0u);
 			const VulkanPipelineLayout* layoutState = VkPipelineLayoutState(impl, stateList.boundLayout);
 			if (!layoutState || !layoutState->usesDescriptorBuffer) {
@@ -5682,7 +7079,7 @@ namespace rhi {
 				std::memcpy(outImage.data() + layoutState->spillAddressOffset, &spillAddress, sizeof(spillAddress));
 			}
 			vkCmdPushConstants(stateList.commandBuffer, impl->descriptorBuffer.pipelineLayout, VK_SHADER_STAGE_ALL, 0,
-				static_cast<uint32_t>(outImage.size()), outImage.data());
+				impl->descriptorBuffer.pushConstantBytes, outImage.data());
 			// The state list's own commands upload their spill again: this one is the executing list's.
 			stateList.pushedDataDirty = false;
 			stateList.spilledDataDirty = layoutState->spillAddressOffset != vulkan_binding::kNoSpill;
@@ -5710,6 +7107,26 @@ namespace rhi {
 			}
 		}
 
+		// D3D12 keeps the stencil reference on the command list, whatever pipeline is bound. Vulkan loses dynamic state
+		// when a pipeline that has it static is bound, so the list keeps the value and sets it again for the next pipeline
+		// that reads it.
+		static void VkApplyFixedFunctionState(VulkanCommandList& commandListState, const VulkanPipeline& pipelineState) noexcept {
+			if (!pipelineState.dynamicStencilReference) {
+				commandListState.stencilReferenceApplied = false;
+			}
+			else if (!commandListState.stencilReferenceApplied) {
+				vkCmdSetStencilReference(commandListState.commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, commandListState.stencilReference);
+				commandListState.stencilReferenceApplied = true;
+			}
+			if (!pipelineState.dynamicBlendConstants) {
+				commandListState.blendConstantsApplied = false;
+			}
+			else if (!commandListState.blendConstantsApplied) {
+				vkCmdSetBlendConstants(commandListState.commandBuffer, commandListState.blendConstants);
+				commandListState.blendConstantsApplied = true;
+			}
+		}
+
 		static void cl_bindPipeline(CommandList* commandList, PipelineHandle pipeline) noexcept {
 			ZoneScopedN("RHI.Vulkan.BindPipeline");
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
@@ -5725,6 +7142,87 @@ namespace rhi {
 
 			VkCmdBindPipelineHooked(commandListState->commandBuffer, pipelineState->bindPoint, pipelineState->pipeline);
 			commandListState->boundPipeline = pipeline;
+			if (pipelineState->bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+				VkApplyFixedFunctionState(*commandListState, *pipelineState);
+			}
+		}
+
+		static void cl_setStencilRef(CommandList* commandList, uint32_t reference) noexcept {
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!impl || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE) {
+				return;
+			}
+			commandListState->stencilReference = reference;
+			// Only a bound pipeline that declares the state takes it now: setting dynamic state a pipeline has static is invalid
+			// (VUID-vkCmdDraw-None-08608). Otherwise the next pipeline that reads it gets it at its bind.
+			const VulkanPipeline* pipelineState = VkPipelineState(impl, commandListState->boundPipeline);
+			if (pipelineState && pipelineState->bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && pipelineState->dynamicStencilReference) {
+				vkCmdSetStencilReference(commandListState->commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, reference);
+				commandListState->stencilReferenceApplied = true;
+			}
+			else {
+				commandListState->stencilReferenceApplied = false;
+			}
+		}
+
+		static void cl_setViewports(CommandList* commandList, Span<const Viewport> viewports) noexcept {
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!impl || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE || viewports.size == 0) {
+				return;
+			}
+			if (viewports.size > VMAX_VIEWPORTS(impl)) {
+				spdlog::error("Vulkan SetViewports: {} viewports, the device takes {}", viewports.size, VMAX_VIEWPORTS(impl));
+				VkMarkCommandListError(commandListState, Result::Unsupported);
+				return;
+			}
+			std::array<VkViewport, MAX_VIEWPORTS> native{};
+			uint32_t emptyMask = 0;
+			for (uint32_t i = 0; i < viewports.size; ++i) {
+				const Viewport& v = viewports.data[i];
+				native[i] = VkFlippedViewportOrPlaceholder(v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth);
+				if (VkViewportEmpty(v.width, v.height)) {
+					emptyMask |= 1u << i;
+				}
+			}
+			vkCmdSetViewport(commandListState->commandBuffer, 0, viewports.size, native.data());
+
+			// Scissors whose viewport became empty, or has an area again, are recorded again.
+			const uint32_t setMask = viewports.size >= 32 ? ~0u : (1u << viewports.size) - 1u;
+			const uint32_t changed = (commandListState->emptyViewportMask ^ emptyMask) & setMask;
+			commandListState->emptyViewportMask = (commandListState->emptyViewportMask & ~setMask) | emptyMask;
+			if (changed != 0) {
+				VkApplyScissors(*commandListState, 0, viewports.size);
+			}
+		}
+
+		static void cl_setScissors(CommandList* commandList, Span<const ScissorRect> scissors) noexcept {
+			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!impl || !commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE || scissors.size == 0) {
+				return;
+			}
+			if (scissors.size > VMAX_VIEWPORTS(impl)) {
+				spdlog::error("Vulkan SetScissors: {} scissors, the device takes {}", scissors.size, VMAX_VIEWPORTS(impl));
+				VkMarkCommandListError(commandListState, Result::Unsupported);
+				return;
+			}
+			for (uint32_t i = 0; i < scissors.size; ++i) {
+				const ScissorRect& s = scissors.data[i];
+				commandListState->scissors[i] = VkClampScissor(s.x, s.y, s.width, s.height);
+			}
+			VkApplyScissors(*commandListState, 0, scissors.size);
+		}
+
+		static void cl_setBlendFactor(CommandList* commandList, const float rgba[4]) noexcept {
+			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (!commandListState || !commandListState->isRecording || commandListState->commandBuffer == VK_NULL_HANDLE || !rgba) {
+				return;
+			}
+			std::copy(rgba, rgba + 4, commandListState->blendConstants);
+			vkCmdSetBlendConstants(commandListState->commandBuffer, commandListState->blendConstants);
+			commandListState->blendConstantsApplied = true;
 		}
 
 		static void cl_setVB(CommandList* commandList, uint32_t startSlot, uint32_t numViews, VertexBufferView* views) noexcept {
@@ -6597,14 +8095,14 @@ namespace rhi {
 					generatedInfo.preprocessAddress = match->preprocessAddress;
 					generatedInfo.preprocessSize = match->preprocessSize;
 					const bool pushConstantsRecorded = match->pushConstantsRecorded;
-					const std::array<uint8_t, VulkanDescriptorBufferModel::kPushConstantBytes> recordedPushConstants = match->pushConstants;
+					const std::array<uint8_t, VulkanDescriptorBufferModel::kMaxPushConstantBytes> recordedPushConstants = match->pushConstants;
 					preprocessed.erase(match);
 					if (!commandListState->passActive)
 						VkFlushPreprocessBarrier(*commandListState);
 					if (pushConstantsRecorded) {
 						// Exactly the push constants the preprocess saw (VkBufferModelPreprocessPushConstants).
 						vkCmdPushConstants(commandListState->commandBuffer, impl->descriptorBuffer.pipelineLayout, VK_SHADER_STAGE_ALL, 0,
-							static_cast<uint32_t>(recordedPushConstants.size()), recordedPushConstants.data());
+							impl->descriptorBuffer.pushConstantBytes, recordedPushConstants.data());
 					}
 					else {
 						VkFlushPendingPushData(impl, *commandListState);
@@ -6978,7 +8476,11 @@ namespace rhi {
 			if (!commandListState || !queryPoolState || index >= queryPoolState->count || queryPoolState->type == QueryType::Timestamp) {
 				return;
 			}
-			vkCmdBeginQuery(commandListState->commandBuffer, queryPoolState->pool, index, 0);
+			// An occlusion query counts samples exactly, as D3D12's OCCLUSION and D3D11's do, when the device enabled
+			// occlusionQueryPrecise. Without it the count is only zero or not zero.
+			const VkQueryControlFlags flags = queryPoolState->type == QueryType::Occlusion && impl->supportedFeatures.occlusionQueryPrecise == VK_TRUE ?
+				VK_QUERY_CONTROL_PRECISE_BIT : 0;
+			vkCmdBeginQuery(commandListState->commandBuffer, queryPoolState->pool, index, flags);
 		}
 
 		static void cl_endQuery(CommandList* commandList, QueryPoolHandle queryPool, uint32_t index) noexcept {
@@ -7024,6 +8526,12 @@ namespace rhi {
 				return;
 			}
 			if (!VkLeavePass(commandList, *commandListState)) {
+				return;
+			}
+			// Occlusion queries are begun on graphics lists only, so their reset is a command: it runs again each time a kept
+			// recording is submitted, before the queries it begins. A host reset runs once, at record time.
+			if (queryPoolState->type == QueryType::Occlusion) {
+				vkCmdResetQueryPool(commandListState->commandBuffer, queryPoolState->pool, firstQuery, queryCount);
 				return;
 			}
 			{
@@ -7175,6 +8683,7 @@ namespace rhi {
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
 			if (commandListState) {
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(commandListState->commandBuffer), VK_OBJECT_TYPE_COMMAND_BUFFER, name);
+				if (impl) VkNameCrashMarkerSlot(impl, *commandListState, name);
 			}
 		}
 
@@ -7201,15 +8710,7 @@ namespace rhi {
 		}
 
 		static void cl_beginDebugLabel(CommandList* commandList, const float rgba[4], const char* name) noexcept {
-			if (commandList) {
-				auto* impl = static_cast<VulkanDevice*>(commandList->impl);
-				if (impl && impl->setCheckpoint && impl->registerCheckpoint) {
-					if (auto* state = VkCommandListState(commandList); state && state->commandBuffer) {
-						if (const void* marker = impl->registerCheckpoint(impl->checkpointUser, name))
-							impl->setCheckpoint(state->commandBuffer, const_cast<void*>(marker));
-					}
-				}
-			}
+			VkLabelCheckpoint(commandList, name, 1);
 			if (const VkCommandBuffer commandBuffer = VkLabelTarget(commandList); commandBuffer != VK_NULL_HANDLE && vkCmdBeginDebugUtilsLabelEXT) {
 				const VkDebugUtilsLabelEXT label = VkMakeLabel(rgba, name);
 				vkCmdBeginDebugUtilsLabelEXT(commandBuffer, &label);
@@ -7217,29 +8718,13 @@ namespace rhi {
 		}
 
 		static void cl_endDebugLabel(CommandList* commandList) noexcept {
-			if (commandList) {
-				auto* impl = static_cast<VulkanDevice*>(commandList->impl);
-				if (impl && impl->setCheckpoint && impl->registerCheckpoint) {
-					if (auto* state = VkCommandListState(commandList); state && state->commandBuffer) {
-						if (const void* marker = impl->registerCheckpoint(impl->checkpointUser, "ORG pass end"))
-							impl->setCheckpoint(state->commandBuffer, const_cast<void*>(marker));
-					}
-				}
-			}
+			VkLabelCheckpoint(commandList, nullptr, -1);
 			if (const VkCommandBuffer commandBuffer = VkLabelTarget(commandList); commandBuffer != VK_NULL_HANDLE && vkCmdEndDebugUtilsLabelEXT)
 				vkCmdEndDebugUtilsLabelEXT(commandBuffer);
 		}
 
 		static void cl_insertDebugLabel(CommandList* commandList, const float rgba[4], const char* name) noexcept {
-			if (commandList) {
-				auto* impl = static_cast<VulkanDevice*>(commandList->impl);
-				if (impl && impl->setCheckpoint && impl->registerCheckpoint) {
-					if (auto* state = VkCommandListState(commandList); state && state->commandBuffer) {
-						if (const void* marker = impl->registerCheckpoint(impl->checkpointUser, name))
-							impl->setCheckpoint(state->commandBuffer, const_cast<void*>(marker));
-					}
-				}
-			}
+			VkLabelCheckpoint(commandList, name, 0);
 			if (const VkCommandBuffer commandBuffer = VkLabelTarget(commandList); commandBuffer != VK_NULL_HANDLE && vkCmdInsertDebugUtilsLabelEXT) {
 				const VkDebugUtilsLabelEXT label = VkMakeLabel(rgba, name);
 				vkCmdInsertDebugUtilsLabelEXT(commandBuffer, &label);
@@ -7302,15 +8787,8 @@ namespace rhi {
 			commandListState->passRenderArea.extent = { inheritance.width, inheritance.height };
 
 			// As BeginPass sets them: flipped, the viewport starting at the bottom of the render area.
-			VkViewport viewport{};
-			viewport.x = static_cast<float>(inheritance.x);
-			viewport.width = static_cast<float>(inheritance.width);
-			viewport.y = static_cast<float>(inheritance.y + inheritance.height);
-			viewport.height = -static_cast<float>(inheritance.height);
-			viewport.minDepth = inheritance.minDepth;
-			viewport.maxDepth = inheritance.maxDepth;
-			vkCmdSetViewport(commandListState->commandBuffer, 0, 1, &viewport);
-			vkCmdSetScissor(commandListState->commandBuffer, 0, 1, &commandListState->passRenderArea);
+			VkSetRenderAreaViewport(*commandListState, inheritance.x, inheritance.y, inheritance.width, inheritance.height,
+				inheritance.minDepth, inheritance.maxDepth);
 			return Result::Ok;
 		}
 
@@ -7330,6 +8808,7 @@ namespace rhi {
 			}
 			std::vector<VkCommandBuffer> commandBuffers;
 			commandBuffers.reserve(lists.size);
+			bool continuesOwnersRendering = false;
 			for (uint32_t index = 0; index < lists.size; ++index) {
 				const VulkanCommandList* secondaryState = lists.data[index] ? VkCommandListState(lists.data[index]) : nullptr;
 				if (!secondaryState || !secondaryState->secondary || secondaryState->isRecording || secondaryState->commandBuffer == VK_NULL_HANDLE ||
@@ -7346,13 +8825,25 @@ namespace rhi {
 					return;
 				}
 				commandBuffers.push_back(secondaryState->commandBuffer);
+				continuesOwnersRendering = continuesOwnersRendering || (!commandListState->passActive && secondaryState->continuesRendering);
 			}
 			vkCmdExecuteCommands(commandListState->commandBuffer, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
 			commandListState->boundPipeline = {};
+			// Dynamic state is undefined too: the next pipeline that reads it sets the list's values again.
+			commandListState->stencilReferenceApplied = false;
+			commandListState->blendConstantsApplied = false;
 			commandListState->emittedCbvSrvUavHeap = {};
 			commandListState->emittedSamplerHeap = {};
 			// Descriptor-buffer model: push constants are undefined too; the list's push data is recorded again before it is read.
 			commandListState->pushedDataDirty = commandListState->spilledDataDirty = VkDescriptorBufferModel(impl);
+			// Placeholder vertex and index buffers, so the caller's next binds reach the driver (VkBindPlaceholderInputBuffers).
+			// Inside the pass only vkCmdExecuteCommands may follow, so EndPass binds them. Secondaries that continue an adopted
+			// buffer's rendering ran inside its owner's pass, which this wrapper does not end: the owner binds its own.
+			if (commandListState->passActive) {
+				commandListState->placeholderInputBindPending = true;
+			} else if (!continuesOwnersRendering) {
+				VkBindPlaceholderInputBuffers(impl, *commandListState);
+			}
 		}
 
 		static void ca_reset(CommandAllocator* allocator) noexcept {
@@ -7362,10 +8853,21 @@ namespace rhi {
 				return;
 			}
 
-			const VkResult result = vkResetCommandPool(impl->device, allocatorState->pool, 0);
+			const VkResult result = vkResetCommandPool(impl->device, allocatorState->pool,
+				ReleaseCommandMemoryOnReset() ? VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT : 0);
 			if (result != VK_SUCCESS) {
 				spdlog::error("Vulkan command allocator reset failed with VkResult {}", static_cast<int>(result));
 			}
+		}
+
+		// The caller holds the pool's external synchronization: no list of it records, resets or is freed meanwhile.
+		static void ca_trim(CommandAllocator* allocator) noexcept {
+			auto* impl = allocator ? static_cast<VulkanDevice*>(allocator->impl) : nullptr;
+			VulkanCommandAllocator* allocatorState = VkAllocatorState(allocator);
+			if (!impl || impl->device == VK_NULL_HANDLE || !allocatorState || allocatorState->pool == VK_NULL_HANDLE || !vkTrimCommandPool) {
+				return;
+			}
+			vkTrimCommandPool(impl->device, allocatorState->pool, 0);
 		}
 
 		static uint32_t sc_count(Swapchain* swapchain) noexcept {
@@ -7390,95 +8892,155 @@ namespace rhi {
 			return {};
 		}
 
+		// Waits until no more than maxUnfinished presented frames are unfinished on the GPU, then forgets the finished ones.
+		static Result VkWaitPresentedFrames(VulkanDevice* impl, VulkanSwapchain& swapchain, uint32_t maxUnfinished, uint64_t timeoutNs) noexcept {
+			if (swapchain.pendingFrames.size() <= maxUnfinished) return Result::Ok;
+			const VulkanSwapchain::PendingFrame target = swapchain.pendingFrames[swapchain.pendingFrames.size() - maxUnfinished - 1];
+			VkSemaphore semaphore = VK_NULL_HANDLE;
+			{
+				const std::lock_guard timelineLock(impl->timelinesMutex);
+				if (const VulkanTimeline* timeline = VkTimelineState(impl, target.timeline)) semaphore = timeline->semaphore;
+			}
+			if (semaphore != VK_NULL_HANDLE) {
+				VkSemaphoreWaitInfo waitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+				waitInfo.semaphoreCount = 1;
+				waitInfo.pSemaphores = &semaphore;
+				waitInfo.pValues = &target.value;
+				const VkResult result = vkWaitSemaphores(impl->device, &waitInfo, timeoutNs);
+				if (result != VK_SUCCESS) return ToRHI(result);
+			}
+			while (swapchain.pendingFrames.size() > maxUnfinished) swapchain.pendingFrames.pop_front();
+			return Result::Ok;
+		}
+
 		static Result sc_present(Swapchain* swapchain, bool vsync, const PresentSyncDesc* sync) noexcept {
-			VkIgnoreUnused(vsync);
 			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
 			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
 			if (!impl || !swapchainState || swapchainState->swapchain == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
-			const std::lock_guard timelineLock(impl->timelinesMutex);
-			if (swapchainState->currentImageIndex >= swapchainState->presentWaitSemaphores.size()) {
-				RHI_FAIL(Result::InvalidArgument);
-			}
 
-			VkSemaphore presentWaitSemaphore = swapchainState->presentWaitSemaphores[swapchainState->currentImageIndex];
-			if (presentWaitSemaphore == VK_NULL_HANDLE) {
-				RHI_FAIL(Result::InvalidArgument);
-			}
-
-			VulkanQueueState* signalQueueState = nullptr;
-			VulkanTimeline* waitTimeline = nullptr;
-			if (sync && sync->queue && sync->wait.value != 0) {
-				signalQueueState = VkQueueStateForHandle(impl, sync->queue.GetQueueHandle());
-				waitTimeline = VkTimelineState(impl, sync->wait.t);
-				if (!signalQueueState || signalQueueState->queue == VK_NULL_HANDLE || !waitTimeline || waitTimeline->semaphore == VK_NULL_HANDLE) {
+			const VkPresentModeKHR presentMode = VkPresentModeForVsync(*swapchainState, vsync);
+			const bool switchInPresent = presentMode != swapchainState->presentMode &&
+				VkHasPresentMode(swapchainState->switchablePresentModes, presentMode);
+			VkResult presentResult = VK_SUCCESS;
+			{
+				const std::lock_guard timelineLock(impl->timelinesMutex);
+				if (swapchainState->currentImageIndex >= swapchainState->presentWaitSemaphores.size()) {
 					RHI_FAIL(Result::InvalidArgument);
 				}
-			} else {
-				signalQueueState = VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
-			}
 
-			VkTimelineSemaphoreSubmitInfo timelineInfo{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
-			VkSemaphore waitSemaphore = VK_NULL_HANDLE;
-			uint64_t waitValue = 0;
-			// VkTimelineSemaphoreSubmitInfo value arrays correspond one-for-one
-			// with every semaphore in VkSubmitInfo, including binary semaphores.
-			// The value for a binary semaphore is ignored, but omitting the entry
-			// leaves this mixed timeline-wait/binary-signal submit malformed and
-			// prevents synchronization validation from following the dependency
-			// through to vkQueuePresentKHR.
-			const uint64_t binarySignalValue = 0;
-			VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-			VkSubmitInfo signalPresentInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-			if (waitTimeline) {
-				waitSemaphore = waitTimeline->semaphore;
-				waitValue = sync->wait.value;
-				// vkQueuePresentKHR can only wait on a binary semaphore.  Complete the
-				// graph timeline wait on the host before relaying it to the per-image
-				// binary semaphore.  This also gives synchronization validation an
-				// explicit completion point for the swapchain layout transition.  The
-				// relay can move into the final graph submission once Queue::Submit can
-				// carry native binary signals.
-				VkSemaphoreWaitInfo hostWaitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-				hostWaitInfo.semaphoreCount = 1;
-				hostWaitInfo.pSemaphores = &waitSemaphore;
-				hostWaitInfo.pValues = &waitValue;
-				const VkResult hostWaitResult = vkWaitSemaphores(impl->device, &hostWaitInfo, UINT64_MAX);
-				if (hostWaitResult != VK_SUCCESS) {
-					return ToRHI(hostWaitResult);
+				VkSemaphore presentWaitSemaphore = swapchainState->presentWaitSemaphores[swapchainState->currentImageIndex];
+				if (presentWaitSemaphore == VK_NULL_HANDLE) {
+					RHI_FAIL(Result::InvalidArgument);
 				}
-				timelineInfo.waitSemaphoreValueCount = 1;
-				timelineInfo.pWaitSemaphoreValues = &waitValue;
-				timelineInfo.signalSemaphoreValueCount = 1;
-				timelineInfo.pSignalSemaphoreValues = &binarySignalValue;
-				signalPresentInfo.pNext = &timelineInfo;
-				signalPresentInfo.waitSemaphoreCount = 1;
-				signalPresentInfo.pWaitSemaphores = &waitSemaphore;
-				signalPresentInfo.pWaitDstStageMask = &waitStage;
-			}
-			signalPresentInfo.signalSemaphoreCount = 1;
-			signalPresentInfo.pSignalSemaphores = &presentWaitSemaphore;
-			VkResult signalResult = vkQueueSubmit(signalQueueState->queue, 1, &signalPresentInfo, VK_NULL_HANDLE);
-			if (signalResult != VK_SUCCESS) {
-				return ToRHI(signalResult);
-			}
 
-			VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-			presentInfo.waitSemaphoreCount = 1;
-			presentInfo.pWaitSemaphores = &presentWaitSemaphore;
-			presentInfo.swapchainCount = 1;
-			presentInfo.pSwapchains = &swapchainState->swapchain;
-			presentInfo.pImageIndices = &swapchainState->currentImageIndex;
+				const bool waitOnGraph = sync && sync->queue && sync->wait.value != 0;
+				VulkanQueueState* signalQueueState = waitOnGraph
+					? VkQueueStateForHandle(impl, sync->queue.GetQueueHandle())
+					: VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
+				if (!signalQueueState || signalQueueState->queue == VK_NULL_HANDLE) {
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				// First: making the progress timeline can move the timeline pool.
+				VulkanTimeline* progressTimeline = impl->timelineSemaphoreEnabled ? VkQueueProgressTimeline(impl, *signalQueueState) : nullptr;
+				VulkanTimeline* waitTimeline = nullptr;
+				if (waitOnGraph) {
+					waitTimeline = VkTimelineState(impl, sync->wait.t);
+					if (!waitTimeline || waitTimeline->semaphore == VK_NULL_HANDLE) {
+						RHI_FAIL(Result::InvalidArgument);
+					}
+				}
 
-			// Present on the queue which relayed the graph completion timeline into
-			// the binary present semaphore.  Presenting through a different logical
-			// wrapper for the same family obscures the execution chain from sync
-			// validation and is unsafe when the implementation returned distinct
-			// native queues for those wrappers.
-			const VkResult presentResult = VkQueuePresentKHRHooked(signalQueueState->queue, &presentInfo);
+				// The relay: the graph's timeline point is waited on the GPU and relayed to the image's binary semaphore, which
+				// is all vkQueuePresentKHR can wait on. It also signals the queue's progress timeline, which marks the frame
+				// finished for the latency limit. VkTimelineSemaphoreSubmitInfo's arrays cover every semaphore of the batch,
+				// binary ones included (their values are ignored); leaving one out makes the batch malformed and hides the
+				// dependency from synchronization validation.
+				const uint64_t waitValue = waitTimeline ? sync->wait.value : 0;
+				const uint64_t progressValue = signalQueueState->progressSubmitted + 1;
+				const VkSemaphore signalSemaphores[2] = { presentWaitSemaphore, progressTimeline ? progressTimeline->semaphore : VK_NULL_HANDLE };
+				const uint64_t signalValues[2] = { 0, progressValue };
+				const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+				VkTimelineSemaphoreSubmitInfo timelineInfo{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+				timelineInfo.waitSemaphoreValueCount = waitTimeline ? 1u : 0u;
+				timelineInfo.pWaitSemaphoreValues = waitTimeline ? &waitValue : nullptr;
+				timelineInfo.signalSemaphoreValueCount = progressTimeline ? 2u : 1u;
+				timelineInfo.pSignalSemaphoreValues = signalValues;
+				VkSubmitInfo relayInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+				relayInfo.pNext = (waitTimeline || progressTimeline) ? &timelineInfo : nullptr;
+				relayInfo.waitSemaphoreCount = waitTimeline ? 1u : 0u;
+				relayInfo.pWaitSemaphores = waitTimeline ? &waitTimeline->semaphore : nullptr;
+				relayInfo.pWaitDstStageMask = waitTimeline ? &waitStage : nullptr;
+				relayInfo.signalSemaphoreCount = progressTimeline ? 2u : 1u;
+				relayInfo.pSignalSemaphores = signalSemaphores;
+
+				const VkQueueAccessGuard queueAccess(impl, signalQueueState->queue);
+				const VkResult relayResult = vkQueueSubmit(signalQueueState->queue, 1, &relayInfo, VK_NULL_HANDLE);
+				if (relayResult != VK_SUCCESS) {
+					return ToRHI(relayResult);
+				}
+				if (progressTimeline) {
+					signalQueueState->progressSubmitted = progressValue;
+					progressTimeline->lastSubmittedSignalValue = progressValue;
+				}
+
+				VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+				presentInfo.waitSemaphoreCount = 1;
+				presentInfo.pWaitSemaphores = &presentWaitSemaphore;
+				presentInfo.swapchainCount = 1;
+				presentInfo.pSwapchains = &swapchainState->swapchain;
+				presentInfo.pImageIndices = &swapchainState->currentImageIndex;
+				const void** next = &presentInfo.pNext;
+				VkSwapchainPresentModeInfoEXT presentModeInfo{ VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT };
+				if (!swapchainState->switchablePresentModes.empty()) {
+					presentModeInfo.swapchainCount = 1;
+					presentModeInfo.pPresentModes = switchInPresent ? &presentMode : &swapchainState->presentMode;
+					*next = &presentModeInfo;
+					next = &presentModeInfo.pNext;
+				}
+				const uint64_t presentId = swapchainState->presentCount + 1;
+				VkPresentIdKHR presentIdInfo{ VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
+				if (impl->presentIdEnabled) {
+					presentIdInfo.swapchainCount = 1;
+					presentIdInfo.pPresentIds = &presentId;
+					*next = &presentIdInfo;
+				}
+
+				// Present on the queue that relayed the graph's timeline into the binary present semaphore. Presenting through
+				// a different logical wrapper for the same family hides the chain from synchronization validation, and is unsafe
+				// when the implementation returned distinct native queues for those wrappers.
+				presentResult = VkQueuePresentKHRHooked(signalQueueState->queue, &presentInfo);
+				if (presentResult == VK_SUCCESS || presentResult == VK_SUBOPTIMAL_KHR) {
+					swapchainState->presentCount = presentId;
+					swapchainState->presentQueue = waitOnGraph ? sync->queue.GetQueueHandle() : VkPrimaryQueueHandleForKind(impl, QueueKind::Graphics);
+					if (switchInPresent) swapchainState->presentMode = presentMode;
+					if (progressTimeline) {
+						swapchainState->pendingFrames.push_back({ signalQueueState->progress, progressValue, presentId });
+					}
+				}
+			}
 			if (presentResult != VK_SUCCESS && presentResult != VK_SUBOPTIMAL_KHR) {
 				return ToRHI(presentResult);
+			}
+
+			// The host-side limit on frames in flight.
+			if (const Result latencyResult = VkWaitPresentedFrames(impl, *swapchainState, swapchainState->maxFrameLatency, UINT64_MAX); latencyResult != Result::Ok) {
+				return latencyResult;
+			}
+
+			if (presentMode != swapchainState->presentMode) {
+				// No VK_EXT_swapchain_maintenance1 switch to this mode: it needs a new swapchain.
+				spdlog::info("Vulkan swapchain: vsync {} needs present mode {}; recreating the swapchain", vsync ? "on" : "off", static_cast<int>(presentMode));
+				const Result idleResult = VkWaitDeviceIdle(impl);
+				if (idleResult != Result::Ok) {
+					return idleResult;
+				}
+				swapchainState->pendingFrames.clear();
+				swapchainState->presentMode = presentMode;
+				const Result recreateResult = VkCreateOrResizeSwapchain(impl, *swapchainState, swapchainState->width, swapchainState->height,
+					swapchainState->sdrFormat, swapchainState->imageCount, swapchainState->allowTearing);
+				return recreateResult == Result::Ok ? Result::ModeChanged : recreateResult;
 			}
 
 			const Result acquireResult = VkAcquireNextSwapchainImage(impl, *swapchainState);
@@ -7496,12 +9058,13 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			const Result idleResult = ToRHI(VkDeviceWaitIdleHooked(impl->device));
+			const Result idleResult = VkWaitDeviceIdle(impl);
 			if (idleResult != Result::Ok) {
 				return idleResult;
 			}
+			swapchainState->pendingFrames.clear();
 
-			const Format targetFormat = newFormat != Format::Unknown ? newFormat : swapchainState->rhiFormat;
+			const Format targetFormat = newFormat != Format::Unknown ? newFormat : swapchainState->sdrFormat;
 			const uint32_t targetWidth = width != 0 ? width : swapchainState->width;
 			const uint32_t targetHeight = height != 0 ? height : swapchainState->height;
 			const uint32_t targetBufferCount = bufferCount != 0 ? bufferCount : swapchainState->imageCount;
@@ -7510,6 +9073,126 @@ namespace rhi {
 
 		static void sc_setName(Swapchain* swapchain, const char* name) noexcept {
 			VkIgnoreUnused(swapchain, name);
+		}
+
+		static SwapchainCaps sc_caps(Swapchain* swapchain) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			const VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState) return {};
+			SwapchainCaps caps{};
+			caps.tearing = swapchainState->allowTearing && VkHasPresentMode(swapchainState->surfacePresentModes, VK_PRESENT_MODE_IMMEDIATE_KHR);
+			caps.presentModeSwitch = !swapchainState->switchablePresentModes.empty();
+			caps.presentWait = impl->presentIdEnabled && impl->presentWaitEnabled;
+			caps.hdrMetadata = impl->hdrMetadataEnabled;
+			return caps;
+		}
+
+		static bool sc_isColorSpaceSupported(Swapchain* swapchain, SwapchainColorSpace colorSpace) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			const VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState) return false;
+			std::vector<VkSurfaceFormatKHR> surfaceFormats;
+			if (VkQuerySurfaceFormats(impl, swapchainState->surface, surfaceFormats) != Result::Ok) return false;
+			VkSurfaceFormatKHR format{};
+			return VkChooseSurfaceFormat(surfaceFormats, colorSpace, swapchainState->sdrFormat, format);
+		}
+
+		static Result sc_setColorSpace(Swapchain* swapchain, SwapchainColorSpace colorSpace) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (colorSpace == swapchainState->colorSpace) return Result::Ok;
+			if (!sc_isColorSpaceSupported(swapchain, colorSpace)) return Result::Unsupported;
+
+			const Result idleResult = VkWaitDeviceIdle(impl);
+			if (idleResult != Result::Ok) {
+				return idleResult;
+			}
+			swapchainState->pendingFrames.clear();
+			const SwapchainColorSpace previous = swapchainState->colorSpace;
+			swapchainState->colorSpace = colorSpace;
+			const Result recreateResult = VkCreateOrResizeSwapchain(impl, *swapchainState, swapchainState->width, swapchainState->height,
+				swapchainState->sdrFormat, swapchainState->imageCount, swapchainState->allowTearing);
+			if (recreateResult != Result::Ok) swapchainState->colorSpace = previous;
+			return recreateResult;
+		}
+
+		static SwapchainColorSpace sc_colorSpace(Swapchain* swapchain) noexcept {
+			const VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			return swapchainState ? swapchainState->colorSpace : SwapchainColorSpace::SrgbNonlinear;
+		}
+
+		static Result sc_setHdrMetadata(Swapchain* swapchain, const HdrMetadata& metadata) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (!impl->hdrMetadataEnabled) return Result::Unsupported;
+			swapchainState->hdrMetadata = metadata;
+			swapchainState->hasHdrMetadata = true;
+			// Sent now in HDR; an SDR swapchain sends it when it switches.
+			VkApplyHdrMetadata(impl, *swapchainState);
+			return Result::Ok;
+		}
+
+		static Result sc_setMaximumFrameLatency(Swapchain* swapchain, uint32_t frames) noexcept {
+			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!swapchainState || frames == 0) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			swapchainState->maxFrameLatency = frames;
+			return Result::Ok;
+		}
+
+		static Result sc_waitForFrameLatency(Swapchain* swapchain, uint64_t timeoutNs) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			// Room for one more frame: no more than maxFrameLatency - 1 outstanding.
+			const uint32_t outstanding = swapchainState->maxFrameLatency - 1;
+			if (impl->presentIdEnabled && impl->presentWaitEnabled) {
+				if (swapchainState->presentCount <= outstanding) return Result::Ok;
+				const VkResult result = vkWaitForPresentKHR(impl->device, swapchainState->swapchain, swapchainState->presentCount - outstanding, timeoutNs);
+				return result == VK_SUBOPTIMAL_KHR ? Result::Ok : ToRHI(result);
+			}
+			return VkWaitPresentedFrames(impl, *swapchainState, outstanding, timeoutNs);
+		}
+
+		static void* sc_frameLatencyWaitableObject(Swapchain*) noexcept {
+			return nullptr;
+		}
+
+		static uint64_t sc_presentCount(Swapchain* swapchain) noexcept {
+			const VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			return swapchainState ? swapchainState->presentCount : 0;
+		}
+
+		static TimelinePoint sc_acquirePoint(Swapchain* swapchain) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			const VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState || !swapchainState->hasAcquireTimeline) return {};
+			const std::lock_guard timelineLock(impl->timelinesMutex);
+			return TimelinePoint{ swapchainState->acquireTimeline, swapchainState->acquireValue };
+		}
+
+		static Result sc_waitForPresent(Swapchain* swapchain, uint64_t presentId, uint64_t timeoutNs) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (!impl->presentIdEnabled || !impl->presentWaitEnabled) return Result::Unsupported;
+			if (presentId == 0) return Result::Ok;
+			if (presentId > swapchainState->presentCount) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			const VkResult result = vkWaitForPresentKHR(impl->device, swapchainState->swapchain, presentId, timeoutNs);
+			return result == VK_SUBOPTIMAL_KHR ? Result::Ok : ToRHI(result);
 		}
 
 		// Descriptor-buffer model: one stage's module, its SPIR-V lowered (rhi_vulkan_spirv_lowering.h) to the stage's binding plan
@@ -7533,7 +9216,7 @@ namespace rhi {
 				target.samplerBinding = 0;
 				target.pushedBytes = layoutState.pushedBytes;
 				target.spillAddressOffset = layoutState.spillAddressOffset;
-				target.pushConstantBytes = VulkanDescriptorBufferModel::kPushConstantBytes;
+				target.pushConstantBytes = impl->descriptorBuffer.pushConstantBytes;
 				// What the heap model's contract guarantees of the addresses shaders read (rhi_vulkan_spirv_lowering.h), and the
 				// alignment of the scratch the spill image is uploaded to (VkAllocateEmulatedRootConstantScratch).
 				target.recordAlignment = 8;
@@ -7600,6 +9283,235 @@ namespace rhi {
 			} catch (...) {
 				RHI_FAIL(Result::OutOfMemory);
 			}
+		}
+
+		static detail::PipelineCacheIdentity VkPipelineCacheIdentity(const VulkanDevice* impl) noexcept {
+			detail::PipelineCacheIdentity identity{};
+			identity.backend = static_cast<uint32_t>(Backend::Vulkan);
+			identity.vendorId = impl->physicalDeviceProperties.vendorID;
+			identity.deviceId = impl->physicalDeviceProperties.deviceID;
+			identity.driverVersion = impl->physicalDeviceProperties.driverVersion;
+			static_assert(sizeof(identity.uuid) == VK_UUID_SIZE);
+			std::memcpy(identity.uuid, impl->physicalDeviceProperties.pipelineCacheUUID, VK_UUID_SIZE);
+			return identity;
+		}
+
+		// The payload's own header (VkPipelineCacheHeaderVersionOne) must name this device too: a driver may reject or
+		// misread data from another one.
+		static bool VkPipelineCacheDataMatchesDevice(const VulkanDevice* impl, const std::vector<uint8_t>& data) noexcept {
+			VkPipelineCacheHeaderVersionOne header{};
+			if (data.size() < sizeof(header)) {
+				return false;
+			}
+			std::memcpy(&header, data.data(), sizeof(header));
+			return header.headerSize >= sizeof(header) && header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+				header.vendorID == impl->physicalDeviceProperties.vendorID && header.deviceID == impl->physicalDeviceProperties.deviceID &&
+				std::memcmp(header.pipelineCacheUUID, impl->physicalDeviceProperties.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+		}
+
+		// Destroys the open cache without saving it. The caller holds the cache's lock exclusively.
+		static void VkClosePipelineCacheLocked(VulkanDevice* impl) noexcept {
+			auto& state = impl->pipelineCache;
+			if (state.cache != VK_NULL_HANDLE && impl->device != VK_NULL_HANDLE) {
+				vkDestroyPipelineCache(impl->device, state.cache, nullptr);
+			}
+			state.cache = VK_NULL_HANDLE;
+			state.path.clear();
+			state.counters.Reset(PipelineCacheLoadResult::Off, 0);
+		}
+
+		static Result d_openPipelineCache(Device* device, const char* path) noexcept {
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl || impl->device == VK_NULL_HANDLE) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			auto& state = impl->pipelineCache;
+			const std::unique_lock lock(state.mutex);
+			VkClosePipelineCacheLocked(impl);
+			if (!path || !*path) {
+				return Result::Ok;
+			}
+			try {
+				state.identity = VkPipelineCacheIdentity(impl);
+				std::vector<uint8_t> payload;
+				PipelineCacheLoadResult load = detail::ReadPipelineCacheFile(path, state.identity, payload);
+				if (load == PipelineCacheLoadResult::Loaded && !VkPipelineCacheDataMatchesDevice(impl, payload)) {
+					load = PipelineCacheLoadResult::Stale;
+					payload.clear();
+				}
+				VkPipelineCacheCreateInfo createInfo{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+				createInfo.initialDataSize = payload.size();
+				createInfo.pInitialData = payload.empty() ? nullptr : payload.data();
+				VkResult result = vkCreatePipelineCache(impl->device, &createInfo, nullptr, &state.cache);
+				if (result != VK_SUCCESS && !payload.empty()) {
+					// The driver refused the data: start empty.
+					load = PipelineCacheLoadResult::Corrupt;
+					payload.clear();
+					createInfo.initialDataSize = 0;
+					createInfo.pInitialData = nullptr;
+					result = vkCreatePipelineCache(impl->device, &createInfo, nullptr, &state.cache);
+				}
+				if (result != VK_SUCCESS) {
+					state.cache = VK_NULL_HANDLE;
+					state.counters.Reset(PipelineCacheLoadResult::Unsupported, 0);
+					spdlog::warn("Vulkan pipeline cache: vkCreatePipelineCache failed ({}); pipelines are not cached", static_cast<int>(result));
+					return ToRHI(result);
+				}
+				state.path = path;
+				const uint32_t apiVersion = (std::min)(impl->instanceApiVersion, impl->physicalDeviceProperties.apiVersion);
+				state.creationFeedback = apiVersion >= VK_API_VERSION_1_3;
+				state.counters.Reset(load, payload.size());
+				spdlog::info("Vulkan pipeline cache '{}': {} ({} bytes)", path, detail::PipelineCacheLoadName(load), payload.size());
+				return Result::Ok;
+			} catch (...) {
+				VkClosePipelineCacheLocked(impl);
+				RHI_FAIL(Result::OutOfMemory);
+			}
+		}
+
+		static Result d_savePipelineCache(Device* device) noexcept {
+			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
+			if (!impl || impl->device == VK_NULL_HANDLE) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			auto& state = impl->pipelineCache;
+			const std::shared_lock lock(state.mutex);
+			if (state.cache == VK_NULL_HANDLE) {
+				return Result::Ok;
+			}
+			const std::lock_guard saveLock(state.saveMutex);
+			// Pipelines created while this runs stay counted for the next save.
+			const uint64_t added = state.counters.added.exchange(0);
+			if (added == 0) {
+				return Result::Ok;
+			}
+			try {
+				std::vector<uint8_t> data;
+				VkResult result = VK_INCOMPLETE;
+				while (result == VK_INCOMPLETE) {
+					size_t size = 0;
+					result = vkGetPipelineCacheData(impl->device, state.cache, &size, nullptr);
+					if (result != VK_SUCCESS) {
+						break;
+					}
+					data.resize(size);
+					result = vkGetPipelineCacheData(impl->device, state.cache, &size, data.data());
+					data.resize(size);
+				}
+				Result written = ToRHI(result);
+				if (result == VK_SUCCESS) {
+					written = detail::WritePipelineCacheFile(state.path.c_str(), state.identity, data.data(), data.size());
+				}
+				if (written != Result::Ok) {
+					state.counters.added += added;
+					spdlog::warn("Vulkan pipeline cache '{}': save failed", state.path);
+					return written;
+				}
+				state.counters.savedBytes = data.size();
+				++state.counters.saves;
+				return Result::Ok;
+			} catch (...) {
+				state.counters.added += added;
+				RHI_FAIL(Result::OutOfMemory);
+			}
+		}
+
+		static Result d_getPipelineCacheStats(const Device* device, PipelineCacheStats& out) noexcept {
+			const auto* impl = device ? static_cast<const VulkanDevice*>(device->impl) : nullptr;
+			out = {};
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			impl->pipelineCache.counters.Fill(out);
+			return Result::Ok;
+		}
+
+		// A swizzle in SrvDesc::componentMapping's encoding (VkComponentMappingForRHI's inverse); 0 for identity.
+		static ComponentMapping VkEncodeComponentMapping(const VkComponentMapping& a_mapping) noexcept {
+			auto source = [](VkComponentSwizzle a_swizzle, uint32_t a_own) -> uint32_t {
+				switch (a_swizzle) {
+				case VK_COMPONENT_SWIZZLE_R: return 0;
+				case VK_COMPONENT_SWIZZLE_G: return 1;
+				case VK_COMPONENT_SWIZZLE_B: return 2;
+				case VK_COMPONENT_SWIZZLE_A: return 3;
+				case VK_COMPONENT_SWIZZLE_ZERO: return 4;
+				case VK_COMPONENT_SWIZZLE_ONE: return 5;
+				default: return a_own;
+				}
+			};
+			const uint32_t r = source(a_mapping.r, 0), g = source(a_mapping.g, 1), b = source(a_mapping.b, 2), a = source(a_mapping.a, 3);
+			if (r == 0 && g == 1 && b == 2 && a == 3) {
+				return 0;
+			}
+			return r | (g << 3) | (b << 6) | (a << 9) | (1u << 12);
+		}
+
+		static Result d_queryFormatSupport(const Device* device, Format format, FormatSupport& out) noexcept {
+			const auto* impl = device ? static_cast<const VulkanDevice*>(device->impl) : nullptr;
+			out = {};
+			if (!impl || impl->physicalDevice == VK_NULL_HANDLE) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			const VkFormat stored = ToVkFormat(impl, format);
+			if (stored == VK_FORMAT_UNDEFINED) {
+				return Result::Ok;
+			}
+			const VkComponentMapping swizzle = VkFormatSwizzle(impl, format);
+			const bool moved = VkSwizzleMovesChannels(swizzle);
+			VkFormatProperties properties{};
+			vkGetPhysicalDeviceFormatProperties(impl->physicalDevice, stored, &properties);
+			const VkFormatFeatureFlags features = properties.optimalTilingFeatures;
+			uint32_t usage = FU_None;
+			if (features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) {
+				usage |= FU_ShaderResource;
+			}
+			// Storage and attachment views cannot swizzle (d_createUnorderedAccessView, d_createRenderTargetView).
+			if ((features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && !moved) {
+				usage |= FU_UnorderedAccess;
+			}
+			if ((features & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) && !moved) {
+				usage |= FU_RenderTarget;
+			}
+			if (features & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+				usage |= FU_DepthStencil;
+			}
+			out.usage = usage;
+			out.storedAs = stored != ToVkFormat(format) ? FromVkFormat(stored) : Format::Unknown;
+			out.srvSwizzle = VkEncodeComponentMapping(swizzle);
+			out.backendFormat = static_cast<uint32_t>(stored);
+			return Result::Ok;
+		}
+
+		// Creates one pipeline through the open pipeline cache, if any, and counts the hit or miss. `create` makes the
+		// vkCreate*Pipelines call with the cache it is given.
+		template<class CreateInfo, class CreateFn>
+		static VkResult VkCreatePipelineThroughCache(VulkanDevice* impl, CreateInfo& info, CreateFn&& create) noexcept {
+			auto& state = impl->pipelineCache;
+			const std::shared_lock lock(state.mutex);
+			if (state.cache == VK_NULL_HANDLE) {
+				return create(VkPipelineCache{ VK_NULL_HANDLE });
+			}
+			VkPipelineCreationFeedback feedback{};
+			VkPipelineCreationFeedbackCreateInfo feedbackInfo{ VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO };
+			feedbackInfo.pPipelineCreationFeedback = &feedback;
+			const void* next = info.pNext;
+			if (state.creationFeedback) {
+				feedbackInfo.pNext = info.pNext;
+				info.pNext = &feedbackInfo;
+			}
+			const VkResult result = create(state.cache);
+			info.pNext = next;
+			if (result == VK_SUCCESS) {
+				const bool hit = (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) != 0 &&
+					(feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0;
+				if (hit) {
+					++state.counters.hits;
+				} else {
+					++state.counters.misses;
+					++state.counters.added;
+				}
+			}
+			return result;
 		}
 
 		static Result d_createPipelineFromStream(Device* device, const PipelineStreamItem* items, uint32_t count, PipelinePtr& out) noexcept {
@@ -7940,7 +9852,9 @@ namespace rhi {
 				pipelineInfo.layout = bufferModel ? impl->descriptorBuffer.pipelineLayout : VK_NULL_HANDLE;
 
 				VkPipeline nativePipeline = VK_NULL_HANDLE;
-				VkResult pipelineResult = vkCreateRayTracingPipelinesKHR(impl->device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &nativePipeline);
+				VkResult pipelineResult = VkCreatePipelineThroughCache(impl, pipelineInfo, [&](VkPipelineCache cache) {
+					return vkCreateRayTracingPipelinesKHR(impl->device, VK_NULL_HANDLE, cache, 1, &pipelineInfo, nullptr, &nativePipeline);
+				});
 				for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
 				if (pipelineResult != VK_SUCCESS) {
 					spdlog::error("Vulkan ray tracing pipeline: vkCreateRayTracingPipelinesKHR failed ({})", static_cast<int>(pipelineResult));
@@ -7987,6 +9901,28 @@ namespace rhi {
 				if ((!hasMeshShader && !VkIsSpirvBytecode(vertexShader->bytecode)) || (pixelShader && !VkIsSpirvBytecode(pixelShader->bytecode))) {
 					spdlog::warn("Vulkan graphics pipeline creation: shader bytecode was not SPIR-V");
 					RHI_FAIL(Result::Unsupported);
+				}
+				// Fixed-function state behind optional core features (FixedFunctionFeatureInfo).
+				if (rasterState.viewportCount > VMAX_VIEWPORTS(impl)) {
+					spdlog::error("Vulkan graphics pipeline creation: {} viewports, the device takes {}", rasterState.viewportCount, VMAX_VIEWPORTS(impl));
+					RHI_FAIL(Result::Unsupported);
+				}
+				if (!rasterState.depthClip && impl->supportedFeatures.depthClamp != VK_TRUE) {
+					spdlog::error("Vulkan graphics pipeline creation: turning depth clip off needs the depthClamp feature");
+					RHI_FAIL(Result::Unsupported);
+				}
+				if (blendState.logicOpEnable && impl->supportedFeatures.logicOp != VK_TRUE) {
+					spdlog::error("Vulkan graphics pipeline creation: a logic op needs the logicOp feature");
+					RHI_FAIL(Result::Unsupported);
+				}
+				for (uint32_t i = 0; i < blendState.numAttachments && i < 8; ++i) {
+					const BlendAttachment& attachment = blendState.attachments[i];
+					if (attachment.enable && !blendState.logicOpEnable && impl->supportedFeatures.dualSrcBlend != VK_TRUE &&
+						(VkBlendFactorIsDualSource(attachment.srcColor) || VkBlendFactorIsDualSource(attachment.dstColor) ||
+							VkBlendFactorIsDualSource(attachment.srcAlpha) || VkBlendFactorIsDualSource(attachment.dstAlpha))) {
+						spdlog::error("Vulkan graphics pipeline creation: dual-source blending needs the dualSrcBlend feature");
+						RHI_FAIL(Result::Unsupported);
+					}
 				}
 
 				std::vector<VkShaderModule> modules;
@@ -8088,8 +10024,8 @@ namespace rhi {
 				VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
 				inputAssembly.topology = VkPrimitiveTopologyForRHI(primitiveTopology);
 				VkPipelineViewportStateCreateInfo viewportState{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-				viewportState.viewportCount = 1;
-				viewportState.scissorCount = 1;
+				viewportState.viewportCount = (std::max)(rasterState.viewportCount, 1u);
+				viewportState.scissorCount = viewportState.viewportCount;
 				VkPipelineRasterizationStateCreateInfo raster{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
 				raster.polygonMode = VkPolygonModeForRHI(rasterState.fill);
 				raster.cullMode = VkCullModeForRHI(rasterState.cull);
@@ -8100,6 +10036,9 @@ namespace rhi {
 				// This is DXVK's mapping too, under the same flip (d3d11_rasterizer.cpp, d3d11_context.cpp).
 				raster.frontFace = rasterState.frontCCW ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
 				raster.lineWidth = 1.0f;
+				// D3D's DepthClipEnable off skips the near and far clip and clamps depth to the viewport range,
+				// which is what depth clamp does.
+				raster.depthClampEnable = rasterState.depthClip ? VK_FALSE : VK_TRUE;
 				raster.depthBiasEnable = (rasterState.depthBias != 0.0f || rasterState.slopeScaledDepthBias != 0.0f) ? VK_TRUE : VK_FALSE;
 				raster.depthBiasConstantFactor = rasterState.depthBias;
 				raster.depthBiasClamp = rasterState.depthBiasClamp;
@@ -8110,17 +10049,46 @@ namespace rhi {
 					multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 				}
 				multisample.alphaToCoverageEnable = blendState.alphaToCoverage ? VK_TRUE : VK_FALSE;
+				// All bits set is Vulkan's default too, so only a real mask is passed.
+				const VkSampleMask sampleMask[2] = { blendState.sampleMask, 0xFFFFFFFFu };
+				if (blendState.sampleMask != 0xFFFFFFFFu) {
+					multisample.pSampleMask = sampleMask;  // two words cover up to 64 samples
+				}
 				VkPipelineDepthStencilStateCreateInfo depthStencil{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
 				depthStencil.depthTestEnable = depthState.depthEnable ? VK_TRUE : VK_FALSE;
 				depthStencil.depthWriteEnable = depthState.depthWrite ? VK_TRUE : VK_FALSE;
 				depthStencil.depthCompareOp = VkToCompareOp(depthState.depthFunc);
+				if (depthState.stencilEnable) {
+					// The reference is dynamic state (SetStencilRef); the masks are the pipeline's, as in D3D12.
+					auto toVk = [&](const StencilFaceState& face) {
+						VkStencilOpState state{};
+						state.failOp = VkStencilOpForRHI(face.failOp);
+						state.passOp = VkStencilOpForRHI(face.passOp);
+						state.depthFailOp = VkStencilOpForRHI(face.depthFailOp);
+						state.compareOp = VkToCompareOp(face.func);
+						state.compareMask = depthState.stencilReadMask;
+						state.writeMask = depthState.stencilWriteMask;
+						return state;
+					};
+					depthStencil.stencilTestEnable = VK_TRUE;
+					depthStencil.front = toVk(depthState.front);
+					depthStencil.back = toVk(depthState.back);
+				}
 				std::vector<VkPipelineColorBlendAttachmentState> blendAttachments;
 				const uint32_t attachmentCount = (std::max)(renderTargets.count, blendState.numAttachments);
 				blendAttachments.resize(attachmentCount);
+				bool dynamicBlendConstants = false;
 				for (uint32_t i = 0; i < attachmentCount; ++i) {
 					const BlendAttachment& src = blendState.attachments[(std::min)(i, blendState.numAttachments ? blendState.numAttachments - 1 : 0)];
 					auto& dst = blendAttachments[i];
-					dst.blendEnable = src.enable ? VK_TRUE : VK_FALSE;
+					// A logic op replaces blending on every attachment.
+					const bool blending = src.enable && !blendState.logicOpEnable;
+					if (blending) {
+						dynamicBlendConstants = dynamicBlendConstants ||
+							VkBlendFactorIsConstant(src.srcColor) || VkBlendFactorIsConstant(src.dstColor) ||
+							VkBlendFactorIsConstant(src.srcAlpha) || VkBlendFactorIsConstant(src.dstAlpha);
+					}
+					dst.blendEnable = blending ? VK_TRUE : VK_FALSE;
 					dst.srcColorBlendFactor = VkBlendFactorForRHI(src.srcColor);
 					dst.dstColorBlendFactor = VkBlendFactorForRHI(src.dstColor);
 					dst.colorBlendOp = VkBlendOpForRHI(src.colorOp);
@@ -8132,7 +10100,11 @@ namespace rhi {
 				VkPipelineColorBlendStateCreateInfo colorBlend{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
 				colorBlend.attachmentCount = static_cast<uint32_t>(blendAttachments.size());
 				colorBlend.pAttachments = blendAttachments.empty() ? nullptr : blendAttachments.data();
-				std::array<VkDynamicState, 4> dynamicStates = {
+				if (blendState.logicOpEnable) {
+					colorBlend.logicOpEnable = VK_TRUE;
+					colorBlend.logicOp = VkLogicOpForRHI(blendState.logicOp);
+				}
+				std::array<VkDynamicState, 6> dynamicStates = {
 					VK_DYNAMIC_STATE_VIEWPORT,
 					VK_DYNAMIC_STATE_SCISSOR,
 					VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
@@ -8141,6 +10113,11 @@ namespace rhi {
 				// Indirect commands bind vertex buffers with their strides (VertexBuffer argument).
 				const bool dynamicVertexStride = !hasMeshShader && !bindings.empty() && (pipelineFlags & PipelineFlags_IndirectBindable) != 0;
 				uint32_t dynamicStateCount = hasMeshShader ? 2u : (dynamicVertexStride ? 4u : 3u);
+				// Command list state in D3D12, so dynamic here. Only pipelines that read it declare it, which keeps
+				// the others as they were.
+				const bool dynamicStencilReference = depthState.stencilEnable;
+				if (dynamicStencilReference) dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
+				if (dynamicBlendConstants) dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;
 				VkPipelineDynamicStateCreateInfo dynamicState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
 				dynamicState.dynamicStateCount = dynamicStateCount;
 				dynamicState.pDynamicStates = dynamicStates.data();
@@ -8206,7 +10183,9 @@ namespace rhi {
 				}
 				if (t_pipelineStatisticsLabel)
 					for (VkShaderModule module : modules) VkSetObjectName(impl, reinterpret_cast<uint64_t>(module), VK_OBJECT_TYPE_SHADER_MODULE, t_pipelineStatisticsLabel);
-				VkResult vkResult = vkCreateGraphicsPipelines(impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &nativePipeline);
+				VkResult vkResult = VkCreatePipelineThroughCache(impl, pipelineInfo, [&](VkPipelineCache cache) {
+					return vkCreateGraphicsPipelines(impl->device, cache, 1, &pipelineInfo, nullptr, &nativePipeline);
+				});
 				if (vkResult == VK_SUCCESS && t_pipelineStatisticsLabel)
 					VkSetObjectName(impl, reinterpret_cast<uint64_t>(nativePipeline), VK_OBJECT_TYPE_PIPELINE, t_pipelineStatisticsLabel);
 				for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
@@ -8215,11 +10194,14 @@ namespace rhi {
 					return ToRHI(vkResult);
 				}
 
+				NotePipelines(1);
 				if (captureStatistics) LogPipelineStatistics(impl->device, nativePipeline);
 				if (dumpIsa) DumpPipelineInternalRepresentations(impl->device, nativePipeline, "graphics", nullptr);
 				VulkanPipeline graphicsPipelineState{ nativePipeline, nativeLayout, VK_PIPELINE_BIND_POINT_GRAPHICS, layoutHandle, false };
 				graphicsPipelineState.indirectBindable = indirectBindable;
 				graphicsPipelineState.dynamicVertexStride = dynamicVertexStride;
+				graphicsPipelineState.dynamicStencilReference = dynamicStencilReference;
+				graphicsPipelineState.dynamicBlendConstants = dynamicBlendConstants;
 				for (const VkPipelineShaderStageCreateInfo& stage : shaderStages) {
 					graphicsPipelineState.shaderStages |= stage.stage;
 				}
@@ -8305,12 +10287,15 @@ namespace rhi {
 			pipelineInfo.layout = bufferModel ? impl->descriptorBuffer.pipelineLayout : nativeLayout;
 
 			VkPipeline nativePipeline = VK_NULL_HANDLE;
-			vkResult = vkCreateComputePipelines(impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &nativePipeline);
+			vkResult = VkCreatePipelineThroughCache(impl, pipelineInfo, [&](VkPipelineCache cache) {
+				return vkCreateComputePipelines(impl->device, cache, 1, &pipelineInfo, nullptr, &nativePipeline);
+			});
 			vkDestroyShaderModule(impl->device, shaderModule, nullptr);
 			if (vkResult != VK_SUCCESS) {
 				spdlog::error("Vulkan compute pipeline creation: vkCreateComputePipelines failed with VkResult {}", static_cast<int>(vkResult));
 				return ToRHI(vkResult);
 			}
+			NotePipelines(1);
 			if (dumpIsa) DumpPipelineInternalRepresentations(impl->device, nativePipeline, "compute", t_pipelineStatisticsLabel ? t_pipelineStatisticsLabel : entryPoint);
 
 			const PipelineHandle handle = impl->pipelines.alloc(VulkanPipeline{
@@ -8336,7 +10321,15 @@ namespace rhi {
 				return;
 			}
 			VkReleaseViewsForResource(impl, handle);
+			VkReleaseViewRef(impl, handle);
 			if (VulkanResource* resource = VkResourceState(impl, handle)) {
+				// A buffer with a device address goes into the fault report's ring: a later read in it is a use after free.
+				if (resource->type == ResourceType::Buffer && resource->deviceAddress != 0) {
+					auto& ring = impl->retiredBuffers;
+					const std::scoped_lock ringLock(ring.mutex);
+					ring.entries[ring.next++ % ring.entries.size()] = { resource->deviceAddress, resource->bufferSize,
+						(uint64_t(handle.generation) << 32) | handle.index, resource->ownsBuffer, resource->name };
+				}
 				VkDestroyResource(impl, *resource);
 			}
 			impl->resources.free(handle);
@@ -8388,6 +10381,7 @@ namespace rhi {
 				if (VulkanCommandAllocator* allocatorState = VkAllocatorState(impl, commandListState->allocatorHandle);
 					allocatorState && allocatorState->pool != VK_NULL_HANDLE && impl->device != VK_NULL_HANDLE) {
 					vkFreeCommandBuffers(impl->device, allocatorState->pool, 1, &commandListState->commandBuffer);
+					g_liveCommandBuffers.fetch_sub(1, std::memory_order_relaxed);
 				}
 			}
 
@@ -8541,11 +10535,11 @@ namespace rhi {
 			if (!impl || impl->device == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::Failed);
 			}
-			if (!impl->ownsDevice) {
+			if (!impl->ownsDevice || impl->sharedQueues) {
 				return VkWaitForSubmittedTimelines(impl);
 			}
 
-			return ToRHI(VkDeviceWaitIdleHooked(impl->device));
+			return ToRHI(VkCheckDeviceLost(impl, VkDeviceWaitIdleHooked(impl->device), "Device::WaitIdle"));
 		}
 
 		static void d_flushDeletionQueue(Device* device) noexcept {
@@ -8581,14 +10575,15 @@ namespace rhi {
 			RHI_FAIL(Result::Unsupported);
 		#endif
 
+			swapchainState.presentQueue = VkPrimaryQueueHandleForKind(impl, QueueKind::Graphics);
 			const Result createResult = VkCreateOrResizeSwapchain(impl, swapchainState, width, height, format, bufferCount, allowTearing);
 			if (createResult != Result::Ok) {
+				(void)VkWaitDeviceIdle(impl);
+				VkReleaseSwapchainImageHandles(impl, swapchainState);
 				VkReleaseSwapchainPresentSemaphores(impl, swapchainState);
-				if (swapchainState.acquireFence != VK_NULL_HANDLE) {
-					vkDestroyFence(impl->device, swapchainState.acquireFence, nullptr);
-				}
-				if (swapchainState.acquireSemaphore != VK_NULL_HANDLE) {
-					vkDestroySemaphore(impl->device, swapchainState.acquireSemaphore, nullptr);
+				VkReleaseSwapchainAcquireSlots(impl, swapchainState);
+				if (swapchainState.swapchain != VK_NULL_HANDLE) {
+					VkDestroySwapchainKHRHooked(impl->device, swapchainState.swapchain, nullptr);
 				}
 				if (swapchainState.surface != VK_NULL_HANDLE) {
 					VkDestroySurfaceKHRHooked(impl->instance, swapchainState.surface, nullptr);
@@ -8618,17 +10613,11 @@ namespace rhi {
 			}
 
 			if (impl->device != VK_NULL_HANDLE) {
-				VkDeviceWaitIdleHooked(impl->device);
+				(void)VkWaitDeviceIdle(impl);
 				VkReleaseSwapchainImageHandles(impl, *swapchainState);
 				VkReleaseSwapchainPresentSemaphores(impl, *swapchainState);
-				if (swapchainState->acquireFence != VK_NULL_HANDLE) {
-					vkDestroyFence(impl->device, swapchainState->acquireFence, nullptr);
-					swapchainState->acquireFence = VK_NULL_HANDLE;
-				}
-				if (swapchainState->acquireSemaphore != VK_NULL_HANDLE) {
-					vkDestroySemaphore(impl->device, swapchainState->acquireSemaphore, nullptr);
-					swapchainState->acquireSemaphore = VK_NULL_HANDLE;
-				}
+				VkReleaseSwapchainAcquireSlots(impl, *swapchainState);
+				VkReleaseSwapchainAcquireTimeline(impl, *swapchainState);
 				if (swapchainState->swapchain != VK_NULL_HANDLE) {
 					VkDestroySwapchainKHRHooked(impl->device, swapchainState->swapchain, nullptr);
 					swapchainState->swapchain = VK_NULL_HANDLE;
@@ -8757,24 +10746,24 @@ namespace rhi {
 			}
 
 			if (VkDescriptorBufferModel(impl)) {
-				// The push data image reaches shaders through the universal layout's kPushConstantBytes of push constants. A layout
+				// The push data image reaches shaders through the universal layout's pushConstantBytes of push constants. A layout
 				// that fits is pushed whole. A larger one pushes a strict prefix of its ranges in declaration order - those ending
-				// within kPushedPrefixBytes, stopping at the first that does not (ranges are never split) - and spills the rest to
-				// memory, whose address is the push constant at kSpillAddressOffset.
-				using Model = VulkanDescriptorBufferModel;
-				if (layoutState.totalPushDataBytes <= Model::kPushConstantBytes) {
+				// within pushedPrefixBytes, stopping at the first that does not (ranges are never split) - and spills the rest to
+				// memory, whose address is the push constant at spillAddressOffset.
+				const VulkanDescriptorBufferModel& model = impl->descriptorBuffer;
+				if (layoutState.totalPushDataBytes <= model.pushConstantBytes) {
 					layoutState.pushedBytes = layoutState.totalPushDataBytes;
 					layoutState.spillAddressOffset = vulkan_binding::kNoSpill;
 				}
 				else {
 					layoutState.pushedBytes = 0;
 					for (const VulkanPushConstantRange& range : layoutState.pushConstantRanges) {
-						if (range.byteOffset + range.byteSize > Model::kPushedPrefixBytes) {
+						if (range.byteOffset + range.byteSize > model.pushedPrefixBytes) {
 							break;
 						}
 						layoutState.pushedBytes = range.byteOffset + range.byteSize;
 					}
-					layoutState.spillAddressOffset = Model::kSpillAddressOffset;
+					layoutState.spillAddressOffset = model.spillAddressOffset;
 				}
 				if (const Result result = VkRegisterStaticSamplers(impl, layoutState); result != Result::Ok) {
 					out.Reset();
@@ -8804,14 +10793,21 @@ namespace rhi {
 				RHI_FAIL(Result::Failed);
 			}
 
+			// UMA means video memory and system memory are the same pool. A discrete GPU with resizable BAR
+			// also has host-visible device-local types, so those do not make a device UMA.
 			bool hasDeviceLocalHeap = false;
-			bool hostVisibleDeviceLocal = false;
+			bool hasHostOnlyHeap = false;
 			bool hostCoherentDeviceLocal = false;
 			for (uint32_t heapIndex = 0; heapIndex < impl->memoryProperties.memoryHeapCount; ++heapIndex) {
 				if ((impl->memoryProperties.memoryHeaps[heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
 					hasDeviceLocalHeap = true;
+				} else {
+					hasHostOnlyHeap = true;
 				}
 			}
+			const VkPhysicalDeviceType deviceType = impl->physicalDeviceProperties.deviceType;
+			const bool uma = deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU
+				|| !hasHostOnlyHeap || !hasDeviceLocalHeap;
 
 			for (uint32_t typeIndex = 0; typeIndex < impl->memoryProperties.memoryTypeCount; ++typeIndex) {
 				const VkMemoryType& type = impl->memoryProperties.memoryTypes[typeIndex];
@@ -8825,9 +10821,6 @@ namespace rhi {
 					continue;
 				}
 
-				if ((type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
-					hostVisibleDeviceLocal = true;
-				}
 				if ((type.propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
 					== (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
 					hostCoherentDeviceLocal = true;
@@ -8860,8 +10853,8 @@ namespace rhi {
 					}
 
 					auto* out = reinterpret_cast<ArchitectureFeatureInfo*>(header);
-					out->uma = hostVisibleDeviceLocal || !hasDeviceLocalHeap;
-					out->cacheCoherentUMA = hostCoherentDeviceLocal;
+					out->uma = uma;
+					out->cacheCoherentUMA = uma && hostCoherentDeviceLocal;
 					out->isolatedMMU = false;
 					out->tileBasedRenderer = false;
 				} break;
@@ -9024,6 +11017,7 @@ namespace rhi {
 					out->gpuUploadHeapSupported = hostCoherentDeviceLocal;
 					out->tightAlignmentSupported = false;
 					out->createNotZeroedHeapSupported = false;
+					out->committedSmallBuffersPacked = false;  // each committed buffer is a vkAllocateMemory of its own
 				} break;
 
 				case FeatureInfoStructType::WorkGraphs: {
@@ -9059,10 +11053,58 @@ namespace rhi {
 					out->indirectBindings = VkBindlessModel(impl);
 					out->maxSequenceCount = generated ? dgcProperties.maxIndirectSequenceCount : 0;
 					if (header->structVersion >= 2) {
-						// The descriptor-buffer model pushes a layout's root constants within kPushedPrefixBytes when they exceed
-						// kPushConstantBytes (VulkanPipelineLayout::pushedBytes); the descriptor-heap model pushes all of them.
-						out->constantArgumentBytes = VkDescriptorBufferModel(impl) ? VulkanDescriptorBufferModel::kPushedPrefixBytes : 0u;
+						// The descriptor-buffer model pushes a layout's root constants within pushedPrefixBytes when they exceed
+						// pushConstantBytes (VulkanPipelineLayout::pushedBytes); the descriptor-heap model pushes all of them.
+						out->constantArgumentBytes = VkDescriptorBufferModel(impl) ? impl->descriptorBuffer.pushedPrefixBytes : 0u;
 					}
+					if (header->structVersion >= 3)
+						out->countedDraws = impl->drawIndirectCountEnabled && vkCmdDrawIndexedIndirectCount;
+				} break;
+
+				case FeatureInfoStructType::CommandMemory: {
+					if (header->structSize < sizeof(CommandMemoryFeatureInfo)) {
+						RHI_FAIL(Result::InvalidArgument);
+					}
+					// Counted process-wide, the pooled part per device: held is alive minus pooled.
+					auto* out = reinterpret_cast<CommandMemoryFeatureInfo*>(header);
+					const auto count = [](const std::atomic<int64_t>& value) { return static_cast<uint64_t>((std::max<int64_t>)(value.load(std::memory_order_relaxed), 0)); };
+					out->commandPools = count(g_liveCommandPools);
+					out->commandLists = count(g_liveCommandBuffers);
+					auto* mutableImpl = const_cast<VulkanDevice*>(impl);
+					uint64_t scratchPooled = 0, scratchPooledBytes = 0, dgcPooled = 0, dgcPooledBytes = 0;
+					{
+						std::scoped_lock poolLock(mutableImpl->scratchPoolMutex);
+						scratchPooled = mutableImpl->scratchPool.size();
+						scratchPooledBytes = mutableImpl->scratchPoolBytes;
+					}
+					{
+						std::scoped_lock poolLock(mutableImpl->preprocessPoolMutex);
+						dgcPooled = mutableImpl->preprocessPool.size();
+						dgcPooledBytes = mutableImpl->preprocessPoolBytes;
+					}
+					const auto held = [](uint64_t alive, uint64_t pooled) { return alive > pooled ? alive - pooled : 0; };
+					out->scratchPagesPooled = scratchPooled;
+					out->scratchBytesPooled = scratchPooledBytes;
+					out->scratchPagesHeld = held(count(g_scratchPages), scratchPooled);
+					out->scratchBytesHeld = held(count(g_scratchBytes), scratchPooledBytes);
+					out->dgcPagesPooled = dgcPooled;
+					out->dgcBytesPooled = dgcPooledBytes;
+					out->dgcPagesHeld = held(count(g_dgcPages), dgcPooled);
+					out->dgcBytesHeld = held(count(g_dgcBytes), dgcPooledBytes);
+				} break;
+
+				case FeatureInfoStructType::FixedFunction: {
+					if (header->structSize < sizeof(FixedFunctionFeatureInfo)) {
+						RHI_FAIL(Result::InvalidArgument);
+					}
+					// The core features the device was created (or adopted) with.
+					auto* out = reinterpret_cast<FixedFunctionFeatureInfo*>(header);
+					out->dualSourceBlend = impl->supportedFeatures.dualSrcBlend == VK_TRUE;
+					out->logicOp = impl->supportedFeatures.logicOp == VK_TRUE;
+					out->depthClipDisable = impl->supportedFeatures.depthClamp == VK_TRUE;
+					out->maxViewports = VMAX_VIEWPORTS(impl);
+					if (header->structVersion >= 2)
+						out->secondaryViewportScissor = true;  // dynamic state in any command buffer
 				} break;
 
 				default:
@@ -9073,6 +11115,9 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// D3D12's QueryVideoMemoryInfo from the heaps: Local sums the device-local heaps, NonLocal the others (the grouping
+		// AdapterInfo uses). Budget and usage are VK_EXT_memory_budget's; without it the budget is the heaps' size and the usage
+		// is 0. Vulkan has no reservations: what can be reserved is the budget, and nothing is reserved.
 		static Result d_queryVideoMemoryInfo(const Device* device, uint32_t nodeIndex, MemorySegmentGroup segmentGroup, VideoMemoryInfo& out) noexcept {
 			VkIgnoreUnused(nodeIndex);
 			auto* impl = device ? static_cast<const VulkanDevice*>(device->impl) : nullptr;
@@ -9082,17 +11127,20 @@ namespace rhi {
 			}
 
 			out = {};
-			switch (segmentGroup) {
-			case MemorySegmentGroup::Local:
-				out.budgetBytes = VkSumHeapBudget(impl->memoryProperties, true);
-				break;
-			case MemorySegmentGroup::NonLocal:
-				out.budgetBytes = VkSumHeapBudget(impl->memoryProperties, false);
-				break;
-			default:
+			if (segmentGroup != MemorySegmentGroup::Local && segmentGroup != MemorySegmentGroup::NonLocal) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
-
+			const bool wantLocal = segmentGroup == MemorySegmentGroup::Local;
+			std::array<vulkan::MemoryHeapBudget, VK_MAX_MEMORY_HEAPS> heaps{};
+			const uint32_t count = VkQueryHeapBudgets(*impl, heaps.data(), static_cast<uint32_t>(heaps.size()));
+			for (uint32_t heapIndex = 0; heapIndex < count; ++heapIndex) {
+				const vulkan::MemoryHeapBudget& heap = heaps[heapIndex];
+				if (((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) != wantLocal) continue;
+				out.budgetBytes += heap.budget;
+				out.currentUsageBytes += heap.usage;
+				out.usageAtBudget = out.usageAtBudget || heap.usageAtBudget;
+			}
+			out.availableForReservationBytes = out.budgetBytes;
 			return Result::Ok;
 		}
 
@@ -9251,7 +11299,7 @@ namespace rhi {
 							spdlog::error("Vulkan CreateCommandSignature: the Constant argument for root parameter {} writes push data bytes [{}, {}), past the {} "
 								"bytes this layout pushes in the descriptor-buffer model (its later ranges are spilled to memory); declare that range "
 								"first or keep the layout's root constants within {} bytes", rootIndex, pushToken.updateRange.offset,
-								pushToken.updateRange.offset + pushToken.updateRange.size, layoutState->pushedBytes, VulkanDescriptorBufferModel::kPushedPrefixBytes);
+								pushToken.updateRange.offset + pushToken.updateRange.size, layoutState->pushedBytes, impl->descriptorBuffer.pushedPrefixBytes);
 							out.Reset();
 							RHI_FAIL(Result::InvalidArgument);
 						}
@@ -9476,7 +11524,7 @@ namespace rhi {
 			const bool samplerHeap = heap.type == DescriptorHeapType::Sampler;
 			heap.descriptorStride = samplerHeap ? model.samplerStride : model.resourceStride;
 			heap.descriptorBaseOffset = samplerHeap ? model.samplerBindingOffset : model.resourceBindingOffset;
-			uint64_t elements = heap.capacity;
+			uint64_t elements = static_cast<uint64_t>(heap.capacity) + heap.viewRefSlots;
 			// d_createDescriptorHeap has checked the capacity against the device's (the universal sets' sizes).
 			if (heap.shaderVisible && samplerHeap) {
 				elements = static_cast<uint64_t>(model.samplerCapacity) + model.staticSamplerCapacity;
@@ -9588,6 +11636,10 @@ namespace rhi {
 				}
 			}
 			heap.imageViewSlots.resize(desc.capacity);
+			// A shader-visible resource heap of the device's full capacity also holds the buffer view refs' region past it.
+			if (desc.shaderVisible && desc.type == DescriptorHeapType::CbvSrvUav && impl->viewRefs.ready && desc.capacity == impl->shaderVisibleResourceCapacity) {
+				heap.viewRefSlots = BUFFER_VIEW_REF_SLOTS;
+			}
 
 			if (VkDescriptorBufferModel(impl) && (desc.type == DescriptorHeapType::CbvSrvUav || desc.type == DescriptorHeapType::Sampler)) {
 				if (const Result result = VkCreateBufferModelHeapBacking(impl, heap); result != Result::Ok) {
@@ -9597,7 +11649,7 @@ namespace rhi {
 			}
 			else if (impl->descriptorHeapEnabled && (desc.type == DescriptorHeapType::CbvSrvUav || desc.type == DescriptorHeapType::Sampler)) {
 				heap.descriptorStride = VkDescriptorHeapStride(impl, desc.type);
-				heap.descriptorBytes = static_cast<uint64_t>(desc.capacity) * heap.descriptorStride;
+				heap.descriptorBytes = (static_cast<uint64_t>(desc.capacity) + heap.viewRefSlots) * heap.descriptorStride;
 				if (desc.type == DescriptorHeapType::Sampler) {
 					heap.reservedRangeSize = (std::max)(
 						static_cast<uint64_t>(impl->descriptorHeapProperties.minSamplerHeapReservedRange),
@@ -9681,6 +11733,19 @@ namespace rhi {
 					stored->mappedData = stored->hostDescriptors.data();
 				}
 			}
+			if (desc.shaderVisible && desc.type == DescriptorHeapType::CbvSrvUav) {
+				const VulkanDescriptorHeap* stored = VkDescriptorHeapState(impl, handle);
+				spdlog::info("Vulkan CreateDescriptorHeap: shader-visible resource heap '{}': {} descriptors + {} view ref slots, bytes [0x{:x}, 0x{:x})",
+					desc.debugName ? desc.debugName : "", desc.capacity, heap.viewRefSlots, stored ? static_cast<uint64_t>(stored->deviceAddress) : 0,
+					stored ? static_cast<uint64_t>(stored->deviceAddress) + stored->descriptorBytes : 0);
+			}
+			if (heap.viewRefSlots != 0) {
+				auto& r = impl->viewRefs;
+				std::unique_lock write(r.lock);
+				r.heaps.push_back(handle);
+				if (VulkanDescriptorHeap* stored = VkDescriptorHeapState(impl, handle))
+					VkCopyViewRefSlots(impl, *stored, 0, BUFFER_VIEW_REF_SLOTS);
+			}
 			DescriptorHeap descriptorHeap{ handle };
 			descriptorHeap.impl = impl;
 			descriptorHeap.vt = &g_vkdhvt;
@@ -9701,6 +11766,11 @@ namespace rhi {
 
 			for (VulkanImageViewSlot& slot : heap->imageViewSlots) {
 				VkResetDescriptorSlot(impl, slot);
+			}
+			if (heap->viewRefSlots != 0) {
+				auto& r = impl->viewRefs;
+				std::unique_lock write(r.lock);
+				std::erase_if(r.heaps, [&](DescriptorHeapHandle h) { return h.index == handle.index && h.generation == handle.generation; });
 			}
 			VkDestroyDescriptorHeapBacking(impl, *heap);
 
@@ -9953,7 +12023,7 @@ namespace rhi {
 				viewCreateInfo.image = resourceState->image;
 				viewCreateInfo.viewType = viewType;
 				viewCreateInfo.format = viewFormat;
-				viewCreateInfo.components = VkSrvComponentMapping(desc.componentMapping, desc.formatOverride);
+				viewCreateInfo.components = VkSrvComponentMapping(impl, desc.componentMapping, desc.formatOverride != Format::Unknown ? desc.formatOverride : resourceState->rhiFormat);
 				viewCreateInfo.subresourceRange = subresourceRange;
 				return VkCreateBufferModelImageSlot(impl, slot, resource, *resourceState, viewCreateInfo, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
 					resourceState->generalLayoutOnly ? VK_IMAGE_LAYOUT_GENERAL : VkToImageLayout(ResourceLayout::ShaderResource, aspectMask));
@@ -9970,7 +12040,7 @@ namespace rhi {
 				viewCreateInfo.image = resourceState->image;
 				viewCreateInfo.viewType = viewType;
 				viewCreateInfo.format = viewFormat;
-				viewCreateInfo.components = VkSrvComponentMapping(desc.componentMapping, desc.formatOverride);
+				viewCreateInfo.components = VkSrvComponentMapping(impl, desc.componentMapping, desc.formatOverride != Format::Unknown ? desc.formatOverride : resourceState->rhiFormat);
 				viewCreateInfo.subresourceRange = subresourceRange;
 
 				VkImageDescriptorInfoEXT imageInfo{ VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT };
@@ -10024,7 +12094,7 @@ namespace rhi {
 				aspectMask,
 				viewType,
 				{ subresourceRange.baseMipLevel, subresourceRange.levelCount, subresourceRange.baseArrayLayer, subresourceRange.layerCount },
-				VkSrvComponentMapping(desc.componentMapping, desc.formatOverride));
+				VkSrvComponentMapping(impl, desc.componentMapping, desc.formatOverride != Format::Unknown ? desc.formatOverride : resourceState->rhiFormat));
 		}
 
 		static Result d_createUnorderedAccessView(Device* device, DescriptorSlot slot, const ResourceHandle& resource, const UavDesc& desc) noexcept {
@@ -10087,6 +12157,10 @@ namespace rhi {
 			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(impl, desc.formatOverride) : resourceState->format;
 			const VkImageAspectFlags aspectMask = VkAspectMaskForFormat(viewFormat);
 			if (viewType == VK_IMAGE_VIEW_TYPE_MAX_ENUM || viewFormat == VK_FORMAT_UNDEFINED) {
+				RHI_FAIL(Result::Unsupported);
+			}
+			// A storage view cannot swizzle: a format stored with its channels moved (A8 as R8) has no unordered access view.
+			if (VkSwizzleMovesChannels(VkFormatSwizzle(impl, desc.formatOverride != Format::Unknown ? desc.formatOverride : resourceState->rhiFormat))) {
 				RHI_FAIL(Result::Unsupported);
 			}
 
@@ -10279,6 +12353,10 @@ namespace rhi {
 			}
 
 			const VkFormat viewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(impl, desc.formatOverride) : resource->format;
+			// An attachment cannot swizzle: a format stored with its channels moved (A8 as R8) has no render target view.
+			if (VkSwizzleMovesChannels(VkFormatSwizzle(impl, desc.formatOverride != Format::Unknown ? desc.formatOverride : resource->rhiFormat))) {
+				RHI_FAIL(Result::Unsupported);
+			}
 			const VkImageViewType viewType = VkImageViewTypeForRtv(desc.dimension);
 			return VkCreateImageViewSlot(impl, slot, DescriptorHeapType::RTV, texture, viewFormat, VK_IMAGE_ASPECT_COLOR_BIT, viewType, desc.range);
 		}
@@ -10323,6 +12401,41 @@ namespace rhi {
 			return VkCreateCommandAllocator(device, impl, queue.GetKind(), VkQueueStateForHandle(impl, queue.GetQueueHandle()), out);
 		}
 
+		// BASICRHI_COMMAND_POOL_PROBE=N: at the first command pool, N more are made and kept for the process's life, each with one
+		// recorded empty primary buffer (BASICRHI_COMMAND_POOL_PROBE_SHARED=1: N buffers in one pool instead). The kernel VRAM
+		// counter's difference against a run without it is the driver's command memory per pool (or per buffer in a shared pool).
+		static void ProbeCommandPools(VkDevice device, uint32_t familyIndex) noexcept {
+			static std::atomic_flag done;
+			if (done.test_and_set()) return;
+			char value[16]{};
+			const uint32_t count = GetEnvironmentVariableA("BASICRHI_COMMAND_POOL_PROBE", value, sizeof(value)) > 0 ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+			if (count == 0) return;
+			char sharedValue[8]{};
+			const bool shared = GetEnvironmentVariableA("BASICRHI_COMMAND_POOL_PROBE_SHARED", sharedValue, sizeof(sharedValue)) > 0 && sharedValue[0] == '1';
+			VkCommandPoolCreateInfo createInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+			createInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+			createInfo.queueFamilyIndex = familyIndex;
+			VkCommandPool sharedPool = VK_NULL_HANDLE;
+			uint32_t made = 0;
+			for (uint32_t i = 0; i < count; ++i) {
+				VkCommandPool pool = sharedPool;
+				if (pool == VK_NULL_HANDLE && vkCreateCommandPool(device, &createInfo, nullptr, &pool) != VK_SUCCESS) break;
+				if (shared) sharedPool = pool;
+				VkCommandBufferAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+				allocateInfo.commandPool = pool;
+				allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+				allocateInfo.commandBufferCount = 1;
+				VkCommandBuffer buffer = VK_NULL_HANDLE;
+				if (vkAllocateCommandBuffers(device, &allocateInfo, &buffer) != VK_SUCCESS) break;
+				VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+				vkBeginCommandBuffer(buffer, &begin);
+				vkEndCommandBuffer(buffer);
+				++made;
+			}
+			spdlog::info("BasicRHI Vulkan: command pool probe made {} recorded buffers in {} (kept for the process's life)", made,
+				shared ? "one shared pool" : "a pool each");
+		}
+
 		static Result VkCreateCommandAllocator(Device* device, VulkanDevice* impl, QueueKind kind, const VulkanQueueState* queueState, CommandAllocatorPtr& out) noexcept {
 			if (!queueState || queueState->familyIndex == kVkInvalidQueueFamily) {
 				out.Reset();
@@ -10340,6 +12453,8 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
+			NoteCommandPools(1);
+			ProbeCommandPools(impl->device, createInfo.queueFamilyIndex);
 			const CommandAllocatorHandle handle = impl->allocators.alloc(VulkanCommandAllocator{ pool, kind, createInfo.queueFamilyIndex });
 			CommandAllocator allocator{ handle };
 			allocator.impl = impl;
@@ -10363,6 +12478,7 @@ namespace rhi {
 
 			if (allocatorState->pool != VK_NULL_HANDLE && impl->device != VK_NULL_HANDLE) {
 				vkDestroyCommandPool(impl->device, allocatorState->pool, nullptr);
+				NoteCommandPools(-1);
 			}
 
 			impl->allocators.free(allocator->GetHandle());
@@ -10401,6 +12517,7 @@ namespace rhi {
 			commandList.impl = impl;
 			commandList.backendState = impl->commandLists.get(handle);
 			commandList.vt = &g_vkclvt;
+			if (VulkanCommandList* created = impl->commandLists.get(handle)) VkWriteCrashMarker(impl, *created, "command list begin");
 			out = MakeCommandListPtr(device, commandList, impl->selfWeak.lock());
 			return Result::Ok;
 		}
@@ -10471,10 +12588,8 @@ namespace rhi {
 			VkMemoryRequirements memoryRequirements{};
 			vkGetBufferMemoryRequirements(impl->device, buffer, &memoryRequirements);
 
-			const VkMemoryPropertyFlags preferredFlags = VkPreferredMemoryPropertyFlags(desc.heapType);
-			const VkMemoryPropertyFlags requiredFlags = VkRequiredMemoryPropertyFlags(desc.heapType);
 			uint32_t memoryTypeIndex = 0;
-			if (!VkFindMemoryTypeIndex(impl->memoryProperties, memoryRequirements.memoryTypeBits, preferredFlags, requiredFlags, memoryTypeIndex)) {
+			if (!VkFindMemoryTypeForHeapType(impl->memoryProperties, memoryRequirements.memoryTypeBits, desc.heapType, memoryTypeIndex)) {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
@@ -10523,6 +12638,7 @@ namespace rhi {
 				resourceState.deviceAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
 			}
 
+			VkKeepResourceName(resourceState, desc.debugName);
 			const ResourceHandle handle = impl->resources.alloc(resourceState);
 			Resource resource{ handle, false };
 			resource.impl = impl;
@@ -10549,7 +12665,7 @@ namespace rhi {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
 			}
-			if (desc.heapType != HeapType::DeviceLocal) {
+			if (desc.heapType != HeapType::DeviceLocal && desc.heapType != HeapType::SystemMemory) {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
 			}
@@ -10595,11 +12711,7 @@ namespace rhi {
 			vkGetImageMemoryRequirements(impl->device, image, &memoryRequirements);
 
 			uint32_t memoryTypeIndex = 0;
-			if (!VkFindMemoryTypeIndex(impl->memoryProperties,
-				memoryRequirements.memoryTypeBits,
-				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-				memoryTypeIndex)) {
+			if (!VkFindMemoryTypeForHeapType(impl->memoryProperties, memoryRequirements.memoryTypeBits, desc.heapType, memoryTypeIndex)) {
 				vkDestroyImage(impl->device, image, nullptr);
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
@@ -10629,6 +12741,7 @@ namespace rhi {
 			resourceState.image = image;
 			resourceState.memory = memory;
 			resourceState.format = format;
+			resourceState.rhiFormat = desc.texture.format;
 			resourceState.type = desc.type;
 			resourceState.concurrentSharing = concurrentSharing;
 			resourceState.currentLayout = ResourceLayout::Undefined;
@@ -10735,15 +12848,13 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			VkMemoryPropertyFlags preferredFlags = VkPreferredMemoryPropertyFlags(desc.memory);
-			VkMemoryPropertyFlags requiredFlags = VkRequiredMemoryPropertyFlags(desc.memory);
 			uint32_t memoryTypeBits = 0;
 			for (uint32_t index = 0; index < impl->memoryProperties.memoryTypeCount; ++index) {
 				memoryTypeBits |= (1u << index);
 			}
 
 			uint32_t memoryTypeIndex = 0;
-			if (!VkFindMemoryTypeIndex(impl->memoryProperties, memoryTypeBits, preferredFlags, requiredFlags, memoryTypeIndex)) {
+			if (!VkFindMemoryTypeForHeapType(impl->memoryProperties, memoryTypeBits, desc.memory, memoryTypeIndex)) {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
 			}
@@ -10790,6 +12901,7 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			VulkanResource* resource = VkResourceState(impl, handle);
 			if (resource) {
+				VkKeepResourceName(*resource, name);
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(resource->buffer), VK_OBJECT_TYPE_BUFFER, name);
 			}
 		}
@@ -10927,6 +13039,7 @@ namespace rhi {
 			resourceState.memory = heapState->memory;
 			resourceState.memoryOffset = offset;
 			resourceState.format = format;
+			resourceState.rhiFormat = desc.texture.format;
 			resourceState.type = desc.type;
 			resourceState.concurrentSharing = concurrentSharing;
 			resourceState.currentLayout = ResourceLayout::Undefined;
@@ -11014,6 +13127,7 @@ namespace rhi {
 				resourceState.deviceAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
 			}
 
+			VkKeepResourceName(resourceState, desc.debugName);
 			const ResourceHandle handle = impl->resources.alloc(resourceState);
 			Resource resource{ handle, false };
 			resource.impl = impl;
@@ -11081,6 +13195,8 @@ namespace rhi {
 				return ToRHI(result);
 			}
 
+			g_liveQueryPools.fetch_add(1, std::memory_order_relaxed);
+			g_liveQueries.fetch_add(desc.count, std::memory_order_relaxed);
 			const QueryPoolHandle handle = impl->queryPools.alloc(VulkanQueryPool{ pool, desc.type, desc.count, requestedStats, vkStats });
 			QueryPool queryPool{ handle };
 			queryPool.impl = impl;
@@ -11097,6 +13213,8 @@ namespace rhi {
 			}
 			if (queryPool->pool != VK_NULL_HANDLE) {
 				vkDestroyQueryPool(impl->device, queryPool->pool, nullptr);
+				g_liveQueryPools.fetch_sub(1, std::memory_order_relaxed);
+				g_liveQueries.fetch_sub(queryPool->count, std::memory_order_relaxed);
 			}
 			impl->queryPools.free(handle);
 		}
@@ -11175,6 +13293,10 @@ namespace rhi {
 		static uint64_t d_getBufferDeviceAddress(Device* device, GpuBufferAddress address) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			return VkBufferAddress(impl, address);
+		}
+
+		static BufferViewRef d_getBufferViewRef(Device* device, GpuBufferAddress address) noexcept {
+			return VkViewRef(device ? static_cast<VulkanDevice*>(device->impl) : nullptr, address);
 		}
 
 		static Result d_getRayTracingAccelerationStructureOperationPrebuildInfo(Device* device, const RayTracingRtasOperationInputs& inputs, RayTracingRtasPrebuildInfo* out) noexcept {
@@ -11332,11 +13454,18 @@ namespace rhi {
 				const ResourceDesc& desc = resources[index];
 				VkMemoryRequirements requirements{};
 				if (desc.type == ResourceType::Buffer) {
+					// The buffer as d_createPlacedBuffer makes it (device address usage, queue sharing): the allocator places by these
+					// requirements, and a stricter real one fails the placement and falls back to a committed allocation of its own.
 					VkBufferCreateInfo createInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
 					createInfo.flags = VkBufferDeviceAddressCreateFlags(impl);
 					createInfo.size = desc.buffer.sizeBytes;
 					createInfo.usage = VkBufferUsageForDesc(impl, desc);
-					createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+					if (impl->bufferDeviceAddressEnabled) {
+						createInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+					}
+					uint32_t sharingFamilies[kVkMaxSharingFamilies]{};
+					bool concurrentSharing = false;
+					VkApplyBufferSharing(impl, desc, createInfo, sharingFamilies, concurrentSharing);
 					VkBuffer buffer = VK_NULL_HANDLE;
 					VkResult result = vkCreateBuffer(impl->device, &createInfo, nullptr, &buffer);
 					if (result != VK_SUCCESS) {
@@ -11533,14 +13662,21 @@ namespace rhi {
 			resources.clear(); commandSignatures.clear(); pipelines.clear(); pipelineLayouts.clear();
 			timelines.clear(); heaps.clear(); queryPools.clear(); allocators.clear(); queues.clear();
 			VkDestroyDescriptorBufferModel(this);
+			VkDestroyCrashMarkers(this);
+			VkDestroyPlaceholderInputBuffer(this);
 			device = VK_NULL_HANDLE;
 			instance = VK_NULL_HANDLE;
 			physicalDevice = VK_NULL_HANDLE;
 			return;
 		}
 		if (device != VK_NULL_HANDLE) {
-			if (ownsDevice) VkDeviceWaitIdleHooked(device);
+			if (ownsDevice && !sharedQueues) VkDeviceWaitIdleHooked(device);
 			else VkWaitForSubmittedTimelines(this);
+			if (pipelineCache.cache != VK_NULL_HANDLE) {
+				d_savePipelineCache(&self);
+				const std::unique_lock lock(pipelineCache.mutex);
+				VkClosePipelineCacheLocked(this);
+			}
 		}
 		for (auto& slot : queues.slots) {
 			if (slot.alive) {
@@ -11581,6 +13717,11 @@ namespace rhi {
 		for (auto& pooled : preprocessPool)
 			VkDestroyGeneratedCommandsPreprocessPage(this, pooled.page);
 		preprocessPool.clear();
+		preprocessPoolBytes = 0;
+		for (auto& pooled : scratchPool)
+			VkDestroyEmulatedRootConstantScratchPage(this, pooled.page);
+		scratchPool.clear();
+		scratchPoolBytes = 0;
 
 		for (auto& slot : descriptorHeaps.slots) {
 			if (!slot.alive) {
@@ -11603,12 +13744,7 @@ namespace rhi {
 
 			VkReleaseSwapchainImageHandles(this, slot.obj);
 			VkReleaseSwapchainPresentSemaphores(this, slot.obj);
-			if (device != VK_NULL_HANDLE && slot.obj.acquireFence != VK_NULL_HANDLE) {
-				vkDestroyFence(device, slot.obj.acquireFence, nullptr);
-			}
-			if (device != VK_NULL_HANDLE && slot.obj.acquireSemaphore != VK_NULL_HANDLE) {
-				vkDestroySemaphore(device, slot.obj.acquireSemaphore, nullptr);
-			}
+			VkReleaseSwapchainAcquireSlots(this, slot.obj);
 			if (device != VK_NULL_HANDLE && slot.obj.swapchain != VK_NULL_HANDLE) {
 				VkDestroySwapchainKHRHooked(device, slot.obj.swapchain, nullptr);
 			}
@@ -11667,6 +13803,8 @@ namespace rhi {
 		// After the heaps (their slots' sampler references are released) and the pipelines and signatures that name the universal
 		// layout.
 		VkDestroyDescriptorBufferModel(this);
+		VkDestroyCrashMarkers(this);
+		VkDestroyPlaceholderInputBuffer(this);
 
 		if (device != VK_NULL_HANDLE) {
 			for (auto& slot : timelines.slots) {
@@ -11757,6 +13895,7 @@ namespace rhi {
 		&d_createAccelerationStructure,
 		&d_getAccelerationStructureDeviceAddress,
 		&d_getBufferDeviceAddress,
+		&d_getBufferViewRef,
 		&d_getRayTracingShaderGroupHandles,
 		&d_setRayTracingPipelineStackSize,
 		&d_getRayTracingAccelerationStructureOperationPrebuildInfo,
@@ -11822,10 +13961,14 @@ namespace rhi {
 		&d_destroyIndirectPipelineSet,
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
-		14u,
+		16u,
 		&d_createCompletionWait,
 		&d_createCommandAllocatorForQueue,
-		&d_createSecondaryCommandList
+		&d_createSecondaryCommandList,
+		&d_openPipelineCache,
+		&d_savePipelineCache,
+		&d_getPipelineCacheStats,
+		&d_queryFormatSupport
 	};
 
 	const QueueVTable g_vkqvt = {
@@ -11843,7 +13986,9 @@ namespace rhi {
 
 	const CommandAllocatorVTable g_vkcalvt = {
 		&ca_reset,
-		1u
+		2u,
+		&ca_trim,
+		true
 	};
 
 	const CommandListVTable g_vkclvt = {
@@ -11890,14 +14035,18 @@ namespace rhi {
 		&cl_setDebugInstrumentationContext,
 		&cl_beginTracyGpuZone,
 		&cl_endTracyGpuZone,
-		8u,
+		9u,
 		&cl_endChecked,
 		&cl_beginDebugLabel,
 		&cl_endDebugLabel,
 		&cl_insertDebugLabel,
 		&cl_preprocessIndirect,
 		&cl_beginSecondary,
-		&cl_executeCommands
+		&cl_executeCommands,
+		&cl_setStencilRef,
+		&cl_setBlendFactor,
+		&cl_setViewports,
+		&cl_setScissors
 	};
 
 	const SwapchainVTable g_vkscvt = {
@@ -11907,7 +14056,18 @@ namespace rhi {
 		&sc_present,
 		&sc_resizeBuffers,
 		&sc_setName,
-		1u
+		3u,
+		&sc_caps,
+		&sc_isColorSpaceSupported,
+		&sc_setColorSpace,
+		&sc_colorSpace,
+		&sc_setHdrMetadata,
+		&sc_setMaximumFrameLatency,
+		&sc_waitForFrameLatency,
+		&sc_frameLatencyWaitableObject,
+		&sc_presentCount,
+		&sc_waitForPresent,
+		&sc_acquirePoint
 	};
 
 	const ResourceVTable g_vkbuf_rvt = {
@@ -11984,6 +14144,96 @@ namespace rhi {
 		1u
 	};
 
+	// The present extensions CreateVulkanDevice enables when the instance and device have them, and the feature structs
+	// they need.
+	struct VkPresentExtensionState {
+		bool swapchainColorSpace = false;   // instance VK_EXT_swapchain_colorspace
+		bool surfaceMaintenance1 = false;   // instance VK_*_surface_maintenance1 with VK_KHR_get_surface_capabilities2
+		bool swapchainMaintenance1 = false;
+		bool presentId = false;
+		bool presentWait = false;
+		bool hdrMetadata = false;
+		VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swapchainMaintenance1Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT };
+		VkPhysicalDevicePresentIdFeaturesKHR presentIdFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR };
+		VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR };
+		// The enabled feature structs, linked, for the front of VkDeviceCreateInfo::pNext. Null when there are none.
+		void* featureChain = nullptr;
+		void** featureChainTail = nullptr;
+	};
+
+	// Instance side. VK_EXT_swapchain_colorspace makes the surface list its HDR colour spaces (without it only sRGB formats
+	// appear), and surface_maintenance1 reports which present modes a swapchain can switch between.
+	static void VkSelectPresentInstanceExtensions(std::vector<const char*>& extensions, VkPresentExtensionState& state) noexcept {
+		if (VkHasInstanceExtension(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+			extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+			state.swapchainColorSpace = true;
+		}
+		const char* surfaceMaintenance1 = VkHasInstanceExtension(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME) ? VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME
+			: VkHasInstanceExtension(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME) ? VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME : nullptr;
+		if (surfaceMaintenance1 && VkHasInstanceExtension(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+			extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+			extensions.push_back(surfaceMaintenance1);
+			state.surfaceMaintenance1 = true;
+		}
+	}
+
+	// Device side, with the swapchain extension. allowPresentId is false under Streamline: an interposer that drops the
+	// present ID leaves a present wait waiting forever.
+	static void VkSelectPresentDeviceExtensions(VkPhysicalDevice physicalDevice, bool allowPresentId, std::vector<const char*>& extensions,
+		VkPresentExtensionState& state) noexcept {
+		const char* swapchainMaintenance1 = nullptr;
+		if (state.surfaceMaintenance1) {
+			// Switchable modes are queried through surface_maintenance1, so the swapchain side is no use without it.
+			swapchainMaintenance1 = VkHasDeviceExtension(physicalDevice, VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) ? VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME
+				: VkHasDeviceExtension(physicalDevice, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) ? VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME : nullptr;
+		}
+		const bool hasPresentId = allowPresentId && VkHasDeviceExtension(physicalDevice, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+		const bool hasPresentWait = hasPresentId && VkHasDeviceExtension(physicalDevice, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+
+		VkPhysicalDeviceFeatures2 features2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+		void** link = &features2.pNext;
+		auto append = [&link](auto& features) {
+			features.pNext = nullptr;
+			*link = &features;
+			link = &features.pNext;
+		};
+		if (swapchainMaintenance1) append(state.swapchainMaintenance1Features);
+		if (hasPresentId) append(state.presentIdFeatures);
+		if (hasPresentWait) append(state.presentWaitFeatures);
+		if (features2.pNext) vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
+
+		link = &state.featureChain;
+		if (swapchainMaintenance1 && state.swapchainMaintenance1Features.swapchainMaintenance1 == VK_TRUE) {
+			extensions.push_back(swapchainMaintenance1);
+			append(state.swapchainMaintenance1Features);
+			state.swapchainMaintenance1 = true;
+		}
+		if (hasPresentId && state.presentIdFeatures.presentId == VK_TRUE) {
+			extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+			append(state.presentIdFeatures);
+			state.presentId = true;
+			if (hasPresentWait && state.presentWaitFeatures.presentWait == VK_TRUE) {
+				extensions.push_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+				append(state.presentWaitFeatures);
+				state.presentWait = true;
+			}
+		}
+		state.featureChainTail = state.featureChain ? link : nullptr;
+		if (VkHasDeviceExtension(physicalDevice, VK_EXT_HDR_METADATA_EXTENSION_NAME)) {
+			extensions.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
+			state.hdrMetadata = true;
+		}
+	}
+
+	static void VkApplyPresentExtensionState(VulkanDevice* impl, const VkPresentExtensionState& state) noexcept {
+		impl->swapchainColorSpaceEnabled = state.swapchainColorSpace;
+		impl->surfaceMaintenance1Enabled = state.surfaceMaintenance1;
+		impl->swapchainMaintenance1Enabled = state.swapchainMaintenance1;
+		impl->presentIdEnabled = state.presentId;
+		impl->presentWaitEnabled = state.presentWait;
+		impl->hdrMetadataEnabled = state.hdrMetadata;
+	}
+
 	// The feature set a VkDevice was actually created with. Extension-gated feature
 	// structs are zero unless their extension is enabled, so each impl flag follows
 	// from the struct alone. Shared by CreateVulkanDevice and AdoptVulkanDevice.
@@ -12014,11 +14264,14 @@ namespace rhi {
 		bool externalMemoryWin32 = false;
 		bool externalSemaphoreWin32 = false;
 		bool maintenance5 = false;  // VK_KHR_maintenance5 enabled
+		bool memoryBudget = false;  // VK_EXT_memory_budget enabled
 		VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipelineExecutableProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
 	};
 
 	static void VkApplyEnabledDeviceState(VulkanDevice* impl, const VkEnabledDeviceState& e) noexcept {
 		impl->maintenance5Enabled = e.maintenance5;
+		impl->formatRemaps = VkFormatRemapsFor(impl->physicalDevice, e.maintenance5);
+		impl->memoryBudgetEnabled = e.memoryBudget;
 		impl->pipelineExecutableInfoEnabled = e.pipelineExecutableProperties.pipelineExecutableInfo == VK_TRUE;
 		impl->accelerationStructureFeatures = e.accelerationStructure;
 		impl->rayTracingPipelineFeatures = e.rayTracingPipeline;
@@ -12052,6 +14305,7 @@ namespace rhi {
 		impl->taskShaderEnabled = e.meshShader.taskShader == VK_TRUE;
 		impl->meshShaderPipelineStatsEnabled = e.meshShader.meshShaderQueries == VK_TRUE;
 		impl->deviceGeneratedCommandsEnabled = e.deviceGeneratedCommands.deviceGeneratedCommands == VK_TRUE;
+		impl->drawIndirectCountEnabled = e.vulkan12.drawIndirectCount == VK_TRUE;
 		impl->dynamicGeneratedPipelineLayoutEnabled = e.deviceGeneratedCommands.dynamicGeneratedPipelineLayout == VK_TRUE;
 		impl->dynamicRenderingEnabled = e.vulkan13.dynamicRendering == VK_TRUE;
 		impl->shaderDemoteToHelperInvocationEnabled = e.vulkan13.shaderDemoteToHelperInvocation == VK_TRUE;
@@ -12233,7 +14487,7 @@ namespace rhi {
 			feature(bufferSupported, kBuffer, "shaderStorageTexelBufferArrayNonUniformIndexing", features12.shaderStorageTexelBufferArrayNonUniformIndexing == VK_TRUE);
 
 			const VkPhysicalDeviceLimits& limits = properties.limits;
-			atLeast(bufferSupported, kBuffer, "maxPushConstantsSize", VulkanDescriptorBufferModel::kPushConstantBytes, limit(limits.maxPushConstantsSize, 128));
+			atLeast(bufferSupported, kBuffer, "maxPushConstantsSize", VulkanDescriptorBufferModel::kMinPushConstantBytes, limit(limits.maxPushConstantsSize, 128));
 			uint64_t resourceLimit = (std::numeric_limits<uint32_t>::max)();
 			const auto resourceLimitOf = [&](const char* name, uint64_t device, uint64_t baseSpecMinimum) {
 				const uint64_t value = limit(device, baseSpecMinimum);
@@ -12411,6 +14665,33 @@ namespace rhi {
 		if (model.uniformBuffers) mutableTypes.push_back(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
 		mutableTypes.push_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
 		if (model.accelerationStructures) mutableTypes.push_back(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+
+		// vkGetDescriptorSetLayoutSupport for a variable-count universal binding: whether the driver supports the layout, and
+		// the variable count it reports for it.
+		const auto layoutSupport = [&](std::span<const VkDescriptorType> types, VkDescriptorType type, uint32_t count, uint32_t& maxVariable) -> bool {
+			const VkUniversalSetLayoutInfo probe(types, type, count, true);
+			VkDescriptorSetVariableDescriptorCountLayoutSupport variableSupport{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT };
+			VkDescriptorSetLayoutSupport support{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT };
+			support.pNext = &variableSupport;
+			vkGetDescriptorSetLayoutSupport(impl->device, &probe.createInfo, &support);
+			maxVariable = variableSupport.maxVariableDescriptorCount;
+			return support.supported == VK_TRUE;
+		};
+		// Some drivers reject a type in the mutable list at any count, which the evaluation cannot see without a device. AMD's
+		// Windows driver rejects acceleration structures there (as their own binding they are fine). Such a list fails even at
+		// the minimum count: acceleration structures then leave the list, and their SRVs are unsupported.
+		uint32_t maxVariable = 0;
+		if (model.accelerationStructures &&
+			!layoutSupport(mutableTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, requirements.heapCapacities.minResources, maxVariable)) {
+			mutableTypes.pop_back();
+			if (layoutSupport(mutableTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, requirements.heapCapacities.minResources, maxVariable)) {
+				spdlog::warn("{}: the device does not support acceleration structures in a mutable descriptor list; acceleration structure "
+					"SRVs are unsupported on the descriptor-buffer model", caller);
+				model.accelerationStructures = false;
+			} else {
+				mutableTypes.push_back(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+			}
+		}
 		const std::span<const VkDescriptorType> resourceTypes(mutableTypes.data(), mutableTypes.size());
 
 		const auto measureStride = [&](std::span<const VkDescriptorType> types, VkDescriptorType type, uint64_t& stride) -> bool {
@@ -12467,17 +14748,22 @@ namespace rhi {
 			samplerElements - model.samplerCapacity));
 		const uint32_t samplerCount = model.samplerCapacity + model.staticSamplerCapacity;
 		// The layout query can hold fewer descriptors than the properties above say (65535 on Intel Arc under Mesa, against 33554432).
+		// A layout the driver rejects at the chosen count steps down by halves to the minimum, which is tried last.
 		{
-			const VkUniversalSetLayoutInfo probe(resourceTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, model.resourceCapacity, true);
-			VkDescriptorSetVariableDescriptorCountLayoutSupport variableSupport{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT };
-			VkDescriptorSetLayoutSupport support{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT };
-			support.pNext = &variableSupport;
-			vkGetDescriptorSetLayoutSupport(impl->device, &probe.createInfo, &support);
-			if (support.supported == VK_TRUE && variableSupport.maxVariableDescriptorCount < model.resourceCapacity &&
-				variableSupport.maxVariableDescriptorCount >= capacities.minResources) {
+			const uint32_t chosen = model.resourceCapacity;
+			uint32_t capacity = chosen;
+			bool supported = layoutSupport(resourceTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, capacity, maxVariable);
+			while (!supported && capacity > capacities.minResources) {
+				capacity = (std::max)(capacity / 2, capacities.minResources);
+				supported = layoutSupport(resourceTypes, VK_DESCRIPTOR_TYPE_MUTABLE_EXT, capacity, maxVariable);
+			}
+			if (supported && maxVariable < capacity && maxVariable >= capacities.minResources) {
+				capacity = maxVariable;
+			}
+			if (supported && capacity != chosen) {
 				spdlog::warn("{}: the device's set layout holds {} resource descriptors, not the {} its properties allow; using {}", caller,
-					variableSupport.maxVariableDescriptorCount, model.resourceCapacity, variableSupport.maxVariableDescriptorCount);
-				model.resourceCapacity = variableSupport.maxVariableDescriptorCount;
+					capacity, chosen, capacity);
+				model.resourceCapacity = capacity;
 			}
 		}
 		impl->shaderVisibleResourceCapacity = model.resourceCapacity;
@@ -12507,7 +14793,12 @@ namespace rhi {
 		vkGetDescriptorSetLayoutBindingOffsetEXT(impl->device, model.samplerSetLayout, 0, &model.samplerBindingOffset);
 
 		const std::array<VkDescriptorSetLayout, 2> setLayouts{ model.resourceSetLayout, model.samplerSetLayout };
-		const VkPushConstantRange pushRange{ VK_SHADER_STAGE_ALL, 0, VulkanDescriptorBufferModel::kPushConstantBytes };
+		// The device's whole push range (a multiple of 8, for the spill address in its last 8 bytes).
+		model.pushConstantBytes = (std::clamp)(impl->physicalDeviceProperties.limits.maxPushConstantsSize, VulkanDescriptorBufferModel::kMinPushConstantBytes,
+			VulkanDescriptorBufferModel::kMaxPushConstantBytes) & ~7u;
+		model.pushedPrefixBytes = model.pushConstantBytes - 8;
+		model.spillAddressOffset = model.pushConstantBytes - 8;
+		const VkPushConstantRange pushRange{ VK_SHADER_STAGE_ALL, 0, model.pushConstantBytes };
 		VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
 		layoutInfo.setLayoutCount = static_cast<uint32_t>(setLayouts.size());
 		layoutInfo.pSetLayouts = setLayouts.data();
@@ -12535,9 +14826,55 @@ namespace rhi {
 			"structures {}), sampler heap {} + {} static x {} bytes (binding offset {}), push constants {} bytes (pushed prefix {} when spilling), "
 			"descriptorBufferOffsetAlignment {}, robust buffer descriptors {}, sampler budget {}", caller, model.resourceCapacity, model.resourceStride,
 			model.resourceBindingOffset, model.uniformBuffers, model.accelerationStructures, model.samplerCapacity,
-			model.staticSamplerCapacity, model.samplerStride, model.samplerBindingOffset, VulkanDescriptorBufferModel::kPushConstantBytes,
-			VulkanDescriptorBufferModel::kPushedPrefixBytes, static_cast<uint64_t>(properties.descriptorBufferOffsetAlignment), robust, model.samplerBudget);
+			model.staticSamplerCapacity, model.samplerStride, model.samplerBindingOffset, model.pushConstantBytes,
+			model.pushedPrefixBytes, static_cast<uint64_t>(properties.descriptorBufferOffsetAlignment), robust, model.samplerBudget);
 		return Result::Ok;
+	}
+
+	namespace vulkan {
+		namespace {
+			void VkParseEnabledFeatureChain(const void* chain, VkPhysicalDeviceFeatures& core, VkEnabledDeviceState& e) noexcept;
+			bool VkNameListContains(const char* const* names, uint32_t count, const char* name) noexcept;
+		}
+	}
+
+	// The present extensions as the final create infos enable them, after a create hook may have added or removed some.
+	// allowPresentId is what VkSelectPresentDeviceExtensions was given.
+	static void VkFinalizePresentExtensionState(VkPresentExtensionState& state, const VkInstanceCreateInfo& instanceInfo,
+		const VkDeviceCreateInfo& deviceInfo, bool allowPresentId) noexcept {
+		const auto instanceHas = [&](const char* name) {
+			return vulkan::VkNameListContains(instanceInfo.ppEnabledExtensionNames, instanceInfo.enabledExtensionCount, name);
+		};
+		const auto deviceHas = [&](const char* name) {
+			return vulkan::VkNameListContains(deviceInfo.ppEnabledExtensionNames, deviceInfo.enabledExtensionCount, name);
+		};
+		bool swapchainMaintenance1Feature = false;
+		bool presentIdFeature = false;
+		bool presentWaitFeature = false;
+		for (auto* node = static_cast<const VkBaseInStructure*>(deviceInfo.pNext); node; node = node->pNext) {
+			switch (node->sType) {
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT:
+				swapchainMaintenance1Feature |= reinterpret_cast<const VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT*>(node)->swapchainMaintenance1 == VK_TRUE;
+				break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR:
+				presentIdFeature |= reinterpret_cast<const VkPhysicalDevicePresentIdFeaturesKHR*>(node)->presentId == VK_TRUE;
+				break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR:
+				presentWaitFeature |= reinterpret_cast<const VkPhysicalDevicePresentWaitFeaturesKHR*>(node)->presentWait == VK_TRUE;
+				break;
+			default:
+				break;
+			}
+		}
+		state.swapchainColorSpace = instanceHas(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+		state.surfaceMaintenance1 = instanceHas(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)
+			&& (instanceHas(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME) || instanceHas(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME));
+		// Switchable modes are queried through surface_maintenance1, so the swapchain side is no use without it.
+		state.swapchainMaintenance1 = state.surfaceMaintenance1 && swapchainMaintenance1Feature
+			&& (deviceHas(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) || deviceHas(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME));
+		state.presentId = allowPresentId && presentIdFeature && deviceHas(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+		state.presentWait = state.presentId && presentWaitFeature && deviceHas(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+		state.hdrMetadata = deviceHas(VK_EXT_HDR_METADATA_EXTENSION_NAME);
 	}
 
 	rhi::Result CreateVulkanDevice(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer) noexcept {
@@ -12590,6 +14927,10 @@ namespace rhi {
 			enabledExtensions.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
 		}
 	#endif
+		VkPresentExtensionState presentExtensions{};
+		if (VkHasInstanceExtension(VK_KHR_SURFACE_EXTENSION_NAME)) {
+			VkSelectPresentInstanceExtensions(enabledExtensions, presentExtensions);
+		}
 		if (ci.enableDebug) {
 			if (VkHasInstanceLayer("VK_LAYER_KHRONOS_validation")) {
 				enabledLayers.push_back("VK_LAYER_KHRONOS_validation");
@@ -12677,7 +15018,7 @@ namespace rhi {
 		applicationInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
 		applicationInfo.pApplicationName = "BasicRenderer";
 		applicationInfo.applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
-		applicationInfo.pEngineName = "BasicRHI";
+		applicationInfo.pEngineName = ci.vulkanEngineName && *ci.vulkanEngineName ? ci.vulkanEngineName : "BasicRHI";
 		applicationInfo.engineVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
 		applicationInfo.apiVersion = requestedApiVersion;
 
@@ -12694,6 +15035,15 @@ namespace rhi {
 			instanceCreateInfo.pNext = &reshapeCreateInfo;
 		}
 #endif
+
+		if (ci.vulkanCreateHooks && ci.vulkanCreateHooks->instance
+			&& !ci.vulkanCreateHooks->instance(ci.vulkanCreateHooks->user, &instanceCreateInfo)) {
+			spdlog::error("CreateVulkanDevice: the instance create hook failed");
+			if (streamlineInitialized) {
+				VkShutdownStreamline();
+			}
+			RHI_FAIL(Result::Failed);
+		}
 
 		VkInstance instance = VK_NULL_HANDLE;
 		VkResult result = vkCreateInstance(&instanceCreateInfo, nullptr, &instance);
@@ -12909,6 +15259,8 @@ namespace rhi {
 		}
 
 		const bool enableSwapchainExtension = VkHasDeviceExtension(physicalDevice, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+		// Not under Streamline: an interposer that drops the present ID leaves a present wait waiting forever.
+		const bool allowPresentId = !streamlineInitialized;
 		const bool hasMaintenance5Extension = VkHasDeviceExtension(physicalDevice, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 		const bool hasDescriptorHeapExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
 		const bool hasMeshShaderExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_MESH_SHADER_EXTENSION_NAME);
@@ -12965,6 +15317,7 @@ namespace rhi {
 		}
 		if (enableSwapchainExtension) {
 			enabledDeviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+			VkSelectPresentDeviceExtensions(physicalDevice, allowPresentId, enabledDeviceExtensions, presentExtensions);
 		}
 		if (hasMaintenance5Extension && (hasDescriptorHeapExtension || hasDeviceGeneratedCommandsExtension)) {
 			enabledDeviceExtensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
@@ -13139,6 +15492,9 @@ namespace rhi {
 		// (DeviceCreateInfo::descriptorHeapCapacities; a model whose limit is below the minimum is unsupported).
 		vulkan::BindingRequirements bindingRequirements{};
 		bindingRequirements.heapCapacities = ci.descriptorHeapCapacities;
+		bindingRequirements.hostSamplerObjects = ci.vulkanGuestSamplerObjects;
+		bindingRequirements.hostResourceDescriptorBufferBytes = ci.vulkanGuestResourceDescriptorBufferBytes;
+		bindingRequirements.hostSamplerDescriptorBufferBytes = ci.vulkanGuestSamplerDescriptorBufferBytes;
 		const VkBindingModelEvaluation bindingEvaluation = VkEvaluateBindingModels(vkGetInstanceProcAddr, instance, physicalDevice, bindingRequirements);
 		const bool descriptorBufferModelSupported = (bindingEvaluation.report.supportedModels & vulkan::BindingModel_DescriptorBuffer) != 0;
 		const bool descriptorHeapModelAvailable = (bindingEvaluation.report.supportedModels & vulkan::BindingModel_DescriptorHeap) != 0 &&
@@ -13155,6 +15511,15 @@ namespace rhi {
 			}
 		}
 		else if (bindingOverride && std::strcmp(bindingOverride, "heap") == 0) {
+			useDescriptorBufferModel = false;
+		}
+		// The caller's allowed models (DeviceCreateInfo::vulkanBindingModels): a guest that records into the same command buffers
+		// must bind descriptors the same way.
+		if (ci.vulkanBindingModels && !(ci.vulkanBindingModels & vulkan::BindingModel_DescriptorHeap)) {
+			useDescriptorBufferModel = descriptorBufferModelSupported && (ci.vulkanBindingModels & vulkan::BindingModel_DescriptorBuffer);
+			allowDescriptorHeapModel = false;
+		}
+		else if (ci.vulkanBindingModels && !(ci.vulkanBindingModels & vulkan::BindingModel_DescriptorBuffer)) {
 			useDescriptorBufferModel = false;
 		}
 		if (useDescriptorBufferModel) {
@@ -13306,14 +15671,64 @@ namespace rhi {
 		}
 #endif
 
+		// Memory budget and crash diagnostics: extensions that change nothing until they are queried. The crash-marker ones only
+		// when crash markers are requested (VkCrashMarkersRequested).
+		const bool hasMemoryBudgetExtension = VkHasDeviceExtension(physicalDevice, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+		if (hasMemoryBudgetExtension) {
+			appendUniqueName(enabledDeviceExtensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+		}
+		const bool crashMarkersRequested = VkCrashMarkersRequested(ci);
+		VkPhysicalDeviceFaultFeaturesEXT enabledFaultFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT };
+		const bool enableBufferMarkers = crashMarkersRequested && VkHasDeviceExtension(physicalDevice, VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+		const bool enableCheckpoints = crashMarkersRequested && VkHasDeviceExtension(physicalDevice, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+		if (crashMarkersRequested && VkHasDeviceExtension(physicalDevice, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			VkPhysicalDeviceFaultFeaturesEXT supportedFaultFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT };
+			VkPhysicalDeviceFeatures2 faultQuery{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+			faultQuery.pNext = &supportedFaultFeatures;
+			vkGetPhysicalDeviceFeatures2(physicalDevice, &faultQuery);
+			if (supportedFaultFeatures.deviceFault == VK_TRUE) {
+				enabledFaultFeatures.deviceFault = VK_TRUE;
+				appendUniqueName(enabledDeviceExtensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+			}
+		}
+		if (enableBufferMarkers) appendUniqueName(enabledDeviceExtensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+		if (enableCheckpoints) appendUniqueName(enabledDeviceExtensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+
 		VkDeviceCreateInfo deviceCreateInfo{};
 		deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		deviceCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
 		deviceCreateInfo.pQueueCreateInfos = queueCreateInfos.data();
 		deviceCreateInfo.pEnabledFeatures = &supportedFeatures;
 		deviceCreateInfo.pNext = &enabledVulkan12Features;
+		if (enabledFaultFeatures.deviceFault == VK_TRUE) {
+			enabledFaultFeatures.pNext = const_cast<void*>(deviceCreateInfo.pNext);
+			deviceCreateInfo.pNext = &enabledFaultFeatures;
+		}
+		if (presentExtensions.featureChain) {
+			*presentExtensions.featureChainTail = const_cast<void*>(deviceCreateInfo.pNext);
+			deviceCreateInfo.pNext = presentExtensions.featureChain;
+		}
 		deviceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(enabledDeviceExtensions.size());
 		deviceCreateInfo.ppEnabledExtensionNames = enabledDeviceExtensions.empty() ? nullptr : enabledDeviceExtensions.data();
+		if (ci.vulkanCreateHooks && ci.vulkanCreateHooks->device
+			&& !ci.vulkanCreateHooks->device(ci.vulkanCreateHooks->user, instance, physicalDevice, &deviceCreateInfo)) {
+			spdlog::error("CreateVulkanDevice: the device create hook failed");
+			vkDestroyInstance(instance, nullptr);
+#if BASICRHI_ENABLE_STREAMLINE
+			if (streamlineInitialized) {
+				VkShutdownStreamline();
+			}
+#endif
+			RHI_FAIL(Result::Failed);
+		}
+		// Every extension flag below follows the final lists, which a hook may have changed.
+		const auto instanceExtensionEnabled = [&](const char* name) {
+			return vulkan::VkNameListContains(instanceCreateInfo.ppEnabledExtensionNames, instanceCreateInfo.enabledExtensionCount, name);
+		};
+		const auto deviceExtensionEnabled = [&](const char* name) {
+			return vulkan::VkNameListContains(deviceCreateInfo.ppEnabledExtensionNames, deviceCreateInfo.enabledExtensionCount, name);
+		};
+		VkFinalizePresentExtensionState(presentExtensions, instanceCreateInfo, deviceCreateInfo, allowPresentId);
 
 		VkDevice device = VK_NULL_HANDLE;
 		result = vkCreateDevice(physicalDevice, &deviceCreateInfo, nullptr, &device);
@@ -13371,9 +15786,7 @@ namespace rhi {
 		auto impl = std::make_shared<VulkanDevice>();
 		impl->selfWeak = impl;
 		impl->instance = instance;
-		impl->debugUtilsEnabled = std::any_of(enabledExtensions.begin(), enabledExtensions.end(), [](const char* name) {
-			return name && std::strcmp(name, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
-		});
+		impl->debugUtilsEnabled = instanceExtensionEnabled(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 		if (ci.enableDebug && vkCreateDebugUtilsMessengerEXT) {
 			VkDebugUtilsMessengerCreateInfoEXT debugInfo{ VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
 			debugInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
@@ -13389,7 +15802,6 @@ namespace rhi {
 		}
 		impl->physicalDevice = physicalDevice;
 		impl->device = device;
-		impl->d24Fallback = VkD24Fallback(physicalDevice);
 		impl->physicalDeviceProperties = physicalDeviceProperties;
 		impl->memoryProperties = memoryProperties;
 		impl->supportedFeatures = supportedFeatures;
@@ -13428,17 +15840,27 @@ namespace rhi {
 #if defined(VK_NV_partitioned_acceleration_structure)
 			enabled.partitionedAccelerationStructure = enabledPartitionedAccelerationStructureFeatures;
 #endif
-			enabled.nvShaderSubgroupPartitioned = hasNvShaderSubgroupPartitionedExtension;
-			enabled.pipelineLibrary = hasPipelineLibraryExtension;
-			enabled.swapchain = enableSwapchainExtension;
-			enabled.externalMemoryWin32 = ci.enableExternalInterop && hasExternalMemoryWin32Extension;
-			enabled.externalSemaphoreWin32 = ci.enableExternalInterop && hasExternalSemaphoreWin32Extension;
-			enabled.maintenance5 = std::any_of(enabledDeviceExtensions.begin(), enabledDeviceExtensions.end(),
-				[](const char* a_name) { return std::strcmp(a_name, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0; });
+			enabled.nvShaderSubgroupPartitioned = deviceExtensionEnabled(VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
+			enabled.pipelineLibrary = deviceExtensionEnabled(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+			enabled.swapchain = deviceExtensionEnabled(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+#ifdef _WIN32
+			enabled.externalMemoryWin32 = deviceExtensionEnabled(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+			enabled.externalSemaphoreWin32 = deviceExtensionEnabled(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+#endif
+			enabled.maintenance5 = deviceExtensionEnabled(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+			enabled.memoryBudget = deviceExtensionEnabled(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+			// A device hook (a guest API's needs) may enable more than BasicRHI asked for: the create info it left is what the
+			// device has, so its feature structs, core features included, replace BasicRHI's own.
+			if (ci.vulkanCreateHooks && ci.vulkanCreateHooks->device) {
+				VkPhysicalDeviceFeatures hookedCore = deviceCreateInfo.pEnabledFeatures ? *deviceCreateInfo.pEnabledFeatures : VkPhysicalDeviceFeatures{};
+				vulkan::VkParseEnabledFeatureChain(deviceCreateInfo.pNext, hookedCore, enabled);
+				impl->supportedFeatures = hookedCore;
+			}
 			VkApplyEnabledDeviceState(impl.get(), enabled);
 		}
 		impl->validateBarrierTransitions = ci.validateBarrierTransitions;
 		impl->streamlineInitialized = streamlineInitialized;
+		VkApplyPresentExtensionState(impl.get(), presentExtensions);
 		impl->loaderApiVersion = loaderApiVersion;
 		impl->instanceApiVersion = requestedApiVersion;
 		impl->queueFamilyProperties = std::move(queueFamilyProperties);
@@ -13490,6 +15912,9 @@ namespace rhi {
 			}
 		}
 		impl->self = Device{ impl.get(), &g_vkdevvt };
+		if (crashMarkersRequested) {
+			VkInitCrashMarkers(impl.get(), enabledFaultFeatures.deviceFault == VK_TRUE, enableBufferMarkers, enableCheckpoints);
+		}
 
 		impl->bindingModel = impl->descriptorHeapEnabled ? VulkanBindingModel::DescriptorHeap
 			: (useDescriptorBufferModel && impl->descriptorBufferEnabled && impl->mutableDescriptorTypeEnabled ? VulkanBindingModel::DescriptorBuffer : VulkanBindingModel::None);
@@ -13506,6 +15931,11 @@ namespace rhi {
 				impl->Shutdown();
 				RHI_FAIL(modelResult);
 			}
+		}
+		VkInitViewRefs(impl.get(), "CreateVulkanDevice");
+		if (ci.pipelineCachePath) {
+			// A cache that cannot open leaves pipelines uncached; the device still works.
+			d_openPipelineCache(&impl->self, ci.pipelineCachePath);
 		}
 
 		spdlog::info(
@@ -13722,13 +16152,15 @@ namespace rhi {
 			enabled.externalSemaphoreWin32 = hasExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
 			enabled.maintenance5 = hasExtension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 #endif
+			// VK_EXT_memory_budget only adds a query struct and has no device commands. Hosts such as DXVK read it without enabling it,
+			// so an adopted device may read it whenever the physical device has it.
+			enabled.memoryBudget = hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) || VkHasDeviceExtension(info.physicalDevice, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 
 			auto impl = std::make_shared<VulkanDevice>();
 			impl->selfWeak = impl;
 			impl->instance = info.instance;
 			impl->physicalDevice = info.physicalDevice;
 			impl->device = info.device;
-			impl->d24Fallback = VkD24Fallback(info.physicalDevice);
 			impl->ownsInstance = false;
 			impl->ownsDevice = false;
 			impl->debugUtilsEnabled = VkNameListContains(info.enabledInstanceExtensions, info.enabledInstanceExtensionCount, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -13740,13 +16172,22 @@ namespace rhi {
 				impl->registerCheckpoint = info.diagnostics.registerMarker;
 				impl->detailedCheckpoints = info.diagnostics.detailedCommands;
 			}
-			impl->submissionHookUser = info.submissionHooks.user;
-			impl->submissionLock = info.submissionHooks.lock;
-			impl->submissionUnlock = info.submissionHooks.unlock;
-			impl->submissionSubmit = info.submissionHooks.submit;
+			if (!VkPublishSubmissionHooks(impl.get(), info.submissionHooks)) {
+				RHI_FAIL(Result::OutOfMemory);
+			}
 			vkGetPhysicalDeviceProperties(info.physicalDevice, &impl->physicalDeviceProperties);
 			vkGetPhysicalDeviceMemoryProperties(info.physicalDevice, &impl->memoryProperties);
 			impl->supportedFeatures = coreFeatures;
+			// Native crash markers on an adopted device (BASICRHI_VK_CRASH_MARKERS=1): VK_AMD_buffer_marker markers in BasicRHI's own
+			// lists, when the host enabled the extension (DXVK does under DXVK_DEBUG=hang). The host's markers cover only its own
+			// commands: without these a device lost in the graph's work names no pass.
+			// With them, VK_EXT_device_fault's report at the loss, when the host enabled it (CS's DXVK does under DXVK_DEBUG=hang, with
+			// its deviceFault feature whenever the device has it).
+			if (const char* value = std::getenv("BASICRHI_VK_CRASH_MARKERS"); value && std::strcmp(value, "1") == 0) {
+				VkInitCrashMarkers(impl.get(),
+					VkNameListContains(info.enabledDeviceExtensions, info.enabledDeviceExtensionCount, VK_EXT_DEVICE_FAULT_EXTENSION_NAME),
+					VkNameListContains(info.enabledDeviceExtensions, info.enabledDeviceExtensionCount, VK_AMD_BUFFER_MARKER_EXTENSION_NAME), false);
+			}
 			{
 				VkPhysicalDeviceProperties2 properties2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
 				properties2.pNext = &impl->descriptorHeapProperties;
@@ -13845,6 +16286,7 @@ namespace rhi {
 					RHI_FAIL(modelResult);
 				}
 			}
+			VkInitViewRefs(impl.get(), "AdoptVulkanDevice");
 
 			spdlog::info(
 				"AdoptVulkanDevice: adopted '{}' queues[gfx={}:{}, compute={}:{}, copy={}:{}] timelineSemaphore={} bufferDeviceAddress={} descriptorHeap={} dynamicRendering={}",
@@ -13870,6 +16312,28 @@ namespace rhi {
 			return VkEvaluateBindingModels(getInstanceProcAddr, instance, physicalDevice, requirements).report;
 		}
 
+		Result ShareVulkanDevice(Device device, const QueueSubmissionHooks& hooks) noexcept {
+			if (!device || device.vt != &g_vkdevvt || !device.impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if ((hooks.lock == nullptr) != (hooks.unlock == nullptr)) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			if (!impl->ownsDevice) {
+				// An adopted device has its host's hooks already.
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (!VkPublishSubmissionHooks(impl, hooks)) {
+				RHI_FAIL(Result::OutOfMemory);
+			}
+			const bool again = impl->sharedQueues;
+			impl->sharedQueues = true;
+			spdlog::info("ShareVulkanDevice: '{}' is {} with a guest API (queue lock {}, submissions {})", impl->physicalDeviceProperties.deviceName,
+				again ? "shared again" : "shared", hooks.lock ? "on" : "off", hooks.submit ? "handed to the host" : "direct");
+			return Result::Ok;
+		}
+
 		uint32_t GetBindingModel(Device device) noexcept {
 			if (!device || device.vt != &g_vkdevvt || !device.impl) return 0;
 			switch (static_cast<const VulkanDevice*>(device.impl)->bindingModel) {
@@ -13877,6 +16341,29 @@ namespace rhi {
 			case VulkanBindingModel::DescriptorBuffer: return BindingModel_DescriptorBuffer;
 			default: return 0;
 			}
+		}
+
+		uint32_t QueryMemoryHeapBudgets(Device device, MemoryHeapBudget* out, uint32_t capacity) noexcept {
+			if (!device || device.vt != &g_vkdevvt || !device.impl) return 0;
+			const auto* impl = static_cast<const VulkanDevice*>(device.impl);
+			if (impl->physicalDevice == VK_NULL_HANDLE) return 0;
+			return VkQueryHeapBudgets(*impl, out, capacity);
+		}
+
+		CrashDiagnosticsState GetCrashDiagnostics(Device device) noexcept {
+			if (!device || device.vt != &g_vkdevvt || !device.impl) return {};
+			const VulkanCrashMarkers& markers = static_cast<const VulkanDevice*>(device.impl)->crashMarkers;
+			if (!markers.enabled) return {};
+			CrashDiagnosticsState state{};
+			state.deviceFault = markers.deviceFault;
+			state.bufferMarkers = markers.bufferMarkers;
+			state.checkpoints = markers.checkpoints;
+			return state;
+		}
+
+		uint32_t DumpCrashDiagnostics(Device device, bool deviceLost) noexcept {
+			if (!device || device.vt != &g_vkdevvt || !device.impl) return 0;
+			return VkDumpCrashMarkers(static_cast<VulkanDevice*>(device.impl), deviceLost);
 		}
 
 		Result import_image(Device device, const ImportedImageDesc& desc, ResourcePtr& out) noexcept {
@@ -13937,6 +16424,7 @@ namespace rhi {
 			state.concurrentSharing = desc.concurrentSharing;
 			state.ownsBuffer = false;
 			state.ownsMemory = false;
+			VkKeepResourceName(state, desc.debugName);
 			// Bindless buffer descriptors are written from the device address.
 			if (impl->bufferDeviceAddressEnabled && (desc.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
 				VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
@@ -13950,6 +16438,67 @@ namespace rhi {
 			if (desc.debugName) VkSetObjectName(impl, reinterpret_cast<uint64_t>(desc.buffer), VK_OBJECT_TYPE_BUFFER, desc.debugName);
 			out = MakeBufferPtr(&device, buffer, impl->selfWeak.lock());
 			return Result::Ok;
+		}
+
+		bool check_buffer_view_ref(Device device, uint32_t viewSlot, ResourceHandle resource, BufferViewRefCheck& out) noexcept {
+			out = {};
+			if (!device || device.vt != &g_vkdevvt || !device.impl)
+				return false;
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			auto& r = impl->viewRefs;
+			if (!r.ready)
+				return true;
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
+			std::shared_lock read(r.lock);
+			out.firstSlot = impl->shaderVisibleResourceCapacity;
+			out.slotCount = BUFFER_VIEW_REF_SLOTS;
+			out.inRegion = viewSlot >= out.firstSlot && viewSlot - out.firstSlot < BUFFER_VIEW_REF_SLOTS && (viewSlot - out.firstSlot) % 2 == 0;
+			if (resource.valid()) {
+				out.resourceGiven = true;
+				if (const VulkanResource* state = VkResourceState(impl, resource); state && state->type == ResourceType::Buffer) {
+					out.resourceLive = true;
+					out.resourceAddress = state->deviceAddress;
+					out.resourceSize = state->bufferSize;
+				}
+			}
+			if (!out.inRegion)
+				return true;
+			out.pair = (viewSlot - out.firstSlot) / 2;
+			const auto& record = r.pairs[out.pair];
+			out.pairLive = record.live;
+			out.pairKey = record.key;
+			out.descriptorAddress = record.address;
+			out.descriptorRange = record.range;
+			out.pairIsResource = out.resourceGiven && record.live && record.key == ((uint64_t(resource.generation) << 32) | resource.index);
+			// What shaders read: each heap's bytes for the pair against what was written.
+			const size_t pairBytes = static_cast<size_t>(2 * r.stride);
+			const std::byte* staged = r.staging.data() + static_cast<size_t>(out.pair) * pairBytes;
+			for (const DescriptorHeapHandle handle : r.heaps) {
+				const VulkanDescriptorHeap* heap = VkDescriptorHeapState(impl, handle);
+				if (!heap || !heap->mappedData)
+					continue;
+				++out.heaps;
+				const uint64_t offset = heap->descriptorBaseOffset + (static_cast<uint64_t>(heap->capacity) + 2ull * out.pair) * r.stride;
+				const bool sized = heap->capacity == out.firstSlot && heap->viewRefSlots == BUFFER_VIEW_REF_SLOTS && heap->descriptorStride == r.stride &&
+					offset + pairBytes <= heap->descriptorBytes;
+				if (!sized || std::memcmp(static_cast<const std::byte*>(heap->mappedData) + offset, staged, pairBytes) != 0)
+					++out.heapsMismatched;
+				const std::byte* slotZero = static_cast<const std::byte*>(heap->mappedData) + heap->descriptorBaseOffset;
+				if (std::any_of(slotZero, slotZero + r.stride, [](std::byte b) { return b != std::byte{ 0 }; }))
+					++out.slotZeroNonzero;
+			}
+			return true;
+		}
+
+		uint64_t get_vk_buffer_device_address(Device device, VkBuffer buffer) noexcept {
+			if (!device || device.vt != &g_vkdevvt || !device.impl || buffer == VK_NULL_HANDLE)
+				return 0;
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			if (!impl->bufferDeviceAddressEnabled)
+				return 0;
+			VkBufferDeviceAddressInfo addressInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+			addressInfo.buffer = buffer;
+			return vkGetBufferDeviceAddress(impl->device, &addressInfo);
 		}
 
 		CommandListPtr AdoptCommandBuffer(Device& device, VkCommandBuffer commandBuffer, QueueKind kind) noexcept {

@@ -78,6 +78,8 @@ namespace rhi::vulkan {
 
     // Called around every host access to an adopted VkQueue. DXVK: IDXGIVkInteropDevice
     // LockSubmissionQueue / ReleaseSubmissionQueue. Both or neither must be set.
+    // On a device BasicRHI owns and shares (ShareVulkanDevice), a null queue means
+    // every queue: BasicRHI holds it around vkDeviceWaitIdle.
     struct QueueSubmissionHooks {
         void* user = nullptr;
         void (*lock)(void* user, VkQueue queue) = nullptr;
@@ -168,6 +170,18 @@ namespace rhi::vulkan {
 
     Result AdoptVulkanDevice(const AdoptedVulkanDeviceInfo& info, rhi::DevicePtr& out) noexcept;
 
+    /// Shares a device from CreateVulkanDevice with a guest API that submits to its queues too (DXVK on a host-created
+    /// device). From then on every queue access BasicRHI makes takes hooks.lock, submissions may be handed to hooks.submit,
+    /// and whole-device waits (Device::WaitIdle, swapchain rebuilds, shutdown) wait for BasicRHI's own timelines instead of
+    /// vkDeviceWaitIdle, which would need every queue externally synchronized. Call it before the first submission.
+    /// It may be called again, from any thread, to replace the hooks: queue accesses that start afterwards take the new
+    /// ones, and an access already inside the old lock unlocks with the old hooks. The old and new locks must therefore
+    /// guard the same queues (the same guest), or the switch must happen while BasicRHI makes no queue access.
+    /// @param device A device from CreateVulkanDevice.
+    /// @param hooks The guest's queue lock (both lock and unlock, or neither) and optional submission hand-off.
+    /// @return InvalidArgument for another device or half a lock.
+    Result ShareVulkanDevice(rhi::Device device, const QueueSubmissionHooks& hooks) noexcept;
+
     // Which binding models a physical device supports for BasicRHI, from instance-level queries only, so that a host can ask
     // before it creates its device. BASICRHI_VK_LIMITS=base clamps every limit to the Vulkan base-spec minimum (to exercise the
     // fallbacks).
@@ -176,6 +190,47 @@ namespace rhi::vulkan {
 
     // The binding model a Vulkan device runs on (one BindingModelBits value), 0 for a device of another backend.
     uint32_t GetBindingModel(rhi::Device device) noexcept;
+
+    /// One memory heap's budget and usage (VK_EXT_memory_budget).
+    struct MemoryHeapBudget {
+        uint32_t heapIndex = 0;
+        VkMemoryHeapFlags flags = 0;
+        uint64_t heapSize = 0;
+        // VK_EXT_memory_budget was enabled: budget and usage are the driver's. Without it the budget is the heap's size and
+        // the usage is 0.
+        bool hasBudget = false;
+        uint64_t budget = 0;  // heapBudget: what the process can use before the OS starts demoting its memory
+        uint64_t usage = 0;   // heapUsage: what the whole process uses, not BasicRHI alone
+        // The usage reached the budget. AMD's Windows driver clamps heapUsage to heapBudget, so the real usage can be
+        // higher: do not derive memory outside your own allocations as usage minus them while this is set.
+        bool usageAtBudget = false;
+    };
+
+    /// Queries the budget and usage of every memory heap of a Vulkan device.
+    /// @param device A device from CreateVulkanDevice or AdoptVulkanDevice.
+    /// @param out Receives up to capacity heaps, in heap order. May be null when capacity is 0.
+    /// @param capacity The number of entries out holds.
+    /// @return The device's heap count (0 for a device of another backend); fewer than that are written when capacity is smaller.
+    uint32_t QueryMemoryHeapBudgets(rhi::Device device, MemoryHeapBudget* out, uint32_t capacity) noexcept;
+
+    /// The native crash-diagnostic sources a device runs with (DeviceCreateInfo::enableCrashMarkers).
+    struct CrashDiagnosticsState {
+        bool deviceFault = false;    // VK_EXT_device_fault: queried on device loss
+        bool bufferMarkers = false;  // VK_AMD_buffer_marker: the last marker begun and finished per command list
+        bool checkpoints = false;    // VK_NV_device_diagnostic_checkpoints: the last checkpoints per queue
+    };
+
+    /// Which native crash-diagnostic sources a Vulkan device runs with. All false when they are off, and for an adopted
+    /// device (its host's checkpoint callbacks are used instead).
+    CrashDiagnosticsState GetCrashDiagnostics(rhi::Device device) noexcept;
+
+    /// Logs the native crash markers: per command list the last marker the GPU began and the last it finished, and per
+    /// queue the last checkpoints. BasicRHI does this by itself when it sees VK_ERROR_DEVICE_LOST; a host that sees the
+    /// loss first calls it.
+    /// @param device A device from CreateVulkanDevice.
+    /// @param deviceLost Also query and log VK_EXT_device_fault's report (only meaningful once the device is lost).
+    /// @return The number of marker lines logged; 0 when crash markers are off.
+    uint32_t DumpCrashDiagnostics(rhi::Device device, bool deviceLost) noexcept;
 
     // Non-owning import of a host image. currentLayout is the layout the image is in
     // when BasicRHI first uses it; the host keeps ownership of image and memory.
@@ -202,6 +257,32 @@ namespace rhi::vulkan {
         const char* debugName = nullptr;
     };
     Result import_buffer(rhi::Device device, const ImportedBufferDesc& desc, rhi::ResourcePtr& out) noexcept;
+
+    // A check of a buffer view ref (rhi_shader_abi.h, BUFFER_VIEW_REF_*), for diagnostics: what its slot names, what the pair's
+    // descriptors were written with, and whether the heaps hold those bytes. Takes the views mutex: not for hot paths.
+    struct BufferViewRefCheck {
+        uint32_t firstSlot = 0;          // the region's first slot
+        uint32_t slotCount = 0;          // its slots (0: the device has no region)
+        bool inRegion = false;           // the slot is an SRV slot of the region
+        uint32_t pair = 0;
+        bool pairLive = false;           // a buffer holds the pair
+        uint64_t pairKey = 0;            // that buffer's handle (generation << 32 | index), or the last one's
+        uint64_t descriptorAddress = 0;  // what the pair's descriptors were written with (the last buffer's when released)
+        uint64_t descriptorRange = 0;
+        bool resourceGiven = false;      // a resource handle was passed
+        bool resourceLive = false;       // it is a live buffer
+        bool pairIsResource = false;     // the pair is that buffer's
+        uint64_t resourceAddress = 0;    // its device address now
+        uint64_t resourceSize = 0;       // its size
+        uint32_t heaps = 0;              // heaps holding the region
+        uint32_t heapsMismatched = 0;    // of them, those whose bytes for the pair differ from what was written, or of another capacity
+        uint32_t slotZeroNonzero = 0;    // of them, those whose slot 0 is not zeros (a load through a null ref reads it)
+    };
+    bool check_buffer_view_ref(rhi::Device device, uint32_t viewSlot, rhi::ResourceHandle resource, BufferViewRefCheck& out) noexcept;
+
+    // The device address of a host buffer (vkGetBufferDeviceAddress), for diagnostics; 0 without one. The buffer must be alive and
+    // have VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT.
+    uint64_t get_vk_buffer_device_address(rhi::Device device, VkBuffer buffer) noexcept;
 
     // Non-owning wrap of a VkCommandBuffer recorded by the host (an adopted device's), already begun: every recording call
     // works on it, starting with nothing bound (no heaps, layout, pipeline or pass), and records on one thread at a time. End

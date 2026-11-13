@@ -178,6 +178,7 @@ namespace rhi {
 		case Format::R16_SInt: return DXGI_FORMAT_R16_SINT;
 		case Format::R8_Typeless: return DXGI_FORMAT_R8_TYPELESS;
 		case Format::R8_UNorm: return DXGI_FORMAT_R8_UNORM;
+		case Format::A8_UNorm: return DXGI_FORMAT_A8_UNORM;
 		case Format::R8_UInt: return DXGI_FORMAT_R8_UINT;
 		case Format::R8_SNorm: return DXGI_FORMAT_R8_SNORM;
 		case Format::R8_SInt: return DXGI_FORMAT_R8_SINT;
@@ -220,8 +221,47 @@ namespace rhi {
 		case BlendFactor::SrcAlpha:return B::D3D12_BLEND_SRC_ALPHA; case BlendFactor::InvSrcAlpha:return B::D3D12_BLEND_INV_SRC_ALPHA;
 		case BlendFactor::DstColor:return B::D3D12_BLEND_DEST_COLOR; case BlendFactor::InvDstColor:return B::D3D12_BLEND_INV_DEST_COLOR;
 		case BlendFactor::DstAlpha:return B::D3D12_BLEND_DEST_ALPHA; case BlendFactor::InvDstAlpha:return B::D3D12_BLEND_INV_DEST_ALPHA;
+		case BlendFactor::BlendFactor:return B::D3D12_BLEND_BLEND_FACTOR; case BlendFactor::InvBlendFactor:return B::D3D12_BLEND_INV_BLEND_FACTOR;
+		case BlendFactor::SrcAlphaSat:return B::D3D12_BLEND_SRC_ALPHA_SAT;
+		case BlendFactor::Src1Color:return B::D3D12_BLEND_SRC1_COLOR; case BlendFactor::InvSrc1Color:return B::D3D12_BLEND_INV_SRC1_COLOR;
+		case BlendFactor::Src1Alpha:return B::D3D12_BLEND_SRC1_ALPHA; case BlendFactor::InvSrc1Alpha:return B::D3D12_BLEND_INV_SRC1_ALPHA;
 		}
 		return B::D3D12_BLEND_ONE;
+	}
+	static inline bool DxBlendIsConstant(D3D12_BLEND b) {
+		return b == D3D12_BLEND_BLEND_FACTOR || b == D3D12_BLEND_INV_BLEND_FACTOR;
+	}
+	static inline D3D12_LOGIC_OP ToDX(const LogicOp o) {
+		switch (o) {
+		case LogicOp::Clear: return D3D12_LOGIC_OP_CLEAR;
+		case LogicOp::Set: return D3D12_LOGIC_OP_SET;
+		case LogicOp::Copy: return D3D12_LOGIC_OP_COPY;
+		case LogicOp::CopyInverted: return D3D12_LOGIC_OP_COPY_INVERTED;
+		case LogicOp::Noop: return D3D12_LOGIC_OP_NOOP;
+		case LogicOp::Invert: return D3D12_LOGIC_OP_INVERT;
+		case LogicOp::And: return D3D12_LOGIC_OP_AND;
+		case LogicOp::Nand: return D3D12_LOGIC_OP_NAND;
+		case LogicOp::Or: return D3D12_LOGIC_OP_OR;
+		case LogicOp::Nor: return D3D12_LOGIC_OP_NOR;
+		case LogicOp::Xor: return D3D12_LOGIC_OP_XOR;
+		case LogicOp::Equiv: return D3D12_LOGIC_OP_EQUIV;
+		case LogicOp::AndReverse: return D3D12_LOGIC_OP_AND_REVERSE;
+		case LogicOp::AndInverted: return D3D12_LOGIC_OP_AND_INVERTED;
+		case LogicOp::OrReverse: return D3D12_LOGIC_OP_OR_REVERSE;
+		case LogicOp::OrInverted: return D3D12_LOGIC_OP_OR_INVERTED;
+		} return D3D12_LOGIC_OP_NOOP;
+	}
+	static inline D3D12_STENCIL_OP ToDX(const StencilOp o) {
+		switch (o) {
+		case StencilOp::Keep: return D3D12_STENCIL_OP_KEEP;
+		case StencilOp::Zero: return D3D12_STENCIL_OP_ZERO;
+		case StencilOp::Replace: return D3D12_STENCIL_OP_REPLACE;
+		case StencilOp::IncrSat: return D3D12_STENCIL_OP_INCR_SAT;
+		case StencilOp::DecrSat: return D3D12_STENCIL_OP_DECR_SAT;
+		case StencilOp::Invert: return D3D12_STENCIL_OP_INVERT;
+		case StencilOp::Incr: return D3D12_STENCIL_OP_INCR;
+		case StencilOp::Decr: return D3D12_STENCIL_OP_DECR;
+		} return D3D12_STENCIL_OP_KEEP;
 	}
 	static inline D3D12_BLEND_OP ToDX(const BlendOp o) {
 		switch (o) {
@@ -247,6 +287,28 @@ namespace rhi {
 		case HeapType::HostVisibleDeviceLocal: return D3D12_HEAP_TYPE_GPU_UPLOAD;
 		default: return D3D12_HEAP_TYPE_CUSTOM;
 		}
+	}
+
+	// Heap properties for a heap type on node 0. SystemMemory is a CUSTOM heap in system memory (L0) with no CPU access;
+	// the other types leave the page property and pool to the heap type.
+	inline static D3D12_HEAP_PROPERTIES ToDxHeapProperties(const HeapType m) {
+		D3D12_HEAP_PROPERTIES properties{};
+		properties.Type = ToDX(m);
+		properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+		properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+		if (m == HeapType::SystemMemory) {
+			properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+			properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+		}
+		// Host-cached system memory the GPU reads and writes: unlike UPLOAD and READBACK, it can hold a buffer with UAV access that
+		// the CPU maps (a GPU-written table the CPU reads back without a copy).
+		if (m == HeapType::HostCached) {
+			properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+			properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+		}
+		properties.CreationNodeMask = 1;
+		properties.VisibleNodeMask = 1;
+		return properties;
 	}
 
 	inline static D3D12_RESOURCE_FLAGS ToDX(const ResourceFlags flags) {
