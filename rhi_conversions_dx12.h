@@ -300,6 +300,12 @@ namespace rhi {
 			properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
 			properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
 		}
+		// Host-cached system memory the GPU reads and writes: unlike UPLOAD and READBACK, it can hold a buffer with UAV access that
+		// the CPU maps (a GPU-written table the CPU reads back without a copy).
+		if (m == HeapType::HostCached) {
+			properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+			properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+		}
 		properties.CreationNodeMask = 1;
 		properties.VisibleNodeMask = 1;
 		return properties;

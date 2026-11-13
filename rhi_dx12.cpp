@@ -1782,6 +1782,14 @@ namespace rhi {
 				if (vs.pShaderBytecode) sb.push(SO_VS{ .Value = vs });
 				if (ps.pShaderBytecode) sb.push(SO_PS{ .Value = ps });
 
+				// BASICRHI_DX12_TEST_NO_DEPTH=1 (a diagnostic): every graphics pipeline without depth, stencil or culling, to tell a
+				// draw its depth or stencil test rejects from one that never rasterizes.
+				static const bool testNoDepth = [] { const char* v = std::getenv("BASICRHI_DX12_TEST_NO_DEPTH"); return v && *v == '1'; }();
+				if (testNoDepth && !isCompute) {
+					rast.CullMode = D3D12_CULL_MODE_NONE;
+					depth.DepthEnable = FALSE;
+					depth.StencilEnable = FALSE;
+				}
 				if (hasRast) sb.push(SO_Rasterizer{ .Value = rast });
 				if (hasBlend) sb.push(SO_Blend{ .Value = blend });
 				if (hasDepth) sb.push(SO_DepthStencil{ .Value = depth });
@@ -9037,6 +9045,12 @@ namespace rhi {
 			BreakIfDebugging();
 			#endif
 		}
+		// A vertex or index buffer view of size 0 covers the rest of the buffer from its offset, as on Vulkan (VK_WHOLE_SIZE). D3D12 reads
+		// a view of size 0 as empty: every index fetched is 0 (each triangle degenerate, nothing rasterized).
+		static UINT Dx12WholeViewBytes(ID3D12Resource& a_buffer, uint64_t a_offset) noexcept {
+			const uint64_t width = a_buffer.GetDesc().Width;
+			return a_offset < width ? static_cast<UINT>((std::min<uint64_t>)(width - a_offset, UINT32_MAX)) : 0u;
+		}
 		static void cl_setVB(CommandList* cl, uint32_t startSlot, uint32_t numViews, VertexBufferView* pBufferViews) noexcept {
 			auto* l = dx12_detail::CL(cl);
 			std::vector<D3D12_VERTEX_BUFFER_VIEW> views; views.resize(numViews);
@@ -9044,7 +9058,7 @@ namespace rhi {
 			for (uint32_t i = 0; i < numViews; ++i) {
 				if (auto* B = dev->resources.get(pBufferViews[i].buffer)) {
 					views[i].BufferLocation = B->res->GetGPUVirtualAddress() + pBufferViews[i].offset;
-					views[i].SizeInBytes = pBufferViews[i].sizeBytes;
+					views[i].SizeInBytes = pBufferViews[i].sizeBytes ? pBufferViews[i].sizeBytes : Dx12WholeViewBytes(*B->res.Get(), pBufferViews[i].offset);
 					views[i].StrideInBytes = pBufferViews[i].stride;
 				}
 			}
@@ -9056,7 +9070,7 @@ namespace rhi {
 			if (auto* B = dev->resources.get(view.buffer)) {
 				D3D12_INDEX_BUFFER_VIEW ibv{};
 				ibv.BufferLocation = B->res->GetGPUVirtualAddress() + view.offset;
-				ibv.SizeInBytes = view.sizeBytes;
+				ibv.SizeInBytes = view.sizeBytes ? view.sizeBytes : Dx12WholeViewBytes(*B->res.Get(), view.offset);
 				ibv.Format = ToDxgi(view.format);
 				l->cl->IASetIndexBuffer(&ibv);
 			}
