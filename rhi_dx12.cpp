@@ -2977,7 +2977,9 @@ namespace rhi {
 					if (h->structVersion >= 2) {
 						// D3D12's shader-visible heap limits: 1,000,000 CBV/SRV/UAV descriptors on every resource binding tier (tier 3 allows more, the
 						// preferred capacity is this) and D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE samplers.
-						out->maxShaderVisibleResourceDescriptors = 1000000u;
+						// The buffer view refs' region sits past this capacity in the same heap (rhi_shader_abi.h), so the device reports its
+						// slots fewer: a heap of the full capacity plus the region stays within the limit (NVIDIA refuses one above it).
+						out->maxShaderVisibleResourceDescriptors = 1000000u - BUFFER_VIEW_REF_SLOTS;
 						out->maxShaderVisibleSamplerDescriptors = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
 					}
 				} break;
@@ -3380,7 +3382,7 @@ namespace rhi {
 			}
 			r.stagingStart = r.staging->GetCPUDescriptorHandleForHeapStart();
 			r.increment = impl->pNativeDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-			r.firstSlot = 1000000u;  // ShaderFeatureInfo::maxShaderVisibleResourceDescriptors
+			r.firstSlot = 1000000u - BUFFER_VIEW_REF_SLOTS;  // ShaderFeatureInfo::maxShaderVisibleResourceDescriptors
 			for (uint32_t pair = 0; pair < BUFFER_VIEW_REF_PAIRS; ++pair)
 				Dx12RawBufferViews(impl, nullptr, 4, false, Dx12ViewRefStaging(r, 2 * pair), Dx12ViewRefStaging(r, 2 * pair + 1));
 			r.ready = true;
