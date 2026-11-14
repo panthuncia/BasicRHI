@@ -15912,8 +15912,17 @@ namespace rhi {
 			}
 		}
 		impl->self = Device{ impl.get(), &g_vkdevvt };
+		// A host's checkpoint markers (DeviceCreateInfo::vulkanRegisterCheckpoint) take the NV checkpoints, as on an adopted device.
+		const bool hostCheckpoints = enableCheckpoints && ci.vulkanRegisterCheckpoint && vkCmdSetCheckpointNV;
+		if (hostCheckpoints) {
+			impl->setCheckpoint = vkCmdSetCheckpointNV;
+			impl->checkpointUser = ci.vulkanCheckpointUser;
+			impl->registerCheckpoint = ci.vulkanRegisterCheckpoint;
+			impl->detailedCheckpoints = ci.vulkanDetailedCheckpoints;
+			spdlog::info("CreateVulkanDevice: the host's checkpoint markers record VK_NV_device_diagnostic_checkpoints at every debug label");
+		}
 		if (crashMarkersRequested) {
-			VkInitCrashMarkers(impl.get(), enabledFaultFeatures.deviceFault == VK_TRUE, enableBufferMarkers, enableCheckpoints);
+			VkInitCrashMarkers(impl.get(), enabledFaultFeatures.deviceFault == VK_TRUE, enableBufferMarkers, enableCheckpoints && !hostCheckpoints);
 		}
 
 		impl->bindingModel = impl->descriptorHeapEnabled ? VulkanBindingModel::DescriptorHeap
