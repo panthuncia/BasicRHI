@@ -3538,6 +3538,25 @@ namespace rhi {
 		static D3D12_GPU_VIRTUAL_ADDRESS Dx12AccelerationStructureAddress(Dx12Device* impl, AccelerationStructureHandle handle) noexcept;
 		static D3D12_GPU_VIRTUAL_ADDRESS Dx12BufferAddress(Dx12Device* impl, GpuBufferAddress address) noexcept;
 
+		// A shader resource view cannot take a depth-stencil format (the device is removed: DXGI_ERROR_INVALID_CALL). A texture's depth
+		// is read through the matching colour format of its depth plane, as Vulkan reads the view's depth aspect.
+		static DXGI_FORMAT DxSrvFormat(DXGI_FORMAT format) noexcept {
+			switch (format) {
+			case DXGI_FORMAT_D24_UNORM_S8_UINT:
+			case DXGI_FORMAT_R24G8_TYPELESS:
+				return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+			case DXGI_FORMAT_D32_FLOAT:
+				return DXGI_FORMAT_R32_FLOAT;
+			case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+			case DXGI_FORMAT_R32G8X24_TYPELESS:
+				return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+			case DXGI_FORMAT_D16_UNORM:
+				return DXGI_FORMAT_R16_UNORM;
+			default:
+				return format;
+			}
+		}
+
 		static Result d_createShaderResourceView(Device* d, DescriptorSlot s, const ResourceHandle& resource, const SrvDesc& dv) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 
@@ -3621,7 +3640,7 @@ namespace rhi {
 
 			case SrvDim::Texture1D: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
 				desc.Texture1D.MostDetailedMip = dv.tex1D.mostDetailedMip;
 				desc.Texture1D.MipLevels = dv.tex1D.mipLevels;
@@ -3632,7 +3651,7 @@ namespace rhi {
 
 			case SrvDim::Texture1DArray: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
 				desc.Texture1DArray.MostDetailedMip = dv.tex1DArray.mostDetailedMip;
 				desc.Texture1DArray.MipLevels = dv.tex1DArray.mipLevels;
@@ -3646,7 +3665,7 @@ namespace rhi {
 
 			case SrvDim::Texture2D: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 				desc.Texture2D.MostDetailedMip = dv.tex2D.mostDetailedMip;
 				desc.Texture2D.MipLevels = dv.tex2D.mipLevels;
@@ -3658,7 +3677,7 @@ namespace rhi {
 
 			case SrvDim::Texture2DArray: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
 				desc.Texture2DArray.MostDetailedMip = dv.tex2DArray.mostDetailedMip;
 				desc.Texture2DArray.MipLevels = dv.tex2DArray.mipLevels;
@@ -3672,7 +3691,7 @@ namespace rhi {
 
 			case SrvDim::Texture2DMS: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
 				impl->pNativeDevice->CreateShaderResourceView(T->res.Get(), &desc, dst);
 				return Result::Ok;
@@ -3680,7 +3699,7 @@ namespace rhi {
 
 			case SrvDim::Texture2DMSArray: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
 				desc.Texture2DMSArray.FirstArraySlice = dv.tex2DMSArray.firstArraySlice;
 				desc.Texture2DMSArray.ArraySize = dv.tex2DMSArray.arraySize;
@@ -3690,7 +3709,7 @@ namespace rhi {
 
 			case SrvDim::Texture3D: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
 				desc.Texture3D.MostDetailedMip = dv.tex3D.mostDetailedMip;
 				desc.Texture3D.MipLevels = dv.tex3D.mipLevels;
@@ -3701,7 +3720,7 @@ namespace rhi {
 
 			case SrvDim::TextureCube: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
 				desc.TextureCube.MostDetailedMip = dv.cube.mostDetailedMip;
 				desc.TextureCube.MipLevels = dv.cube.mipLevels;
@@ -3712,7 +3731,7 @@ namespace rhi {
 
 			case SrvDim::TextureCubeArray: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
 				desc.TextureCubeArray.MostDetailedMip = dv.cubeArray.mostDetailedMip;
 				desc.TextureCubeArray.MipLevels = dv.cubeArray.mipLevels;
