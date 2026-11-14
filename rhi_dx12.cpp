@@ -3331,7 +3331,10 @@ namespace rhi {
 				Dx12LogInfoQueueMessagesSince(impl->pNativeDevice.Get(), 0, 32);
 				RHI_FAIL(ToRHI(hr));
 			}
-			const Dx12CommandSignature s(cs, cd.byteStride, impl);
+			Dx12CommandSignature s(cs, cd.byteStride, impl);
+			for (uint32_t i = 0; i < cd.args.size; ++i)
+				if (cd.args.data[i].kind == IndirectArgKind::Constant)
+					s.setsRootConstants = true;
 			const auto handle = impl->commandSignatures.alloc(s);
 			CommandSignature ret(handle);
 			ret.vt = &g_csvt;
@@ -8902,6 +8905,7 @@ namespace rhi {
 #endif
 			l->boundLayout = {};
 			l->boundLayoutPtr = nullptr;
+			l->rootConstantValues.clear();
 			l->activeRootCbvShadowStateCount = 0;
 			l->stencilRef = 0;
 			l->stencilRefApplied = false;
@@ -9173,6 +9177,7 @@ namespace rhi {
 
 			if (impl->boundLayout.index != layoutH.index || impl->boundLayout.generation != layoutH.generation) {
 				impl->activeRootCbvShadowStateCount = 0;
+				impl->rootConstantValues.clear();
 			}
 			impl->boundLayout = layoutH;
 			impl->boundLayoutPtr = L;
@@ -9662,6 +9667,21 @@ namespace rhi {
 				maxCount,
 				argB->res.Get(), argOff,
 				cntRes, cntOff);
+			// A signature that sets root constants leaves the root arguments undefined after the call (the D3D12 spec): the 32-bit
+			// constants pushed under the layout are set again, so the next draw reads what was pushed, not what the last command set.
+			if (S->setsRootConstants) {
+				for (const auto& entry : l->rootConstantValues) {
+					if (entry.values.empty()) {
+						continue;
+					}
+					if (entry.graphics) {
+						l->cl->SetGraphicsRoot32BitConstants(entry.rootIndex, static_cast<UINT>(entry.values.size()), entry.values.data(), 0);
+					}
+					if (entry.compute) {
+						l->cl->SetComputeRoot32BitConstants(entry.rootIndex, static_cast<UINT>(entry.values.size()), entry.values.data(), 0);
+					}
+				}
+			}
 		}
 		static void cl_setDescriptorHeaps(CommandList* cl, DescriptorHeapHandle csu, std::optional<DescriptorHeapHandle> samp) noexcept {
 			auto* l = dx12_detail::CL(cl);
@@ -9773,6 +9793,18 @@ namespace rhi {
 				scope(barrier.SyncAfter, barrier.AccessAfter);
 			};
 
+			// BASICRHI_DX12_FULL_BARRIERS=1, a diagnostic: every barrier waits for and blocks all work (SYNC_ALL on each side that
+			// has an access), so a missing or too narrow sync scope shows as a change in what the frame draws.
+			static const bool fullBarriers = [] { const char* v = std::getenv("BASICRHI_DX12_FULL_BARRIERS"); return v && *v == '1'; }();
+			const auto fullSync = [](auto& barrier) {
+				if (!fullBarriers)
+					return;
+				if (barrier.AccessBefore != D3D12_BARRIER_ACCESS_NO_ACCESS || barrier.SyncBefore != D3D12_BARRIER_SYNC_NONE)
+					barrier.SyncBefore = D3D12_BARRIER_SYNC_ALL;
+				if (barrier.AccessAfter != D3D12_BARRIER_ACCESS_NO_ACCESS || barrier.SyncAfter != D3D12_BARRIER_SYNC_NONE)
+					barrier.SyncAfter = D3D12_BARRIER_SYNC_ALL;
+			};
+
 			// Textures
 			for (uint32_t i = 0; i < b.textures.size; ++i) {
 				const auto& t = b.textures.data[i];
@@ -9812,6 +9844,7 @@ namespace rhi {
 						T->fmt == DXGI_FORMAT_R32G8X24_TYPELESS))
 					tb.Subresources.NumPlanes = 2;
 				tb.Flags = nativeDiscard ? D3D12_TEXTURE_BARRIER_FLAG_DISCARD : D3D12_TEXTURE_BARRIER_FLAG_NONE;
+				fullSync(tb);
 				noSyncNoAccess(tb);
 				listTypeScope(tb);
 				// The COMMON layout takes shader reads and copies only (a simultaneous-access texture takes any but the attachment
@@ -9887,6 +9920,7 @@ namespace rhi {
 					noUav(bb.AccessBefore);
 					noUav(bb.AccessAfter);
 				}
+				fullSync(bb);
 				noSyncNoAccess(bb);
 				listTypeScope(bb);
 				buf.push_back(bb);
@@ -9900,6 +9934,7 @@ namespace rhi {
 				gb.SyncAfter = ToDX(g.afterSync);
 				gb.AccessBefore = ToDX(g.beforeAccess);
 				gb.AccessAfter = ToDX(g.afterAccess);
+				fullSync(gb);
 				noSyncNoAccess(gb);
 				// A global barrier names no texture, so it cannot take the accesses bound to a layout (attachments, resolves, shading
 				// rate): those images are ordered by their own texture barriers. What is left orders buffers, UAVs and copies.
@@ -10467,12 +10502,26 @@ namespace rhi {
 			// Write to requested stages. On DX12, graphics/compute have distinct root constant slots, and raytracing shaders read the compute ones.
 			const auto* p32 = static_cast<const uint32_t*>(data);
 			if (rc->type == PushConstantRangeType::RootConstants32) {
-				if (static_cast<uint32_t>(stages) & (static_cast<uint32_t>(ShaderStage::Compute) | static_cast<uint32_t>(ShaderStage::AllRayTracing))) {
+				const bool compute = static_cast<uint32_t>(stages) & (static_cast<uint32_t>(ShaderStage::Compute) | static_cast<uint32_t>(ShaderStage::AllRayTracing));
+				const bool graphics = static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::AllGraphics);
+				if (compute) {
 					impl->cl->SetComputeRoot32BitConstants(rc->rootIndex, num32, p32, dstOffset32);
 				}
-				if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::AllGraphics)) {
+				if (graphics) {
 					impl->cl->SetGraphicsRoot32BitConstants(rc->rootIndex, num32, p32, dstOffset32);
 				}
+				// Kept for an ExecuteIndirect that sets root constants (cl_executeIndirect sets them again after it).
+				auto found = std::find_if(impl->rootConstantValues.begin(), impl->rootConstantValues.end(),
+					[&](const auto& entry) { return entry.rootIndex == rc->rootIndex; });
+				if (found == impl->rootConstantValues.end()) {
+					found = impl->rootConstantValues.insert(impl->rootConstantValues.end(), Dx12CommandList::RootConstantValues{ rc->rootIndex });
+				}
+				if (found->values.size() < maxAvail) {
+					found->values.resize(maxAvail, 0u);
+				}
+				std::memcpy(found->values.data() + dstOffset32, p32, static_cast<size_t>(num32) * sizeof(uint32_t));
+				found->graphics = found->graphics || graphics;
+				found->compute = found->compute || compute;
 				return;
 			}
 

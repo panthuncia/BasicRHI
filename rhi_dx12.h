@@ -155,6 +155,8 @@ namespace rhi {
 		Microsoft::WRL::ComPtr<ID3D12CommandSignature> sig;
 		uint32_t stride = 0;
 		Dx12Device* dev = nullptr;
+		// Its arguments set root constants: after an ExecuteIndirect with it, D3D12 leaves the root arguments undefined.
+		bool setsRootConstants = false;
 	};
 
 	struct Dx12Allocator {
@@ -230,6 +232,14 @@ namespace rhi {
 		Result pendingError = Result::Ok;
 		PipelineLayoutHandle boundLayout{};
 		Dx12PipelineLayout* boundLayoutPtr = nullptr;
+		// The 32-bit root constants pushed under the bound layout, per root parameter, so that an ExecuteIndirect whose signature
+		// sets root constants (which leaves the root arguments undefined after it) can set them again. Cleared with the layout.
+		struct RootConstantValues {
+			uint32_t rootIndex = 0;
+			bool graphics = false, compute = false;
+			std::vector<uint32_t> values;
+		};
+		std::vector<RootConstantValues> rootConstantValues;
 		Dx12Device* dev = nullptr;
 		Dx12Pipeline* boundPipeline = nullptr; // For debug validation
 		// The stencil reference set with SetStencilRef (0 until then). Applied: the list holds it. A list starts
