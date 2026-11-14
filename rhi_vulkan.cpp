@@ -5903,6 +5903,7 @@ namespace rhi {
 		}
 
 		static Result q_submit(Queue* queue, Span<CommandList> lists, const SubmitDesc& submit) noexcept {
+			ZoneScopedN("RHI.Vulkan.Submit");
 			auto* impl = queue ? static_cast<VulkanDevice*>(queue->impl) : nullptr;
 			if (!impl || impl->device == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
@@ -6065,6 +6066,7 @@ namespace rhi {
 				submitResult = ToRHI(hooks->submit(hooks->user, queueState->queue, submitInfo2));
 			}
 			else {
+				ZoneScopedN("RHI.Vulkan.QueueSubmit");
 				const VkQueueAccessGuard queueAccess(impl, queueState->queue);
 				submitResult = ToRHI(VkCheckDeviceLost(impl, vkQueueSubmit(queueState->queue, 1, &submitInfo, VK_NULL_HANDLE), "Queue::Submit"));
 			}
