@@ -240,6 +240,20 @@ namespace rhi {
 		float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 		bool blendFactorApplied = false;
 		std::string debugName;
+		// Close diagnostics: the last commands recorded since the reset (Dx12NoteCommand), logged when Close fails.
+		struct RecordedCommand {
+			const char* kind = nullptr;   // a literal naming the command and what a, b and c hold
+			uint32_t label = UINT32_MAX;  // index into labels of the innermost open debug label, UINT32_MAX for none
+			uint64_t a = 0, b = 0, c = 0;
+		};
+		static constexpr uint32_t kRecordedCommands = 32;
+		std::array<RecordedCommand, kRecordedCommands> recorded{};
+		uint32_t recordedCount = 0;  // commands recorded since the reset
+		// Debug labels begun since the reset (at most kMaxLabels kept), and the open ones' indices, innermost last
+		// (UINT32_MAX for one past the cap).
+		static constexpr uint32_t kMaxLabels = 1024;
+		std::vector<std::string> labels;
+		std::vector<uint32_t> openLabels;
 		std::string instrumentationPassName;
 		std::string instrumentationTechniquePath;
 		std::vector<RootCbvScratchPage> rootCbvScratchPages;
