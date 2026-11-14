@@ -8609,6 +8609,40 @@ namespace rhi {
 			return D3D12CalcSubresource(mip, arraySlice, 0, T.tex.mips, T.tex.arraySize);
 		}
 
+		// A buffer-texture copy's subresource and its placed footprint's format. A colour texture copies its own format from its
+		// one plane. A depth or depth-stencil texture copies one plane (BufferTextureCopyFootprint::plane): depth or stencil, each
+		// its own subresource, in the footprint format the device gives for it (GetCopyableFootprints), not the texture's.
+		static void DxBufferCopyLocation(Dx12Device& impl, const Dx12Resource& T, const BufferTextureCopyFootprint& r, UINT& subresource, DXGI_FORMAT& format) {
+			const UINT slice = T.dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 0u : r.arraySlice;
+			subresource = CalcSubresourceFor(T, r.mip, slice);
+			format = T.fmt;
+			const D3D12_RESOURCE_DESC desc = T.res->GetDesc();
+			bool depth = false;
+			switch (desc.Format) {
+			case DXGI_FORMAT_D16_UNORM:
+			case DXGI_FORMAT_D24_UNORM_S8_UINT:
+			case DXGI_FORMAT_D32_FLOAT:
+			case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+			case DXGI_FORMAT_R24G8_TYPELESS:
+			case DXGI_FORMAT_R32G8X24_TYPELESS:
+				depth = true;
+				break;
+			default:
+				break;
+			}
+			if (!depth) {
+				return;
+			}
+			const UINT planes = D3D12GetFormatPlaneCount(impl.pNativeDevice.Get(), desc.Format);
+			const UINT plane = (std::min)(r.plane, planes ? planes - 1 : 0u);
+			subresource = D3D12CalcSubresource(r.mip, slice, plane, T.tex.mips, T.tex.arraySize);
+			D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed{};
+			impl.pNativeDevice->GetCopyableFootprints(&desc, subresource, 1, 0, &placed, nullptr, nullptr, nullptr);
+			if (placed.Footprint.Format != DXGI_FORMAT_UNKNOWN) {
+				format = placed.Footprint.Format;
+			}
+		}
+
 		// Bundles cannot hold barriers, clears, copies, queries, render-target, viewport or scissor changes: such a command is
 		// not recorded and the bundle fails (End reports it).
 		static bool DxRejectInBundle(CommandList* cl, const char* command) noexcept {
@@ -9849,8 +9883,11 @@ namespace rhi {
 			D3D12_TEXTURE_COPY_LOCATION dst{};
 			dst.pResource = B->res.Get();
 			dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			UINT subresource = 0;
+			DXGI_FORMAT format = T->fmt;
+			DxBufferCopyLocation(*impl, *T, r, subresource, format);
 			dst.PlacedFootprint.Offset = r.footprint.offset;
-			dst.PlacedFootprint.Footprint.Format = T->fmt;     // texture s actual DXGI format
+			dst.PlacedFootprint.Footprint.Format = format;
 			dst.PlacedFootprint.Footprint.Width = r.footprint.width;
 			dst.PlacedFootprint.Footprint.Height = r.footprint.height;
 			dst.PlacedFootprint.Footprint.Depth = r.footprint.depth;
@@ -9859,8 +9896,7 @@ namespace rhi {
 			D3D12_TEXTURE_COPY_LOCATION src{};
 			src.pResource = T->res.Get();
 			src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			src.SubresourceIndex = CalcSubresourceFor(*T, r.mip,
-				(T->dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? 0u : r.arraySlice);
+			src.SubresourceIndex = subresource;
 
 			// The texture's region at (x, y, z) of the footprint's extent, into the footprint's start: the Vulkan backend's meaning of
 			// the offset (vkCmdCopyImageToBuffer's imageOffset). A full-subresource copy has offset 0 and the subresource's extent.
@@ -9895,8 +9931,11 @@ namespace rhi {
 			D3D12_TEXTURE_COPY_LOCATION src{};
 			src.pResource = B->res.Get();
 			src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			UINT subresource = 0;
+			DXGI_FORMAT format = T->fmt;
+			DxBufferCopyLocation(*impl, *T, r, subresource, format);
 			src.PlacedFootprint.Offset = r.footprint.offset;
-			src.PlacedFootprint.Footprint.Format = T->fmt;
+			src.PlacedFootprint.Footprint.Format = format;
 			src.PlacedFootprint.Footprint.Width = r.footprint.width;
 			src.PlacedFootprint.Footprint.Height = r.footprint.height;
 			src.PlacedFootprint.Footprint.Depth = r.footprint.depth;
@@ -9905,8 +9944,7 @@ namespace rhi {
 			D3D12_TEXTURE_COPY_LOCATION dst{};
 			dst.pResource = T->res.Get();
 			dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			dst.SubresourceIndex = CalcSubresourceFor(*T, r.mip,
-				(T->dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? 0u : r.arraySlice);
+			dst.SubresourceIndex = subresource;
 
 			rec->cl->CopyTextureRegion(&dst, r.x, r.y, r.z, &src, nullptr);
 		}

@@ -2690,9 +2690,18 @@ namespace rhi {
 			}
 
 			const Format format = FromVkFormat(texture.format);
-			const BlockInfo blockInfo = GetBlockInfo(format);
+			BlockInfo blockInfo = GetBlockInfo(format);
 			if (blockInfo.bytesPerBlock == 0) {
 				return false;
+			}
+
+			// A buffer copy takes one aspect. A depth-stencil texture copies its depth plane (plane 0) or its stencil plane
+			// (plane 1), each with its own texel size in the buffer.
+			VkImageAspectFlags aspectMask = VkAspectMaskForFormat(texture.format);
+			if ((aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0) {
+				const bool stencil = footprint.plane == 1 || (aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) == 0;
+				aspectMask = stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+				blockInfo.bytesPerBlock = stencil ? 1u : texture.format == VK_FORMAT_D16_UNORM ? 2u : 4u;
 			}
 
 			uint32_t bufferRowLength = 0;
@@ -2707,7 +2716,7 @@ namespace rhi {
 			out.bufferOffset = footprint.footprint.offset;
 			out.bufferRowLength = bufferRowLength;
 			out.bufferImageHeight = 0;
-			out.imageSubresource.aspectMask = VkAspectMaskForFormat(texture.format);
+			out.imageSubresource.aspectMask = aspectMask;
 			out.imageSubresource.mipLevel = footprint.mip;
 			out.imageSubresource.baseArrayLayer = texture.type == ResourceType::Texture3D ? 0u : footprint.arraySlice;
 			out.imageSubresource.layerCount = 1;

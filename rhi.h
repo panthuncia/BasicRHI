@@ -2971,6 +2971,10 @@ namespace rhi {
 
 		// Placed footprint coming from Device::GetCopyableFootprints:
 		CopyableFootprint footprint;
+
+		// The plane of a depth-stencil texture: 0 is depth, 1 is stencil. A depth plane's texels are 2 bytes (D16) or 4 bytes
+		// (D24, with depth in the low 24 bits, and D32); a stencil plane's are 1 byte. Ignored for colour textures.
+		uint32_t plane = 0;
 	};
 
 	enum class MemorySegmentGroup : uint32_t { Local, NonLocal, Count };
