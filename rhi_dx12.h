@@ -645,6 +645,7 @@ namespace rhi {
 		QueueHandle gfxHandle, compHandle, copyHandle;
 
 		bool steamlineInitialized = false;
+		bool streamlineHostOwned = false;  // DeviceCreateInfo::streamlineHost: the host owns slInit and slShutdown
 		Dx12DebugInstrumentationSession debugInstrumentation;
 
 		// The on-disk pipeline cache (Device::OpenPipelineCache): an ID3D12PipelineLibrary that keys each pipeline by a hash

@@ -384,6 +384,10 @@ namespace rhi {
 		static HMODULE g_vkSlCommonModule = nullptr;
 		static sl::FeatureRequirements g_vkSlDlssRequirements{};
 		static bool g_vkSlDlssRequirementsValid = false;
+		// DeviceCreateInfo::streamlineHost: the host owns slInit, slShutdown and the interposer module.
+		static bool g_vkSlHostOwned = false;
+		// The union of the host's features' requirements, which g_vkSlDlssRequirements points into.
+		static std::vector<const char*> g_vkSlUnionInstanceExtensions, g_vkSlUnionDeviceExtensions, g_vkSlUnionFeatures12, g_vkSlUnionFeatures13;
 
 		static void VkClearStreamlineVulkanProxies() noexcept {
 			g_vkSlGetDeviceProcAddr = nullptr;
@@ -406,14 +410,16 @@ namespace rhi {
 		}
 
 		static void VkShutdownStreamline() noexcept {
-			if (g_vkSlShutdown) {
+			if (g_vkSlShutdown && !g_vkSlHostOwned) {
 				g_vkSlShutdown();
 			}
 			VkClearStreamlineVulkanProxies();
 			if (g_vkSlInterposerModule) {
-				FreeLibrary(g_vkSlInterposerModule);
+				if (!g_vkSlHostOwned)
+					FreeLibrary(g_vkSlInterposerModule);
 				g_vkSlInterposerModule = nullptr;
 			}
+			g_vkSlHostOwned = false;
 			if (g_vkSlCommonModule) {
 				FreeLibrary(g_vkSlCommonModule);
 				g_vkSlCommonModule = nullptr;
@@ -454,6 +460,79 @@ namespace rhi {
 			if (!g_vkSlCommonBeginCommandBuffer || !g_vkSlCommonCmdBindPipeline || !g_vkSlCommonCmdBindDescriptorSets) {
 				spdlog::warn("CreateVulkanDevice: sl.common.dll is missing one or more direct Vulkan command hook fallbacks.");
 			}
+		}
+
+		/**
+		 * @brief DeviceCreateInfo::streamlineHost: the host's interposer, already initialized. Its features' requirements are combined
+		 * into g_vkSlDlssRequirements (the one requirements record the device creation reads): every extension and feature name once,
+		 * and the largest queue count of each kind, since Streamline takes one queue of each kind (slSetVulkanInfo).
+		 */
+		static bool VkInitHostStreamline(const DeviceCreateInfo::StreamlineHost& host) noexcept {
+			auto* module = static_cast<HMODULE>(host.interposer);
+			if (module) {
+				g_vkSlShutdown = reinterpret_cast<PFun_slShutdown*>(GetProcAddress(module, "slShutdown"));
+				g_vkSlGetFeatureRequirements = reinterpret_cast<PFun_slGetFeatureRequirements*>(GetProcAddress(module, "slGetFeatureRequirements"));
+				g_vkSlSetVulkanInfo = reinterpret_cast<PFun_slSetVulkanInfo*>(GetProcAddress(module, "slSetVulkanInfo"));
+				g_vkSlGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(module, "vkGetInstanceProcAddr"));
+			}
+			if (!module || !g_vkSlShutdown || !g_vkSlGetFeatureRequirements || !g_vkSlSetVulkanInfo || !g_vkSlGetInstanceProcAddr) {
+				spdlog::error("CreateVulkanDevice: the host's Streamline interposer has no Vulkan entry points.");
+				g_vkSlShutdown = nullptr;
+				g_vkSlGetFeatureRequirements = nullptr;
+				g_vkSlSetVulkanInfo = nullptr;
+				g_vkSlGetInstanceProcAddr = nullptr;
+				return false;
+			}
+			g_vkSlInterposerModule = module;
+			g_vkSlHostOwned = true;
+			if (host.pluginDirectory)
+				VkResolveStreamlineCommonHooks(host.pluginDirectory);
+			g_vkSlUnionInstanceExtensions.clear();
+			g_vkSlUnionDeviceExtensions.clear();
+			g_vkSlUnionFeatures12.clear();
+			g_vkSlUnionFeatures13.clear();
+			const auto addNames = [](std::vector<const char*>& names, const char* const* add, uint32_t count) {
+				for (uint32_t i = 0; i < count; ++i)
+					if (add && add[i] && std::none_of(names.begin(), names.end(), [&](const char* name) { return std::strcmp(name, add[i]) == 0; }))
+						names.push_back(add[i]);
+			};
+			sl::FeatureRequirements merged{};
+			uint32_t taken = 0;
+			for (uint32_t f = 0; f < host.featureCount; ++f) {
+				sl::FeatureRequirements requirements{};
+				const auto feature = static_cast<sl::Feature>(host.features[f]);
+				if (SL_FAILED(result, g_vkSlGetFeatureRequirements(feature, requirements))) {
+					spdlog::warn("CreateVulkanDevice: Streamline feature {} has no requirements (result {}); left out of the device.", host.features[f], static_cast<int>(result));
+					continue;
+				}
+				if ((static_cast<uint32_t>(requirements.flags) & static_cast<uint32_t>(sl::FeatureRequirementFlags::eVulkanSupported)) == 0) {
+					spdlog::info("CreateVulkanDevice: Streamline feature {} does not support Vulkan; left out of the device.", host.features[f]);
+					continue;
+				}
+				addNames(g_vkSlUnionInstanceExtensions, requirements.vkInstanceExtensions, requirements.vkNumInstanceExtensions);
+				addNames(g_vkSlUnionDeviceExtensions, requirements.vkDeviceExtensions, requirements.vkNumDeviceExtensions);
+				addNames(g_vkSlUnionFeatures12, requirements.vkFeatures12, requirements.vkNumFeatures12);
+				addNames(g_vkSlUnionFeatures13, requirements.vkFeatures13, requirements.vkNumFeatures13);
+				merged.vkNumGraphicsQueuesRequired = (std::max)(merged.vkNumGraphicsQueuesRequired, requirements.vkNumGraphicsQueuesRequired);
+				merged.vkNumComputeQueuesRequired = (std::max)(merged.vkNumComputeQueuesRequired, requirements.vkNumComputeQueuesRequired);
+				merged.vkNumOpticalFlowQueuesRequired = (std::max)(merged.vkNumOpticalFlowQueuesRequired, requirements.vkNumOpticalFlowQueuesRequired);
+				merged.flags = static_cast<sl::FeatureRequirementFlags>(static_cast<uint32_t>(merged.flags) | static_cast<uint32_t>(requirements.flags));
+				++taken;
+			}
+			merged.vkNumInstanceExtensions = static_cast<uint32_t>(g_vkSlUnionInstanceExtensions.size());
+			merged.vkInstanceExtensions = g_vkSlUnionInstanceExtensions.data();
+			merged.vkNumDeviceExtensions = static_cast<uint32_t>(g_vkSlUnionDeviceExtensions.size());
+			merged.vkDeviceExtensions = g_vkSlUnionDeviceExtensions.data();
+			merged.vkNumFeatures12 = static_cast<uint32_t>(g_vkSlUnionFeatures12.size());
+			merged.vkFeatures12 = g_vkSlUnionFeatures12.data();
+			merged.vkNumFeatures13 = static_cast<uint32_t>(g_vkSlUnionFeatures13.size());
+			merged.vkFeatures13 = g_vkSlUnionFeatures13.data();
+			g_vkSlDlssRequirements = merged;
+			g_vkSlDlssRequirementsValid = true;
+			spdlog::info("CreateVulkanDevice: the host's Streamline: {} of {} features, {} instance and {} device extensions, queues: {} graphics, {} compute, {} optical flow.",
+				taken, host.featureCount, merged.vkNumInstanceExtensions, merged.vkNumDeviceExtensions, merged.vkNumGraphicsQueuesRequired,
+				merged.vkNumComputeQueuesRequired, merged.vkNumOpticalFlowQueuesRequired);
+			return true;
 		}
 
 		static bool VkInitStreamline() noexcept {
@@ -529,6 +608,7 @@ namespace rhi {
 		}
 #else
 		static bool VkInitStreamline() noexcept { return false; }
+		static bool VkInitHostStreamline(const DeviceCreateInfo::StreamlineHost&) noexcept { return false; }
 		static void VkShutdownStreamline() noexcept {}
 #endif
 
@@ -14889,7 +14969,7 @@ namespace rhi {
 	rhi::Result CreateVulkanDevice(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer) noexcept {
 		outPtr = {};
 		bool streamlineInitialized = false;
-		bool enableStreamline = enableStreamlineInterposer;
+		bool enableStreamline = enableStreamlineInterposer || ci.streamlineHost;
 		if (enableStreamline && ci.instrumentation.enableRuntimeInstrumentation) {
 			spdlog::warn("CreateVulkanDevice: disabling Streamline because GPU-Reshape instrumentation is enabled for this device.");
 			enableStreamline = false;
@@ -14898,7 +14978,7 @@ namespace rhi {
 			RHI_FAIL(Result::InvalidArgument);
 		}
 		if (enableStreamline) {
-			streamlineInitialized = VkInitStreamline();
+			streamlineInitialized = ci.streamlineHost ? VkInitHostStreamline(*ci.streamlineHost) : VkInitStreamline();
 			enableStreamline = streamlineInitialized;
 		}
 

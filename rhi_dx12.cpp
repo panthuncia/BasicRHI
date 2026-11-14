@@ -11826,7 +11826,7 @@ namespace rhi {
 		pSLProxyFactory.Reset();
 
 	#if BASICRHI_ENABLE_STREAMLINE
-		if (steamlineInitialized) {
+		if (steamlineInitialized && !streamlineHostOwned) {
 			slShutdown();
 		}
 	#endif
@@ -12129,7 +12129,7 @@ namespace rhi {
 
 	rhi::Result CreateD3D12Device(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer) noexcept
 	{
-		bool l_enableStreamline = enableStreamlineInterposer;
+		bool l_enableStreamline = enableStreamlineInterposer || ci.streamlineHost != nullptr;
 	#if !BASICRHI_ENABLE_STREAMLINE
 		l_enableStreamline = false;
 	#endif
@@ -12313,7 +12313,8 @@ namespace rhi {
 		if (l_enableStreamline)
 		{
 	#if BASICRHI_ENABLE_STREAMLINE
-			if (!TakeOrInitSL())
+			// The host's Streamline is initialized already (DeviceCreateInfo::streamlineHost).
+			if (!ci.streamlineHost && !TakeOrInitSL())
 			{
 				spdlog::error("Failed to initialize NVIDIA Streamline. DLSS will not be available.");
 				l_enableStreamline = false;
@@ -12347,6 +12348,7 @@ namespace rhi {
 				impl->pSLProxyDevice.Attach(dev);
 			}
 			impl->steamlineInitialized = true;
+			impl->streamlineHostOwned = ci.streamlineHost != nullptr;
 	#else
 			l_enableStreamline = false;
 			impl->pSLProxyDevice = impl->pNativeDevice;

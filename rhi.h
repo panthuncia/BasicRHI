@@ -4007,6 +4007,21 @@ namespace rhi {
 			bool (*device)(void* user, void* vkInstance, void* vkPhysicalDevice, void* vkDeviceCreateInfo) = nullptr;
 		};
 		const VulkanCreateHooks* vulkanCreateHooks = nullptr;
+		// Streamline that the application initialized itself (BasicRHI built with BASICRHI_ENABLE_STREAMLINE). interposer is the
+		// sl.interposer.dll module the host loaded and called slInit on, with sl::PreferenceFlags::eUseManualHooking. features are the
+		// sl::Feature values it loaded. BasicRHI then skips its own slInit and slShutdown, and takes the union of those features'
+		// requirements: their instance and device extensions, Vulkan 1.2 and 1.3 features, and extra graphics, compute and optical-flow
+		// queues. After that it does as with its own Streamline: on Vulkan slSetVulkanInfo and the swap chain through Streamline's
+		// proxies, on D3D12 slSetD3DDevice and the upgraded factory and device. pluginDirectory holds sl.common.dll, whose command hooks
+		// the Vulkan backend calls. A feature whose requirements cannot be read is left out, and logged. Null: as before, BasicRHI's own
+		// Streamline when the device is created with enableStreamlineInterposer.
+		struct StreamlineHost {
+			void* interposer = nullptr;
+			const uint32_t* features = nullptr;
+			uint32_t featureCount = 0;
+			const wchar_t* pluginDirectory = nullptr;
+		};
+		const StreamlineHost* streamlineHost = nullptr;
 		// Vulkan: the binding models BasicRHI may pick from (vulkan::BindingModelBits). 0 allows every one.
 		uint32_t vulkanBindingModels = 0;
 		// Vulkan: what a guest sharing the device takes from its descriptor budgets (vulkan::BindingRequirements' host counts:
