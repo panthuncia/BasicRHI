@@ -9851,6 +9851,21 @@ namespace rhi {
 				bb.pResource = B->res.Get();
 				bb.Offset = br.offset;
 				bb.Size = br.size;
+				// A buffer made without unordered access cannot name it in a barrier (E_INVALIDARG at Close; the debug layer's id
+				// 1332). The graph names a buffer's uses whatever its flags, so the bit is dropped and the first such buffer logged.
+				if (!(bufferDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+					const auto noUav = [&](D3D12_BARRIER_ACCESS& access) {
+						if (access == D3D12_BARRIER_ACCESS_NO_ACCESS || !(access & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS))
+							return;
+						static std::atomic_flag logged;
+						if (!logged.test_and_set())
+							spdlog::warn("D3D12 barrier: buffer {} has no unordered access; the access bit is dropped from its barrier (logged once)",
+								static_cast<const void*>(B->res.Get()));
+						access = static_cast<D3D12_BARRIER_ACCESS>(access & ~D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+					};
+					noUav(bb.AccessBefore);
+					noUav(bb.AccessAfter);
+				}
 				noSyncNoAccess(bb);
 				listTypeScope(bb);
 				buf.push_back(bb);
