@@ -4014,6 +4014,12 @@ namespace rhi {
 		uint32_t vulkanGuestSamplerObjects = 0;
 		uint64_t vulkanGuestResourceDescriptorBufferBytes = 0;
 		uint64_t vulkanGuestSamplerDescriptorBufferBytes = 0;
+		// Vulkan: a host's checkpoint markers, as an adopted device's AdoptedVulkanDeviceInfo::Diagnostics. With crash markers on and
+		// VK_NV_device_diagnostic_checkpoints enabled, every debug label also sets a checkpoint whose marker the callback returns
+		// (Nsight Aftermath resolves those in its dump), and the native markers leave NV checkpoints to the host. Null adds none.
+		const void* (*vulkanRegisterCheckpoint)(void* user, const char* name) noexcept = nullptr;
+		void* vulkanCheckpointUser = nullptr;
+		bool vulkanDetailedCheckpoints = false;
 	};
 
 	// Accepts any blob exposing GetBufferPointer/GetBufferSize (ID3DBlob, IDxcBlob) without

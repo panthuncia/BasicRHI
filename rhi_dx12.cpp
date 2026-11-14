@@ -8658,6 +8658,128 @@ namespace rhi {
 			return true;
 		}
 
+		// ---- Close diagnostics and debug labels ----
+		// D3D12 reports an invalid command only at Close (E_INVALIDARG), with no word of which one unless the debug layer is on. Each
+		// list keeps its last commands in a small ring and the debug labels open around them, and a failed Close logs both.
+
+		/** @brief Notes a recorded command in the list's ring. kind is a literal that names the command and what a, b and c hold. */
+		static void Dx12NoteCommand(Dx12CommandList* l, const char* kind, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0) noexcept {
+			if (!l)
+				return;
+			auto& entry = l->recorded[l->recordedCount % Dx12CommandList::kRecordedCommands];
+			entry.kind = kind;
+			entry.label = l->openLabels.empty() ? UINT32_MAX : l->openLabels.back();
+			entry.a = a;
+			entry.b = b;
+			entry.c = c;
+			++l->recordedCount;
+		}
+
+		/** @brief The name of the label at index a_label, or a stand-in. */
+		static const char* Dx12LabelName(const Dx12CommandList& l, uint32_t a_label) noexcept {
+			if (a_label == UINT32_MAX)
+				return "(no label)";
+			return a_label < l.labels.size() ? l.labels[a_label].c_str() : "(label past the cap)";
+		}
+
+		/** @brief The innermost open debug label of the list (the graph's pass), or a stand-in. */
+		static const char* Dx12OpenLabel(const Dx12CommandList& l) noexcept {
+			return Dx12LabelName(l, l.openLabels.empty() ? UINT32_MAX : l.openLabels.back());
+		}
+
+		/** @brief A D3D12 object's debug name (SetName), or "(unnamed)". */
+		static std::string Dx12ObjectName(ID3D12Object* a_object) noexcept {
+			wchar_t name[128]{};
+			UINT size = sizeof(name) - sizeof(wchar_t);
+			if (!a_object || FAILED(a_object->GetPrivateData(WKPDID_D3DDebugObjectNameW, &size, name)) || size == 0)
+				return "(unnamed)";
+			try {
+				return Dx12WideToUtf8(name);
+			} catch (...) {
+				return "(unnamed)";
+			}
+		}
+
+		/** @brief Forgets the commands and labels of the last recording: the list starts recording again. */
+		static void Dx12ResetDiagnostics(Dx12CommandList& l) noexcept {
+			l.recordedCount = 0;
+			l.labels.clear();
+			l.openLabels.clear();
+		}
+
+		/**
+		 * @brief An invalid command BasicRHI does not record, because D3D12 would fail the whole list at Close for it: true for the first
+		 * 16 reports of a call site, which the caller logs with Dx12OpenLabel (the pass) and the list's name.
+		 */
+		static bool Dx12ReportSkipped(std::atomic<uint32_t>& a_reports) noexcept {
+			return a_reports.fetch_add(1, std::memory_order_relaxed) < 16;
+		}
+
+		/** @brief After a failed Close: the list's last commands, oldest first, each with the label open around it. */
+		static void Dx12LogRecordedCommands(const Dx12CommandList& l) noexcept {
+			const uint32_t count = (std::min)(l.recordedCount, Dx12CommandList::kRecordedCommands);
+			spdlog::error("D3D12 command-list Close failed: '{}' recorded {} commands since its reset; the last {} follow, oldest first ({} labels open at Close)",
+				l.debugName, l.recordedCount, count, l.openLabels.size());
+			for (uint32_t i = l.recordedCount - count; i < l.recordedCount; ++i) {
+				const auto& entry = l.recorded[i % Dx12CommandList::kRecordedCommands];
+				spdlog::error("D3D12   #{} {} a={} b={} c={} in '{}'", i, entry.kind ? entry.kind : "?", entry.a, entry.b, entry.c, Dx12LabelName(l, entry.label));
+			}
+		}
+
+		/**
+		 * @brief A debug label as PIX, RenderDoc and Nsight read it on D3D12: BeginEvent with metadata 0 (WINPIX_EVENT_UNICODE_VERSION) and
+		 * the name as a null-terminated UTF-16 string, as pix3's PIXBeginEvent falls back to. The colour is not carried.
+		 */
+		static void Dx12LabelEvent(ID3D12GraphicsCommandList* a_list, const char* a_name, bool a_marker) noexcept {
+			wchar_t text[256]{};
+			const char* name = a_name ? a_name : "";
+			int written = MultiByteToWideChar(CP_UTF8, 0, name, -1, text, static_cast<int>(std::size(text)));
+			if (written <= 0) {
+				// Longer than the buffer (or invalid UTF-8): the part that fits.
+				text[std::size(text) - 1] = L'\0';
+				written = static_cast<int>(wcslen(text)) + 1;
+			}
+			const UINT bytes = static_cast<UINT>(written) * sizeof(wchar_t);
+			if (a_marker)
+				a_list->SetMarker(0, text, bytes);
+			else
+				a_list->BeginEvent(0, text, bytes);
+		}
+
+		static void cl_beginDebugLabel(CommandList* cl, const float /*rgba*/[4], const char* name) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl)
+				return;
+			Dx12LabelEvent(l->cl.Get(), name, false);
+			uint32_t index = UINT32_MAX;
+			if (l->labels.size() < Dx12CommandList::kMaxLabels) {
+				try {
+					l->labels.emplace_back(name ? name : "");
+					index = static_cast<uint32_t>(l->labels.size() - 1);
+				} catch (...) {
+				}
+			}
+			try {
+				l->openLabels.push_back(index);
+			} catch (...) {
+			}
+		}
+
+		static void cl_endDebugLabel(CommandList* cl) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl)
+				return;
+			l->cl->EndEvent();
+			if (!l->openLabels.empty())
+				l->openLabels.pop_back();
+		}
+
+		static void cl_insertDebugLabel(CommandList* cl, const float /*rgba*/[4], const char* name) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (l && l->cl)
+				Dx12LabelEvent(l->cl.Get(), name, true);
+		}
+
 		static Result cl_endChecked(CommandList* cl) noexcept {
 			auto* w = dx12_detail::CL(cl);
 			if (!w || !w->cl) return Result::InvalidArgument;
@@ -8690,6 +8812,7 @@ namespace rhi {
 					messageCount > 64 ? messageCount - 64 : 0, 64);
 				spdlog::error("D3D12 command-list Close failed: hr=0x{:08x} type={} name='{}'",
 					static_cast<uint32_t>(closeResult), static_cast<uint32_t>(w->type), w->debugName);
+				Dx12LogRecordedCommands(*w);
 				spdlog::default_logger()->flush();
 			}
 			if (SUCCEEDED(closeResult) && w->pendingError != Result::Ok) {
@@ -8770,6 +8893,7 @@ namespace rhi {
 			l->tracyGpuZoneEvents.clear();
 			l->tracyGpuZoneEventsSubmitted = false;
 			l->pendingError = Result::Ok;
+			Dx12ResetDiagnostics(*l);
 			ID3D12CommandAllocator* resetAllocator = l->bundle ? a->bundleAlloc.Get() : a->alloc.Get();
 			if (!resetAllocator) {
 				spdlog::error("D3D12 command list Reset for '{}': the allocator has no bundle allocator (not the one the secondary was made from)", l->debugName);
@@ -8922,6 +9046,7 @@ namespace rhi {
 				BreakIfDebugging();
 				return;
 			}
+			Dx12NoteCommand(l, "BeginPass(colours, -, -)", p.colors.size);
 
 			std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;
 			rtvs.reserve(p.colors.size);
@@ -9130,14 +9255,17 @@ namespace rhi {
 		}
 		static void cl_draw(CommandList* cl, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) noexcept {
 			auto* l = dx12_detail::CL(cl);
+			Dx12NoteCommand(l, "Draw(vertices, instances, firstVertex)", vc, ic, fv);
 			l->cl->DrawInstanced(vc, ic, fv, fi);
 		}
 		static void cl_drawIndexed(CommandList* cl, uint32_t ic, uint32_t inst, uint32_t firstIdx, int32_t vtxOff, uint32_t firstInst) noexcept {
 			auto* l = dx12_detail::CL(cl);
+			Dx12NoteCommand(l, "DrawIndexed(indices, instances, firstIndex)", ic, inst, firstIdx);
 			l->cl->DrawIndexedInstanced(ic, inst, firstIdx, vtxOff, firstInst);
 		}
 		static void cl_dispatch(CommandList* cl, uint32_t x, uint32_t y, uint32_t z) noexcept {
 			auto* l = dx12_detail::CL(cl);
+			Dx12NoteCommand(l, "Dispatch(x, y, z)", x, y, z);
 			l->cl->Dispatch(x, y, z);
 		}
 
@@ -9415,6 +9543,7 @@ namespace rhi {
 			}
 
 			float rgba[4] = { cv.rgba[0], cv.rgba[1], cv.rgba[2], cv.rgba[3] };
+			Dx12NoteCommand(impl, "ClearRenderTargetView(descriptor, -, -)", cpu.ptr);
 			impl->cl->ClearRenderTargetView(cpu, rgba, 0, nullptr);
 		}
 
@@ -9440,6 +9569,7 @@ namespace rhi {
 			if (clearDepth)   flags |= D3D12_CLEAR_FLAG_DEPTH;
 			if (clearStencil) flags |= D3D12_CLEAR_FLAG_STENCIL;
 
+			Dx12NoteCommand(impl, "ClearDepthStencilView(descriptor, flags, -)", cpu.ptr, static_cast<uint64_t>(flags));
 			impl->cl->ClearDepthStencilView(cpu, flags, depth, stencil, 0, nullptr);
 		}
 		static void cl_executeIndirect(
@@ -9477,6 +9607,14 @@ namespace rhi {
 			if (cntBufH.valid()) {
 				auto* c = dev->resources.get(cntBufH);
 				if (c && c->res) cntRes = c->res.Get();
+				// The count is a 32-bit value at cntOff, on 4 bytes, inside the buffer; anything else fails the list at Close.
+				if (c && c->res && (c->kind != Dx12ResourceKind::Buffer || cntOff % 4 != 0 || cntOff > c->buf.size || c->buf.size - cntOff < 4)) {
+					static std::atomic<uint32_t> reports{ 0 };
+					if (Dx12ReportSkipped(reports))
+						spdlog::error("DX12 ExecuteIndirect skipped: the count buffer '{}' ({} bytes) cannot hold a count at offset {}; list '{}', label '{}'",
+							Dx12ObjectName(c->res.Get()), c->kind == Dx12ResourceKind::Buffer ? c->buf.size : 0, cntOff, l->debugName, Dx12OpenLabel(*l));
+					return;
+				}
 			}
 
 			// D3D12 rejects the entire command list at Close when an indirect
@@ -9497,6 +9635,7 @@ namespace rhi {
 			}
 #endif
 
+			Dx12NoteCommand(l, "ExecuteIndirect(argument offset, max count, count offset)", argOff, maxCount, cntRes ? cntOff : UINT64_MAX);
 			l->cl->ExecuteIndirect(
 				S->sig.Get(),
 				maxCount,
@@ -9771,6 +9910,7 @@ namespace rhi {
 			}
 
 			if (groupCount != 0) {
+				Dx12NoteCommand(l, "Barrier(textures, buffers, globals)", tex.size(), buf.size(), glob.size());
 				l->cl->Barrier(groupCount, groups.data());
 			}
 		}
@@ -9816,6 +9956,7 @@ namespace rhi {
 
 			// NOTE: caller must have bound the shader-visible heap via SetDescriptorHeaps()
 			// and transitioned 'res' to UAV/UNORDERED_ACCESS
+			Dx12NoteCommand(rec, "ClearUnorderedAccessViewUint(gpu descriptor, cpu descriptor, -)", gpu.ptr, cpu.ptr);
 			rec->cl->ClearUnorderedAccessViewUint(gpu, cpu, res, v.v, 0, nullptr);
 		}
 
@@ -9862,6 +10003,24 @@ namespace rhi {
 		static UINT Align256(UINT x) { return (x + 255u) & ~255u; }
 
 		// texture -> buffer
+		/**
+		 * @brief Notes a copy between a buffer footprint and a texture, and logs a footprint D3D12 may refuse at Close (an offset not on 512
+		 * bytes, a row pitch not on 256, or a start past the buffer). It is still recorded: runtimes with unrestricted copy pitches take it.
+		 */
+		static void Dx12NoteFootprintCopy(Dx12CommandList& a_list, const char* a_kind, const BufferTextureCopyFootprint& a_copy, UINT a_subresource,
+			const Dx12Resource& a_buffer) noexcept {
+			Dx12NoteCommand(&a_list, a_kind, a_copy.footprint.offset, a_copy.footprint.rowPitch, a_subresource);
+			const bool misaligned = a_copy.footprint.offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT != 0 || a_copy.footprint.rowPitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT != 0;
+			const bool outside = a_buffer.kind == Dx12ResourceKind::Buffer && a_copy.footprint.offset >= a_buffer.buf.size;
+			if (!misaligned && !outside)
+				return;
+			static std::atomic<uint32_t> reports{ 0 };
+			if (Dx12ReportSkipped(reports))
+				spdlog::warn("DX12 {}: footprint offset {} row pitch {} ({}) in buffer '{}' ({} bytes); D3D12 may fail the list '{}' at Close; label '{}'", a_kind,
+					a_copy.footprint.offset, a_copy.footprint.rowPitch, outside ? "starts past the buffer" : "not aligned to 512 / 256 bytes",
+					Dx12ObjectName(a_buffer.res.Get()), a_buffer.kind == Dx12ResourceKind::Buffer ? a_buffer.buf.size : 0, a_list.debugName, Dx12OpenLabel(a_list));
+		}
+
 		static void cl_copyTextureToBuffer(rhi::CommandList* cl, const rhi::BufferTextureCopyFootprint& r) noexcept {
 			if (DxRejectInBundle(cl, "a copy")) {
 				return;
@@ -9906,6 +10065,7 @@ namespace rhi {
 			const uint32_t mipDepth = T->dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? (std::max)(uint32_t(T->tex.depth) >> r.mip, 1u) : 1u;
 			const D3D12_BOX box{ r.x, r.y, r.z, (std::min)(r.x + r.footprint.width, mipWidth), (std::min)(r.y + r.footprint.height, mipHeight),
 				(std::min)(r.z + (std::max)(r.footprint.depth, 1u), mipDepth) };
+			Dx12NoteFootprintCopy(*rec, "CopyTextureToBuffer(buffer offset, row pitch, subresource)", r, src.SubresourceIndex, *B);
 			rec->cl->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
 		}
 
@@ -9946,6 +10106,7 @@ namespace rhi {
 			dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 			dst.SubresourceIndex = subresource;
 
+			Dx12NoteFootprintCopy(*rec, "CopyBufferToTexture(buffer offset, row pitch, subresource)", r, dst.SubresourceIndex, *B);
 			rec->cl->CopyTextureRegion(&dst, r.x, r.y, r.z, &src, nullptr);
 		}
 
@@ -10001,6 +10162,8 @@ namespace rhi {
 			srcBox.bottom = src.y + srcH;
 			srcBox.back = src.z + srcD;
 
+			Dx12NoteCommand(rec, "CopyTextureRegion(dst subresource, src subresource, width << 32 | height)", dxDst.SubresourceIndex, dxSrc.SubresourceIndex,
+				(uint64_t(srcW) << 32) | srcH);
 			// Perform the copy
 			// NOTE: Resources must already be in COPY_SOURCE / COPY_DEST layouts respectively.
 			rec->cl->CopyTextureRegion(
@@ -10038,7 +10201,17 @@ namespace rhi {
 				return;
 			}
 
-			// We don't validate bounds here (we don't store sizes). DX12 will validate.
+			// Out of either buffer's bounds, D3D12 fails the whole list at Close: skipped and named instead.
+			if (D->kind == Dx12ResourceKind::Buffer && S->kind == Dx12ResourceKind::Buffer &&
+				(dstOffset > D->buf.size || numBytes > D->buf.size - dstOffset || srcOffset > S->buf.size || numBytes > S->buf.size - srcOffset)) {
+				static std::atomic<uint32_t> reports{ 0 };
+				if (Dx12ReportSkipped(reports))
+					spdlog::error("DX12 CopyBufferRegion skipped: {} bytes from '{}' ({} bytes) at {} into '{}' ({} bytes) at {} leave a buffer; list '{}', label '{}'",
+						numBytes, Dx12ObjectName(S->res.Get()), S->buf.size, srcOffset, Dx12ObjectName(D->res.Get()), D->buf.size, dstOffset, rec->debugName,
+						Dx12OpenLabel(*rec));
+				return;
+			}
+			Dx12NoteCommand(rec, "CopyBufferRegion(dstOffset, srcOffset, bytes)", dstOffset, srcOffset, numBytes);
 			// Required states (caller's responsibility via barriers):
 			//   src:  COPY_SOURCE   (ResourceAccessType::CopySource / Layout::CopySource)
 			//   dst:  COPY_DEST     (ResourceAccessType::CopyDest   / Layout::CopyDest)
@@ -10088,7 +10261,13 @@ namespace rhi {
 				BreakIfDebugging();
 				return;
 			}
-
+			if (index >= P->count) {
+				static std::atomic<uint32_t> reports{ 0 };
+				if (Dx12ReportSkipped(reports))
+					spdlog::error("DX12 timestamp skipped: index {} past its heap of {}; list '{}', label '{}'", index, P->count, rec->debugName, Dx12OpenLabel(*rec));
+				return;
+			}
+			Dx12NoteCommand(rec, "WriteTimestamp(index, heap size, -)", index, P->count);
 			rec->cl->EndQuery(P->heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, index);
 		}
 
@@ -10108,6 +10287,13 @@ namespace rhi {
 				BreakIfDebugging();
 				return;
 			}
+			if (index >= P->count) {
+				static std::atomic<uint32_t> reports{ 0 };
+				if (Dx12ReportSkipped(reports))
+					spdlog::error("DX12 BeginQuery skipped: index {} past its heap of {}; list '{}', label '{}'", index, P->count, rec->debugName, Dx12OpenLabel(*rec));
+				return;
+			}
+			Dx12NoteCommand(rec, "BeginQuery(index, heap type, -)", index, static_cast<uint64_t>(P->type));
 
 			if (P->type == D3D12_QUERY_HEAP_TYPE_OCCLUSION) {
 				rec->cl->BeginQuery(P->heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, index);
@@ -10136,6 +10322,13 @@ namespace rhi {
 				BreakIfDebugging();
 				return;
 			}
+			if (index >= P->count) {
+				static std::atomic<uint32_t> reports{ 0 };
+				if (Dx12ReportSkipped(reports))
+					spdlog::error("DX12 EndQuery skipped: index {} past its heap of {}; list '{}', label '{}'", index, P->count, rec->debugName, Dx12OpenLabel(*rec));
+				return;
+			}
+			Dx12NoteCommand(rec, "EndQuery(index, heap type, -)", index, static_cast<uint64_t>(P->type));
 
 			if (P->type == D3D12_QUERY_HEAP_TYPE_OCCLUSION) {
 				rec->cl->EndQuery(P->heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, index);
@@ -10188,6 +10381,20 @@ namespace rhi {
 			default: return;
 			}
 
+			// The range inside the heap, the destination on 8 bytes and inside the buffer; anything else fails the list at Close.
+			const uint64_t resultBytes = type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS ? sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) :
+				type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS1 ? sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1) : sizeof(uint64_t);
+			const uint64_t bytes = resultBytes * queryCount;
+			if (uint64_t(firstQuery) + queryCount > P->count || dstOffset % 8 != 0 ||
+				(B->kind == Dx12ResourceKind::Buffer && (dstOffset > B->buf.size || bytes > B->buf.size - dstOffset))) {
+				static std::atomic<uint32_t> reports{ 0 };
+				if (Dx12ReportSkipped(reports))
+					spdlog::error("DX12 ResolveQueryData skipped: queries {}..{} of a heap of {} into '{}' ({} bytes) at {}; list '{}', label '{}'", firstQuery,
+						uint64_t(firstQuery) + queryCount, P->count, Dx12ObjectName(B->res.Get()), B->kind == Dx12ResourceKind::Buffer ? B->buf.size : 0, dstOffset,
+						rec->debugName, Dx12OpenLabel(*rec));
+				return;
+			}
+			Dx12NoteCommand(rec, "ResolveQueryData(first, count, dstOffset)", firstQuery, queryCount, dstOffset);
 			rec->cl->ResolveQueryData(P->heap.Get(), type, firstQuery, queryCount, B->res.Get(), dstOffset);
 		}
 
@@ -10891,6 +11098,7 @@ namespace rhi {
 				l->closeFailed = false;
 				l->pendingReset.Reset();
 				Dx12NoteReset(*l);
+				Dx12ResetDiagnostics(*l);
 			}
 			if (inheritance.debugName) {
 				cl_setName(cl, inheritance.debugName);
@@ -10914,6 +11122,7 @@ namespace rhi {
 					BreakIfDebugging();
 					return;
 				}
+				Dx12NoteCommand(l, "ExecuteBundle(index, of, -)", index, lists.size);
 				l->cl->ExecuteBundle(bundle->cl.Get());
 			}
 			// A bundle's state changes carry back into this list: set the list's values again before they are read.
@@ -11767,9 +11976,9 @@ namespace rhi {
 		&cl_endTracyGpuZone,
 		9u,
 		&cl_endChecked,
-		nullptr,  // beginDebugLabel: PIX markers go through the native list
-		nullptr,  // endDebugLabel
-		nullptr,  // insertDebugLabel
+		&cl_beginDebugLabel,  // PIX events (BeginEvent with a UTF-16 name)
+		&cl_endDebugLabel,
+		&cl_insertDebugLabel,
 		nullptr,  // preprocessIndirect: the driver preprocesses inside ExecuteIndirect
 		&cl_beginSecondary,
 		&cl_executeCommands,
