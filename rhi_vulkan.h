@@ -21,6 +21,7 @@ using namespace volk;
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -677,7 +678,13 @@ namespace rhi {
 		std::array<uint32_t, kHistory> historyIds{};
 		std::array<const char*, kHistory> historyNames{};
 		std::array<const char*, kSlots> slotNames{};  // the command list's name (SetName) per slot
-		std::unordered_set<std::string> names;  // interned, so the pointers above stay valid
+		// Interned, so the pointers above stay valid. Looked up by string_view, so a name already seen allocates nothing.
+		struct NameHash {
+			using is_transparent = void;
+			size_t operator()(std::string_view name) const noexcept { return std::hash<std::string_view>{}(name); }
+		};
+		std::unordered_set<std::string, NameHash, std::equal_to<>> names;
+		std::unordered_map<const char*, const char*> endNames;  // an interned label's "end: <label>" name
 	};
 
 	struct VulkanDevice {

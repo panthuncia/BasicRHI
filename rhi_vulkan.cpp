@@ -2959,7 +2959,9 @@ namespace rhi {
 		static uint32_t VkRegisterCrashMarker(VulkanCrashMarkers& markers, std::string_view name, const char** interned = nullptr) noexcept {
 			try {
 				const std::lock_guard lock(markers.mutex);
-				const char* stored = markers.names.emplace(name.empty() ? std::string_view("(unnamed)") : name).first->c_str();
+				const std::string_view key = name.empty() ? std::string_view("(unnamed)") : name;
+				const auto found = markers.names.find(key);
+				const char* stored = (found != markers.names.end() ? found : markers.names.emplace(key).first)->c_str();
 				uint32_t id = markers.nextId++;
 				if (id == 0) id = markers.nextId++;
 				markers.historyIds[id % VulkanCrashMarkers::kHistory] = id;
@@ -3015,6 +3017,18 @@ namespace rhi {
 			}
 		}
 
+		// The interned "end: <label>" name of an interned label, made once per label.
+		static const char* VkCrashMarkerEndName(VulkanCrashMarkers& markers, const char* open) noexcept {
+			try {
+				const std::lock_guard lock(markers.mutex);
+				const char*& end = markers.endNames[open];
+				if (!end) end = markers.names.emplace(std::string("end: ") + open).first->c_str();
+				return end;
+			} catch (...) {
+				return "end";
+			}
+		}
+
 		// A debug label's marker, for the host's checkpoint callbacks (adopted devices) and the native markers. depthChange is
 		// +1 for a label's begin, -1 for its end and 0 for an inserted label.
 		static void VkLabelCheckpoint(CommandList* commandList, const char* name, int depthChange) noexcept {
@@ -3030,7 +3044,7 @@ namespace rhi {
 				if (depthChange < 0) {
 					const char* open = state->crashLabelStack.empty() ? "(unmatched label)" : state->crashLabelStack.back();
 					if (!state->crashLabelStack.empty()) state->crashLabelStack.pop_back();
-					VkWriteCrashMarker(impl, *state, std::string("end: ") + open);
+					VkWriteCrashMarker(impl, *state, VkCrashMarkerEndName(impl->crashMarkers, open));
 				} else {
 					const char* interned = nullptr;
 					VkWriteCrashMarker(impl, *state, name ? name : "", &interned);
@@ -6691,8 +6705,14 @@ namespace rhi {
 			}
 			VkFlushPreprocessBarrier(*commandListState);
 
-			std::vector<VkRenderingAttachmentInfo> colorAttachments;
-			colorAttachments.reserve(passInfo.colors.size);
+			// On the stack: a pass has at most eight render targets (D3D11's limit, and every Vulkan device's minimum).
+			constexpr size_t kMaxColorAttachments = 8;
+			std::array<VkRenderingAttachmentInfo, kMaxColorAttachments> colorAttachmentStorage;
+			uint32_t colorAttachmentCount = 0;
+			if (passInfo.colors.size > colorAttachmentStorage.size()) {
+				spdlog::error("Vulkan BeginPass: {} color attachments, more than {}", passInfo.colors.size, colorAttachmentStorage.size());
+				return;
+			}
 			commandListState->passColorResources.clear();
 
 			for (const ColorAttachment& color : passInfo.colors) {
@@ -6733,7 +6753,7 @@ namespace rhi {
 					break;
 				}
 
-				colorAttachments.push_back(attachmentInfo);
+				colorAttachmentStorage[colorAttachmentCount++] = attachmentInfo;
 				commandListState->passColorResources.push_back(viewSlot->resource);
 			}
 
@@ -6774,8 +6794,8 @@ namespace rhi {
 			renderingInfo.renderArea.extent = { passInfo.width, passInfo.height };
 			commandListState->passRenderArea = renderingInfo.renderArea;
 			renderingInfo.layerCount = 1;
-			renderingInfo.colorAttachmentCount = static_cast<uint32_t>(colorAttachments.size());
-			renderingInfo.pColorAttachments = colorAttachments.empty() ? nullptr : colorAttachments.data();
+			renderingInfo.colorAttachmentCount = colorAttachmentCount;
+			renderingInfo.pColorAttachments = colorAttachmentCount ? colorAttachmentStorage.data() : nullptr;
 			renderingInfo.pDepthAttachment = depthAttachmentPtr;
 			renderingInfo.pStencilAttachment = stencilAttachmentPtr;
 			const bool secondaryContents = passInfo.contents == PassContents::SecondaryLists;
@@ -6826,9 +6846,14 @@ namespace rhi {
 				return;
 			}
 
-			std::vector<VkImageMemoryBarrier> imageBarriers;
-			std::vector<VkBufferMemoryBarrier> bufferBarriers;
-			std::vector<VkMemoryBarrier> memoryBarriers;
+			// Scratch kept per thread: a barrier batch allocates nothing once the vectors have grown. Nothing below records another
+			// barrier on this thread before they are used up.
+			thread_local std::vector<VkImageMemoryBarrier> imageBarriers;
+			thread_local std::vector<VkBufferMemoryBarrier> bufferBarriers;
+			thread_local std::vector<VkMemoryBarrier> memoryBarriers;
+			imageBarriers.clear();
+			bufferBarriers.clear();
+			memoryBarriers.clear();
 			struct TextureStateUpdate {
 				ResourceHandle handle{};
 				VulkanResource* resource = nullptr;
@@ -6842,8 +6867,10 @@ namespace rhi {
 				ResourceAccessType access = ResourceAccessType::Common;
 				ResourceSyncState sync = ResourceSyncState::All;
 			};
-			std::vector<TextureStateUpdate> textureUpdates;
-			std::vector<BufferStateUpdate> bufferUpdates;
+			thread_local std::vector<TextureStateUpdate> textureUpdates;
+			thread_local std::vector<BufferStateUpdate> bufferUpdates;
+			textureUpdates.clear();
+			bufferUpdates.clear();
 			VulkanCommandList::RecordedBarrierBatch recordedBatch{};
 			if (impl->validateBarrierTransitions) {
 				recordedBatch.textures.reserve(barriers.textures.size);
