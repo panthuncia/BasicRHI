@@ -4878,6 +4878,7 @@ namespace rhi {
 			const uint32_t slot = swapchain.nextAcquireSlot;
 			if (swapchain.acquireFencePending[slot]) {
 				// Normally long done: the slot was last used imageCount + 1 acquires ago.
+				ZoneScopedN("RHI.Vulkan.AcquireSlotWait");
 				VkResult result = vkWaitForFences(impl->device, 1, &swapchain.acquireFences[slot], VK_TRUE, UINT64_MAX);
 				if (result == VK_SUCCESS) result = vkResetFences(impl->device, 1, &swapchain.acquireFences[slot]);
 				if (result != VK_SUCCESS) return ToRHI(result);
@@ -9006,7 +9007,11 @@ namespace rhi {
 				waitInfo.semaphoreCount = 1;
 				waitInfo.pSemaphores = &semaphore;
 				waitInfo.pValues = &target.value;
-				const VkResult result = vkWaitSemaphores(impl->device, &waitInfo, timeoutNs);
+				VkResult result;
+				{
+					ZoneScopedN("RHI.Vulkan.WaitPresentedFrames");
+					result = vkWaitSemaphores(impl->device, &waitInfo, timeoutNs);
+				}
 				if (result != VK_SUCCESS) return ToRHI(result);
 			}
 			while (swapchain.pendingFrames.size() > maxUnfinished) swapchain.pendingFrames.pop_front();
@@ -9076,7 +9081,11 @@ namespace rhi {
 				relayInfo.pSignalSemaphores = signalSemaphores;
 
 				const VkQueueAccessGuard queueAccess(impl, signalQueueState->queue);
-				const VkResult relayResult = vkQueueSubmit(signalQueueState->queue, 1, &relayInfo, VK_NULL_HANDLE);
+				VkResult relayResult;
+				{
+					ZoneScopedN("RHI.Vulkan.PresentRelaySubmit");
+					relayResult = vkQueueSubmit(signalQueueState->queue, 1, &relayInfo, VK_NULL_HANDLE);
+				}
 				if (relayResult != VK_SUCCESS) {
 					return ToRHI(relayResult);
 				}
