@@ -6551,6 +6551,7 @@ namespace rhi {
 			commandListState->passActive = false;
 			commandListState->boundLayout = {};
 			commandListState->boundPipeline = {};
+			commandListState->boundPipelineRecorded = false;
 			commandListState->stencilReference = 0;
 			commandListState->stencilReferenceApplied = false;
 			std::fill(std::begin(commandListState->blendConstants), std::end(commandListState->blendConstants), 1.0f);
@@ -7268,8 +7269,15 @@ namespace rhi {
 				return;
 			}
 
+			// The same pipeline again records nothing: the buffer's pipeline and the dynamic state it set are unchanged. Not in an
+			// adopted buffer, whose owner binds between these calls; vkCmdExecuteCommands clears boundPipeline.
+			if (!commandListState->adopted && commandListState->boundPipelineRecorded && commandListState->boundPipeline.index == pipeline.index &&
+				commandListState->boundPipeline.generation == pipeline.generation) {
+				return;
+			}
 			VkCmdBindPipelineHooked(commandListState->commandBuffer, pipelineState->bindPoint, pipelineState->pipeline);
 			commandListState->boundPipeline = pipeline;
+			commandListState->boundPipelineRecorded = true;
 			if (pipelineState->bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
 				VkApplyFixedFunctionState(*commandListState, *pipelineState);
 			}
@@ -8193,6 +8201,8 @@ namespace rhi {
 				const auto afterGeneratedCommands = [&] {
 					if (!VkDescriptorBufferModel(impl)) {
 						commandListState->pushedDataDirty = true;
+						if (generatedInfo.indirectExecutionSet != VK_NULL_HANDLE)
+							commandListState->boundPipelineRecorded = false;
 						return;
 					}
 					commandListState->pushedDataDirty = commandListState->spilledDataDirty = true;
@@ -8957,6 +8967,7 @@ namespace rhi {
 			}
 			vkCmdExecuteCommands(commandListState->commandBuffer, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
 			commandListState->boundPipeline = {};
+			commandListState->boundPipelineRecorded = false;
 			// Dynamic state is undefined too: the next pipeline that reads it sets the list's values again.
 			commandListState->stencilReferenceApplied = false;
 			commandListState->blendConstantsApplied = false;

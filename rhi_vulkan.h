@@ -521,6 +521,9 @@ namespace rhi {
 		bool passActive = false;
 		PipelineLayoutHandle boundLayout{};
 		PipelineHandle boundPipeline{};
+		// boundPipeline is what the command buffer has bound: a bind of the same pipeline records nothing. False when the buffer's
+		// pipeline is undefined although boundPipeline names one (generated commands with an execution set, not bound again).
+		bool boundPipelineRecorded = false;
 		// The stencil reference set with SetStencilRef (0 until then). Applied: the buffer holds it. A bound pipeline with
 		// the state static, or executed secondaries, lose it, and the next pipeline that has it dynamic sets it again.
 		uint32_t stencilReference = 0;
