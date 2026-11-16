@@ -662,11 +662,13 @@ namespace rhi {
 		}
 
 		static VkResult VkAcquireNextImageKHRHooked(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t* imageIndex) noexcept {
+			ZoneScopedN("RHI.Vulkan.AcquireNextImage");
 			const PFN_vkAcquireNextImageKHR fn = g_vkSlAcquireNextImageKHR ? g_vkSlAcquireNextImageKHR : vkAcquireNextImageKHR;
 			return fn(device, swapchain, timeout, semaphore, fence, imageIndex);
 		}
 
 		static VkResult VkQueuePresentKHRHooked(VkQueue queue, const VkPresentInfoKHR* presentInfo) noexcept {
+			ZoneScopedN("RHI.Vulkan.QueuePresent");
 			const PFN_vkQueuePresentKHR fn = g_vkSlQueuePresentKHR ? g_vkSlQueuePresentKHR : vkQueuePresentKHR;
 			return fn(queue, presentInfo);
 		}
@@ -5528,7 +5530,11 @@ namespace rhi {
 			const uint64_t timeoutNs = timeoutMs == UINT32_MAX
 				? UINT64_MAX
 				: static_cast<uint64_t>(timeoutMs) * 1000000ull;
-			const VkResult waitResult = vkWaitSemaphores(impl->device, &waitInfo, timeoutNs);
+			VkResult waitResult;
+			{
+				ZoneScopedN("RHI.Vulkan.TimelineHostWait");
+				waitResult = vkWaitSemaphores(impl->device, &waitInfo, timeoutNs);
+			}
 			{
 				const std::lock_guard lock(impl->timelinesMutex);
 				if (VulkanTimeline* timelineState = VkTimelineState(impl, handle);
@@ -5591,7 +5597,10 @@ namespace rhi {
 					info.semaphoreCount = points.size + 1;
 					info.pSemaphores = semaphores.data();
 					info.pValues = values.data();
-					result = ToRHI(VkCheckDeviceLost(m_device, vkWaitSemaphores(m_device->device, &info, UINT64_MAX), "CompletionWait::Wait"));
+					{
+						ZoneScopedN("RHI.Vulkan.CompletionWait");
+						result = ToRHI(VkCheckDeviceLost(m_device, vkWaitSemaphores(m_device->device, &info, UINT64_MAX), "CompletionWait::Wait"));
+					}
 					std::lock_guard lock(m_mutex);
 					m_waiting = false;
 				}
