@@ -18,6 +18,8 @@
 #include <string_view>
 #include <cstddef>
 #include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1656,6 +1658,81 @@ namespace rhi {
 				g_liveCommandPools.load(std::memory_order_relaxed), g_liveCommandBuffers.load(std::memory_order_relaxed),
 				g_livePipelines.load(std::memory_order_relaxed), g_liveQueryPools.load(std::memory_order_relaxed), g_liveQueries.load(std::memory_order_relaxed));
 		}
+		// BASICRHI_COMMAND_POOL_SITES=1: each live VkCommandPool's creating call stack, logged with the driver objects line by
+		// call site (each pool costs the driver about 2 MB on the RX 6600). Attribution only.
+		static bool CommandPoolSitesRequested() noexcept {
+			static const bool requested = [] {
+				char value[8]{};
+				return GetEnvironmentVariableA("BASICRHI_COMMAND_POOL_SITES", value, sizeof(value)) > 0 && value[0] == '1';
+			}();
+			return requested;
+		}
+		struct VkPoolSite {
+			std::array<void*, 10> frames{};
+			uint16_t count = 0;
+		};
+		static std::mutex g_poolSitesMutex;
+		static std::unordered_map<VkCommandPool, VkPoolSite> g_poolSites;
+		static void VkNotePoolSite(VkCommandPool pool, bool created) noexcept {
+			if (!CommandPoolSitesRequested()) return;
+			VkPoolSite site;
+			if (created) site.count = RtlCaptureStackBackTrace(2, static_cast<DWORD>(site.frames.size()), site.frames.data(), nullptr);
+			std::scoped_lock lock(g_poolSitesMutex);
+			if (created) g_poolSites[pool] = site;
+			else g_poolSites.erase(pool);
+		}
+		static std::string VkFrameText(void* address) noexcept {
+			using SymFromAddrFn = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD64, void*);
+			using SymInitializeFn = BOOL(WINAPI*)(HANDLE, PCSTR, BOOL);
+			using SymSetOptionsFn = DWORD(WINAPI*)(DWORD);
+			static SymFromAddrFn symFromAddr = [] {
+				HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+				if (!dbghelp) return SymFromAddrFn{};
+				auto setOptions = reinterpret_cast<SymSetOptionsFn>(GetProcAddress(dbghelp, "SymSetOptions"));
+				auto initialize = reinterpret_cast<SymInitializeFn>(GetProcAddress(dbghelp, "SymInitialize"));
+				if (!setOptions || !initialize) return SymFromAddrFn{};
+				setOptions(0x00000002 /*SYMOPT_UNDNAME*/ | 0x00000004 /*SYMOPT_DEFERRED_LOADS*/);
+				if (!initialize(GetCurrentProcess(), nullptr, TRUE)) return SymFromAddrFn{};
+				return reinterpret_cast<SymFromAddrFn>(GetProcAddress(dbghelp, "SymFromAddr"));
+			}();
+			HMODULE module = nullptr;
+			char moduleName[MAX_PATH]{};
+			if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(address), &module) && module)
+				GetModuleFileNameA(module, moduleName, MAX_PATH);
+			const char* base = std::strrchr(moduleName, '\\');
+			std::string text = std::format("{}+{:#x}", base ? base + 1 : moduleName,
+				reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(module));
+			if (symFromAddr) {
+				struct { ULONG SizeOfStruct; ULONG TypeIndex; ULONG64 Reserved[2]; ULONG Index; ULONG Size; ULONG64 ModBase; ULONG Flags; ULONG64 Value; ULONG64 Address; ULONG Register; ULONG Scope; ULONG Tag; ULONG NameLen; ULONG MaxNameLen; CHAR Name[256]; } info{};
+				info.SizeOfStruct = 88;  // sizeof(SYMBOL_INFO) without the name buffer
+				info.MaxNameLen = sizeof(info.Name) - 1;
+				DWORD64 displacement = 0;
+				if (symFromAddr(GetCurrentProcess(), reinterpret_cast<DWORD64>(address), &displacement, &info))
+					text += std::format(" ({}+{:#x})", info.Name, displacement);
+			}
+			return text;
+		}
+		static void VkLogPoolSites() noexcept {
+			if (!CommandPoolSitesRequested()) return;
+			std::vector<std::pair<std::array<void*, 10>, int>> sites;
+			{
+				std::scoped_lock lock(g_poolSitesMutex);
+				for (const auto& [pool, site] : g_poolSites) {
+					auto it = std::find_if(sites.begin(), sites.end(), [&](const auto& s) { return s.first == site.frames; });
+					if (it == sites.end()) sites.push_back({ site.frames, 1 });
+					else ++it->second;
+				}
+			}
+			std::sort(sites.begin(), sites.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+			for (const auto& [frames, count] : sites) {
+				std::string text;
+				for (void* frame : frames) {
+					if (!frame) break;
+					text += " < " + VkFrameText(frame);
+				}
+				spdlog::info("BasicRHI Vulkan: {} command pools from{}", count, text);
+			}
+		}
 		static void NoteCommandPools(int64_t delta) noexcept {
 			const int64_t live = g_liveCommandPools.fetch_add(delta, std::memory_order_relaxed) + delta;
 			int64_t logged = g_loggedCommandPools.load(std::memory_order_relaxed);
@@ -1675,18 +1752,220 @@ namespace rhi {
 		static std::atomic<uint64_t> g_memoryAllocations{ 0 };
 		static std::atomic<uint64_t> g_memoryAllocationBytes{ 0 };
 		// By site (VkAllocationSite), for the same report.
-		enum VkAllocationSite : uint32_t { kAllocRootConstants, kAllocPreprocess, kAllocDescriptorHeap, kAllocBuffer, kAllocTexture, kAllocHeap, kAllocImport, kAllocSites };
+		enum VkAllocationSite : uint32_t { kAllocRootConstants, kAllocPreprocess, kAllocDescriptorHeap, kAllocBuffer, kAllocTexture, kAllocHeap, kAllocImport, kAllocOther, kAllocSites };
 		static std::atomic<uint64_t> g_siteAllocations[kAllocSites]{};
 		static std::atomic<uint64_t> g_siteAllocationBytes[kAllocSites]{};
-		static void VkNoteAllocationSite(VkAllocationSite site, uint64_t bytes) noexcept {
+		// The site and name of the next allocation on this thread. VkAllocateDeviceMemory takes them for the live ledger.
+		static thread_local VkAllocationSite t_nextAllocationSite = kAllocOther;
+		static thread_local const char* t_nextAllocationName = nullptr;
+		static void VkNoteAllocationSite(VkAllocationSite site, uint64_t bytes, const char* name = nullptr) noexcept {
 			g_siteAllocations[site].fetch_add(1, std::memory_order_relaxed);
 			g_siteAllocationBytes[site].fetch_add(bytes, std::memory_order_relaxed);
+			t_nextAllocationSite = site;
+			t_nextAllocationName = name;
+		}
+
+		// Live device memory by site and memory kind, for VRAM attribution. Every vkAllocateMemory and vkFreeMemory goes
+		// through it. Kinds: 0 device-local only, 1 device-local and host-visible (ReBAR), 2 system memory.
+		struct VkLiveMemory {
+			uint64_t bytes = 0;
+			uint32_t site = kAllocOther;
+			uint32_t kind = 0;
+			std::string name;
+		};
+		static std::mutex g_liveMemoryMutex;
+		static std::unordered_map<VkDeviceMemory, VkLiveMemory> g_liveMemory;
+		static uint64_t g_liveSiteBytes[kAllocSites][3]{};
+		static uint64_t g_liveSiteCount[kAllocSites][3]{};
+		static uint32_t VkMemoryKind(const VkPhysicalDeviceMemoryProperties& properties, uint32_t typeIndex) noexcept {
+			const VkMemoryPropertyFlags flags = properties.memoryTypes[typeIndex].propertyFlags;
+			if (!(flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return 2u;
+			return (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? 1u : 0u;
+		}
+		static void VkNoteLiveMemory(const VkPhysicalDeviceMemoryProperties& properties, VkDeviceMemory memory, uint64_t bytes, uint32_t typeIndex,
+			VkAllocationSite site, const char* name) noexcept {
+			if (memory == VK_NULL_HANDLE) return;
+			VkLiveMemory entry;
+			entry.bytes = bytes;
+			entry.site = site;
+			entry.kind = VkMemoryKind(properties, typeIndex);
+			if (name) entry.name = name;
+			std::scoped_lock lock(g_liveMemoryMutex);
+			g_liveSiteBytes[site][entry.kind] += bytes;
+			g_liveSiteCount[site][entry.kind] += 1;
+			g_liveMemory[memory] = std::move(entry);
+		}
+		// vkFreeMemory, with the ledger's entry removed.
+		static void VkFreeDeviceMemory(VkDevice device, VkDeviceMemory memory) noexcept {
+			if (memory == VK_NULL_HANDLE) return;
+			{
+				std::scoped_lock lock(g_liveMemoryMutex);
+				if (auto it = g_liveMemory.find(memory); it != g_liveMemory.end()) {
+					g_liveSiteBytes[it->second.site][it->second.kind] -= it->second.bytes;
+					g_liveSiteCount[it->second.site][it->second.kind] -= 1;
+					g_liveMemory.erase(it);
+				}
+			}
+			vkFreeMemory(device, memory, nullptr);
+		}
+		// BASICRHI_DEVICE_MEMORY_REPORT=1: the driver's own device memory by object type (VK_EXT_device_memory_report), logged with
+		// the live memory. It covers what no vkAllocateMemory shows: command pools, pipelines, query pools, the swap chain.
+		static bool DeviceMemoryReportRequested() noexcept {
+			static const bool requested = [] {
+				char value[8]{};
+				return GetEnvironmentVariableA("BASICRHI_DEVICE_MEMORY_REPORT", value, sizeof(value)) > 0 && value[0] == '1';
+			}();
+			return requested;
+		}
+		struct VkReportedMemory {
+			uint32_t objectType = 0;
+			uint32_t heapIndex = 0;
+			uint64_t bytes = 0;
+		};
+		static std::mutex g_reportMutex;
+		static std::unordered_map<uint64_t, VkReportedMemory> g_reportLive;
+		static bool g_reportActive = false;
+		static void VKAPI_PTR VkDeviceMemoryReportCallback(const VkDeviceMemoryReportCallbackDataEXT* data, void*) {
+			std::scoped_lock lock(g_reportMutex);
+			// A free's size is undefined: the allocation's is kept.
+			if (data->type == VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_ALLOCATE_EXT || data->type == VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_IMPORT_EXT)
+				g_reportLive[data->memoryObjectId] = { static_cast<uint32_t>(data->objectType), data->heapIndex, data->size };
+			else if (data->type == VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_FREE_EXT || data->type == VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_UNIMPORT_EXT)
+				g_reportLive.erase(data->memoryObjectId);
+		}
+		static std::string VkDeviceMemoryReportText() {
+			if (!g_reportActive) return {};
+			struct Total { uint64_t bytes = 0; uint64_t count = 0; };
+			std::vector<std::pair<std::pair<uint32_t, uint32_t>, Total>> totals;
+			{
+				std::scoped_lock lock(g_reportMutex);
+				for (const auto& [id, entry] : g_reportLive) {
+					auto it = std::find_if(totals.begin(), totals.end(), [&](const auto& t) { return t.first.first == entry.objectType && t.first.second == entry.heapIndex; });
+					if (it == totals.end()) { totals.push_back({ { entry.objectType, entry.heapIndex }, {} }); it = totals.end() - 1; }
+					it->second.bytes += entry.bytes;
+					it->second.count += 1;
+				}
+			}
+			std::sort(totals.begin(), totals.end(), [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+			const auto typeName = [](uint32_t type) -> std::string {
+				switch (type) {
+				case VK_OBJECT_TYPE_UNKNOWN: return "unknown";
+				case VK_OBJECT_TYPE_DEVICE: return "device";
+				case VK_OBJECT_TYPE_QUEUE: return "queue";
+				case VK_OBJECT_TYPE_COMMAND_BUFFER: return "command buffer";
+				case VK_OBJECT_TYPE_DEVICE_MEMORY: return "device memory";
+				case VK_OBJECT_TYPE_BUFFER: return "buffer";
+				case VK_OBJECT_TYPE_IMAGE: return "image";
+				case VK_OBJECT_TYPE_QUERY_POOL: return "query pool";
+				case VK_OBJECT_TYPE_SHADER_MODULE: return "shader module";
+				case VK_OBJECT_TYPE_PIPELINE_CACHE: return "pipeline cache";
+				case VK_OBJECT_TYPE_PIPELINE: return "pipeline";
+				case VK_OBJECT_TYPE_DESCRIPTOR_POOL: return "descriptor pool";
+				case VK_OBJECT_TYPE_COMMAND_POOL: return "command pool";
+				case VK_OBJECT_TYPE_SWAPCHAIN_KHR: return "swap chain";
+				default: return std::to_string(type);
+				}
+			};
+			std::string text = "; driver report (type, heap):";
+			for (const auto& [key, total] : totals)
+				text += std::format(" {} h{} {} ({:.1f} MiB),", typeName(key.first), key.second, total.count, total.bytes / 1048576.0);
+			return text;
+		}
+		// One line of live memory by site and kind. BASICRHI_MEMORY_DUMP=<file>: also every live allocation, largest first.
+		static void VkLogLiveMemory(VulkanDevice* impl) noexcept {
+			static const char* const names[kAllocSites] = { "root-constant pages", "preprocess pages", "descriptor heaps", "buffers", "textures", "heaps", "imports", "other" };
+			static const char* const kinds[3] = { "device-local", "ReBAR", "system" };
+			static const std::string dumpPath = [] {
+				char value[512]{};
+				const DWORD n = GetEnvironmentVariableA("BASICRHI_MEMORY_DUMP", value, sizeof(value));
+				return n > 0 && n < sizeof(value) ? std::string(value) : std::string();
+			}();
+			std::string text;
+			std::vector<VkLiveMemory> all;
+			{
+				std::scoped_lock lock(g_liveMemoryMutex);
+				for (uint32_t kind = 0; kind < 3; ++kind) {
+					std::string part;
+					uint64_t total = 0;
+					for (uint32_t site = 0; site < kAllocSites; ++site) {
+						total += g_liveSiteBytes[site][kind];
+						if (g_liveSiteCount[site][kind])
+							part += std::format("{}{} {} ({:.1f} MiB)", part.empty() ? "" : ", ", names[site], g_liveSiteCount[site][kind], g_liveSiteBytes[site][kind] / 1048576.0);
+					}
+					if (!part.empty()) text += std::format("; {} {:.1f} MiB: {}", kinds[kind], total / 1048576.0, part);
+				}
+				if (!dumpPath.empty()) {
+					all.reserve(g_liveMemory.size());
+					for (const auto& entry : g_liveMemory) all.push_back(entry.second);
+				}
+			}
+			spdlog::info("BasicRHI Vulkan: live device memory{}{}", text, VkDeviceMemoryReportText());
+			if (dumpPath.empty()) return;
+			std::sort(all.begin(), all.end(), [](const VkLiveMemory& a, const VkLiveMemory& b) { return a.bytes > b.bytes; });
+			if (FILE* file = std::fopen(dumpPath.c_str(), "w")) {
+				std::fprintf(file, "bytes,site,kind,name\n");
+				for (const auto& entry : all)
+					std::fprintf(file, "%llu,%s,%s,%s\n", static_cast<unsigned long long>(entry.bytes), names[entry.site], kinds[entry.kind], entry.name.c_str());
+				std::fclose(file);
+			}
+			// Every live resource with its memory: placed ones name what the heaps hold. Aliased resources share memory, so the
+			// memory handle and offset are written too.
+			if (!impl || impl->device == VK_NULL_HANDLE) return;
+			struct Row { uint64_t bytes; uint64_t memory; uint64_t offset; uint32_t site; uint32_t kind; bool image; bool owns; uint32_t width, height, layers, mips, format; std::string name; };
+			std::vector<Row> rows;
+			{
+				std::shared_lock lock(impl->resources.mutex);
+				rows.reserve(impl->resources.slots.size());
+				for (const auto& slot : impl->resources.slots) {
+					if (!slot.alive || slot.obj.memory == VK_NULL_HANDLE) continue;
+					const auto& r = slot.obj;
+					Row row{};
+					VkMemoryRequirements requirements{};
+					if (r.image != VK_NULL_HANDLE) vkGetImageMemoryRequirements(impl->device, r.image, &requirements);
+					else if (r.buffer != VK_NULL_HANDLE) vkGetBufferMemoryRequirements(impl->device, r.buffer, &requirements);
+					else continue;
+					row.bytes = requirements.size;
+					row.memory = reinterpret_cast<uint64_t>(r.memory);
+					row.offset = r.memoryOffset;
+					row.image = r.image != VK_NULL_HANDLE;
+					row.owns = r.ownsMemory;
+					row.width = r.width; row.height = r.height; row.layers = r.depthOrLayers; row.mips = r.mipLevels;
+					row.format = static_cast<uint32_t>(r.format);
+					row.name.assign(r.name.data(), strnlen(r.name.data(), r.name.size()));
+					rows.push_back(std::move(row));
+				}
+			}
+			{
+				std::scoped_lock lock(g_liveMemoryMutex);
+				for (auto& row : rows) {
+					if (auto it = g_liveMemory.find(reinterpret_cast<VkDeviceMemory>(row.memory)); it != g_liveMemory.end()) {
+						row.site = it->second.site;
+						row.kind = it->second.kind;
+					}
+					else {
+						row.site = kAllocSites;
+					}
+				}
+			}
+			if (FILE* file = std::fopen((dumpPath + ".resources.csv").c_str(), "w")) {
+				std::fprintf(file, "bytes,memory,offset,site,kind,image,owns,width,height,layers,mips,format,name\n");
+				for (const auto& row : rows)
+					std::fprintf(file, "%llu,%llx,%llu,%s,%s,%d,%d,%u,%u,%u,%u,%u,%s\n", static_cast<unsigned long long>(row.bytes), static_cast<unsigned long long>(row.memory),
+						static_cast<unsigned long long>(row.offset), row.site < kAllocSites ? names[row.site] : "unknown", kinds[row.kind], row.image ? 1 : 0, row.owns ? 1 : 0,
+						row.width, row.height, row.layers, row.mips, row.format, row.name.c_str());
+				std::fclose(file);
+			}
 		}
 		static VkResult VkAllocateDeviceMemory(VulkanDevice* impl, const VkMemoryAllocateInfo* info, VkDeviceMemory* memory) noexcept {
+			const VkAllocationSite site = t_nextAllocationSite;
+			const char* name = t_nextAllocationName;
+			t_nextAllocationSite = kAllocOther;
+			t_nextAllocationName = nullptr;
 			const VkResult result = vkAllocateMemory(impl->device, info, nullptr, memory);
 			if (result == VK_SUCCESS) {
 				g_memoryAllocations.fetch_add(1, std::memory_order_relaxed);
 				g_memoryAllocationBytes.fetch_add(info->allocationSize, std::memory_order_relaxed);
+				VkNoteLiveMemory(impl->memoryProperties, *memory, info->allocationSize, info->memoryTypeIndex, site, name);
 			}
 			if (result == VK_SUCCESS && vkSetDeviceMemoryPriorityEXT
 				&& (impl->memoryProperties.memoryTypes[info->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
@@ -1738,7 +2017,7 @@ namespace rhi {
 				vkDestroyBuffer(impl->device, page.buffer, nullptr);
 			}
 			if (page.memory != VK_NULL_HANDLE) {
-				vkFreeMemory(impl->device, page.memory, nullptr);
+				VkFreeDeviceMemory(impl->device, page.memory);
 			}
 			page = {};
 		}
@@ -1813,14 +2092,14 @@ namespace rhi {
 			}
 
 			if (VkBindBufferMemorySynchronized(impl, buffer, memory, 0) != VK_SUCCESS) {
-				vkFreeMemory(impl->device, memory, nullptr);
+				VkFreeDeviceMemory(impl->device, memory);
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return false;
 			}
 
 			void* mappedData = nullptr;
 			if (VkMapMemorySynchronized(impl, memory, 0, capacity64, &mappedData) != VK_SUCCESS || mappedData == nullptr) {
-				vkFreeMemory(impl->device, memory, nullptr);
+				VkFreeDeviceMemory(impl->device, memory);
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return false;
 			}
@@ -1830,7 +2109,7 @@ namespace rhi {
 			const VkDeviceAddress deviceAddress = vkGetBufferDeviceAddress(impl->device, &addressInfo);
 			if (deviceAddress == 0) {
 				VkUnmapMemorySynchronized(impl, memory);
-				vkFreeMemory(impl->device, memory, nullptr);
+				VkFreeDeviceMemory(impl->device, memory);
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return false;
 			}
@@ -2959,7 +3238,7 @@ namespace rhi {
 				vkDestroyBuffer(impl->device, heap.buffer, nullptr);
 			}
 			if (heap.memory != VK_NULL_HANDLE) {
-				vkFreeMemory(impl->device, heap.memory, nullptr);
+				VkFreeDeviceMemory(impl->device, heap.memory);
 			}
 
 			heap.buffer = VK_NULL_HANDLE;
@@ -3132,7 +3411,7 @@ namespace rhi {
 			VulkanCrashMarkers& markers = impl->crashMarkers;
 			if (impl->device != VK_NULL_HANDLE && !impl->abandoned) {
 				if (markers.buffer != VK_NULL_HANDLE) vkDestroyBuffer(impl->device, markers.buffer, nullptr);
-				if (markers.memory != VK_NULL_HANDLE) vkFreeMemory(impl->device, markers.memory, nullptr);
+				if (markers.memory != VK_NULL_HANDLE) VkFreeDeviceMemory(impl->device, markers.memory);
 			}
 			markers.buffer = VK_NULL_HANDLE;
 			markers.memory = VK_NULL_HANDLE;
@@ -3146,7 +3425,7 @@ namespace rhi {
 		static void VkDestroyPlaceholderInputBuffer(VulkanDevice* impl) noexcept {
 			if (impl->device != VK_NULL_HANDLE && !impl->abandoned) {
 				if (impl->placeholderInputBuffer != VK_NULL_HANDLE) vkDestroyBuffer(impl->device, impl->placeholderInputBuffer, nullptr);
-				if (impl->placeholderInputMemory != VK_NULL_HANDLE) vkFreeMemory(impl->device, impl->placeholderInputMemory, nullptr);
+				if (impl->placeholderInputMemory != VK_NULL_HANDLE) VkFreeDeviceMemory(impl->device, impl->placeholderInputMemory);
 			}
 			impl->placeholderInputBuffer = VK_NULL_HANDLE;
 			impl->placeholderInputMemory = VK_NULL_HANDLE;
@@ -3178,9 +3457,10 @@ namespace rhi {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return;
 			}
+			VkNoteLiveMemory(impl->memoryProperties, memory, allocateInfo.allocationSize, memoryTypeIndex, kAllocOther, "BasicRHI::PlaceholderInput");
 			if (VkBindBufferMemorySynchronized(impl, buffer, memory, 0) != VK_SUCCESS) {
 				spdlog::warn("Vulkan ExecuteCommands: could not bind the placeholder input buffer");
-				vkFreeMemory(impl->device, memory, nullptr);
+				VkFreeDeviceMemory(impl->device, memory);
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return;
 			}
@@ -3226,6 +3506,7 @@ namespace rhi {
 			allocateInfo.memoryTypeIndex = memoryTypeIndex;
 			void* mapped = nullptr;
 			if (vkAllocateMemory(impl->device, &allocateInfo, nullptr, &markers.memory) != VK_SUCCESS ||
+				(VkNoteLiveMemory(impl->memoryProperties, markers.memory, allocateInfo.allocationSize, memoryTypeIndex, kAllocOther, "BasicRHI::CrashMarkers"), false) ||
 				vkBindBufferMemory(impl->device, markers.buffer, markers.memory, 0) != VK_SUCCESS ||
 				vkMapMemory(impl->device, markers.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
 				return false;
@@ -4281,7 +4562,7 @@ namespace rhi {
 				vkDestroyBuffer(impl->device, page.buffer, nullptr);
 			}
 			if (page.memory != VK_NULL_HANDLE) {
-				vkFreeMemory(impl->device, page.memory, nullptr);
+				VkFreeDeviceMemory(impl->device, page.memory);
 			}
 			page = {};
 		}
@@ -4445,7 +4726,7 @@ namespace rhi {
 			result = VkBindBufferMemorySynchronized(impl, page.buffer, page.memory, 0);
 			if (result != VK_SUCCESS) {
 				vkDestroyBuffer(impl->device, page.buffer, nullptr);
-				vkFreeMemory(impl->device, page.memory, nullptr);
+				VkFreeDeviceMemory(impl->device, page.memory);
 				return ToRHI(result);
 			}
 
@@ -4714,7 +4995,7 @@ namespace rhi {
 			}
 
 			if (resource.ownsMemory && resource.memory != VK_NULL_HANDLE) {
-				vkFreeMemory(impl->device, resource.memory, nullptr);
+				VkFreeDeviceMemory(impl->device, resource.memory);
 			}
 
 			resource = {};
@@ -9609,7 +9890,7 @@ namespace rhi {
 					const uint64_t count = g_memoryAllocations.exchange(0, std::memory_order_relaxed);
 					const uint64_t bytes = g_memoryAllocationBytes.exchange(0, std::memory_order_relaxed);
 					if (count) {
-						static const char* const names[kAllocSites] = { "root-constant pages", "preprocess pages", "descriptor heaps", "buffers", "textures", "heaps", "imports" };
+						static const char* const names[kAllocSites] = { "root-constant pages", "preprocess pages", "descriptor heaps", "buffers", "textures", "heaps", "imports", "other" };
 						std::string sitesText;
 						for (uint32_t site = 0; site < kAllocSites; ++site) {
 							const uint64_t n = g_siteAllocations[site].exchange(0, std::memory_order_relaxed);
@@ -9618,6 +9899,9 @@ namespace rhi {
 						}
 						spdlog::info("BasicRHI Vulkan: {} memory allocations ({:.1f} MiB) in the last 300 presents{}", count, bytes / 1048576.0, sitesText);
 					}
+					VkLogLiveMemory(impl);
+					LogDriverObjects();
+					VkLogPoolSites();
 				}
 			}
 			const VkPresentModeKHR presentMode = VkPresentModeForVsync(*swapchainState, vsync);
@@ -12435,7 +12719,7 @@ namespace rhi {
 
 				const VkResult bindResult = VkBindBufferMemorySynchronized(impl, heap.buffer, heap.memory, 0);
 				if (bindResult != VK_SUCCESS) {
-					vkFreeMemory(impl->device, heap.memory, nullptr);
+					VkFreeDeviceMemory(impl->device, heap.memory);
 					vkDestroyBuffer(impl->device, heap.buffer, nullptr);
 					out.Reset();
 					return ToRHI(bindResult);
@@ -12443,7 +12727,7 @@ namespace rhi {
 
 				const VkResult mapResult = VkMapMemorySynchronized(impl, heap.memory, 0, totalBytes, &heap.mappedData);
 				if (mapResult != VK_SUCCESS) {
-					vkFreeMemory(impl->device, heap.memory, nullptr);
+					VkFreeDeviceMemory(impl->device, heap.memory);
 					vkDestroyBuffer(impl->device, heap.buffer, nullptr);
 					out.Reset();
 					return ToRHI(mapResult);
@@ -13184,6 +13468,7 @@ namespace rhi {
 			}
 
 			NoteCommandPools(1);
+			VkNotePoolSite(pool, true);
 			ProbeCommandPools(impl->device, createInfo.queueFamilyIndex);
 			const CommandAllocatorHandle handle = impl->allocators.alloc(VulkanCommandAllocator{ pool, kind, createInfo.queueFamilyIndex });
 			CommandAllocator allocator{ handle };
@@ -13207,6 +13492,7 @@ namespace rhi {
 			}
 
 			if (allocatorState->pool != VK_NULL_HANDLE && impl->device != VK_NULL_HANDLE) {
+				VkNotePoolSite(allocatorState->pool, false);
 				vkDestroyCommandPool(impl->device, allocatorState->pool, nullptr);
 				NoteCommandPools(-1);
 			}
@@ -13335,7 +13621,7 @@ namespace rhi {
 			}
 
 			VkDeviceMemory memory = VK_NULL_HANDLE;
-			VkNoteAllocationSite(kAllocBuffer, allocateInfo.allocationSize);
+			VkNoteAllocationSite(kAllocBuffer, allocateInfo.allocationSize, desc.debugName);
 			result = VkAllocateDeviceMemory(impl, &allocateInfo, &memory);
 			if (result != VK_SUCCESS) {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
@@ -13345,7 +13631,7 @@ namespace rhi {
 
 			result = VkBindBufferMemorySynchronized(impl, buffer, memory, 0);
 			if (result != VK_SUCCESS) {
-				vkFreeMemory(impl->device, memory, nullptr);
+				VkFreeDeviceMemory(impl->device, memory);
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				out.Reset();
 				return ToRHI(result);
@@ -13453,7 +13739,7 @@ namespace rhi {
 			allocateInfo.memoryTypeIndex = memoryTypeIndex;
 
 			VkDeviceMemory memory = VK_NULL_HANDLE;
-			VkNoteAllocationSite(kAllocTexture, allocateInfo.allocationSize);
+			VkNoteAllocationSite(kAllocTexture, allocateInfo.allocationSize, desc.debugName);
 			result = VkAllocateDeviceMemory(impl, &allocateInfo, &memory);
 			if (result != VK_SUCCESS) {
 				vkDestroyImage(impl->device, image, nullptr);
@@ -13463,7 +13749,7 @@ namespace rhi {
 
 			result = VkBindImageMemorySynchronized(impl, image, memory, 0);
 			if (result != VK_SUCCESS) {
-				vkFreeMemory(impl->device, memory, nullptr);
+				VkFreeDeviceMemory(impl->device, memory);
 				vkDestroyImage(impl->device, image, nullptr);
 				out.Reset();
 				return ToRHI(result);
@@ -13603,7 +13889,7 @@ namespace rhi {
 				allocateInfo.pNext = &allocateFlagsInfo;
 			}
 			VkDeviceMemory memory = VK_NULL_HANDLE;
-			VkNoteAllocationSite(kAllocHeap, allocateInfo.allocationSize);
+			VkNoteAllocationSite(kAllocHeap, allocateInfo.allocationSize, desc.debugName);
 			const VkResult result = VkAllocateDeviceMemory(impl, &allocateInfo, &memory);
 			if (result != VK_SUCCESS) {
 				out.Reset();
@@ -13628,7 +13914,7 @@ namespace rhi {
 				return;
 			}
 			if (heap->memory != VK_NULL_HANDLE) {
-				vkFreeMemory(impl->device, heap->memory, nullptr);
+				VkFreeDeviceMemory(impl->device, heap->memory);
 			}
 			impl->heaps.free(handle);
 		}
@@ -14556,7 +14842,7 @@ namespace rhi {
 
 			for (auto& slot : heaps.slots) {
 				if (slot.alive && slot.obj.memory != VK_NULL_HANDLE) {
-					vkFreeMemory(device, slot.obj.memory, nullptr);
+					VkFreeDeviceMemory(device, slot.obj.memory);
 					slot.obj.memory = VK_NULL_HANDLE;
 				}
 				slot.alive = false;
@@ -16448,6 +16734,26 @@ namespace rhi {
 			*presentExtensions.featureChainTail = const_cast<void*>(deviceCreateInfo.pNext);
 			deviceCreateInfo.pNext = presentExtensions.featureChain;
 		}
+		VkDeviceDeviceMemoryReportCreateInfoEXT memoryReport{ VK_STRUCTURE_TYPE_DEVICE_DEVICE_MEMORY_REPORT_CREATE_INFO_EXT };
+		VkPhysicalDeviceDeviceMemoryReportFeaturesEXT memoryReportFeature{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_MEMORY_REPORT_FEATURES_EXT };
+		if (DeviceMemoryReportRequested()) {
+			uint32_t count = 0;
+			vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, nullptr);
+			std::vector<VkExtensionProperties> available(count);
+			vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, available.data());
+			const bool supported = std::any_of(available.begin(), available.end(),
+				[](const VkExtensionProperties& e) { return std::strcmp(e.extensionName, VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME) == 0; });
+			if (supported) {
+				memoryReportFeature.deviceMemoryReport = VK_TRUE;
+				memoryReportFeature.pNext = const_cast<void*>(deviceCreateInfo.pNext);
+				memoryReport.pNext = &memoryReportFeature;
+				memoryReport.pfnUserCallback = VkDeviceMemoryReportCallback;
+				deviceCreateInfo.pNext = &memoryReport;
+				enabledDeviceExtensions.push_back(VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME);
+				g_reportActive = true;
+			}
+			spdlog::info("CreateVulkanDevice: device memory report {}", supported ? "on" : "requested, but the device does not support it");
+		}
 		deviceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(enabledDeviceExtensions.size());
 		deviceCreateInfo.ppEnabledExtensionNames = enabledDeviceExtensions.empty() ? nullptr : enabledDeviceExtensions.data();
 		if (ci.vulkanCreateHooks && ci.vulkanCreateHooks->device
@@ -17464,9 +17770,10 @@ namespace rhi {
 			allocation.memoryTypeIndex = memoryTypeIndex;
 			VkDeviceMemory memory = VK_NULL_HANDLE;
 			result = vkAllocateMemory(impl->device, &allocation, nullptr, &memory);
+			if (result == VK_SUCCESS) VkNoteLiveMemory(impl->memoryProperties, memory, allocation.allocationSize, memoryTypeIndex, kAllocImport, desc.debugName);
 			if (result == VK_SUCCESS) result = VkBindImageMemorySynchronized(impl, image, memory, 0);
 			if (result != VK_SUCCESS) {
-				if (memory) vkFreeMemory(impl->device, memory, nullptr);
+				if (memory) VkFreeDeviceMemory(impl->device, memory);
 				vkDestroyImage(impl->device, image, nullptr);
 				return ToRHI(result);
 			}
@@ -17514,6 +17821,7 @@ namespace rhi {
 			VkDeviceMemory memory = VK_NULL_HANDLE;
 			result = vkAllocateMemory(impl->device, &allocation, nullptr, &memory);
 			if (result != VK_SUCCESS) return ToRHI(result);
+			VkNoteLiveMemory(impl->memoryProperties, memory, allocation.allocationSize, memoryTypeIndex, kAllocImport, desc.debugName);
 			const HeapHandle handle = impl->heaps.alloc(VulkanHeap{ memory, desc.sizeBytes, memoryTypeIndex, desc.memory, true });
 			Heap heap{ handle }; heap.impl = impl; heap.vt = &g_vkhevt;
 			out = MakeHeapPtr(&device, heap, impl->selfWeak.lock());
@@ -17601,7 +17909,7 @@ namespace rhi {
 			}
 			vkResult = VkBindBufferMemorySynchronized(impl, buffer, memory, 0);
 			if (vkResult != VK_SUCCESS) {
-				vkFreeMemory(impl->device, memory, nullptr);
+				VkFreeDeviceMemory(impl->device, memory);
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return ToRHI(vkResult);
 			}
