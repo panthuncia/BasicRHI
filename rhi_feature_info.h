@@ -269,7 +269,7 @@ struct LiveMemoryFeatureInfo {
 };
 
 struct FixedFunctionFeatureInfo {
-    FeatureInfoHeader header{ FeatureInfoStructType::FixedFunction, nullptr, sizeof(FixedFunctionFeatureInfo), 2 };
+    FeatureInfoHeader header{ FeatureInfoStructType::FixedFunction, nullptr, sizeof(FixedFunctionFeatureInfo), 3 };
 
     bool dualSourceBlend = false;  // BlendFactor::Src1* (Vulkan dualSrcBlend)
     bool logicOp = false;          // BlendState::logicOpEnable (D3D12 OutputMergerLogicOp, Vulkan logicOp)
@@ -278,4 +278,7 @@ struct FixedFunctionFeatureInfo {
     // (structVersion 2) A secondary list may call SetViewports and SetScissors. Vulkan: true. D3D12: false (bundles inherit
     // them). Without it, record a pass that needs its own viewports or scissors inline rather than in secondaries.
     bool secondaryViewportScissor = false;
+    // (structVersion 3) A pixel shader may write SV_StencilRef. Vulkan: VK_EXT_shader_stencil_export. D3D12:
+    // PSSpecifiedStencilRefSupported.
+    bool stencilExport = false;
 };

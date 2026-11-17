@@ -12133,6 +12133,8 @@ namespace rhi {
 					out->maxViewports = VMAX_VIEWPORTS(impl);
 					if (header->structVersion >= 2)
 						out->secondaryViewportScissor = true;  // dynamic state in any command buffer
+					if (header->structVersion >= 3)
+						out->stencilExport = impl->shaderStencilExportEnabled;
 				} break;
 
 				default:
@@ -13042,18 +13044,27 @@ namespace rhi {
 			const bool isDepthStencilResource = VkIsDepthStencilFormat(resourceState->format);
 			const VkFormat requestedViewFormat = desc.formatOverride != Format::Unknown ? ToVkFormat(impl, desc.formatOverride) : resourceState->format;
 			const VkFormat viewFormat = isDepthStencilResource ? resourceState->format : requestedViewFormat;
-			const VkImageAspectFlags aspectMask = isDepthStencilResource ? VkSampledImageAspectMaskForFormat(resourceState->format) : VkAspectMaskForFormat(viewFormat);
+			// Plane 1 of a depth-stencil texture is its stencil, read as uint in the first channel (D3D12 reads it in the second).
+			const uint32_t plane = desc.dimension == SrvDim::Texture2D ? desc.tex2D.planeSlice : (desc.dimension == SrvDim::Texture2DArray ? desc.tex2DArray.planeSlice : 0u);
+			const bool stencilPlane = isDepthStencilResource && plane == 1;
+			if (stencilPlane && (VkAspectMaskForFormat(resourceState->format) & VK_IMAGE_ASPECT_STENCIL_BIT) == 0) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			const VkImageAspectFlags aspectMask = stencilPlane ? VK_IMAGE_ASPECT_STENCIL_BIT
+				: (isDepthStencilResource ? VkSampledImageAspectMaskForFormat(resourceState->format) : VkAspectMaskForFormat(viewFormat));
 			if (viewType == VK_IMAGE_VIEW_TYPE_MAX_ENUM || viewFormat == VK_FORMAT_UNDEFINED) {
 				RHI_FAIL(Result::Unsupported);
 			}
 			const VkImageSubresourceRange subresourceRange = VkSrvSubresourceRange(*resourceState, desc, aspectMask);
+			const VkComponentMapping components = stencilPlane ? VkComponentMapping{}
+				: VkSrvComponentMapping(impl, desc.componentMapping, desc.formatOverride != Format::Unknown ? desc.formatOverride : resourceState->rhiFormat);
 
 			if (VkDescriptorBufferModel(impl)) {
 				VkImageViewCreateInfo viewCreateInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
 				viewCreateInfo.image = resourceState->image;
 				viewCreateInfo.viewType = viewType;
 				viewCreateInfo.format = viewFormat;
-				viewCreateInfo.components = VkSrvComponentMapping(impl, desc.componentMapping, desc.formatOverride != Format::Unknown ? desc.formatOverride : resourceState->rhiFormat);
+				viewCreateInfo.components = components;
 				viewCreateInfo.subresourceRange = subresourceRange;
 				return VkCreateBufferModelImageSlot(impl, slot, resource, *resourceState, viewCreateInfo, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
 					resourceState->generalLayoutOnly ? VK_IMAGE_LAYOUT_GENERAL : VkToImageLayout(ResourceLayout::ShaderResource, aspectMask));
@@ -13070,7 +13081,7 @@ namespace rhi {
 				viewCreateInfo.image = resourceState->image;
 				viewCreateInfo.viewType = viewType;
 				viewCreateInfo.format = viewFormat;
-				viewCreateInfo.components = VkSrvComponentMapping(impl, desc.componentMapping, desc.formatOverride != Format::Unknown ? desc.formatOverride : resourceState->rhiFormat);
+				viewCreateInfo.components = components;
 				viewCreateInfo.subresourceRange = subresourceRange;
 
 				VkImageDescriptorInfoEXT imageInfo{ VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT };
@@ -13124,7 +13135,7 @@ namespace rhi {
 				aspectMask,
 				viewType,
 				{ subresourceRange.baseMipLevel, subresourceRange.levelCount, subresourceRange.baseArrayLayer, subresourceRange.layerCount },
-				VkSrvComponentMapping(impl, desc.componentMapping, desc.formatOverride != Format::Unknown ? desc.formatOverride : resourceState->rhiFormat));
+				components);
 		}
 
 		static Result d_createUnorderedAccessView(Device* device, DescriptorSlot slot, const ResourceHandle& resource, const UavDesc& desc) noexcept {
@@ -15300,6 +15311,7 @@ namespace rhi {
 		VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV partitionedAccelerationStructure{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV };
 #endif
 		bool nvShaderSubgroupPartitioned = false;
+		bool shaderStencilExport = false;  // VK_EXT_shader_stencil_export enabled
 		bool pipelineLibrary = false;
 		bool swapchain = false;
 		bool externalMemoryWin32 = false;
@@ -15354,6 +15366,7 @@ namespace rhi {
 		impl->computeDerivativeGroupLinearEnabled = e.computeShaderDerivatives.computeDerivativeGroupLinear == VK_TRUE;
 		impl->shaderImageInt64AtomicsEnabled = e.shaderImageAtomicInt64.shaderImageInt64Atomics == VK_TRUE;
 		impl->shaderSubgroupPartitionedEnabled = e.shaderSubgroupPartitioned.shaderSubgroupPartitioned == VK_TRUE || e.nvShaderSubgroupPartitioned;
+		impl->shaderStencilExportEnabled = e.shaderStencilExport;
 		impl->deferredHostOperationsEnabled = e.accelerationStructure.accelerationStructure == VK_TRUE;
 		impl->accelerationStructureEnabled = e.accelerationStructure.accelerationStructure == VK_TRUE;
 		impl->rayTracingPipelineEnabled = e.rayTracingPipeline.rayTracingPipeline == VK_TRUE;
@@ -16626,6 +16639,10 @@ namespace rhi {
 			enabledDeviceExtensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
 			enabledPipelineExecutableFeatures.pipelineExecutableInfo = VK_TRUE;
 		}
+		// SV_StencilRef in pixel shaders (FixedFunctionFeatureInfo::stencilExport): a depth-stencil copy drawn as a fullscreen pass.
+		if (VkHasDeviceExtension(physicalDevice, VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME)) {
+			enabledDeviceExtensions.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+		}
 		if (hasShaderSubgroupPartitionedExtension && supportedShaderSubgroupPartitionedFeatures.shaderSubgroupPartitioned == VK_TRUE) {
 			enabledDeviceExtensions.push_back(VK_EXT_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
 			enabledShaderSubgroupPartitionedFeatures.shaderSubgroupPartitioned = VK_TRUE;
@@ -16903,6 +16920,7 @@ namespace rhi {
 			enabled.partitionedAccelerationStructure = enabledPartitionedAccelerationStructureFeatures;
 #endif
 			enabled.nvShaderSubgroupPartitioned = deviceExtensionEnabled(VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
+			enabled.shaderStencilExport = deviceExtensionEnabled(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
 			enabled.pipelineLibrary = deviceExtensionEnabled(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
 			enabled.swapchain = deviceExtensionEnabled(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 #ifdef _WIN32
@@ -17216,6 +17234,7 @@ namespace rhi {
 				enabled.partitionedAccelerationStructure = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV };
 #endif
 			enabled.nvShaderSubgroupPartitioned = hasExtension(VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
+			enabled.shaderStencilExport = hasExtension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
 			enabled.pipelineLibrary = hasExtension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
 			enabled.swapchain = false; // presentation stays with the host
 #ifdef _WIN32

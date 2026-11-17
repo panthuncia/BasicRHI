@@ -834,6 +834,7 @@ namespace rhi {
 		bool computeDerivativeGroupLinearEnabled = false;
 		bool shaderImageInt64AtomicsEnabled = false;
 		bool shaderSubgroupPartitionedEnabled = false;
+		bool shaderStencilExportEnabled = false;  // VK_EXT_shader_stencil_export
 		bool deferredHostOperationsEnabled = false;
 		bool accelerationStructureEnabled = false;
 		bool rayTracingPipelineEnabled = false;

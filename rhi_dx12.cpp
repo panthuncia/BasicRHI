@@ -3138,6 +3138,8 @@ namespace rhi {
 					out->maxViewports = MAX_VIEWPORTS;
 					if (h->structVersion >= 2)
 						out->secondaryViewportScissor = false;  // bundles cannot set them (RSSetViewports, RSSetScissorRects)
+					if (h->structVersion >= 3)
+						out->stencilExport = opt0.PSSpecifiedStencilRefSupported != 0;
 				} break;
 				default:
 					// Unknown sType: ignore
@@ -3560,6 +3562,22 @@ namespace rhi {
 			}
 		}
 
+		// A depth-stencil texture's stencil plane (SrvDesc plane 1): its stencil in the second channel. Unknown for other formats.
+		static DXGI_FORMAT DxStencilSrvFormat(DXGI_FORMAT format) noexcept {
+			switch (format) {
+			case DXGI_FORMAT_D24_UNORM_S8_UINT:
+			case DXGI_FORMAT_R24G8_TYPELESS:
+			case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+				return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+			case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+			case DXGI_FORMAT_R32G8X24_TYPELESS:
+			case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+				return DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+			default:
+				return DXGI_FORMAT_UNKNOWN;
+			}
+		}
+
 		static Result d_createShaderResourceView(Device* d, DescriptorSlot s, const ResourceHandle& resource, const SrvDesc& dv) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 
@@ -3669,6 +3687,8 @@ namespace rhi {
 			case SrvDim::Texture2D: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
 				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
+				if (dv.tex2D.planeSlice == 1 && DxStencilSrvFormat(T->fmt) != DXGI_FORMAT_UNKNOWN)
+					desc.Format = DxStencilSrvFormat(T->fmt);
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 				desc.Texture2D.MostDetailedMip = dv.tex2D.mostDetailedMip;
 				desc.Texture2D.MipLevels = dv.tex2D.mipLevels;

@@ -910,7 +910,7 @@ namespace rhi {
 			struct { // ===== TEX2D =====
 				uint32_t mostDetailedMip{ 0 };
 				uint32_t mipLevels{ 0 };
-				uint32_t planeSlice{ 0 };     // for planar formats
+				uint32_t planeSlice{ 0 };     // for planar formats; a depth-stencil texture's plane 1 is its stencil (uint)
 				float    minLodClamp{ 0.0f };
 			} tex2D;
 
