@@ -502,6 +502,14 @@ namespace rhi {
 			std::vector<uint32_t> values;
 		};
 
+		// rhi::census: this recording's counts, its label, and the previous render pass's attachments.
+		census::Counts census{};
+		std::string censusLabel;
+		bool censusLabelled = false;
+		bool censusBarrierSincePass = false;
+		std::vector<ResourceHandle> censusPreviousAttachments;
+		std::vector<ResourceHandle> censusAttachments;
+
 		VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 		CommandAllocatorHandle allocatorHandle{};
 		QueueKind kind = QueueKind::Graphics;

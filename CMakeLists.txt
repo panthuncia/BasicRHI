@@ -129,6 +129,8 @@ add_library(BasicRHI STATIC
 
 target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/WX>)
 target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+# rhi_vulkan.cpp is past the default section limit in Debug builds.
+target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
 target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:Clang>:
     -Wno-error=switch
     -Wno-error=reorder-ctor

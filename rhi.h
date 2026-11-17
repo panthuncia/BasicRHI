@@ -16,6 +16,7 @@
 #include <string>
 #include <cstring>
 #include <atomic>
+#include <mutex>
 
 #include "resource_states.h"
 #include "rhi_shader_abi.h"
@@ -4260,6 +4261,72 @@ namespace rhi {
 				callback(info);
 			} catch (...) {
 			}
+		}
+	}
+
+	/**
+	 * @brief A diagnostic census of what command lists record, summed per submission (Vulkan backend). Off by default; while off
+	 * a recording command pays one atomic load. A list takes the label its recording thread set (SetLabel) at its first counted
+	 * command; Queue::Submit adds each list's counts to its label's row, so a list submitted again counts again.
+	 */
+	namespace census {
+		struct Counts {
+			uint64_t lists = 0;                   // list submissions
+			uint64_t passBegins = 0;              // render passes begun
+			uint64_t sameAttachmentPasses = 0;    // begun on the same attachments as the list's previous pass
+			uint64_t sameAttachmentNoBarrier = 0; // ...with no barrier recorded since that pass
+			uint64_t colorAttachments = 0, depthAttachments = 0;
+			uint64_t loadOpLoad = 0, loadOpClear = 0, loadOpDontCare = 0;
+			uint64_t storeOpStore = 0, storeOpDontCare = 0;
+			uint64_t generalAttachments = 0;      // attachments of images kept in GENERAL
+			uint64_t barrierCalls = 0;            // pipeline barrier commands recorded
+			uint64_t imageBarriers = 0;
+			uint64_t imageLayoutChanges = 0;      // old layout differs from the new one
+			uint64_t imageSameState = 0;          // same access and layout before and after (ordering only)
+			uint64_t imageOntoPreviousPass = 0;   // on an attachment of the list's previous render pass
+			uint64_t bufferBarriers = 0, memoryBarriers = 0;
+			uint64_t draws = 0, dispatches = 0, copies = 0;
+
+			void Add(const Counts& o) noexcept {
+				uint64_t* a = &lists;
+				const uint64_t* b = &o.lists;
+				for (size_t i = 0; i < sizeof(Counts) / sizeof(uint64_t); ++i) a[i] += b[i];
+			}
+		};
+		inline std::atomic<bool>& EnabledFlag() noexcept {
+			static std::atomic<bool> enabled{ false };
+			return enabled;
+		}
+		inline bool Enabled() noexcept { return EnabledFlag().load(std::memory_order_relaxed); }
+		inline void Enable(bool on) noexcept { EnabledFlag().store(on, std::memory_order_relaxed); }
+		inline std::string& ThreadLabel() noexcept {
+			thread_local std::string label;
+			return label;
+		}
+		// The label of lists this thread records from now on (a list keeps the one it took at its first counted command).
+		inline void SetLabel(const char* label) noexcept {
+			if (Enabled()) ThreadLabel().assign(label ? label : "");
+		}
+		struct Totals {
+			std::mutex mutex;
+			std::unordered_map<std::string, Counts> rows;
+		};
+		inline Totals& GlobalTotals() noexcept {
+			static Totals totals;
+			return totals;
+		}
+		inline void AddSubmitted(const std::string& label, const Counts& counts) noexcept {
+			auto& totals = GlobalTotals();
+			std::scoped_lock lock(totals.mutex);
+			auto& row = totals.rows[label];
+			row.Add(counts);
+			++row.lists;
+		}
+		// The rows since the last call, by label.
+		inline std::unordered_map<std::string, Counts> Take() {
+			auto& totals = GlobalTotals();
+			std::scoped_lock lock(totals.mutex);
+			return std::exchange(totals.rows, {});
 		}
 	}
 

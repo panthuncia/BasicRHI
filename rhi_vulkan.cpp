@@ -2923,6 +2923,17 @@ namespace rhi {
 			return impl ? impl->commandLists.get(handle) : nullptr;
 		}
 
+		// rhi::census: the list's counts while the census is on (null while off). A list takes its recording thread's label at its
+		// first counted command.
+		static census::Counts* VkCensus(VulkanCommandList& commandListState) noexcept {
+			if (!census::Enabled()) return nullptr;
+			if (!commandListState.censusLabelled) {
+				commandListState.censusLabel = census::ThreadLabel();
+				commandListState.censusLabelled = true;
+			}
+			return &commandListState.census;
+		}
+
 		static VulkanCommandList* VkCommandListState(CommandList* commandList) noexcept {
 			if (commandList && commandList->backendState) {
 				return static_cast<VulkanCommandList*>(commandList->backendState);
@@ -5971,6 +5982,8 @@ namespace rhi {
 					spdlog::error("Vulkan queue submit rejected a command list that is still recording");
 					RHI_FAIL(Result::InvalidArgument);
 				}
+				if (census::Enabled() && commandListState->censusLabelled)
+					census::AddSubmitted(commandListState->censusLabel, commandListState->census);
 				// A command buffer runs only on a queue of the family its pool was made for (Device::CreateCommandAllocator(Queue)).
 				if (const VulkanCommandAllocator* allocatorState = VkAllocatorState(impl, commandListState->allocatorHandle);
 					allocatorState && allocatorState->familyIndex != queueState->familyIndex) {
@@ -6540,6 +6553,11 @@ namespace rhi {
 
 			commandListState->allocatorHandle = allocator.GetHandle();
 			commandListState->kind = allocatorState->kind;
+			commandListState->census = {};
+			commandListState->censusLabel.clear();
+			commandListState->censusLabelled = false;
+			commandListState->censusBarrierSincePass = false;
+			commandListState->censusPreviousAttachments.clear();
 			// A secondary begins in BeginSecondary, which knows the pass it continues.
 			if (!commandListState->secondary && VkBeginCommandRecording(commandListState->commandBuffer) != Result::Ok) {
 				spdlog::error("Vulkan command list reset failed to begin recording");
@@ -6804,6 +6822,45 @@ namespace rhi {
 				renderingInfo.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
 			}
 
+			if (census::Counts* counts = VkCensus(*commandListState)) {
+				++counts->passBegins;
+				auto& attachments = commandListState->censusAttachments;
+				attachments.clear();
+				for (uint32_t i = 0; i < colorAttachmentCount; ++i) {
+					++counts->colorAttachments;
+					const auto& info = colorAttachmentStorage[i];
+					counts->loadOpLoad += info.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
+					counts->loadOpClear += info.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+					counts->loadOpDontCare += info.loadOp == VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+					counts->storeOpStore += info.storeOp == VK_ATTACHMENT_STORE_OP_STORE;
+					counts->storeOpDontCare += info.storeOp != VK_ATTACHMENT_STORE_OP_STORE;
+					counts->generalAttachments += info.imageLayout == VK_IMAGE_LAYOUT_GENERAL;
+					attachments.push_back(commandListState->passColorResources[i]);
+				}
+				if (depthAttachmentPtr || stencilAttachmentPtr) {
+					const auto& info = depthAttachmentPtr ? *depthAttachmentPtr : *stencilAttachmentPtr;
+					++counts->depthAttachments;
+					counts->loadOpLoad += info.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
+					counts->loadOpClear += info.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+					counts->loadOpDontCare += info.loadOp == VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+					counts->storeOpStore += info.storeOp == VK_ATTACHMENT_STORE_OP_STORE;
+					counts->storeOpDontCare += info.storeOp != VK_ATTACHMENT_STORE_OP_STORE;
+					counts->generalAttachments += info.imageLayout == VK_IMAGE_LAYOUT_GENERAL;
+					attachments.push_back(commandListState->passDepthResource);
+				}
+				const auto same = [](const std::vector<ResourceHandle>& a, const std::vector<ResourceHandle>& b) {
+					if (a.size() != b.size() || a.empty()) return false;
+					for (size_t i = 0; i < a.size(); ++i)
+						if (a[i].index != b[i].index || a[i].generation != b[i].generation) return false;
+					return true;
+				};
+				if (same(attachments, commandListState->censusPreviousAttachments)) {
+					++counts->sameAttachmentPasses;
+					counts->sameAttachmentNoBarrier += !commandListState->censusBarrierSincePass;
+				}
+				commandListState->censusPreviousAttachments = attachments;
+				commandListState->censusBarrierSincePass = false;
+			}
 			vkCmdBeginRendering(commandListState->commandBuffer, &renderingInfo);
 			commandListState->passActive = true;
 			if (secondaryContents) {
@@ -6972,6 +7029,17 @@ namespace rhi {
 				vkBarrier.image = resource->image;
 				vkBarrier.subresourceRange = VkMakeImageSubresourceRange(*resource, barrier.range, aspect);
 				imageBarriers.push_back(vkBarrier);
+				if (census::Counts* counts = VkCensus(*commandListState)) {
+					++counts->imageBarriers;
+					counts->imageLayoutChanges += vkBarrier.oldLayout != vkBarrier.newLayout;
+					counts->imageSameState += barrier.beforeAccess == barrier.afterAccess && barrier.beforeLayout == barrier.afterLayout
+						&& barrier.beforeSync == barrier.afterSync && !barrier.discard;
+					for (const auto& attachment : commandListState->censusPreviousAttachments)
+						if (attachment.index == barrier.texture.index && attachment.generation == barrier.texture.generation) {
+							++counts->imageOntoPreviousPass;
+							break;
+						}
+				}
 				const bool beforeTransferClear = (barrier.beforeAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
 				const bool afterTransferClear = (barrier.afterAccess & (ResourceAccessType::DepthStencilClear | ResourceAccessType::RenderTargetClear | ResourceAccessType::UnorderedAccessClear)) != 0;
 				srcStages |= orderedDiscard ? VkStageMaskForSync(barrier.beforeSync)
@@ -7077,6 +7145,12 @@ namespace rhi {
 				for (auto& barrier : memoryBarriers) clip(barrier);
 				for (auto& barrier : bufferBarriers) clip(barrier);
 				for (auto& barrier : imageBarriers) clip(barrier);
+				if (census::Counts* counts = VkCensus(*commandListState)) {
+					++counts->barrierCalls;
+					counts->bufferBarriers += bufferBarriers.size();
+					counts->memoryBarriers += memoryBarriers.size();
+					commandListState->censusBarrierSincePass = true;
+				}
 				vkCmdPipelineBarrier(commandListState->commandBuffer,
 					srcStages,
 					dstStages,
@@ -7446,6 +7520,7 @@ namespace rhi {
 			if (!pipelineState || pipelineState->bindPoint != VK_PIPELINE_BIND_POINT_COMPUTE || pipelineState->pipeline == VK_NULL_HANDLE) {
 				return;
 			}
+			if (census::Counts* counts = VkCensus(*commandListState)) ++counts->dispatches;
 
 			if (impl->detailedCheckpoints) {
 				char marker[160]{};
