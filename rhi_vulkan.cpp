@@ -226,6 +226,15 @@ namespace rhi {
 			} catch (...) {
 			}
 		}
+		// The census label of each command buffer at its last submission, for the destroy-in-use report (with the census on).
+		struct VkSubmittedLabels {
+			std::mutex mutex;
+			std::unordered_map<uint64_t, std::string> labels;
+		};
+		static VkSubmittedLabels& VkSubmittedLabelsState() noexcept {
+			static VkSubmittedLabels state;
+			return state;
+		}
 		static constexpr size_t kMaxQueuedValidationMessages = 1024;
 
 		static void VkQueueValidationMessage(VulkanDevice* impl, VkDebugUtilsMessageSeverityFlagBitsEXT severity, std::string message) noexcept {
@@ -281,6 +290,36 @@ namespace rhi {
 							static_cast<uint32_t>(object.objectType),
 							object.objectHandle,
 							object.pObjectName ? object.pObjectName : "<unnamed>");
+					}
+				}
+				// A destroy of an object still in use: the callback runs on the destroying thread, so its stack names the owner, and
+				// the command buffer's census label names the list.
+				if (callbackData && diagnostic.find("vkDestroy") != std::string::npos) {
+					auto& submitted = VkSubmittedLabelsState();
+					std::scoped_lock lock(submitted.mutex);
+					for (uint32_t i = 0; i < callbackData->objectCount; ++i)
+						if (callbackData->pObjects[i].objectType == VK_OBJECT_TYPE_COMMAND_BUFFER)
+							if (const auto found = submitted.labels.find(callbackData->pObjects[i].objectHandle); found != submitted.labels.end())
+								diagnostic += std::format("\n  command buffer 0x{:x}: list '{}'", found->first, found->second);
+				}
+				if (diagnostic.find("VUID-vkDestroyImage-image-01000") != std::string::npos
+					|| diagnostic.find("VUID-vkDestroyImageView-imageView-01026") != std::string::npos
+					|| diagnostic.find("VUID-vkDestroyBuffer-buffer-00922") != std::string::npos) {
+					void* frames[48]{};
+					const USHORT count = RtlCaptureStackBackTrace(1, 48, frames, nullptr);
+					diagnostic += "\n  stack:";
+					for (USHORT i = 0; i < count; ++i) {
+						HMODULE module = nullptr;
+						char name[MAX_PATH] = "?";
+						if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+								static_cast<LPCSTR>(frames[i]), &module) && module) {
+							GetModuleFileNameA(module, name, MAX_PATH);
+							const char* base = std::strrchr(name, '\\');
+							diagnostic += std::format(" {}+0x{:x}", base ? base + 1 : name,
+								reinterpret_cast<uintptr_t>(frames[i]) - reinterpret_cast<uintptr_t>(module));
+						} else {
+							diagnostic += std::format(" 0x{:x}", reinterpret_cast<uintptr_t>(frames[i]));
+						}
 					}
 				}
 				VkQueueValidationMessage(static_cast<VulkanDevice*>(userData), severity, std::move(diagnostic));
@@ -1631,8 +1670,24 @@ namespace rhi {
 		}
 
 		// The graph's memory is read by every pass: under memory pressure, the driver demotes everything else first.
+		// Memory allocations since the last report (sc_present logs them every 300 presents when there were any): a steady
+		// frame should make none.
+		static std::atomic<uint64_t> g_memoryAllocations{ 0 };
+		static std::atomic<uint64_t> g_memoryAllocationBytes{ 0 };
+		// By site (VkAllocationSite), for the same report.
+		enum VkAllocationSite : uint32_t { kAllocRootConstants, kAllocPreprocess, kAllocDescriptorHeap, kAllocBuffer, kAllocTexture, kAllocHeap, kAllocImport, kAllocSites };
+		static std::atomic<uint64_t> g_siteAllocations[kAllocSites]{};
+		static std::atomic<uint64_t> g_siteAllocationBytes[kAllocSites]{};
+		static void VkNoteAllocationSite(VkAllocationSite site, uint64_t bytes) noexcept {
+			g_siteAllocations[site].fetch_add(1, std::memory_order_relaxed);
+			g_siteAllocationBytes[site].fetch_add(bytes, std::memory_order_relaxed);
+		}
 		static VkResult VkAllocateDeviceMemory(VulkanDevice* impl, const VkMemoryAllocateInfo* info, VkDeviceMemory* memory) noexcept {
 			const VkResult result = vkAllocateMemory(impl->device, info, nullptr, memory);
+			if (result == VK_SUCCESS) {
+				g_memoryAllocations.fetch_add(1, std::memory_order_relaxed);
+				g_memoryAllocationBytes.fetch_add(info->allocationSize, std::memory_order_relaxed);
+			}
 			if (result == VK_SUCCESS && vkSetDeviceMemoryPriorityEXT
 				&& (impl->memoryProperties.memoryTypes[info->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
 				vkSetDeviceMemoryPriorityEXT(impl->device, *memory, 1.0f);
@@ -1751,6 +1806,7 @@ namespace rhi {
 			allocateInfo.pNext = &allocateFlagsInfo;
 
 			VkDeviceMemory memory = VK_NULL_HANDLE;
+			VkNoteAllocationSite(kAllocRootConstants, allocateInfo.allocationSize);
 			if (VkAllocateDeviceMemory(impl, &allocateInfo, &memory) != VK_SUCCESS) {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
 				return false;
@@ -4380,6 +4436,7 @@ namespace rhi {
 			allocateInfo.pNext = &allocateFlags;
 			allocateInfo.allocationSize = bufferRequirements.size;
 			allocateInfo.memoryTypeIndex = page.memoryTypeIndex;
+			VkNoteAllocationSite(kAllocPreprocess, allocateInfo.allocationSize);
 			result = VkAllocateDeviceMemory(impl, &allocateInfo, &page.memory);
 			if (result != VK_SUCCESS) {
 				vkDestroyBuffer(impl->device, page.buffer, nullptr);
@@ -6081,6 +6138,11 @@ namespace rhi {
 				}
 				if (census::Enabled() && commandListState->censusLabelled)
 					census::AddSubmitted(commandListState->censusLabel, commandListState->census);
+				if (census::Enabled() && commandListState->censusLabelled && impl->debugUtilsEnabled) {
+					auto& submitted = VkSubmittedLabelsState();
+					std::scoped_lock lock(submitted.mutex);
+					submitted.labels[reinterpret_cast<uint64_t>(commandListState->commandBuffer)] = commandListState->censusLabel;
+				}
 				// A command buffer runs only on a queue of the family its pool was made for (Device::CreateCommandAllocator(Queue)).
 				if (const VulkanCommandAllocator* allocatorState = VkAllocatorState(impl, commandListState->allocatorHandle);
 					allocatorState && allocatorState->familyIndex != queueState->familyIndex) {
@@ -6114,6 +6176,7 @@ namespace rhi {
 			waitSemaphores.reserve(submit.waits.size);
 			waitValues.reserve(submit.waits.size);
 			waitStages.resize(submit.waits.size, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+
 			signalSemaphores.reserve(submit.signals.size);
 			signalValues.reserve(submit.signals.size);
 
@@ -6513,6 +6576,7 @@ namespace rhi {
 			auto* impl = resource ? static_cast<VulkanDevice*>(resource->impl) : nullptr;
 			VulkanResource* resourceState = VkResourceState(impl, resource ? resource->GetHandle() : ResourceHandle{});
 			if (resourceState) {
+				VkKeepResourceName(*resourceState, name);
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(resourceState->image), VK_OBJECT_TYPE_IMAGE, name);
 			}
 		}
@@ -6662,6 +6726,8 @@ namespace rhi {
 			listState->tracyGpuZoneStack.pop_back();
 		}
 
+		static void VkBarrierProbeRelease(VulkanCommandList& list) noexcept;
+
 		static void cl_reset(CommandList* commandList, const CommandAllocator& allocator) noexcept {
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
@@ -6715,6 +6781,7 @@ namespace rhi {
 			commandListState->censusWorkSeen = false;
 			commandListState->censusWorkSinceBarrier = false;
 			commandListState->censusPreviousAttachments.clear();
+			VkBarrierProbeRelease(*commandListState);
 			// A secondary begins in BeginSecondary, which knows the pass it continues.
 			if (!commandListState->secondary && VkBeginCommandRecording(commandListState->commandBuffer) != Result::Ok) {
 				spdlog::error("Vulkan command list reset failed to begin recording");
@@ -7052,6 +7119,170 @@ namespace rhi {
 			commandListState->passActive = false;
 		}
 
+		// The barrier probe (diagnostics): with BASICRHI_BARRIER_PROBE=<label part> and the command census on, a barrier command in a
+		// list whose census label holds that text ("*" for every list) records each image barrier as a command of its own, with a
+		// bottom-of-pipe timestamp before the first and after each. At each present the results that changed are read, and every
+		// 300 presents the mean cost per image barrier (label, image, layouts) goes to BASICRHI_BARRIER_PROBE_FILE.
+		struct VkBarrierProbe {
+			struct Entry {
+				uint32_t first = 0, count = 0;  // queries
+				uint64_t lastBegin = 0;
+				std::vector<std::string> keys;  // per interval
+				bool live = false;
+			};
+			struct Row {
+				double totalUs = 0;
+				uint64_t samples = 0;
+			};
+			std::mutex mutex;
+			VkQueryPool pool = VK_NULL_HANDLE;
+			uint32_t capacity = 1u << 16;
+			uint32_t next = 0;
+			std::vector<std::pair<uint32_t, uint32_t>> freeRanges;  // first, count
+			std::vector<Entry> entries;
+			std::vector<uint32_t> freeEntries;
+			std::unordered_map<std::string, Row> rows;
+			uint32_t presents = 0;
+			bool exhaustedLogged = false;
+		};
+		static const std::string& VkBarrierProbeFilter() noexcept {
+			static const std::string filter = [] { const char* value = std::getenv("BASICRHI_BARRIER_PROBE"); return std::string(value ? value : ""); }();
+			return filter;
+		}
+		static VkBarrierProbe& VkBarrierProbeState() noexcept {
+			static VkBarrierProbe probe;
+			return probe;
+		}
+		static const char* VkProbeLayoutName(VkImageLayout layout) noexcept {
+			switch (layout) {
+			case VK_IMAGE_LAYOUT_UNDEFINED: return "UNDEFINED";
+			case VK_IMAGE_LAYOUT_GENERAL: return "GENERAL";
+			case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: return "COLOR_ATT";
+			case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: return "DS_ATT";
+			case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: return "DS_READ";
+			case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: return "SHADER_READ";
+			case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return "XFER_SRC";
+			case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return "XFER_DST";
+			case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: return "PRESENT";
+			case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL: return "D_ATT";
+			case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL: return "D_READ";
+			case VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL: return "READ_ONLY";
+			case VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL: return "ATTACHMENT";
+			default: return "other";
+			}
+		}
+		// Takes a query range and an entry for a probed barrier command; false when the pool is full.
+		static bool VkBarrierProbeAcquire(VulkanDevice* impl, VulkanCommandList& list, uint32_t count, std::vector<std::string>&& keys,
+			uint32_t& first) noexcept {
+			auto& probe = VkBarrierProbeState();
+			std::scoped_lock lock(probe.mutex);
+			try {
+				if (probe.pool == VK_NULL_HANDLE) {
+					VkQueryPoolCreateInfo info{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+					info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+					info.queryCount = probe.capacity;
+					if (vkCreateQueryPool(impl->device, &info, nullptr, &probe.pool) != VK_SUCCESS) return false;
+				}
+				bool found = false;
+				for (size_t i = 0; i < probe.freeRanges.size(); ++i) {
+					if (probe.freeRanges[i].second >= count) {
+						first = probe.freeRanges[i].first;
+						probe.freeRanges.erase(probe.freeRanges.begin() + static_cast<ptrdiff_t>(i));
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					if (probe.next + count > probe.capacity) {
+						if (!probe.exhaustedLogged) spdlog::warn("BasicRHI barrier probe: the query pool is full");
+						probe.exhaustedLogged = true;
+						return false;
+					}
+					first = probe.next;
+					probe.next += count;
+				}
+				uint32_t id;
+				if (!probe.freeEntries.empty()) {
+					id = probe.freeEntries.back();
+					probe.freeEntries.pop_back();
+				} else {
+					id = static_cast<uint32_t>(probe.entries.size());
+					probe.entries.emplace_back();
+				}
+				auto& entry = probe.entries[id];
+				entry.first = first;
+				entry.count = count;
+				entry.lastBegin = 0;
+				entry.keys = std::move(keys);
+				entry.live = true;
+				list.barrierProbeEntries.push_back(id);
+				return true;
+			} catch (...) {
+				return false;
+			}
+		}
+		static void VkBarrierProbeRelease(VulkanCommandList& list) noexcept {
+			if (list.barrierProbeEntries.empty()) return;
+			auto& probe = VkBarrierProbeState();
+			std::scoped_lock lock(probe.mutex);
+			try {
+				for (const auto id : list.barrierProbeEntries) {
+					auto& entry = probe.entries[id];
+					if (!entry.live) continue;
+					entry.live = false;
+					probe.freeRanges.emplace_back(entry.first, entry.count);
+					probe.freeEntries.push_back(id);
+				}
+			} catch (...) {
+			}
+			list.barrierProbeEntries.clear();
+		}
+		// At a present: reads the entries whose first timestamp changed, and writes the table every 300 presents.
+		static void VkBarrierProbePoll(VulkanDevice* impl) noexcept {
+			if (VkBarrierProbeFilter().empty()) return;
+			auto& probe = VkBarrierProbeState();
+			std::scoped_lock lock(probe.mutex);
+			if (probe.pool == VK_NULL_HANDLE) return;
+			try {
+				const double nsPerTick = static_cast<double>(impl->physicalDeviceProperties.limits.timestampPeriod);
+				std::vector<uint64_t> data;
+				for (auto& entry : probe.entries) {
+					if (!entry.live) continue;
+					data.assign(size_t{ entry.count } * 2, 0);
+					const VkResult result = vkGetQueryPoolResults(impl->device, probe.pool, entry.first, entry.count, data.size() * sizeof(uint64_t),
+						data.data(), 2 * sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+					if (result != VK_SUCCESS && result != VK_NOT_READY) continue;
+					bool ready = true;
+					for (uint32_t i = 0; i < entry.count; ++i) ready = ready && data[size_t{ i } * 2 + 1] != 0;
+					if (!ready || data[0] == entry.lastBegin) continue;
+					entry.lastBegin = data[0];
+					for (uint32_t i = 1; i < entry.count && i - 1 < entry.keys.size(); ++i) {
+						const uint64_t a = data[size_t{ i - 1 } * 2], b = data[size_t{ i } * 2];
+						if (b < a) continue;
+						auto& row = probe.rows[entry.keys[i - 1]];
+						row.totalUs += static_cast<double>(b - a) * nsPerTick / 1000.0;
+						++row.samples;
+					}
+				}
+				if (++probe.presents < 300) return;
+				static const std::string path = [] { const char* value = std::getenv("BASICRHI_BARRIER_PROBE_FILE"); return std::string(value ? value : ""); }();
+				if (!path.empty()) {
+					if (FILE* file = std::fopen(path.c_str(), "a")) {
+						std::vector<std::pair<std::string, VkBarrierProbe::Row>> sorted(probe.rows.begin(), probe.rows.end());
+						std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.totalUs > b.second.totalUs; });
+						std::fprintf(file, "# barrier probe: %u presents, %zu rows (us a frame, mean us a sample, samples a frame, key)\n", probe.presents, sorted.size());
+						for (const auto& [key, row] : sorted)
+							std::fprintf(file, "%9.2f %9.2f %7.2f  %s\n", row.totalUs / probe.presents, row.totalUs / static_cast<double>(row.samples),
+								static_cast<double>(row.samples) / probe.presents, key.c_str());
+						std::fclose(file);
+					}
+				}
+				probe.rows.clear();
+				probe.presents = 0;
+			} catch (...) {
+			}
+		}
+
 		static void cl_barrier(CommandList* commandList, const BarrierBatch& barriers) noexcept {
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
@@ -7141,6 +7372,16 @@ namespace rhi {
 				commandListState->recordingBufferStates.push_back(VulkanCommandList::RecordingBufferState{ buffer, access, sync });
 			};
 
+			// The barrier probe: this list's image barriers are recorded one by one between timestamps.
+			thread_local std::vector<std::string> probeKeys;
+			probeKeys.clear();
+			const bool probing = [&] {
+				const auto& filter = VkBarrierProbeFilter();
+				if (filter.empty() || barriers.textures.size == 0 || !VkCensus(*commandListState)) return false;
+				if (filter != "*" && commandListState->censusLabel.find(filter) == std::string::npos) return false;
+				const VulkanQueueState* queue = VkPrimaryQueueStateForKind(impl, commandListState->kind);
+				return queue && queue->familyIndex < impl->queueFamilyProperties.size() && impl->queueFamilyProperties[queue->familyIndex].timestampValidBits != 0;
+			}();
 			for (const TextureBarrier& barrier : barriers.textures) {
 				VulkanResource* resource = VkResourceState(impl, barrier.texture);
 				if (!resource || resource->image == VK_NULL_HANDLE) {
@@ -7187,6 +7428,14 @@ namespace rhi {
 				vkBarrier.image = resource->image;
 				vkBarrier.subresourceRange = VkMakeImageSubresourceRange(*resource, barrier.range, aspect);
 				imageBarriers.push_back(vkBarrier);
+				if (probing) {
+					char key[256];
+					std::snprintf(key, sizeof(key), "%s | %s | %s->%s | mips %u+%u layers %u+%u%s", commandListState->censusLabel.c_str(),
+						resource->name[0] ? resource->name.data() : "(unnamed)", VkProbeLayoutName(vkBarrier.oldLayout), VkProbeLayoutName(vkBarrier.newLayout),
+						vkBarrier.subresourceRange.baseMipLevel, vkBarrier.subresourceRange.levelCount, vkBarrier.subresourceRange.baseArrayLayer,
+						vkBarrier.subresourceRange.layerCount, barrier.discard ? " discard" : "");
+					probeKeys.emplace_back(key);
+				}
 				if (census::Counts* counts = VkCensus(*commandListState)) {
 					++counts->imageBarriers;
 					counts->imageLayoutChanges += vkBarrier.oldLayout != vkBarrier.newLayout;
@@ -7312,7 +7561,33 @@ namespace rhi {
 					counts->memoryBarriers += memoryBarriers.size();
 					commandListState->censusBarrierSincePass = true;
 				}
-				vkCmdPipelineBarrier(commandListState->commandBuffer,
+				uint32_t probeFirst = 0;
+				if (probing && probeKeys.size() == imageBarriers.size() && !imageBarriers.empty()) {
+					// Intervals: buffers and memory (and the drain of the work before), then each image barrier.
+					std::vector<std::string> keys;
+					keys.reserve(probeKeys.size() + 1);
+					keys.push_back(commandListState->censusLabel + " | (buffers, memory and the drain before)");
+					keys.insert(keys.end(), probeKeys.begin(), probeKeys.end());
+					const uint32_t count = static_cast<uint32_t>(imageBarriers.size()) + 2;
+					if (VkBarrierProbeAcquire(impl, *commandListState, count, std::move(keys), probeFirst)) {
+						VkQueryPool pool = VkBarrierProbeState().pool;
+						VkCommandBuffer cb = commandListState->commandBuffer;
+						vkCmdResetQueryPool(cb, pool, probeFirst, count);
+						vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, probeFirst);
+						vkCmdPipelineBarrier(cb, srcStages, dstStages, 0,
+							static_cast<uint32_t>(memoryBarriers.size()), memoryBarriers.empty() ? nullptr : memoryBarriers.data(),
+							static_cast<uint32_t>(bufferBarriers.size()), bufferBarriers.empty() ? nullptr : bufferBarriers.data(), 0, nullptr);
+						vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, probeFirst + 1);
+						for (uint32_t i = 0; i < imageBarriers.size(); ++i) {
+							vkCmdPipelineBarrier(cb, srcStages, dstStages, 0, 0, nullptr, 0, nullptr, 1, &imageBarriers[i]);
+							vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, probeFirst + 2 + i);
+						}
+						memoryBarriers.clear();
+						bufferBarriers.clear();
+						imageBarriers.clear();
+					}
+				}
+				if (!imageBarriers.empty() || !bufferBarriers.empty() || !memoryBarriers.empty()) vkCmdPipelineBarrier(commandListState->commandBuffer,
 					srcStages,
 					dstStages,
 					0,
@@ -9326,6 +9601,25 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
+			VkBarrierProbePoll(impl);
+			{
+				static uint32_t presentsSinceReport = 0;
+				if (++presentsSinceReport >= 300) {
+					presentsSinceReport = 0;
+					const uint64_t count = g_memoryAllocations.exchange(0, std::memory_order_relaxed);
+					const uint64_t bytes = g_memoryAllocationBytes.exchange(0, std::memory_order_relaxed);
+					if (count) {
+						static const char* const names[kAllocSites] = { "root-constant pages", "preprocess pages", "descriptor heaps", "buffers", "textures", "heaps", "imports" };
+						std::string sitesText;
+						for (uint32_t site = 0; site < kAllocSites; ++site) {
+							const uint64_t n = g_siteAllocations[site].exchange(0, std::memory_order_relaxed);
+							const uint64_t b = g_siteAllocationBytes[site].exchange(0, std::memory_order_relaxed);
+							if (n) sitesText += std::format("; {} {} ({:.1f} MiB)", names[site], n, b / 1048576.0);
+						}
+						spdlog::info("BasicRHI Vulkan: {} memory allocations ({:.1f} MiB) in the last 300 presents{}", count, bytes / 1048576.0, sitesText);
+					}
+				}
+			}
 			const VkPresentModeKHR presentMode = VkPresentModeForVsync(*swapchainState, vsync);
 			const bool switchInPresent = presentMode != swapchainState->presentMode &&
 				VkHasPresentMode(swapchainState->switchablePresentModes, presentMode);
@@ -10810,6 +11104,7 @@ namespace rhi {
 				return;
 			}
 
+			VkBarrierProbeRelease(*commandListState);
 			if (commandListState->commandBuffer != VK_NULL_HANDLE && !commandListState->adopted) {
 				if (VulkanCommandAllocator* allocatorState = VkAllocatorState(impl, commandListState->allocatorHandle);
 					allocatorState && allocatorState->pool != VK_NULL_HANDLE && impl->device != VK_NULL_HANDLE) {
@@ -12007,6 +12302,7 @@ namespace rhi {
 			allocateInfo.pNext = &allocateFlagsInfo;
 			allocateInfo.allocationSize = memoryRequirements.size;
 			allocateInfo.memoryTypeIndex = memoryTypeIndex;
+			VkNoteAllocationSite(kAllocDescriptorHeap, allocateInfo.allocationSize);
 			VkResult result = VkAllocateDeviceMemory(impl, &allocateInfo, &heap.memory);
 			if (result == VK_SUCCESS) {
 				result = VkBindBufferMemorySynchronized(impl, heap.buffer, heap.memory, 0);
@@ -12129,6 +12425,7 @@ namespace rhi {
 				allocateInfo.allocationSize = memoryRequirements.size;
 				allocateInfo.memoryTypeIndex = memoryTypeIndex;
 
+				VkNoteAllocationSite(kAllocDescriptorHeap, allocateInfo.allocationSize);
 				const VkResult allocateResult = VkAllocateDeviceMemory(impl, &allocateInfo, &heap.memory);
 				if (allocateResult != VK_SUCCESS) {
 					vkDestroyBuffer(impl->device, heap.buffer, nullptr);
@@ -13038,6 +13335,7 @@ namespace rhi {
 			}
 
 			VkDeviceMemory memory = VK_NULL_HANDLE;
+			VkNoteAllocationSite(kAllocBuffer, allocateInfo.allocationSize);
 			result = VkAllocateDeviceMemory(impl, &allocateInfo, &memory);
 			if (result != VK_SUCCESS) {
 				vkDestroyBuffer(impl->device, buffer, nullptr);
@@ -13155,6 +13453,7 @@ namespace rhi {
 			allocateInfo.memoryTypeIndex = memoryTypeIndex;
 
 			VkDeviceMemory memory = VK_NULL_HANDLE;
+			VkNoteAllocationSite(kAllocTexture, allocateInfo.allocationSize);
 			result = VkAllocateDeviceMemory(impl, &allocateInfo, &memory);
 			if (result != VK_SUCCESS) {
 				vkDestroyImage(impl->device, image, nullptr);
@@ -13186,6 +13485,8 @@ namespace rhi {
 			resourceState.imageUsage = createInfo.usage;
 			resourceState.ownsImage = true;
 			resourceState.ownsMemory = true;
+			VkKeepResourceName(resourceState, desc.debugName);
+			if (desc.debugName) VkSetObjectName(impl, reinterpret_cast<uint64_t>(resourceState.image), VK_OBJECT_TYPE_IMAGE, desc.debugName);
 
 			const ResourceHandle handle = impl->resources.alloc(resourceState);
 			Resource texture{ handle, true };
@@ -13302,6 +13603,7 @@ namespace rhi {
 				allocateInfo.pNext = &allocateFlagsInfo;
 			}
 			VkDeviceMemory memory = VK_NULL_HANDLE;
+			VkNoteAllocationSite(kAllocHeap, allocateInfo.allocationSize);
 			const VkResult result = VkAllocateDeviceMemory(impl, &allocateInfo, &memory);
 			if (result != VK_SUCCESS) {
 				out.Reset();
@@ -13344,6 +13646,7 @@ namespace rhi {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			VulkanResource* resource = VkResourceState(impl, handle);
 			if (resource) {
+				VkKeepResourceName(*resource, name);
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(resource->image), VK_OBJECT_TYPE_IMAGE, name);
 			}
 		}
@@ -13485,6 +13788,8 @@ namespace rhi {
 			resourceState.imageUsage = createInfo.usage;
 			resourceState.ownsImage = true;
 			resourceState.ownsMemory = false;
+			VkKeepResourceName(resourceState, desc.debugName);
+			if (desc.debugName) VkSetObjectName(impl, reinterpret_cast<uint64_t>(resourceState.image), VK_OBJECT_TYPE_IMAGE, desc.debugName);
 
 			const ResourceHandle handle = impl->resources.alloc(resourceState);
 			Resource texture{ handle, true };
@@ -17288,6 +17593,7 @@ namespace rhi {
 			allocateInfo.allocationSize = requirements.size;
 			allocateInfo.memoryTypeIndex = memoryTypeIndex;
 			VkDeviceMemory memory = VK_NULL_HANDLE;
+			VkNoteAllocationSite(kAllocImport, allocateInfo.allocationSize);
 			vkResult = VkAllocateDeviceMemory(impl, &allocateInfo, &memory);
 			if (vkResult != VK_SUCCESS) {
 				vkDestroyBuffer(impl->device, buffer, nullptr);

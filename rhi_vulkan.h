@@ -511,6 +511,8 @@ namespace rhi {
 		bool censusWorkSinceBarrier = false;  // ...since its last barrier command
 		std::vector<ResourceHandle> censusPreviousAttachments;
 		std::vector<ResourceHandle> censusAttachments;
+		// The barrier probe's entries this recording holds (BASICRHI_BARRIER_PROBE), released when it resets.
+		std::vector<uint32_t> barrierProbeEntries;
 
 		VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 		CommandAllocatorHandle allocatorHandle{};
