@@ -2934,6 +2934,13 @@ namespace rhi {
 			return &commandListState.census;
 		}
 
+		// rhi::census: the list recorded work (a pass, a dispatch, a copy or a clear), for the barrier adjacency counts.
+		static void VkCensusWork(VulkanCommandList& commandListState) noexcept {
+			if (!census::Enabled()) return;
+			commandListState.censusWorkSeen = true;
+			commandListState.censusWorkSinceBarrier = true;
+		}
+
 		static VulkanCommandList* VkCommandListState(CommandList* commandList) noexcept {
 			if (commandList && commandList->backendState) {
 				return static_cast<VulkanCommandList*>(commandList->backendState);
@@ -4728,6 +4735,84 @@ namespace rhi {
 			}
 		}
 
+		// The submission trace's clock (rhi::submittrace): QueryPerformanceCounter ticks.
+		static int64_t VkTraceNow() noexcept {
+			LARGE_INTEGER now{};
+			QueryPerformanceCounter(&now);
+			return now.QuadPart;
+		}
+
+		// While the submission trace is on: a sample of the GPU clock against the CPU clock, at most every 50 ms. Needs
+		// VK_EXT_calibrated_timestamps with the QueryPerformanceCounter domain; without it there are no samples.
+		static void VkTraceCalibrate(VulkanDevice* impl) noexcept {
+			static std::atomic<int64_t> last{ 0 };
+			static std::atomic<bool> unsupported{ false };
+			if (unsupported.load(std::memory_order_relaxed) || !vkGetCalibratedTimestampsEXT) return;
+			LARGE_INTEGER frequency{};
+			QueryPerformanceFrequency(&frequency);
+			const int64_t now = VkTraceNow();
+			int64_t previous = last.load(std::memory_order_relaxed);
+			if (now - previous < frequency.QuadPart / 20 || !last.compare_exchange_strong(previous, now)) return;
+			const VkCalibratedTimestampInfoEXT infos[2] = {
+				{ VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr, VK_TIME_DOMAIN_DEVICE_EXT },
+				{ VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr, VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT },
+			};
+			uint64_t stamps[2] = {};
+			uint64_t deviation = 0;
+			if (vkGetCalibratedTimestampsEXT(impl->device, 2, infos, stamps, &deviation) != VK_SUCCESS) {
+				unsupported.store(true, std::memory_order_relaxed);
+				return;
+			}
+			submittrace::AddCalibration({ stamps[0], static_cast<int64_t>(stamps[1]), deviation });
+		}
+
+		// Diagnostics for the cost of a queue submission and of a command buffer boundary on the GPU (environment, read once):
+		// - BASICRHI_PAD_LISTS=<n>: n empty command buffers after each list of every submission;
+		// - BASICRHI_SPLIT_SUBMITS=1: every list of a submission in a vkQueueSubmit of its own (the first waits, the last signals).
+		// - BASICRHI_HEAP_BIND_REPEAT=<n>: each descriptor heap bind is recorded n more times.
+		struct VkSubmitDiagnostics {
+			uint32_t padLists = 0;
+			bool splitSubmits = false;
+			uint32_t heapBindRepeat = 0;
+		};
+		static const VkSubmitDiagnostics& VkReadSubmitDiagnostics() noexcept {
+			static const VkSubmitDiagnostics diagnostics = [] {
+				VkSubmitDiagnostics read{};
+				char value[16] = {};
+				if (GetEnvironmentVariableA("BASICRHI_PAD_LISTS", value, sizeof(value)) && value[0]) read.padLists = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+				value[0] = 0;
+				if (GetEnvironmentVariableA("BASICRHI_SPLIT_SUBMITS", value, sizeof(value)) && value[0] == '1') read.splitSubmits = true;
+				value[0] = 0;
+				if (GetEnvironmentVariableA("BASICRHI_HEAP_BIND_REPEAT", value, sizeof(value)) && value[0]) read.heapBindRepeat = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+				return read;
+			}();
+			return diagnostics;
+		}
+
+		// An empty command buffer for BASICRHI_PAD_LISTS, one per queue family, made at its first use. It may be pending many times.
+		// Under timelinesMutex.
+		static VkCommandBuffer VkEmptyCommandBuffer(VulkanDevice* impl, uint32_t family) noexcept {
+			static std::unordered_map<uint32_t, VkCommandBuffer> made;
+			if (const auto found = made.find(family); found != made.end()) return found->second;
+			VkCommandPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+			poolInfo.queueFamilyIndex = family;
+			VkCommandPool pool = VK_NULL_HANDLE;
+			VkCommandBuffer buffer = VK_NULL_HANDLE;
+			if (vkCreateCommandPool(impl->device, &poolInfo, nullptr, &pool) == VK_SUCCESS) {
+				VkCommandBufferAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+				allocateInfo.commandPool = pool;
+				allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+				allocateInfo.commandBufferCount = 1;
+				if (vkAllocateCommandBuffers(impl->device, &allocateInfo, &buffer) == VK_SUCCESS) {
+					VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+					beginInfo.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+					if (vkBeginCommandBuffer(buffer, &beginInfo) != VK_SUCCESS || vkEndCommandBuffer(buffer) != VK_SUCCESS) buffer = VK_NULL_HANDLE;
+				}
+			}
+			made[family] = buffer;
+			return buffer;
+		}
+
 		// Holds the queue hooks' lock. The hooks are read once, so the unlock always matches the lock even when
 		// ShareVulkanDevice publishes new hooks in between.
 		struct VkQueueAccessGuard {
@@ -4964,7 +5049,19 @@ namespace rhi {
 				}
 				{
 					const VkQueueAccessGuard queueAccess(impl, queueState->queue);
+					const int64_t tracedBegin = submittrace::Enabled() ? VkTraceNow() : 0;
 					submitResult = vkQueueSubmit(queueState->queue, 1, &acquireSubmit, swapchain.acquireFences[slot]);
+					if (tracedBegin && submitResult == VK_SUCCESS) {
+						submittrace::Record record;
+						record.cpuBegin = tracedBegin;
+						record.cpuEnd = VkTraceNow();
+						record.queueKind = queueState->queueIndex;
+						record.queueFamily = queueState->familyIndex;
+						record.thread = static_cast<uint32_t>(GetCurrentThreadId());
+						record.kind = submittrace::Kind::Acquire;
+						if (acquireTimeline) record.signals.push_back({ swapchain.acquireTimeline.index, acquireSignalValue });
+						submittrace::Add(std::move(record));
+					}
 				}
 				if (submitResult == VK_SUCCESS && acquireTimeline) {
 					swapchain.acquireValue = acquireSignalValue;
@@ -6074,6 +6171,8 @@ namespace rhi {
 			submitInfo.pSignalSemaphores = signalSemaphores.empty() ? nullptr : signalSemaphores.data();
 
 			Result submitResult = Result::Ok;
+			const bool traced = submittrace::Enabled();
+			const int64_t tracedBegin = traced ? VkTraceNow() : 0;
 			const VulkanDevice::SubmissionHooks* hooks = impl->submissionHooks.load(std::memory_order_acquire);
 			if (hooks && hooks->submit) {
 				// The adopting host orders the batch within its own queue stream.
@@ -6105,7 +6204,63 @@ namespace rhi {
 			else {
 				ZoneScopedN("RHI.Vulkan.QueueSubmit");
 				const VkQueueAccessGuard queueAccess(impl, queueState->queue);
-				submitResult = ToRHI(VkCheckDeviceLost(impl, vkQueueSubmit(queueState->queue, 1, &submitInfo, VK_NULL_HANDLE), "Queue::Submit"));
+				const VkSubmitDiagnostics& diagnostics = VkReadSubmitDiagnostics();
+				const VkCommandBuffer empty = diagnostics.padLists ? VkEmptyCommandBuffer(impl, queueState->familyIndex) : VK_NULL_HANDLE;
+				if (empty != VK_NULL_HANDLE && !commandBuffers.empty()) {
+					std::vector<VkCommandBuffer> padded;
+					padded.reserve(commandBuffers.size() * (1 + diagnostics.padLists));
+					for (const VkCommandBuffer buffer : commandBuffers) {
+						padded.push_back(buffer);
+						padded.insert(padded.end(), diagnostics.padLists, empty);
+					}
+					commandBuffers = std::move(padded);
+					submitInfo.commandBufferCount = static_cast<uint32_t>(commandBuffers.size());
+					submitInfo.pCommandBuffers = commandBuffers.data();
+				}
+				if (diagnostics.splitSubmits && commandBuffers.size() > 1) {
+					// The first part waits, the last part signals, and queue order keeps the rest in order between them.
+					VkResult result = VK_SUCCESS;
+					for (size_t index = 0; index < commandBuffers.size() && result == VK_SUCCESS; ++index) {
+						VkSubmitInfo part = submitInfo;
+						VkTimelineSemaphoreSubmitInfo partTimeline = timelineInfo;
+						part.pNext = submitInfo.pNext ? &partTimeline : nullptr;
+						part.commandBufferCount = 1;
+						part.pCommandBuffers = &commandBuffers[index];
+						if (index != 0) {
+							part.waitSemaphoreCount = 0;
+							partTimeline.waitSemaphoreValueCount = 0;
+						}
+						if (index + 1 != commandBuffers.size()) {
+							part.signalSemaphoreCount = 0;
+							partTimeline.signalSemaphoreValueCount = 0;
+						}
+						result = vkQueueSubmit(queueState->queue, 1, &part, VK_NULL_HANDLE);
+					}
+					submitResult = ToRHI(VkCheckDeviceLost(impl, result, "Queue::Submit"));
+				} else {
+					submitResult = ToRHI(VkCheckDeviceLost(impl, vkQueueSubmit(queueState->queue, 1, &submitInfo, VK_NULL_HANDLE), "Queue::Submit"));
+				}
+			}
+			if (traced && submitResult == Result::Ok) {
+				submittrace::Record record;
+				record.cpuBegin = tracedBegin;
+				record.cpuEnd = VkTraceNow();
+				record.queueKind = queueState->queueIndex;
+				record.queueFamily = queueState->familyIndex;
+				record.thread = static_cast<uint32_t>(GetCurrentThreadId());
+				record.lists.reserve(lists.size);
+				for (uint32_t index = 0; index < lists.size; ++index) {
+					record.lists.push_back(lists.data[index].GetHandle().index | (uint64_t{lists.data[index].GetHandle().generation} << 32));
+					if (census::Enabled()) {
+						const VulkanCommandList* commandListState = VkCommandListState(impl, lists.data[index].GetHandle());
+						record.labels.push_back(commandListState && commandListState->censusLabelled ? commandListState->censusLabel : std::string());
+						record.counts.push_back(commandListState ? commandListState->census : census::Counts{});
+					}
+				}
+				for (const TimelinePoint& wait : submit.waits) record.waits.push_back({ wait.t.index, wait.value });
+				for (const TimelinePoint& signal : submit.signals) record.signals.push_back({ signal.t.index, signal.value });
+				submittrace::Add(std::move(record));
+				VkTraceCalibrate(impl);
 			}
 			if (submitResult == Result::Ok) {
 				for (uint32_t index = 0; index < lists.size; ++index) {
@@ -6557,6 +6712,8 @@ namespace rhi {
 			commandListState->censusLabel.clear();
 			commandListState->censusLabelled = false;
 			commandListState->censusBarrierSincePass = false;
+			commandListState->censusWorkSeen = false;
+			commandListState->censusWorkSinceBarrier = false;
 			commandListState->censusPreviousAttachments.clear();
 			// A secondary begins in BeginSecondary, which knows the pass it continues.
 			if (!commandListState->secondary && VkBeginCommandRecording(commandListState->commandBuffer) != Result::Ok) {
@@ -6823,6 +6980,7 @@ namespace rhi {
 			}
 
 			if (census::Counts* counts = VkCensus(*commandListState)) {
+				VkCensusWork(*commandListState);
 				++counts->passBegins;
 				auto& attachments = commandListState->censusAttachments;
 				attachments.clear();
@@ -7147,6 +7305,9 @@ namespace rhi {
 				for (auto& barrier : imageBarriers) clip(barrier);
 				if (census::Counts* counts = VkCensus(*commandListState)) {
 					++counts->barrierCalls;
+					if (!commandListState->censusWorkSeen) ++counts->leadingBarrierCalls;
+					else if (!commandListState->censusWorkSinceBarrier) ++counts->adjacentBarrierCalls;
+					commandListState->censusWorkSinceBarrier = false;
 					counts->bufferBarriers += bufferBarriers.size();
 					counts->memoryBarriers += memoryBarriers.size();
 					commandListState->censusBarrierSincePass = true;
@@ -7520,7 +7681,10 @@ namespace rhi {
 			if (!pipelineState || pipelineState->bindPoint != VK_PIPELINE_BIND_POINT_COMPUTE || pipelineState->pipeline == VK_NULL_HANDLE) {
 				return;
 			}
-			if (census::Counts* counts = VkCensus(*commandListState)) ++counts->dispatches;
+			if (census::Counts* counts = VkCensus(*commandListState)) {
+				++counts->dispatches;
+				VkCensusWork(*commandListState);
+			}
 
 			if (impl->detailedCheckpoints) {
 				char marker[160]{};
@@ -8251,6 +8415,10 @@ namespace rhi {
 			ZoneScopedN("RHI.Vulkan.ExecuteIndirect");
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (commandListState && census::Enabled()) {
+				VkCensus(*commandListState);
+				VkCensusWork(*commandListState);
+			}
 			VulkanCommandSignature* signatureState = VkCommandSignatureState(impl, signature);
 			VulkanResource* argumentResource = VkResourceState(impl, argumentBuffer);
 			VulkanResource* countResource = VkResourceState(impl, countBuffer);
@@ -8492,7 +8660,8 @@ namespace rhi {
 					bindInfo.heapRange.size = heap->descriptorBytes + heap->reservedRangeSize;
 					bindInfo.reservedRangeOffset = heap->reservedRangeOffset;
 					bindInfo.reservedRangeSize = heap->reservedRangeSize;
-					vkCmdBindResourceHeapEXT(commandListState->commandBuffer, &bindInfo);
+					for (uint32_t repeat = 0; repeat <= VkReadSubmitDiagnostics().heapBindRepeat; ++repeat)
+						vkCmdBindResourceHeapEXT(commandListState->commandBuffer, &bindInfo);
 				}
 			}
 			else {
@@ -8514,7 +8683,8 @@ namespace rhi {
 						bindInfo.heapRange.size = heap->descriptorBytes + heap->reservedRangeSize;
 						bindInfo.reservedRangeOffset = heap->reservedRangeOffset;
 						bindInfo.reservedRangeSize = heap->reservedRangeSize;
-						vkCmdBindSamplerHeapEXT(commandListState->commandBuffer, &bindInfo);
+						for (uint32_t repeat = 0; repeat <= VkReadSubmitDiagnostics().heapBindRepeat; ++repeat)
+							vkCmdBindSamplerHeapEXT(commandListState->commandBuffer, &bindInfo);
 					}
 				}
 				else {
@@ -8529,6 +8699,10 @@ namespace rhi {
 		static void cl_clearUavUint(CommandList* commandList, const UavClearInfo& clearInfo, const UavClearUint& value) noexcept {
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (commandListState && census::Enabled()) {
+				VkCensus(*commandListState);
+				VkCensusWork(*commandListState);
+			}
 			VulkanResource* resource = VkResourceState(impl, clearInfo.resource.GetHandle());
 			if (!commandListState || !resource) {
 				return;
@@ -8556,6 +8730,10 @@ namespace rhi {
 		static void cl_clearUavFloat(CommandList* commandList, const UavClearInfo& clearInfo, const UavClearFloat& value) noexcept {
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (commandListState && census::Enabled()) {
+				VkCensus(*commandListState);
+				VkCensusWork(*commandListState);
+			}
 			VulkanResource* resource = VkResourceState(impl, clearInfo.resource.GetHandle());
 			if (!commandListState || !resource) {
 				return;
@@ -8610,6 +8788,11 @@ namespace rhi {
 		static void cl_copyTextureRegion(CommandList* commandList, const TextureCopyRegion& dst, const TextureCopyRegion& src) noexcept {
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (commandListState && census::Enabled()) {
+				VkCensus(*commandListState);
+				++commandListState->census.copies;
+				VkCensusWork(*commandListState);
+			}
 			if (commandListState && VkRejectInSecondary(*commandListState, "a copy")) {
 				return;
 			}
@@ -8639,6 +8822,11 @@ namespace rhi {
 		static void cl_copyBufferRegion(CommandList* commandList, ResourceHandle dst, uint64_t dstOffset, ResourceHandle src, uint64_t srcOffset, uint64_t numBytes) noexcept {
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
+			if (commandListState && census::Enabled()) {
+				VkCensus(*commandListState);
+				++commandListState->census.copies;
+				VkCensusWork(*commandListState);
+			}
 			if (commandListState && VkRejectInSecondary(*commandListState, "a copy")) {
 				return;
 			}
@@ -9197,7 +9385,19 @@ namespace rhi {
 				VkResult relayResult;
 				{
 					ZoneScopedN("RHI.Vulkan.PresentRelaySubmit");
+					const int64_t tracedBegin = submittrace::Enabled() ? VkTraceNow() : 0;
 					relayResult = vkQueueSubmit(signalQueueState->queue, 1, &relayInfo, VK_NULL_HANDLE);
+					if (tracedBegin && relayResult == VK_SUCCESS) {
+						submittrace::Record record;
+						record.cpuBegin = tracedBegin;
+						record.cpuEnd = VkTraceNow();
+						record.queueKind = signalQueueState->queueIndex;
+						record.queueFamily = signalQueueState->familyIndex;
+						record.thread = static_cast<uint32_t>(GetCurrentThreadId());
+						record.kind = submittrace::Kind::PresentRelay;
+						if (waitTimeline) record.waits.push_back({ sync->wait.t.index, waitValue });
+						submittrace::Add(std::move(record));
+					}
 				}
 				if (relayResult != VK_SUCCESS) {
 					return ToRHI(relayResult);
@@ -9232,7 +9432,18 @@ namespace rhi {
 				// Present on the queue that relayed the graph's timeline into the binary present semaphore. Presenting through
 				// a different logical wrapper for the same family hides the chain from synchronization validation, and is unsafe
 				// when the implementation returned distinct native queues for those wrappers.
+				const int64_t tracedPresent = submittrace::Enabled() ? VkTraceNow() : 0;
 				presentResult = VkQueuePresentKHRHooked(signalQueueState->queue, &presentInfo);
+				if (tracedPresent) {
+					submittrace::Record record;
+					record.cpuBegin = tracedPresent;
+					record.cpuEnd = VkTraceNow();
+					record.queueKind = signalQueueState->queueIndex;
+					record.queueFamily = signalQueueState->familyIndex;
+					record.thread = static_cast<uint32_t>(GetCurrentThreadId());
+					record.kind = submittrace::Kind::Present;
+					submittrace::Add(std::move(record));
+				}
 				if (presentResult == VK_SUCCESS || presentResult == VK_SUBOPTIMAL_KHR) {
 					swapchainState->presentCount = presentId;
 					swapchainState->presentQueue = waitOnGraph ? sync->queue.GetQueueHandle() : VkPrimaryQueueHandleForKind(impl, QueueKind::Graphics);
@@ -13038,6 +13249,7 @@ namespace rhi {
 			if (debugName) {
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(semaphore), VK_OBJECT_TYPE_SEMAPHORE, debugName);
 			}
+			submittrace::NameTimeline(handle.index, debugName);
 			return Result::Ok;
 		}
 
@@ -15550,7 +15762,8 @@ namespace rhi {
 		if (hasMeshShaderExtension) {
 			enabledDeviceExtensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
 		}
-		if (BASICRHI_ENABLE_TRACY_GPU_PROFILING && hasCalibratedTimestampsExtension) {
+		// Calibrated timestamps serve Tracy's GPU zones and the submission trace (rhi::submittrace).
+		if (hasCalibratedTimestampsExtension) {
 			enabledDeviceExtensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
 		}
 		if (hasComputeShaderDerivativesExtension) {

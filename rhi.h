@@ -4286,6 +4286,8 @@ namespace rhi {
 			uint64_t imageOntoPreviousPass = 0;   // on an attachment of the list's previous render pass
 			uint64_t bufferBarriers = 0, memoryBarriers = 0;
 			uint64_t draws = 0, dispatches = 0, copies = 0;
+			uint64_t leadingBarrierCalls = 0;     // barrier commands before the list's first pass, dispatch, copy or clear
+			uint64_t adjacentBarrierCalls = 0;    // barrier commands right after another one, with no work between
 
 			void Add(const Counts& o) noexcept {
 				uint64_t* a = &lists;
@@ -4327,6 +4329,90 @@ namespace rhi {
 			auto& totals = GlobalTotals();
 			std::scoped_lock lock(totals.mutex);
 			return std::exchange(totals.rows, {});
+		}
+	}
+
+	/**
+	 * @brief A diagnostic trace of every queue submission (Vulkan backend). Off by default; while off a submission pays one atomic
+	 * load. Each record holds the CPU time around the driver call (QueryPerformanceCounter ticks), the queue, the command lists by
+	 * handle, and the timeline waits and signals. While on, the backend also samples the GPU clock against the CPU clock now and
+	 * then (VK_EXT_calibrated_timestamps), so a reader can place GPU timestamps on the CPU clock.
+	 */
+	namespace submittrace {
+		enum class Kind : uint8_t { Submit, PresentRelay, Present, Acquire };
+		struct Point {
+			uint32_t timeline = 0;  // the timeline handle's index
+			uint64_t value = 0;
+		};
+		struct Record {
+			int64_t cpuBegin = 0, cpuEnd = 0;  // QueryPerformanceCounter ticks before and after the driver call
+			uint32_t queueKind = 0;            // QueueKind
+			uint32_t queueFamily = 0;
+			uint32_t thread = 0;               // the submitting thread's id
+			Kind kind = Kind::Submit;
+			std::vector<uint64_t> lists;       // CommandList handles, in submission order
+			// With the command census on (rhi::census) as well: each list's census label and counts, in the order of lists.
+			std::vector<std::string> labels;
+			std::vector<census::Counts> counts;
+			std::vector<Point> waits, signals;
+		};
+		struct Calibration {
+			uint64_t gpu = 0;        // the device's timestamp, in its ticks
+			int64_t cpu = 0;         // QueryPerformanceCounter ticks at the same moment
+			uint64_t deviation = 0;  // the driver's maximum deviation, in nanoseconds
+		};
+		inline std::atomic<bool>& EnabledFlag() noexcept {
+			static std::atomic<bool> enabled{ false };
+			return enabled;
+		}
+		inline bool Enabled() noexcept { return EnabledFlag().load(std::memory_order_relaxed); }
+		inline void Enable(bool on) noexcept { EnabledFlag().store(on, std::memory_order_relaxed); }
+		struct Log {
+			std::mutex mutex;
+			std::vector<Record> records;
+			std::vector<Calibration> calibrations;
+			std::unordered_map<uint32_t, std::string> timelineNames;  // by handle index, as the timelines were made
+		};
+		inline Log& GlobalLog() noexcept {
+			static Log log;
+			return log;
+		}
+		inline void Add(Record&& record) noexcept {
+			try {
+				auto& log = GlobalLog();
+				std::scoped_lock lock(log.mutex);
+				log.records.push_back(std::move(record));
+			} catch (...) {
+			}
+		}
+		inline void AddCalibration(const Calibration& calibration) noexcept {
+			try {
+				auto& log = GlobalLog();
+				std::scoped_lock lock(log.mutex);
+				log.calibrations.push_back(calibration);
+			} catch (...) {
+			}
+		}
+		// Timelines are named as they are made, whether the trace is on or not, so a trace started later can name them.
+		inline void NameTimeline(uint32_t index, const char* name) noexcept {
+			try {
+				auto& log = GlobalLog();
+				std::scoped_lock lock(log.mutex);
+				log.timelineNames[index] = name ? name : "";
+			} catch (...) {
+			}
+		}
+		// The records and calibrations since the last call.
+		inline void Take(std::vector<Record>& records, std::vector<Calibration>& calibrations) {
+			auto& log = GlobalLog();
+			std::scoped_lock lock(log.mutex);
+			records = std::exchange(log.records, {});
+			calibrations = std::exchange(log.calibrations, {});
+		}
+		inline std::unordered_map<uint32_t, std::string> TimelineNames() {
+			auto& log = GlobalLog();
+			std::scoped_lock lock(log.mutex);
+			return log.timelineNames;
 		}
 	}
 

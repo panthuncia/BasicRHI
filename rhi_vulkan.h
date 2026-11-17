@@ -507,6 +507,8 @@ namespace rhi {
 		std::string censusLabel;
 		bool censusLabelled = false;
 		bool censusBarrierSincePass = false;
+		bool censusWorkSeen = false;          // a pass, dispatch, copy or clear recorded in the list
+		bool censusWorkSinceBarrier = false;  // ...since its last barrier command
 		std::vector<ResourceHandle> censusPreviousAttachments;
 		std::vector<ResourceHandle> censusAttachments;
 
