@@ -14,6 +14,7 @@ enum class FeatureInfoStructType : uint64_t {
 	IndirectCommands = 10,
 	FixedFunction = 11,
 	CommandMemory = 12,
+	LiveMemory = 13,
 };
 
 struct FeatureInfoHeader {
@@ -253,6 +254,18 @@ struct CommandMemoryFeatureInfo {
     // Device-generated commands' preprocess memory.
     uint64_t dgcPagesHeld = 0, dgcBytesHeld = 0;
     uint64_t dgcPagesPooled = 0, dgcBytesPooled = 0;
+};
+
+// Not a capability: the device memory the backend has allocated and not freed (Device::LiveMemoryStats), by where it was
+// allocated and by memory kind. Process-wide. Zero where a backend does not count it (D3D12): check `counted`.
+enum class LiveMemorySite : uint32_t { RootConstants, Preprocess, DescriptorHeaps, Buffers, Textures, Heaps, Imports, Other, Count };
+enum class LiveMemoryKind : uint32_t { DeviceLocal, DeviceLocalHostVisible, System, Count };
+struct LiveMemoryFeatureInfo {
+    FeatureInfoHeader header{ FeatureInfoStructType::LiveMemory, nullptr, sizeof(LiveMemoryFeatureInfo), 1 };
+
+    bool counted = false;  // the backend keeps the ledger
+    uint64_t bytes[static_cast<uint32_t>(LiveMemorySite::Count)][static_cast<uint32_t>(LiveMemoryKind::Count)]{};
+    uint64_t allocations[static_cast<uint32_t>(LiveMemorySite::Count)][static_cast<uint32_t>(LiveMemoryKind::Count)]{};
 };
 
 struct FixedFunctionFeatureInfo {

@@ -12105,6 +12105,22 @@ namespace rhi {
 					out->dgcBytesHeld = held(count(g_dgcBytes), dgcPooledBytes);
 				} break;
 
+				case FeatureInfoStructType::LiveMemory: {
+					if (header->structSize < sizeof(LiveMemoryFeatureInfo)) {
+						RHI_FAIL(Result::InvalidArgument);
+					}
+					// The live ledger's totals. Its sites and kinds are in LiveMemorySite's and LiveMemoryKind's order.
+					static_assert(static_cast<uint32_t>(LiveMemorySite::Count) == kAllocSites);
+					auto* out = reinterpret_cast<LiveMemoryFeatureInfo*>(header);
+					out->counted = true;
+					std::scoped_lock lock(g_liveMemoryMutex);
+					for (uint32_t site = 0; site < kAllocSites; ++site)
+						for (uint32_t kind = 0; kind < 3; ++kind) {
+							out->bytes[site][kind] = g_liveSiteBytes[site][kind];
+							out->allocations[site][kind] = g_liveSiteCount[site][kind];
+						}
+				} break;
+
 				case FeatureInfoStructType::FixedFunction: {
 					if (header->structSize < sizeof(FixedFunctionFeatureInfo)) {
 						RHI_FAIL(Result::InvalidArgument);

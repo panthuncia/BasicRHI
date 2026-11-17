@@ -3725,6 +3725,13 @@ namespace rhi {
 			(void)QueryFeatureInfo(&info.header);
 			return info;
 		}
+		// The device memory the backend has allocated and not freed, by site and kind (LiveMemoryFeatureInfo). `counted` is false
+		// where the backend does not keep the ledger.
+		LiveMemoryFeatureInfo LiveMemoryStats() const noexcept {
+			LiveMemoryFeatureInfo info{};
+			(void)QueryFeatureInfo(&info.header);
+			return info;
+		}
 		Result SetResidencyPriority(const Span<PageableRef>& resources, ResidencyPriority p) const noexcept { return vt->setResidencyPriority(this, resources, p); }
 		Result QueryVideoMemoryInfo(uint32_t nodeIndex, MemorySegmentGroup segmentGroup, VideoMemoryInfo& out) const noexcept {
 			return vt->queryVideoMemoryInfo(this, nodeIndex, segmentGroup, out);
