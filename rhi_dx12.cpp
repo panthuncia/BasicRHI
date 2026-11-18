@@ -739,12 +739,47 @@ namespace rhi {
 			return;
 		}
 
+		// The page fault goes first and is flushed, because the process often dies before a long breadcrumb list is written.
+		D3D12_DRED_PAGE_FAULT_OUTPUT1 pageFaultOutput{};
+		if (SUCCEEDED(pDred->GetPageFaultAllocationOutput1(&pageFaultOutput))) {
+			if (pageFaultOutput.PageFaultVA != 0) {
+				notify.faultAddress = pageFaultOutput.PageFaultVA;
+				spdlog::error("  GPU Page Fault VA: 0x{:016X}", pageFaultOutput.PageFaultVA);
+
+				auto logAllocList = [](const char* label, const D3D12_DRED_ALLOCATION_NODE1* node) {
+					if (!node) { spdlog::error("    {}: (none)", label); return; }
+					spdlog::error("    {}:", label);
+					while (node) {
+						const char* name = node->ObjectNameA ? node->ObjectNameA : "<unnamed>";
+						spdlog::error("      - '{}' ({})", name, DredAllocationTypeToString(node->AllocationType));
+						node = node->pNext;
+					}
+				};
+
+				logAllocList("Existing allocations matching fault VA", pageFaultOutput.pHeadExistingAllocationNode);
+				logAllocList("Recently freed allocations matching fault VA", pageFaultOutput.pHeadRecentFreedAllocationNode);
+			} else {
+				spdlog::error("  No GPU page fault reported.");
+			}
+		} else {
+			spdlog::error("  GetPageFaultAllocationOutput1 failed.");
+		}
+		spdlog::default_logger()->flush();
+
 		// ---- Auto Breadcrumbs ----
 		D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 breadcrumbsOutput{};
 		if (SUCCEEDED(pDred->GetAutoBreadcrumbsOutput1(&breadcrumbsOutput))) {
 			const D3D12_AUTO_BREADCRUMB_NODE1* node = breadcrumbsOutput.pHeadAutoBreadcrumbNode;
 			int nodeIdx = 0;
+			int finishedNodes = 0;
 			while (node) {
+				// A list whose last breadcrumb completed cannot hold the fault.
+				if (node->pLastBreadcrumbValue && *node->pLastBreadcrumbValue >= node->BreadcrumbCount) {
+					++finishedNodes;
+					node = node->pNext;
+					nodeIdx++;
+					continue;
+				}
 				const std::string clName = node->pCommandListDebugNameA
 					? node->pCommandListDebugNameA
 					: (node->pCommandListDebugNameW
@@ -800,35 +835,11 @@ namespace rhi {
 				nodeIdx++;
 			}
 			if (nodeIdx == 0) spdlog::error("  No auto-breadcrumb nodes.");
+			else spdlog::error("  {} of {} breadcrumb nodes had finished (not listed).", finishedNodes, nodeIdx);
 		} else {
 			spdlog::error("  GetAutoBreadcrumbsOutput1 failed.");
 		}
-
-		// ---- Page Fault ----
-		D3D12_DRED_PAGE_FAULT_OUTPUT1 pageFaultOutput{};
-		if (SUCCEEDED(pDred->GetPageFaultAllocationOutput1(&pageFaultOutput))) {
-			if (pageFaultOutput.PageFaultVA != 0) {
-				notify.faultAddress = pageFaultOutput.PageFaultVA;
-				spdlog::error("  GPU Page Fault VA: 0x{:016X}", pageFaultOutput.PageFaultVA);
-
-				auto logAllocList = [](const char* label, const D3D12_DRED_ALLOCATION_NODE1* node) {
-					if (!node) { spdlog::error("    {}: (none)", label); return; }
-					spdlog::error("    {}:", label);
-					while (node) {
-						const char* name = node->ObjectNameA ? node->ObjectNameA : "<unnamed>";
-						spdlog::error("      - '{}' ({})", name, DredAllocationTypeToString(node->AllocationType));
-						node = node->pNext;
-					}
-				};
-
-				logAllocList("Existing allocations matching fault VA", pageFaultOutput.pHeadExistingAllocationNode);
-				logAllocList("Recently freed allocations matching fault VA", pageFaultOutput.pHeadRecentFreedAllocationNode);
-			} else {
-				spdlog::error("  No GPU page fault reported.");
-			}
-		} else {
-			spdlog::error("  GetPageFaultAllocationOutput1 failed.");
-		}
+		spdlog::default_logger()->flush();
 
 		Dx12LogInfoQueueMessagesSince(g_dredDevice, 0, 256);
 
