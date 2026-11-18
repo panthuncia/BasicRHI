@@ -5,7 +5,11 @@
 #pragma once
 #include <utility>     // std::move
 #include <type_traits> // std::is_trivially_copyable_v
+#ifdef _WIN32
 #include <dxgi1_6.h>
+#else
+#include <directx/dxgiformat.h> // DirectX-Headers' portable DXGI_FORMAT
+#endif
 #include <string>
 #include <stdexcept>
 
@@ -224,6 +228,7 @@ namespace rhi {
             case DXGI_FORMAT_R16_SINT: return Format::R16_SInt;
             case DXGI_FORMAT_R8_TYPELESS: return Format::R8_Typeless;
             case DXGI_FORMAT_R8_UNORM: return Format::R8_UNorm;
+            case DXGI_FORMAT_A8_UNORM: return Format::A8_UNorm;
             case DXGI_FORMAT_R8_UINT: return Format::R8_UInt;
             case DXGI_FORMAT_R8_SNORM: return Format::R8_SNorm;
             case DXGI_FORMAT_R8_SINT: return Format::R8_SInt;
@@ -245,6 +250,9 @@ namespace rhi {
             case DXGI_FORMAT_B8G8R8A8_TYPELESS: return Format::B8G8R8A8_Typeless;
             case DXGI_FORMAT_B8G8R8A8_UNORM: return Format::B8G8R8A8_UNorm;
             case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return Format::B8G8R8A8_UNorm_sRGB;
+            case DXGI_FORMAT_B8G8R8X8_TYPELESS: return Format::B8G8R8X8_Typeless;
+            case DXGI_FORMAT_B8G8R8X8_UNORM: return Format::B8G8R8X8_UNorm;
+            case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return Format::B8G8R8X8_UNorm_sRGB;
             case DXGI_FORMAT_BC6H_TYPELESS: return Format::BC6H_Typeless;
             case DXGI_FORMAT_BC6H_UF16: return Format::BC6H_UF16;
             case DXGI_FORMAT_BC6H_SF16: return Format::BC6H_SF16;
@@ -286,6 +294,9 @@ namespace rhi {
             case Format::B8G8R8A8_Typeless:
             case Format::B8G8R8A8_UNorm:
             case Format::B8G8R8A8_UNorm_sRGB:
+            case Format::B8G8R8X8_Typeless:
+            case Format::B8G8R8X8_UNorm:
+            case Format::B8G8R8X8_UNorm_sRGB:
                 return 4;
 
                 // 3-channel
@@ -341,6 +352,7 @@ namespace rhi {
             case Format::R8_UInt:
             case Format::R8_SNorm:
             case Format::R8_SInt:
+            case Format::A8_UNorm:
                 return 1;
 
                 // Block-compressed: report the decoded channel count (not bytes-per-block)
@@ -557,7 +569,7 @@ namespace rhi {
             // Uncompressed: bytes-per-pixel
             switch (f) {
             case Format::R8_UNorm: case Format::R8_UInt: case Format::R8_SNorm: case Format::R8_SInt:
-            case Format::R8_Typeless: return 1;
+            case Format::R8_Typeless: case Format::A8_UNorm: return 1;
             case Format::R8G8_UNorm: case Format::R8G8_UInt: case Format::R8G8_SNorm: case Format::R8G8_SInt:
             case Format::R8G8_Typeless: return 2;
                 case Format::R16_UNorm: case Format::R16_UInt: case Format::R16_SNorm: case Format::R16_SInt:
@@ -566,6 +578,7 @@ namespace rhi {
             case Format::R8G8B8A8_UNorm: case Format::R8G8B8A8_UNorm_sRGB: case Format::R8G8B8A8_UInt:
             case Format::R8G8B8A8_SNorm: case Format::R8G8B8A8_SInt: case Format::R8G8B8A8_Typeless:
             case Format::B8G8R8A8_Typeless: case Format::B8G8R8A8_UNorm: case Format::B8G8R8A8_UNorm_sRGB:
+            case Format::B8G8R8X8_Typeless: case Format::B8G8R8X8_UNorm: case Format::B8G8R8X8_UNorm_sRGB:
                 case Format::R10G10B10A2_UNorm: case Format::R10G10B10A2_UInt: case Format::R10G10B10A2_Typeless:
                 case Format::R11G11B10_Float:
                 case Format::R16G16_UNorm: case Format::R16G16_UInt: case Format::R16G16_SNorm: case Format::R16G16_SInt:
@@ -594,6 +607,7 @@ namespace rhi {
 	        switch (f) {
 		        case Format::R8G8B8A8_UNorm_sRGB:
 		        case Format::B8G8R8A8_UNorm_sRGB:
+		        case Format::B8G8R8X8_UNorm_sRGB:
 				case Format::BC1_UNorm_sRGB:
 				case Format::BC2_UNorm_sRGB:
 				case Format::BC3_UNorm_sRGB:
@@ -607,6 +621,8 @@ namespace rhi {
 	        switch (f) {
 	        case Format::B8G8R8A8_UNorm_sRGB:
                 				return Format::B8G8R8A8_Typeless;
+	        case Format::B8G8R8X8_UNorm_sRGB:
+				return Format::B8G8R8X8_Typeless;
 	        case Format::R8G8B8A8_UNorm_sRGB:
 				return Format::R8G8B8A8_Typeless;
             default:
@@ -618,6 +634,8 @@ namespace rhi {
 	        switch (f) {
 	        case Format::B8G8R8A8_UNorm_sRGB:
 				return Format::B8G8R8A8_UNorm;
+	        case Format::B8G8R8X8_UNorm_sRGB:
+				return Format::B8G8R8X8_UNorm;
 	        case Format::R8G8B8A8_UNorm_sRGB:
 				return Format::R8G8B8A8_UNorm;
             default:

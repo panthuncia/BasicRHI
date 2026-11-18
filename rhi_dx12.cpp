@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <future>
 #include <deque>
 #include <queue>
 #include <cstring>
@@ -480,6 +481,33 @@ namespace rhi {
 		case D3D12_AUTO_BREADCRUMB_OP_ESTIMATEMOTION:                                 return "EstimateMotion";
 		case D3D12_AUTO_BREADCRUMB_OP_RESOLVEMOTIONVECTORHEAP:                        return "ResolveMotionVectorHeap";
 		case D3D12_AUTO_BREADCRUMB_OP_SETPIPELINESTATE1:                              return "SetPipelineState1";
+		case D3D12_AUTO_BREADCRUMB_OP_INITIALIZEEXTENSIONCOMMAND:                     return "Initializeextensioncommand";
+		case D3D12_AUTO_BREADCRUMB_OP_EXECUTEEXTENSIONCOMMAND:                        return "Executeextensioncommand";
+		case D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH:                                   return "Dispatchmesh";
+		case D3D12_AUTO_BREADCRUMB_OP_ENCODEFRAME:                                    return "Encodeframe";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOLVEENCODEROUTPUTMETADATA:                   return "Resolveencoderoutputmetadata";
+		case D3D12_AUTO_BREADCRUMB_OP_BARRIER:                                        return "Barrier";
+		case D3D12_AUTO_BREADCRUMB_OP_BEGIN_COMMAND_LIST:                             return "BeginCommandList";
+		case D3D12_AUTO_BREADCRUMB_OP_DISPATCHGRAPH:                                  return "Dispatchgraph";
+		case D3D12_AUTO_BREADCRUMB_OP_SETPROGRAM:                                     return "Setprogram";
+		case D3D12_AUTO_BREADCRUMB_OP_ENCODEFRAME1:                                   return "Encodeframe1";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOLVEENCODEROUTPUTMETADATA1:                  return "Resolveencoderoutputmetadata1";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOLVEINPUTPARAMLAYOUT:                        return "Resolveinputparamlayout";
+		case D3D12_AUTO_BREADCRUMB_OP_PROCESSFRAMES2:                                 return "Processframes2";
+		case D3D12_AUTO_BREADCRUMB_OP_SET_WORK_GRAPH_MAXIMUM_GPU_INPUT_RECORDS:       return "SetWorkGraphMaximumGpuInputRecords";
+		case D3D12_AUTO_BREADCRUMB_OP_WAITBARRIER:                                    return "Waitbarrier";
+		case D3D12_AUTO_BREADCRUMB_OP_SIGNALBARRIER:                                  return "Signalbarrier";
+		case D3D12_AUTO_BREADCRUMB_OP_CONVERT_LINEAR_ALGEBRA_MATRIX:                  return "ConvertLinearAlgebraMatrix";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGIONS:                              return "Copybufferregions";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGIONS:                             return "Copytextureregions";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCES:                                  return "Copyresources";
+		case D3D12_AUTO_BREADCRUMB_OP_ASYNCCOPYTILES:                                 return "Asynccopytiles";
+		case D3D12_AUTO_BREADCRUMB_OP_ASYNCRESOLVESUBRESOURCEREGION:                  return "Asyncresolvesubresourceregion";
+		case D3D12_AUTO_BREADCRUMB_OP_ASYNCRESOLVEQUERYDATA:                          return "Asyncresolvequerydata";
+		case D3D12_AUTO_BREADCRUMB_OP_CLEARBOUNDDEPTHSTENCILVIEW:                     return "Clearbounddepthstencilview";
+		case D3D12_AUTO_BREADCRUMB_OP_CLEARBOUNDRENDERTARGETVIEWS:                    return "Clearboundrendertargetviews";
+		case D3D12_AUTO_BREADCRUMB_OP_CLEARTEXTURESUBRESOURCES:                       return "Cleartexturesubresources";
+		case D3D12_AUTO_BREADCRUMB_OP_FILLBUFFERS:                                    return "Fillbuffers";
 		default:                                                                      return "Unknown";
 		}
 	}
@@ -687,6 +715,21 @@ namespace rhi {
 		}
 
 		spdlog::error("======== DEVICE REMOVED (reason 0x{:08X}) – DRED Report ========", static_cast<unsigned>(reason));
+		// The host's loss callback once the report is logged, however it ends.
+		struct NotifyOnExit {
+			HRESULT reason;
+			uint64_t faultAddress = 0;
+			~NotifyOnExit() {
+				char where[64]{};
+				std::snprintf(where, sizeof(where), "D3D12 device removed (reason 0x%08X)", static_cast<unsigned>(reason));
+				DeviceLossInfo info;
+				info.backend = "d3d12";
+				info.where = where;
+				info.faultAddress = faultAddress;
+				info.faultKind = faultAddress ? "page fault" : "";
+				NotifyDeviceLoss(info);
+			}
+		} notify{ reason };
 
 		ComPtr<ID3D12DeviceRemovedExtendedData1> pDred;
 		if (FAILED(g_dredDevice->QueryInterface(IID_PPV_ARGS(&pDred)))) {
@@ -725,12 +768,22 @@ namespace rhi {
 					for (UINT32 i = start; i < end; ++i) {
 						const char* marker = (i == last) ? " <<< LAST COMPLETED" :
 						                     (i == last + 1) ? " <<< LIKELY FAULTING OP" : "";
-						spdlog::error("    [{:5}] {}{}", i, BreadcrumbOpToString(node->pCommandHistory[i]), marker);
+						spdlog::error("    [{:5}] {} ({}){}", i, BreadcrumbOpToString(node->pCommandHistory[i]), static_cast<int>(node->pCommandHistory[i]), marker);
 					}
 				}
 				if (node->pBreadcrumbContexts && node->BreadcrumbContextsCount > 0) {
 					const UINT32 contextStart = last >= 4 ? last - 4 : 0;
 					const UINT32 contextEnd = last + 5;
+					// The pass enclosing the faulting op: the last context recorded at or before it, however far back.
+					const D3D12_DRED_BREADCRUMB_CONTEXT* enclosing = nullptr;
+					for (UINT32 contextIndex = 0; contextIndex < node->BreadcrumbContextsCount; ++contextIndex) {
+						const auto& context = node->pBreadcrumbContexts[contextIndex];
+						if (context.BreadcrumbIndex <= last + 1 && (!enclosing || context.BreadcrumbIndex >= enclosing->BreadcrumbIndex)) enclosing = &context;
+					}
+					if (enclosing && enclosing->BreadcrumbIndex < contextStart) {
+						spdlog::error("      enclosing context breadcrumb={} '{}'", enclosing->BreadcrumbIndex,
+							enclosing->pContextString ? Dx12WideToUtf8(enclosing->pContextString) : "<null>");
+					}
 					for (UINT32 contextIndex = 0; contextIndex < node->BreadcrumbContextsCount; ++contextIndex) {
 						const auto& context = node->pBreadcrumbContexts[contextIndex];
 						if (context.BreadcrumbIndex < contextStart || context.BreadcrumbIndex > contextEnd) {
@@ -755,6 +808,7 @@ namespace rhi {
 		D3D12_DRED_PAGE_FAULT_OUTPUT1 pageFaultOutput{};
 		if (SUCCEEDED(pDred->GetPageFaultAllocationOutput1(&pageFaultOutput))) {
 			if (pageFaultOutput.PageFaultVA != 0) {
+				notify.faultAddress = pageFaultOutput.PageFaultVA;
 				spdlog::error("  GPU Page Fault VA: 0x{:016X}", pageFaultOutput.PageFaultVA);
 
 				auto logAllocList = [](const char* label, const D3D12_DRED_ALLOCATION_NODE1* node) {
@@ -933,14 +987,25 @@ namespace rhi {
 			}
 		}
 
+		static bool Dx12EnablePreviewRayTracing() noexcept {
+			const UUID features[] = { D3D12ExperimentalShaderModels, D3D12RaytracingPreview };
+			const HRESULT hr = D3D12EnableExperimentalFeatures(static_cast<UINT>(std::size(features)), features, nullptr, nullptr);
+			if (FAILED(hr)) {
+				// E_NOINTERFACE: Windows Developer Mode is off, or the loaded runtime isn't the preview.
+				spdlog::warn("DX12 preview raytracing unavailable: D3D12EnableExperimentalFeatures hr=0x{:08X}", static_cast<uint32_t>(hr));
+				return false;
+			}
+			spdlog::info("DX12 preview raytracing enabled (experimental shader models, Raytracing2)");
+			return true;
+		}
+
 		static D3D12_RAYTRACING_PIPELINE_FLAGS Dx12RtPipelineFlags(RayTracingPipelineFlags flags) noexcept {
 			const uint32_t bits = static_cast<uint32_t>(flags);
 			D3D12_RAYTRACING_PIPELINE_FLAGS out = D3D12_RAYTRACING_PIPELINE_FLAG_NONE;
 			if ((bits & RTPipeline_SkipTriangles) != 0) out |= D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_TRIANGLES;
 			if ((bits & RTPipeline_SkipProceduralPrimitives) != 0) out |= D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_PROCEDURAL_PRIMITIVES;
-#if BASICRHI_HAS_DXR2_HEADERS && defined(D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY)
 			if ((bits & RTPipeline_AllowClusteredGeometry) != 0) out |= D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY;
-#endif
+			if ((bits & RTPipeline_AllowOpacityMicromaps) != 0) out |= D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS;
 			return out;
 		}
 
@@ -957,11 +1022,13 @@ namespace rhi {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
 			}
-			if ((static_cast<uint32_t>(rt.flags) & RTPipeline_AllowClusteredGeometry) != 0) {
-#if !(BASICRHI_HAS_DXR2_HEADERS && defined(D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY))
+			if ((static_cast<uint32_t>(rt.flags) & RTPipeline_AllowClusteredGeometry) != 0 && !dimpl->pNativeDeviceRaytracing2) {
 				out.Reset();
 				RHI_FAIL(Result::Unsupported);
-#endif
+			}
+			if ((static_cast<uint32_t>(rt.flags) & RTPipeline_AllowOpacityMicromaps) != 0 && options5.RaytracingTier < D3D12_RAYTRACING_TIER_1_2) {
+				out.Reset();
+				RHI_FAIL(Result::Unsupported);
 			}
 
 			struct StringStore {
@@ -1102,6 +1169,408 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// A pipeline layout's root signature carries the hash of its serialized description, so a pipeline cache key can
+		// name the root signature by content rather than by pointer.
+		static constexpr GUID kDx12RootSignatureHashGuid = { 0x5b8d2c61, 0x93a4, 0x4f0e, { 0x8c, 0x27, 0x1d, 0x6e, 0x4a, 0x90, 0xb3, 0x52 } };
+
+		// A subobject in a PSO stream is laid out as PsoStreamBuilder writes it: a PsoSubobject of its value type.
+		template<class T>
+		using Dx12StreamSlot = PsoSubobject<T, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MAX_VALID>;
+
+		template<class T>
+		static const T& Dx12StreamValue(const uint8_t* subobject) noexcept {
+			return *reinterpret_cast<const T*>(subobject + offsetof(Dx12StreamSlot<T>, Value));
+		}
+
+		template<class T>
+		static constexpr size_t Dx12StreamSubobjectSize() noexcept {
+			return sizeof(Dx12StreamSlot<T>);
+		}
+
+		static void Dx12HashStencilOp(detail::Fnv1a64& hash, const D3D12_DEPTH_STENCILOP_DESC& op) noexcept {
+			hash.AddValue(op.StencilFailOp);
+			hash.AddValue(op.StencilDepthFailOp);
+			hash.AddValue(op.StencilPassOp);
+			hash.AddValue(op.StencilFunc);
+		}
+
+		static void Dx12HashStencilOp1(detail::Fnv1a64& hash, const D3D12_DEPTH_STENCILOP_DESC1& op) noexcept {
+			hash.AddValue(op.StencilFailOp);
+			hash.AddValue(op.StencilDepthFailOp);
+			hash.AddValue(op.StencilPassOp);
+			hash.AddValue(op.StencilFunc);
+			hash.AddValue(op.StencilReadMask);
+			hash.AddValue(op.StencilWriteMask);
+		}
+
+		// The pipeline cache key of a PSO stream: every subobject by content, field by field where a struct has padding or
+		// pointers. False for a subobject this does not know, which leaves that pipeline uncached.
+		static bool Dx12PipelineStreamKey(const D3D12_PIPELINE_STATE_STREAM_DESC& stream, uint64_t& key) noexcept {
+			constexpr uint32_t kKeyVersion = 1u;
+			detail::Fnv1a64 hash;
+			hash.AddValue(kKeyVersion);
+			const auto* bytes = static_cast<const uint8_t*>(stream.pPipelineStateSubobjectStream);
+			size_t offset = 0;
+			while (offset < stream.SizeInBytes) {
+				const uint8_t* subobject = bytes + offset;
+				D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type{};
+				std::memcpy(&type, subobject, sizeof(type));
+				hash.AddValue(type);
+				size_t size = 0;
+				auto shader = [&]() {
+					const auto& bytecode = Dx12StreamValue<D3D12_SHADER_BYTECODE>(subobject);
+					hash.AddValue(static_cast<uint64_t>(bytecode.BytecodeLength));
+					hash.Add(bytecode.pShaderBytecode, bytecode.BytecodeLength);
+					size = Dx12StreamSubobjectSize<D3D12_SHADER_BYTECODE>();
+				};
+				auto plain = [&]<class T>(const T*) {
+					hash.AddValue(Dx12StreamValue<T>(subobject));
+					size = Dx12StreamSubobjectSize<T>();
+				};
+				switch (type) {
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: {
+					ID3D12RootSignature* root = Dx12StreamValue<ID3D12RootSignature*>(subobject);
+					uint64_t rootHash = 0;
+					UINT rootHashSize = sizeof(rootHash);
+					if (!root || FAILED(root->GetPrivateData(kDx12RootSignatureHashGuid, &rootHashSize, &rootHash)) || rootHashSize != sizeof(rootHash)) {
+						return false;
+					}
+					hash.AddValue(rootHash);
+					size = Dx12StreamSubobjectSize<ID3D12RootSignature*>();
+				} break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
+					shader();
+					break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: {
+					const auto& blend = Dx12StreamValue<D3D12_BLEND_DESC>(subobject);
+					hash.AddValue(blend.AlphaToCoverageEnable);
+					hash.AddValue(blend.IndependentBlendEnable);
+					for (const D3D12_RENDER_TARGET_BLEND_DESC& target : blend.RenderTarget) {
+						hash.AddValue(target.BlendEnable);
+						hash.AddValue(target.LogicOpEnable);
+						hash.AddValue(target.SrcBlend);
+						hash.AddValue(target.DestBlend);
+						hash.AddValue(target.BlendOp);
+						hash.AddValue(target.SrcBlendAlpha);
+						hash.AddValue(target.DestBlendAlpha);
+						hash.AddValue(target.BlendOpAlpha);
+						hash.AddValue(target.LogicOp);
+						hash.AddValue(target.RenderTargetWriteMask);
+					}
+					size = Dx12StreamSubobjectSize<D3D12_BLEND_DESC>();
+				} break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: {
+					const auto& depth = Dx12StreamValue<D3D12_DEPTH_STENCIL_DESC>(subobject);
+					hash.AddValue(depth.DepthEnable);
+					hash.AddValue(depth.DepthWriteMask);
+					hash.AddValue(depth.DepthFunc);
+					hash.AddValue(depth.StencilEnable);
+					hash.AddValue(depth.StencilReadMask);
+					hash.AddValue(depth.StencilWriteMask);
+					Dx12HashStencilOp(hash, depth.FrontFace);
+					Dx12HashStencilOp(hash, depth.BackFace);
+					size = Dx12StreamSubobjectSize<D3D12_DEPTH_STENCIL_DESC>();
+				} break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
+					const auto& depth = Dx12StreamValue<D3D12_DEPTH_STENCIL_DESC1>(subobject);
+					hash.AddValue(depth.DepthEnable);
+					hash.AddValue(depth.DepthWriteMask);
+					hash.AddValue(depth.DepthFunc);
+					hash.AddValue(depth.StencilEnable);
+					hash.AddValue(depth.StencilReadMask);
+					hash.AddValue(depth.StencilWriteMask);
+					Dx12HashStencilOp(hash, depth.FrontFace);
+					Dx12HashStencilOp(hash, depth.BackFace);
+					hash.AddValue(depth.DepthBoundsTestEnable);
+					size = Dx12StreamSubobjectSize<D3D12_DEPTH_STENCIL_DESC1>();
+				} break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: {
+					const auto& depth = Dx12StreamValue<D3D12_DEPTH_STENCIL_DESC2>(subobject);
+					hash.AddValue(depth.DepthEnable);
+					hash.AddValue(depth.DepthWriteMask);
+					hash.AddValue(depth.DepthFunc);
+					hash.AddValue(depth.StencilEnable);
+					Dx12HashStencilOp1(hash, depth.FrontFace);
+					Dx12HashStencilOp1(hash, depth.BackFace);
+					hash.AddValue(depth.DepthBoundsTestEnable);
+					size = Dx12StreamSubobjectSize<D3D12_DEPTH_STENCIL_DESC2>();
+				} break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: {
+					const auto& layout = Dx12StreamValue<D3D12_INPUT_LAYOUT_DESC>(subobject);
+					hash.AddValue(layout.NumElements);
+					for (UINT index = 0; index < layout.NumElements; ++index) {
+						const D3D12_INPUT_ELEMENT_DESC& element = layout.pInputElementDescs[index];
+						hash.AddString(element.SemanticName);
+						hash.AddValue(element.SemanticIndex);
+						hash.AddValue(element.Format);
+						hash.AddValue(element.InputSlot);
+						hash.AddValue(element.AlignedByteOffset);
+						hash.AddValue(element.InputSlotClass);
+						hash.AddValue(element.InstanceDataStepRate);
+					}
+					size = Dx12StreamSubobjectSize<D3D12_INPUT_LAYOUT_DESC>();
+				} break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
+					const auto& viewInstancing = Dx12StreamValue<D3D12_VIEW_INSTANCING_DESC>(subobject);
+					hash.AddValue(viewInstancing.ViewInstanceCount);
+					for (UINT index = 0; index < viewInstancing.ViewInstanceCount; ++index) {
+						hash.AddValue(viewInstancing.pViewInstanceLocations[index].ViewportArrayIndex);
+						hash.AddValue(viewInstancing.pViewInstanceLocations[index].RenderTargetArrayIndex);
+					}
+					hash.AddValue(viewInstancing.Flags);
+					size = Dx12StreamSubobjectSize<D3D12_VIEW_INSTANCING_DESC>();
+				} break;
+				// Structs of 4-byte fields: no padding, so their bytes are their content.
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: plain(static_cast<const UINT*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: plain(static_cast<const D3D12_RASTERIZER_DESC*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1: plain(static_cast<const D3D12_RASTERIZER_DESC1*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2: plain(static_cast<const D3D12_RASTERIZER_DESC2*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: plain(static_cast<const D3D12_INDEX_BUFFER_STRIP_CUT_VALUE*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: plain(static_cast<const D3D12_PRIMITIVE_TOPOLOGY_TYPE*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: plain(static_cast<const D3D12_RT_FORMAT_ARRAY*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: plain(static_cast<const DXGI_FORMAT*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: plain(static_cast<const DXGI_SAMPLE_DESC*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: plain(static_cast<const UINT*>(nullptr)); break;
+				case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: plain(static_cast<const D3D12_PIPELINE_STATE_FLAGS*>(nullptr)); break;
+				default:
+					return false;
+				}
+				offset += size;
+			}
+			key = hash.Value();
+			return true;
+		}
+
+		// Creates a PSO through the open pipeline cache, if any: loads it by key, or compiles and stores it.
+		static HRESULT Dx12CreatePipelineStateThroughCache(Dx12Device* impl, const D3D12_PIPELINE_STATE_STREAM_DESC& stream, ComPtr<ID3D12PipelineState>& pso) noexcept {
+			auto& state = impl->pipelineCache;
+			const std::shared_lock lock(state.mutex);
+			uint64_t key = 0;
+			if (!state.library || !Dx12PipelineStreamKey(stream, key)) {
+				return impl->pNativeDevice->CreatePipelineState(&stream, IID_PPV_ARGS(&pso));
+			}
+			wchar_t name[24]{};
+			std::swprintf(name, std::size(name), L"BRPC%016llX", static_cast<unsigned long long>(key));
+			bool stored = false;
+			{
+				const std::lock_guard keysLock(state.keysMutex);
+				stored = state.keys.contains(key);
+			}
+			if (stored) {
+				D3D12_PIPELINE_STATE_STREAM_DESC loadStream = stream;
+				const std::lock_guard stripe(state.keyStripes[key % state.keyStripes.size()]);
+				// A description that differs from the stored one under the same key fails here and is compiled below.
+				if (SUCCEEDED(state.library->LoadPipeline(name, &loadStream, IID_PPV_ARGS(&pso)))) {
+					++state.counters.hits;
+					return S_OK;
+				}
+			}
+			const HRESULT hr = impl->pNativeDevice->CreatePipelineState(&stream, IID_PPV_ARGS(&pso));
+			if (FAILED(hr)) {
+				return hr;
+			}
+			++state.counters.misses;
+			if (stored) {
+				return S_OK;
+			}
+			// Another thread may store the same key first; then this store fails and the pipeline is already cached.
+			if (SUCCEEDED(state.library->StorePipeline(name, pso.Get()))) {
+				const std::lock_guard keysLock(state.keysMutex);
+				state.keys.insert(key);
+				++state.counters.added;
+			}
+			return S_OK;
+		}
+
+		static detail::PipelineCacheIdentity Dx12PipelineCacheIdentity(const Dx12Device* impl) noexcept {
+			detail::PipelineCacheIdentity identity{};
+			identity.backend = static_cast<uint32_t>(Backend::D3D12);
+			if (impl->adapter) {
+				DXGI_ADAPTER_DESC1 desc{};
+				if (SUCCEEDED(impl->adapter->GetDesc1(&desc))) {
+					identity.vendorId = desc.VendorId;
+					identity.deviceId = desc.DeviceId;
+				}
+				LARGE_INTEGER driverVersion{};
+				if (SUCCEEDED(impl->adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driverVersion))) {
+					identity.driverVersion = static_cast<uint64_t>(driverVersion.QuadPart);
+				}
+			}
+			return identity;
+		}
+
+		// Drops the open library without saving it. The caller holds the cache's lock exclusively.
+		static void Dx12ClosePipelineCacheLocked(Dx12Device* impl) noexcept {
+			auto& state = impl->pipelineCache;
+			state.library.Reset();
+			state.blob.clear();
+			{
+				const std::lock_guard keysLock(state.keysMutex);
+				state.keys.clear();
+			}
+			state.path.clear();
+			state.counters.Reset(PipelineCacheLoadResult::Off, 0);
+		}
+
+		static Result Dx12OpenPipelineCache(Dx12Device* impl, const char* path) noexcept {
+			if (!impl || !impl->pNativeDevice) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			auto& state = impl->pipelineCache;
+			const std::unique_lock lock(state.mutex);
+			Dx12ClosePipelineCacheLocked(impl);
+			if (!path || !*path) {
+				return Result::Ok;
+			}
+			try {
+				state.identity = Dx12PipelineCacheIdentity(impl);
+				PipelineCacheLoadResult load = detail::ReadPipelineCacheFile(path, state.identity, state.blob);
+				// The payload: a key count, the keys, then the serialized library.
+				size_t libraryOffset = 0;
+				if (load == PipelineCacheLoadResult::Loaded) {
+					uint64_t keyCount = 0;
+					if (state.blob.size() >= sizeof(keyCount)) {
+						std::memcpy(&keyCount, state.blob.data(), sizeof(keyCount));
+					}
+					if (state.blob.size() < sizeof(keyCount) || keyCount > (state.blob.size() - sizeof(keyCount)) / sizeof(uint64_t)) {
+						load = PipelineCacheLoadResult::Corrupt;
+						state.blob.clear();
+					} else {
+						libraryOffset = sizeof(keyCount) + static_cast<size_t>(keyCount) * sizeof(uint64_t);
+						std::vector<uint64_t> keys(static_cast<size_t>(keyCount));
+						std::memcpy(keys.data(), state.blob.data() + sizeof(keyCount), keys.size() * sizeof(uint64_t));
+						const std::lock_guard keysLock(state.keysMutex);
+						state.keys.insert(keys.begin(), keys.end());
+					}
+				}
+				const size_t libraryBytes = state.blob.size() - libraryOffset;
+				HRESULT hr = impl->pNativeDevice->CreatePipelineLibrary(libraryBytes ? state.blob.data() + libraryOffset : nullptr, libraryBytes,
+					IID_PPV_ARGS(&state.library));
+				if (FAILED(hr) && libraryBytes) {
+					// The runtime checks the driver and adapter too.
+					load = (hr == D3D12_ERROR_DRIVER_VERSION_MISMATCH || hr == D3D12_ERROR_ADAPTER_NOT_FOUND) ? PipelineCacheLoadResult::Stale : PipelineCacheLoadResult::Corrupt;
+					state.blob.clear();
+					{
+						const std::lock_guard keysLock(state.keysMutex);
+						state.keys.clear();
+					}
+					hr = impl->pNativeDevice->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&state.library));
+				}
+				if (FAILED(hr)) {
+					state.library.Reset();
+					state.counters.Reset(PipelineCacheLoadResult::Unsupported, 0);
+					spdlog::warn("DX12 pipeline cache: CreatePipelineLibrary failed (hr=0x{:08X}); pipelines are not cached", static_cast<uint32_t>(hr));
+					return ToRHI(hr);
+				}
+				state.path = path;
+				state.counters.Reset(load, state.blob.size());
+				spdlog::info("DX12 pipeline cache '{}': {} ({} bytes)", path, detail::PipelineCacheLoadName(load), state.blob.size());
+				return Result::Ok;
+			} catch (...) {
+				Dx12ClosePipelineCacheLocked(impl);
+				RHI_FAIL(Result::OutOfMemory);
+			}
+		}
+
+		static Result Dx12SavePipelineCache(Dx12Device* impl) noexcept {
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			auto& state = impl->pipelineCache;
+			const std::unique_lock lock(state.mutex);
+			if (!state.library) {
+				return Result::Ok;
+			}
+			const uint64_t added = state.counters.added.exchange(0);
+			if (added == 0) {
+				return Result::Ok;
+			}
+			try {
+				// Stores take the shared lock, so the keys and the library are consistent here.
+				const uint64_t keyCount = state.keys.size();
+				const size_t libraryOffset = sizeof(keyCount) + static_cast<size_t>(keyCount) * sizeof(uint64_t);
+				std::vector<uint8_t> data(libraryOffset + state.library->GetSerializedSize());
+				std::memcpy(data.data(), &keyCount, sizeof(keyCount));
+				size_t keyOffset = sizeof(keyCount);
+				for (const uint64_t key : state.keys) {
+					std::memcpy(data.data() + keyOffset, &key, sizeof(key));
+					keyOffset += sizeof(key);
+				}
+				HRESULT hr = state.library->Serialize(data.data() + libraryOffset, data.size() - libraryOffset);
+				Result written = ToRHI(hr);
+				if (SUCCEEDED(hr)) {
+					written = detail::WritePipelineCacheFile(state.path.c_str(), state.identity, data.data(), data.size());
+				}
+				if (written != Result::Ok) {
+					state.counters.added += added;
+					spdlog::warn("DX12 pipeline cache '{}': save failed", state.path);
+					return written;
+				}
+				state.counters.savedBytes = data.size();
+				++state.counters.saves;
+				return Result::Ok;
+			} catch (...) {
+				state.counters.added += added;
+				RHI_FAIL(Result::OutOfMemory);
+			}
+		}
+
+		static Result d_openPipelineCache(Device* d, const char* path) noexcept {
+			return Dx12OpenPipelineCache(d ? static_cast<Dx12Device*>(d->impl) : nullptr, path);
+		}
+
+		static Result d_savePipelineCache(Device* d) noexcept {
+			return Dx12SavePipelineCache(d ? static_cast<Dx12Device*>(d->impl) : nullptr);
+		}
+
+		static Result d_getPipelineCacheStats(const Device* d, PipelineCacheStats& out) noexcept {
+			const auto* impl = d ? static_cast<const Dx12Device*>(d->impl) : nullptr;
+			out = {};
+			if (!impl) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			impl->pipelineCache.counters.Fill(out);
+			return Result::Ok;
+		}
+
+		// D3D12 stores every format as itself.
+		static Result d_queryFormatSupport(const Device* d, Format format, FormatSupport& out) noexcept {
+			const auto* impl = d ? static_cast<const Dx12Device*>(d->impl) : nullptr;
+			out = {};
+			if (!impl || !impl->pNativeDevice) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			D3D12_FEATURE_DATA_FORMAT_SUPPORT support{ ToDxgi(format) };
+			if (support.Format == DXGI_FORMAT_UNKNOWN ||
+				FAILED(impl->pNativeDevice->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))) {
+				return Result::Ok;
+			}
+			uint32_t usage = FU_None;
+			// A shader resource view needs loads, not sampling: integer formats are loaded only (D3D11 binds them as SRVs too).
+			if (support.Support1 & (D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_LOAD)) {
+				usage |= FU_ShaderResource;
+			}
+			if (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) {
+				usage |= FU_UnorderedAccess;
+			}
+			if (support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) {
+				usage |= FU_RenderTarget;
+			}
+			if (support.Support1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL) {
+				usage |= FU_DepthStencil;
+			}
+			out.usage = usage;
+			out.backendFormat = static_cast<uint32_t>(support.Format);
+			return Result::Ok;
+		}
+
 		static Result d_createPipelineFromStream(Device* d,
 			const PipelineStreamItem* items,
 			uint32_t count,
@@ -1141,6 +1610,8 @@ namespace rhi {
 			D3D12_INPUT_LAYOUT_DESC inputLayoutDesc{ nullptr, 0 };
 
 			bool hasRast = false, hasBlend = false, hasDepth = false, hasRTV = false, hasDSV = false, hasSample = false, hasInputLayout = false, hasPrimitiveTopology = false;
+			UINT sampleMask = UINT_MAX;  // the stream's default when no mask subobject is pushed
+			bool readsBlendFactor = false;
 
 			for (uint32_t i = 0; i < count; i++) {
 				switch (items[i].type) {
@@ -1192,6 +1663,7 @@ namespace rhi {
 					rast.DepthBias = static_cast<int>(R.rs.depthBias);
 					rast.DepthBiasClamp = R.rs.depthBiasClamp;
 					rast.SlopeScaledDepthBias = R.rs.slopeScaledDepthBias;
+					rast.DepthClipEnable = R.rs.depthClip;
 				} break;
 				case PsoSubobj::Blend: {
 					hasBlend = true;
@@ -1199,10 +1671,14 @@ namespace rhi {
 					blend = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
 					blend.AlphaToCoverageEnable = B.bs.alphaToCoverage;
 					blend.IndependentBlendEnable = B.bs.independentBlend;
+					sampleMask = B.bs.sampleMask;
 					for (uint32_t a = 0; a < B.bs.numAttachments && a < 8; a++) {
 						const auto& src = B.bs.attachments[a];
 						auto& dst = blend.RenderTarget[a];
-						dst.BlendEnable = src.enable;
+						// A logic op replaces blending on every attachment, as on Vulkan.
+						dst.BlendEnable = src.enable && !B.bs.logicOpEnable;
+						dst.LogicOpEnable = B.bs.logicOpEnable;
+						dst.LogicOp = ToDX(B.bs.logicOp);
 						dst.RenderTargetWriteMask = src.writeMask;
 						dst.BlendOp = ToDX(src.colorOp);
 						dst.SrcBlend = ToDX(src.srcColor);
@@ -1210,6 +1686,22 @@ namespace rhi {
 						dst.BlendOpAlpha = ToDX(src.alphaOp);
 						dst.SrcBlendAlpha = ToDX(src.srcAlpha);
 						dst.DestBlendAlpha = ToDX(src.dstAlpha);
+						// MIN and MAX ignore their factors, and the debug layer warns about any but ONE (D3D11 descriptions carry others).
+						const auto ignoresFactors = [](D3D12_BLEND_OP a_op) { return a_op == D3D12_BLEND_OP_MIN || a_op == D3D12_BLEND_OP_MAX; };
+						if (ignoresFactors(dst.BlendOp)) {
+							dst.SrcBlend = D3D12_BLEND_ONE;
+							dst.DestBlend = D3D12_BLEND_ONE;
+						}
+						if (ignoresFactors(dst.BlendOpAlpha)) {
+							dst.SrcBlendAlpha = D3D12_BLEND_ONE;
+							dst.DestBlendAlpha = D3D12_BLEND_ONE;
+						}
+						// Without independent blend only render target 0 is read.
+						if (dst.BlendEnable && (a == 0 || B.bs.independentBlend)) {
+							readsBlendFactor = readsBlendFactor ||
+								DxBlendIsConstant(dst.SrcBlend) || DxBlendIsConstant(dst.DestBlend) ||
+								DxBlendIsConstant(dst.SrcBlendAlpha) || DxBlendIsConstant(dst.DestBlendAlpha);
+						}
 					}
 				} break;
 				case PsoSubobj::DepthStencil: {
@@ -1219,6 +1711,14 @@ namespace rhi {
 					depth.DepthEnable = D.ds.depthEnable;
 					depth.DepthWriteMask = D.ds.depthWrite ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
 					depth.DepthFunc = ToDX(D.ds.depthFunc);
+					depth.StencilEnable = D.ds.stencilEnable;
+					depth.StencilReadMask = D.ds.stencilReadMask;
+					depth.StencilWriteMask = D.ds.stencilWriteMask;
+					auto toDx = [](const StencilFaceState& face) {
+						return D3D12_DEPTH_STENCILOP_DESC{ ToDX(face.failOp), ToDX(face.depthFailOp), ToDX(face.passOp), ToDX(face.func) };
+					};
+					depth.FrontFace = toDx(D.ds.front);
+					depth.BackFace = toDx(D.ds.back);
 				} break;
 				case PsoSubobj::RTVFormats: {
 					hasRTV = true;
@@ -1283,12 +1783,21 @@ namespace rhi {
 				if (vs.pShaderBytecode) sb.push(SO_VS{ .Value = vs });
 				if (ps.pShaderBytecode) sb.push(SO_PS{ .Value = ps });
 
+				// BASICRHI_DX12_TEST_NO_DEPTH=1 (a diagnostic): every graphics pipeline without depth, stencil or culling, to tell a
+				// draw its depth or stencil test rejects from one that never rasterizes.
+				static const bool testNoDepth = [] { const char* v = std::getenv("BASICRHI_DX12_TEST_NO_DEPTH"); return v && *v == '1'; }();
+				if (testNoDepth && !isCompute) {
+					rast.CullMode = D3D12_CULL_MODE_NONE;
+					depth.DepthEnable = FALSE;
+					depth.StencilEnable = FALSE;
+				}
 				if (hasRast) sb.push(SO_Rasterizer{ .Value = rast });
 				if (hasBlend) sb.push(SO_Blend{ .Value = blend });
 				if (hasDepth) sb.push(SO_DepthStencil{ .Value = depth });
 				if (hasRTV) sb.push(SO_RtvFormats{ .Value = rtv });
 				if (hasDSV) sb.push(SO_DsvFormat{ .Value = dsv });
 				if (hasSample) sb.push(SO_SampleDesc{ .Value = sample });
+				if (sampleMask != UINT_MAX) sb.push(SO_SampleMask{ .Value = sampleMask });
 				if (hasInputLayout) sb.push(SO_InputLayout{ .Value = inputLayoutDesc });
 			}
 			auto sd = sb.desc();
@@ -1300,7 +1809,7 @@ namespace rhi {
 			}
 
 			ComPtr<ID3D12PipelineState> pso;
-			if (const auto hr = dimpl->pNativeDevice->CreatePipelineState(&sd, IID_PPV_ARGS(&pso)); FAILED(hr)) {
+			if (const auto hr = Dx12CreatePipelineStateThroughCache(dimpl, sd, pso); FAILED(hr)) {
 				spdlog::error(
 					"DX12 CreatePipelineState failed: hr=0x{:08X}, isCompute={}, hasCS={}, hasGfx={}, hasVS={}, hasPS={}, hasAS={}, hasMS={}, rootSet={}, topologyType={}, rtvCount={}, rtv0=0x{:X}, dsv=0x{:X}, sampleCount={}, sampleQuality={}, hasDepth={}, depthEnable={}, depthWrite={}, streamSize={}",
 					static_cast<uint32_t>(hr),
@@ -1326,7 +1835,10 @@ namespace rhi {
 				RHI_FAIL(ToRHI(hr));
 			}
 
-			auto handle = dimpl->pipelines.alloc(Dx12Pipeline(pso, isCompute, dimpl));
+			Dx12Pipeline pipeline(pso, isCompute, dimpl);
+			pipeline.readsStencilRef = !isCompute && hasDepth && depth.StencilEnable;
+			pipeline.readsBlendFactor = !isCompute && readsBlendFactor;
+			auto handle = dimpl->pipelines.alloc(std::move(pipeline));
 			Pipeline ret(handle);
 			ret.vt = &g_psovt;
 			ret.impl = dimpl;
@@ -1335,8 +1847,10 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		static void Dx12ReleaseViewRef(Dx12Device* impl, ResourceHandle handle) noexcept;
 		static void d_destroyBuffer(DeviceDeletionContext* d, ResourceHandle h) noexcept
 		{
+			Dx12ReleaseViewRef(dx12_detail::Dev(d), h);
 			dx12_detail::Dev(d)->resources.free(h);
 		}
 		static void d_destroyTexture(DeviceDeletionContext* d, ResourceHandle h) noexcept
@@ -1672,6 +2186,7 @@ namespace rhi {
 			// Drain the queue before destroying it
 			Dx12WaitQueueIdle(*qs);
 			Dx12DestroyTracyGpuContext(*qs);
+			if (qs->hasProgress) impl->timelines.free(qs->progress);
 			impl->queues.free(h);
 		}
 
@@ -1750,6 +2265,10 @@ namespace rhi {
 				imgs, imgHandles,
 				impl
 			);
+			scWrap.sdrFormat = fmt;
+			if (ComPtr<IDXGISwapChain2> sc2; SUCCEEDED(proxySc3.As(&sc2))) {
+				scWrap.frameLatencyWaitable = sc2->GetFrameLatencyWaitableObject();
+			}
 
 			auto scHandle = impl->swapchains.alloc(scWrap);
 
@@ -1763,6 +2282,10 @@ namespace rhi {
 		static void d_destroySwapchain(DeviceDeletionContext*, Swapchain* sc) noexcept {
 			auto* s = dx12_detail::SC(sc);
 			if (!s) { sc->impl = nullptr; sc->vt = nullptr; return; }
+			if (s->frameLatencyWaitable) {
+				CloseHandle(s->frameLatencyWaitable);
+				s->frameLatencyWaitable = nullptr;
+			}
 
 			// Ensure GPU is idle before ripping out backbuffers.
 			if (s->dev && s->dev->self.vt && s->dev->self.vt->deviceWaitIdle) {
@@ -2085,7 +2608,7 @@ namespace rhi {
 					sizeof(options0));
 
 				D3D12_FEATURE_DATA_SHADER_MODEL shaderModelFeature{};
-				shaderModelFeature.HighestShaderModel = D3D_SHADER_MODEL_6_8;
+				shaderModelFeature.HighestShaderModel = D3D_HIGHEST_SHADER_MODEL;
 				(void)impl->pNativeDevice->CheckFeatureSupport(
 					D3D12_FEATURE_SHADER_MODEL,
 					&shaderModelFeature,
@@ -2207,6 +2730,13 @@ namespace rhi {
 				L.staticSamplers.assign(ld.staticSamplers.data, ld.staticSamplers.data + ld.staticSamplers.size);
 			}
 			L.root = root;
+			{
+				// The pipeline cache keys pipelines by this hash (Dx12PipelineStreamKey).
+				detail::Fnv1a64 rootHash;
+				rootHash.Add(blob->GetBufferPointer(), blob->GetBufferSize());
+				const uint64_t rootHashValue = rootHash.Value();
+				root->SetPrivateData(kDx12RootSignatureHashGuid, sizeof(rootHashValue), &rootHashValue);
+			}
 			auto handle = impl->pipelineLayouts.alloc(L);
 			PipelineLayout ret(handle);
 			ret.vt = &g_plvt;
@@ -2231,6 +2761,8 @@ namespace rhi {
 		}
 
 		inline std::vector<D3D_SHADER_MODEL> shaderModels = {
+			D3D_SHADER_MODEL_6_10,
+			D3D_SHADER_MODEL_6_9,
 			D3D_SHADER_MODEL_6_8,
 			D3D_SHADER_MODEL_6_7,
 			D3D_SHADER_MODEL_6_6,
@@ -2249,8 +2781,10 @@ namespace rhi {
 			for (const auto& model : shaderModels) {
 				D3D12_FEATURE_DATA_SHADER_MODEL sm{};
 				sm.HighestShaderModel = model;
+				// A runtime that doesn't know the requested model fails the query; otherwise it
+				// lowers HighestShaderModel to what the device supports.
 				if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) {
-					return model;
+					return sm.HighestShaderModel;
 				}
 			}
 			BreakIfDebugging(); // Nothing under 6_0 is supported
@@ -2330,17 +2864,32 @@ namespace rhi {
 			const bool hasMeshShaders =
 				(opt7.MeshShaderTier == D3D12_MESH_SHADER_TIER_1);
 
+			// Tiers are ordered; drivers report newer tiers (e.g. 1.2) that include everything below.
 			const bool hasRayTracingPipeline =
-				(opt5.RaytracingTier == D3D12_RAYTRACING_TIER_1_0) ||
-				(opt5.RaytracingTier == D3D12_RAYTRACING_TIER_1_1);
+				(opt5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0);
 
 			const bool hasRayTracing11 =
-				(opt5.RaytracingTier == D3D12_RAYTRACING_TIER_1_1);
+				(opt5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1);
 
-			bool hasRayTracing20 = false;
-#if BASICRHI_HAS_DXR2_HEADERS && defined(D3D12_RAYTRACING_TIER_2_0)
-			hasRayTracing20 = opt5.RaytracingTier >= D3D12_RAYTRACING_TIER_2_0;
-#endif
+			const bool hasOpacityMicromaps =
+				(opt5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_2);
+
+			// A required part of shader model 6.9 with ray tracing, so the calls are valid even where the driver doesn't sort.
+			D3D12_FEATURE_DATA_SHADER_MODEL serShaderModel{ D3D_SHADER_MODEL_6_9 };
+			const bool hasShaderExecutionReordering = hasRayTracingPipeline
+				&& SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &serShaderModel, sizeof(serShaderModel)))
+				&& serShaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_9;
+			D3D12_FEATURE_DATA_D3D12_OPTIONS22 options22{};
+			const bool actuallyReorders = hasShaderExecutionReordering
+				&& SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS22, &options22, sizeof(options22)))
+				&& options22.ShaderExecutionReorderingActuallyReorders;
+
+			// The cap, not the tier: tier 2.0 also needs opacity micromaps, which clusters can do without.
+			const Dx12Device* raytracing2Device = static_cast<const Dx12Device*>(d ? d->impl : nullptr);
+			D3D12_FEATURE_DATA_D3D12_OPTIONS_RAYTRACING2 optRaytracing2{};
+			const bool hasRayTracing20 = raytracing2Device && raytracing2Device->pNativeDeviceRaytracing2
+				&& SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS_RAYTRACING2, &optRaytracing2, sizeof(optRaytracing2)))
+				&& optRaytracing2.ClustersAndPTLASSupported;
 
 			const bool hasVrsPerDraw =
 				(opt6.VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_1) ||
@@ -2425,6 +2974,14 @@ namespace rhi {
 					out->atomicInt64OnGroupShared = atomicInt64GroupShared;
 					out->atomicInt64OnTypedResource = atomicInt64Typed;
 					out->atomicInt64OnDescriptorHeapResources = atomicInt64OnDescriptorHeapResources;
+					if (h->structVersion >= 2) {
+						// D3D12's shader-visible heap limits: 1,000,000 CBV/SRV/UAV descriptors on every resource binding tier (tier 3 allows more, the
+						// preferred capacity is this) and D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE samplers.
+						// The buffer view refs' region sits past this capacity in the same heap (rhi_shader_abi.h), so the device reports its
+						// slots fewer: a heap of the full capacity plus the region stays within the limit (NVIDIA refuses one above it).
+						out->maxShaderVisibleResourceDescriptors = 1000000u - BUFFER_VIEW_REF_SLOTS;
+						out->maxShaderVisibleSamplerDescriptors = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+					}
 				} break;
 
 				case FeatureInfoStructType::MeshShaders: {
@@ -2461,8 +3018,9 @@ namespace rhi {
 					out->pipelineLibrary = hasRayTracingPipeline;
 					out->deferredHostOperations = false;
 					out->shaderGroupHandleCaptureReplay = false;
-					out->opacityMicromap = false;
-					out->shaderExecutionReordering = false;
+					out->opacityMicromap = hasOpacityMicromaps;
+					out->shaderExecutionReordering = hasShaderExecutionReordering;
+					out->shaderExecutionReorderingActuallyReorders = actuallyReorders;
 					out->gpuRtasOperations = hasRayTracing20;
 					out->clusterAccelerationStructure = hasRayTracing20;
 					out->clusterTemplates = hasRayTracing20;
@@ -2486,16 +3044,16 @@ namespace rhi {
 					out->maxPrimitiveCount = hasRayTracingPipeline ? D3D12_RAYTRACING_MAX_PRIMITIVES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE : 0;
 					out->scratchAlignment = hasRayTracingPipeline ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
 					out->resultAlignment = hasRayTracingPipeline ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
-					out->maxClusterVertices = 0;
-					out->maxClusterTriangles = 0;
-					out->maxClusterGeometryIndex = 0;
-					out->maxClusterUniqueGeometryCount = 0;
+					out->maxClusterVertices = hasRayTracing20 ? 256u : 0u;
+					out->maxClusterTriangles = hasRayTracing20 ? 256u : 0u;
+					out->maxClusterGeometryIndex = hasRayTracing20 ? D3D12_RAYTRACING_MAXIMUM_GEOMETRY_INDEX : 0u;
+					out->maxClusterUniqueGeometryCount = hasRayTracing20 ? 256u : 0u;
 					out->maxPartitionCount = 0;
 					out->clusterScratchAlignment = hasRayTracing20 ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
-					out->clusterAlignment = hasRayTracing20 ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
-					out->clusterTemplateAlignment = hasRayTracing20 ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
+					out->clusterAlignment = hasRayTracing20 ? D3D12_RAYTRACING_CLAS_BYTE_ALIGNMENT : 0;
+					out->clusterTemplateAlignment = hasRayTracing20 ? D3D12_RAYTRACING_CLUSTER_TEMPLATE_BYTE_ALIGNMENT : 0;
 					out->clusterBottomLevelAlignment = hasRayTracing20 ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT : 0;
-					out->clusterTemplateBoundsAlignment = 0;
+					out->clusterTemplateBoundsAlignment = hasRayTracing20 ? D3D12_RAYTRACING_CLUSTER_TEMPLATE_BOUNDS_BYTE_ALIGNMENT : 0;
 				} break;
 
 				case FeatureInfoStructType::ShadingRate: {
@@ -2543,6 +3101,7 @@ namespace rhi {
 					out->gpuUploadHeapSupported = gpuUploadHeapSupported;
 					out->tightAlignmentSupported = tightAlignmentSupported;
 					out->createNotZeroedHeapSupported = createNotZeroedSupported;
+					out->committedSmallBuffersPacked = true;
 				} break;
 				case FeatureInfoStructType::WorkGraphs: {
 					if (h->structSize < sizeof(WorkGraphFeatureInfo)) return Result::InvalidArgument;
@@ -2566,6 +3125,21 @@ namespace rhi {
 					out->maxPipelineSetCount = 0;
 					out->vertexBufferArguments = true;
 					out->indirectBindings = false;
+					out->maxSequenceCount = UINT32_MAX;  // ExecuteIndirect's MaxCommandCount has no device limit
+					if (h->structVersion >= 3)
+						out->countedDraws = true;  // ExecuteIndirect's count buffer is core D3D12
+				} break;
+				case FeatureInfoStructType::FixedFunction: {
+					if (h->structSize < sizeof(FixedFunctionFeatureInfo)) return Result::InvalidArgument;
+					auto* out = reinterpret_cast<FixedFunctionFeatureInfo*>(h);
+					out->dualSourceBlend = true;  // core D3D12
+					out->logicOp = opt0.OutputMergerLogicOp != 0;
+					out->depthClipDisable = true;  // core D3D12
+					out->maxViewports = MAX_VIEWPORTS;
+					if (h->structVersion >= 2)
+						out->secondaryViewportScissor = false;  // bundles cannot set them (RSSetViewports, RSSetScissorRects)
+					if (h->structVersion >= 3)
+						out->stencilExport = opt0.PSSpecifiedStencilRefSupported != 0;
 				} break;
 				default:
 					// Unknown sType: ignore
@@ -2759,7 +3333,10 @@ namespace rhi {
 				Dx12LogInfoQueueMessagesSince(impl->pNativeDevice.Get(), 0, 32);
 				RHI_FAIL(ToRHI(hr));
 			}
-			const Dx12CommandSignature s(cs, cd.byteStride, impl);
+			Dx12CommandSignature s(cs, cd.byteStride, impl);
+			for (uint32_t i = 0; i < cd.args.size; ++i)
+				if (cd.args.data[i].kind == IndirectArgKind::Constant)
+					s.setsRootConstants = true;
 			const auto handle = impl->commandSignatures.alloc(s);
 			CommandSignature ret(handle);
 			ret.vt = &g_csvt;
@@ -2772,6 +3349,125 @@ namespace rhi {
 			dx12_detail::Dev(d)->commandSignatures.free(h);
 		}
 
+		// ---- Buffer view refs (rhi_shader_abi.h, BUFFER_VIEW_REF_*) ----
+
+		static void Dx12RawBufferViews(Dx12Device* impl, ID3D12Resource* resource, uint64_t bytes, bool unordered,
+			D3D12_CPU_DESCRIPTOR_HANDLE srv, D3D12_CPU_DESCRIPTOR_HANDLE uav) noexcept {
+			D3D12_SHADER_RESOURCE_VIEW_DESC s{};
+			s.Format = DXGI_FORMAT_R32_TYPELESS;
+			s.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+			s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			s.Buffer.NumElements = static_cast<UINT>((std::min<uint64_t>)(bytes / 4, UINT32_MAX));
+			s.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+			impl->pNativeDevice->CreateShaderResourceView(resource, &s, srv);
+			D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
+			u.Format = DXGI_FORMAT_R32_TYPELESS;
+			u.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+			u.Buffer.NumElements = s.Buffer.NumElements;
+			u.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+			// Without UAV access the slot holds a null view, so every slot of the region is a valid descriptor to copy.
+			impl->pNativeDevice->CreateUnorderedAccessView(unordered ? resource : nullptr, nullptr, &u, uav);
+		}
+
+		static D3D12_CPU_DESCRIPTOR_HANDLE Dx12ViewRefStaging(const Dx12ViewRefRegion& r, uint32_t a_slot) noexcept {
+			D3D12_CPU_DESCRIPTOR_HANDLE handle = r.stagingStart;
+			handle.ptr += SIZE_T(a_slot) * r.increment;
+			return handle;
+		}
+
+		/** @brief The staging heap, at device creation, with a null pair in every slot. Without it no buffer has a ref. */
+		static void Dx12InitViewRefs(Dx12Device* impl) noexcept {
+			auto& r = impl->viewRefs;
+			D3D12_DESCRIPTOR_HEAP_DESC staging{};
+			staging.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+			staging.NumDescriptors = BUFFER_VIEW_REF_SLOTS;
+			if (FAILED(impl->pNativeDevice->CreateDescriptorHeap(&staging, IID_PPV_ARGS(&r.staging)))) {
+				spdlog::warn("DX12 buffer view refs: the staging heap could not be made; no buffer has a view ref");
+				return;
+			}
+			r.stagingStart = r.staging->GetCPUDescriptorHandleForHeapStart();
+			r.increment = impl->pNativeDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			r.firstSlot = 1000000u - BUFFER_VIEW_REF_SLOTS;  // ShaderFeatureInfo::maxShaderVisibleResourceDescriptors
+			for (uint32_t pair = 0; pair < BUFFER_VIEW_REF_PAIRS; ++pair)
+				Dx12RawBufferViews(impl, nullptr, 4, false, Dx12ViewRefStaging(r, 2 * pair), Dx12ViewRefStaging(r, 2 * pair + 1));
+			r.ready = true;
+			spdlog::info("DX12 buffer view refs: {} pairs at heap slot {}", BUFFER_VIEW_REF_PAIRS, r.firstSlot);
+		}
+
+		/** @brief Copies a pair from the staging heap into every full-size heap. Under the write lock. */
+		static void Dx12PublishViewRefPair(Dx12Device* impl, uint32_t a_pair) noexcept {
+			auto& r = impl->viewRefs;
+			const D3D12_CPU_DESCRIPTOR_HANDLE from = Dx12ViewRefStaging(r, 2 * a_pair);
+			for (const auto& [heap, start] : r.heaps) {
+				D3D12_CPU_DESCRIPTOR_HANDLE to = start;
+				to.ptr += SIZE_T(r.firstSlot + 2 * a_pair) * r.increment;
+				impl->pNativeDevice->CopyDescriptorsSimple(2, to, from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			}
+		}
+
+		/** @brief A buffer's pair, made the first time it is asked for. Readback buffers have no shader views and get none. */
+		static BufferViewRef Dx12ViewRef(Dx12Device* impl, GpuBufferAddress address) noexcept {
+			if (!impl || !impl->viewRefs.ready || !address.buffer.valid() || address.offset > UINT32_MAX)
+				return {};
+			auto& r = impl->viewRefs;
+			const uint64_t key = (uint64_t(address.buffer.generation) << 32) | address.buffer.index;
+			const auto refAt = [&](uint32_t pair) { return BufferViewRef{ r.firstSlot + 2 * pair, static_cast<uint32_t>(address.offset) }; };
+			{
+				std::shared_lock read(r.lock);
+				if (const auto found = r.pairByResource.find(key); found != r.pairByResource.end())
+					return refAt(found->second);
+			}
+			Dx12Resource* resource = impl->resources.get(address.buffer);
+			if (!resource || !resource->res || resource->kind != Dx12ResourceKind::Buffer)
+				return {};
+			D3D12_HEAP_PROPERTIES heapProperties{};
+			D3D12_HEAP_FLAGS heapFlags{};
+			if (SUCCEEDED(resource->res->GetHeapProperties(&heapProperties, &heapFlags)) && heapProperties.Type == D3D12_HEAP_TYPE_READBACK)
+				return {};
+			const D3D12_RESOURCE_DESC desc = resource->res->GetDesc();
+			if (desc.Width == 0)
+				return {};
+			const bool unordered = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+
+			std::unique_lock write(r.lock);
+			if (const auto found = r.pairByResource.find(key); found != r.pairByResource.end())
+				return refAt(found->second);
+			uint32_t pair = 0;
+			if (!r.freePairs.empty()) {
+				pair = r.freePairs.back();
+				r.freePairs.pop_back();
+			} else if (r.nextPair < BUFFER_VIEW_REF_PAIRS) {
+				pair = r.nextPair++;
+			} else {
+				if (!r.loggedFull) {
+					r.loggedFull = true;
+					spdlog::error("DX12 buffer view refs: all {} pairs are in use; further buffers have no view ref", BUFFER_VIEW_REF_PAIRS);
+				}
+				return {};
+			}
+			Dx12RawBufferViews(impl, resource->res.Get(), desc.Width, unordered, Dx12ViewRefStaging(r, 2 * pair), Dx12ViewRefStaging(r, 2 * pair + 1));
+			Dx12PublishViewRefPair(impl, pair);
+			r.pairByResource.emplace(key, pair);
+			return refAt(pair);
+		}
+
+		/** @brief A destroyed buffer's pair goes back, null again. The deferred destruction has waited for the frames that read it. */
+		static void Dx12ReleaseViewRef(Dx12Device* impl, ResourceHandle handle) noexcept {
+			if (!impl || !impl->viewRefs.ready)
+				return;
+			auto& r = impl->viewRefs;
+			const uint64_t key = (uint64_t(handle.generation) << 32) | handle.index;
+			std::unique_lock write(r.lock);
+			const auto found = r.pairByResource.find(key);
+			if (found == r.pairByResource.end())
+				return;
+			const uint32_t pair = found->second;
+			r.pairByResource.erase(found);
+			Dx12RawBufferViews(impl, nullptr, 4, false, Dx12ViewRefStaging(r, 2 * pair), Dx12ViewRefStaging(r, 2 * pair + 1));
+			Dx12PublishViewRefPair(impl, pair);
+			r.freePairs.push_back(pair);
+		}
+
 		static Result d_createDescriptorHeap(Device* d, const DescriptorHeapDesc& hd, DescriptorHeapPtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 
@@ -2779,10 +3475,32 @@ namespace rhi {
 			desc.Type = ToDX(hd.type);
 			desc.NumDescriptors = hd.capacity;
 			desc.Flags = hd.shaderVisible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+			// A shader-visible resource heap of the device's full capacity also holds the buffer view refs' reserved region, past
+			// the capacity the client indexes (rhi_shader_abi.h).
+			const bool addressRegion = hd.shaderVisible && hd.type == DescriptorHeapType::CbvSrvUav && impl->viewRefs.ready &&
+				hd.capacity == impl->viewRefs.firstSlot;
+			if (addressRegion)
+				desc.NumDescriptors += BUFFER_VIEW_REF_SLOTS;
 
 			Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
-			if (const auto hr = impl->pNativeDevice->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap)); FAILED(hr)) {
-				RHI_FAIL(ToRHI(hr));
+			HRESULT created = impl->pNativeDevice->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap));
+			bool withRegion = addressRegion && SUCCEEDED(created);
+			if (FAILED(created) && addressRegion) {
+				spdlog::warn("DX12 buffer view refs: a heap of {} descriptors was refused (hr=0x{:08X}); this heap has no view refs",
+					desc.NumDescriptors, static_cast<uint32_t>(created));
+				desc.NumDescriptors = hd.capacity;
+				created = impl->pNativeDevice->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap));
+			}
+			if (FAILED(created)) {
+				RHI_FAIL(ToRHI(created));
+			}
+			if (withRegion) {
+				auto& r = impl->viewRefs;
+				std::unique_lock write(r.lock);
+				r.heaps.emplace_back(heap.Get(), heap->GetCPUDescriptorHandleForHeapStart());
+				D3D12_CPU_DESCRIPTOR_HANDLE to = heap->GetCPUDescriptorHandleForHeapStart();
+				to.ptr += SIZE_T(r.firstSlot) * r.increment;
+				impl->pNativeDevice->CopyDescriptorsSimple(BUFFER_VIEW_REF_SLOTS, to, r.stagingStart, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 			}
 
 			const auto descriptorSize = impl->pNativeDevice->GetDescriptorHandleIncrementSize(desc.Type);
@@ -2796,7 +3514,13 @@ namespace rhi {
 			return Result::Ok;
 		}
 		static void d_destroyDescriptorHeap(DeviceDeletionContext* d, DescriptorHeapHandle h) noexcept {
-			dx12_detail::Dev(d)->descHeaps.free(h);
+			auto* impl = dx12_detail::Dev(d);
+			if (auto* H = impl->descHeaps.get(h)) {
+				auto& r = impl->viewRefs;
+				std::unique_lock write(r.lock);
+				std::erase_if(r.heaps, [&](const auto& entry) { return entry.first == H->heap.Get(); });
+			}
+			impl->descHeaps.free(h);
 		}
 		static bool DxGetDstCpu(Dx12Device* impl, DescriptorSlot s, D3D12_CPU_DESCRIPTOR_HANDLE& out, D3D12_DESCRIPTOR_HEAP_TYPE expect) {
 			auto* H = impl->descHeaps.get(s.heap);
@@ -2819,6 +3543,41 @@ namespace rhi {
 		static D3D12_GPU_VIRTUAL_ADDRESS Dx12AccelerationStructureAddress(Dx12Device* impl, AccelerationStructureHandle handle) noexcept;
 		static D3D12_GPU_VIRTUAL_ADDRESS Dx12BufferAddress(Dx12Device* impl, GpuBufferAddress address) noexcept;
 
+		// A shader resource view cannot take a depth-stencil format (the device is removed: DXGI_ERROR_INVALID_CALL). A texture's depth
+		// is read through the matching colour format of its depth plane, as Vulkan reads the view's depth aspect.
+		static DXGI_FORMAT DxSrvFormat(DXGI_FORMAT format) noexcept {
+			switch (format) {
+			case DXGI_FORMAT_D24_UNORM_S8_UINT:
+			case DXGI_FORMAT_R24G8_TYPELESS:
+				return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+			case DXGI_FORMAT_D32_FLOAT:
+				return DXGI_FORMAT_R32_FLOAT;
+			case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+			case DXGI_FORMAT_R32G8X24_TYPELESS:
+				return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+			case DXGI_FORMAT_D16_UNORM:
+				return DXGI_FORMAT_R16_UNORM;
+			default:
+				return format;
+			}
+		}
+
+		// A depth-stencil texture's stencil plane (SrvDesc plane 1): its stencil in the second channel. Unknown for other formats.
+		static DXGI_FORMAT DxStencilSrvFormat(DXGI_FORMAT format) noexcept {
+			switch (format) {
+			case DXGI_FORMAT_D24_UNORM_S8_UINT:
+			case DXGI_FORMAT_R24G8_TYPELESS:
+			case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+				return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+			case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+			case DXGI_FORMAT_R32G8X24_TYPELESS:
+			case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+				return DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+			default:
+				return DXGI_FORMAT_UNKNOWN;
+			}
+		}
+
 		static Result d_createShaderResourceView(Device* d, DescriptorSlot s, const ResourceHandle& resource, const SrvDesc& dv) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 
@@ -2833,7 +3592,8 @@ namespace rhi {
 				? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
 				: dv.componentMapping;
 
-			if (!resource.valid()) {
+			// An acceleration structure is named by address, so its view never has a resource.
+			if (!resource.valid() && dv.dimension != SrvDim::AccelerationStruct) {
 				// A null view: reads return zero. D3D12 needs only its dimension and format.
 				switch (dv.dimension) {
 				case SrvDim::Buffer:
@@ -2901,7 +3661,7 @@ namespace rhi {
 
 			case SrvDim::Texture1D: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
 				desc.Texture1D.MostDetailedMip = dv.tex1D.mostDetailedMip;
 				desc.Texture1D.MipLevels = dv.tex1D.mipLevels;
@@ -2912,7 +3672,7 @@ namespace rhi {
 
 			case SrvDim::Texture1DArray: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
 				desc.Texture1DArray.MostDetailedMip = dv.tex1DArray.mostDetailedMip;
 				desc.Texture1DArray.MipLevels = dv.tex1DArray.mipLevels;
@@ -2926,7 +3686,9 @@ namespace rhi {
 
 			case SrvDim::Texture2D: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
+				if (dv.tex2D.planeSlice == 1 && DxStencilSrvFormat(T->fmt) != DXGI_FORMAT_UNKNOWN)
+					desc.Format = DxStencilSrvFormat(T->fmt);
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 				desc.Texture2D.MostDetailedMip = dv.tex2D.mostDetailedMip;
 				desc.Texture2D.MipLevels = dv.tex2D.mipLevels;
@@ -2938,7 +3700,7 @@ namespace rhi {
 
 			case SrvDim::Texture2DArray: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
 				desc.Texture2DArray.MostDetailedMip = dv.tex2DArray.mostDetailedMip;
 				desc.Texture2DArray.MipLevels = dv.tex2DArray.mipLevels;
@@ -2952,7 +3714,7 @@ namespace rhi {
 
 			case SrvDim::Texture2DMS: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
 				impl->pNativeDevice->CreateShaderResourceView(T->res.Get(), &desc, dst);
 				return Result::Ok;
@@ -2960,7 +3722,7 @@ namespace rhi {
 
 			case SrvDim::Texture2DMSArray: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
 				desc.Texture2DMSArray.FirstArraySlice = dv.tex2DMSArray.firstArraySlice;
 				desc.Texture2DMSArray.ArraySize = dv.tex2DMSArray.arraySize;
@@ -2970,7 +3732,7 @@ namespace rhi {
 
 			case SrvDim::Texture3D: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
 				desc.Texture3D.MostDetailedMip = dv.tex3D.mostDetailedMip;
 				desc.Texture3D.MipLevels = dv.tex3D.mipLevels;
@@ -2981,7 +3743,7 @@ namespace rhi {
 
 			case SrvDim::TextureCube: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
 				desc.TextureCube.MostDetailedMip = dv.cube.mostDetailedMip;
 				desc.TextureCube.MipLevels = dv.cube.mipLevels;
@@ -2992,7 +3754,7 @@ namespace rhi {
 
 			case SrvDim::TextureCubeArray: {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
-				desc.Format = (dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride);
+				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
 				desc.TextureCubeArray.MostDetailedMip = dv.cubeArray.mostDetailedMip;
 				desc.TextureCubeArray.MipLevels = dv.cubeArray.mipLevels;
@@ -3472,6 +4234,9 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		static Result d_createCommandAllocator(Device* d, QueueKind q, CommandAllocatorPtr& out) noexcept;
+		// D3D12 allocators are per command list type, which every queue of a kind shares.
+		static Result d_createCommandAllocatorForQueue(Device* d, const Queue& q, CommandAllocatorPtr& out) noexcept { return d_createCommandAllocator(d, q.GetKind(), out); }
 		static Result d_createCommandAllocator(Device* d, QueueKind q, CommandAllocatorPtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 			ID3D12Device* createDevice = impl->steamlineInitialized ? impl->pSLProxyDevice.Get() : impl->pNativeDevice.Get();
@@ -3555,12 +4320,17 @@ namespace rhi {
 			
 			Dx12CommandList rec(cl, A->alloc, A->type, impl);
 			rec.slProxyCl = proxyCl;
+			if (impl->pNativeDeviceRaytracing2) {
+				(void)cl.As(&rec.clRaytracing2);
+			}
 			Dx12CommandList recWithScratch = rec;
 			if (!Dx12EnsureRootCbvScratchPage(impl, recWithScratch, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT)) {
 				spdlog::error("DX12 create command list EnsureRootCbvScratchPage failed queue={}", static_cast<int>(q));
 				RHI_FAIL(Result::Failed);
 			}
+			recWithScratch.open = true;  // CreateCommandList opens it
 			const auto h = impl->commandLists.alloc(recWithScratch);
+			const_cast<Dx12Allocator*>(A)->lists.push_back(h);
 
 			CommandList ret{ h };
 			ret.impl = impl;
@@ -3570,16 +4340,63 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// A bundle, from the allocator's bundle allocator (made here with its first secondary: an allocator is recorded from by
+		// one thread at a time). Created closed: Recycle, then BeginSecondary.
+		static Result d_createSecondaryCommandList(Device* d, QueueKind q, CommandAllocator ca, CommandListPtr& out) noexcept {
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			auto* A = dx12_detail::Alloc(&ca);
+			if (!impl || !impl->pNativeDevice || !A || A->type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+				out.Reset();
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (!A->bundleAlloc) {
+				if (const auto hr = impl->pNativeDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&A->bundleAlloc)); FAILED(hr)) {
+					spdlog::error("DX12 create bundle allocator failed hr=0x{:08X}", static_cast<unsigned>(hr));
+					out.Reset();
+					RHI_FAIL(ToRHI(hr));
+				}
+			}
+			ComPtr<ID3D12GraphicsCommandList> created;
+			if (const auto hr = impl->pNativeDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, A->bundleAlloc.Get(), nullptr, IID_PPV_ARGS(&created)); FAILED(hr)) {
+				spdlog::error("DX12 create bundle failed queue={} hr=0x{:08X}", static_cast<int>(q), static_cast<unsigned>(hr));
+				out.Reset();
+				RHI_FAIL(ToRHI(hr));
+			}
+			Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList10> cl;
+			if (const auto hr = created.As(&cl); FAILED(hr)) {
+				spdlog::error("DX12 create bundle As(ID3D12GraphicsCommandList10) failed hr=0x{:08X}", static_cast<unsigned>(hr));
+				out.Reset();
+				RHI_FAIL(ToRHI(hr));
+			}
+			if (const auto hr = cl->Close(); FAILED(hr)) {
+				out.Reset();
+				RHI_FAIL(ToRHI(hr));
+			}
+
+			Dx12CommandList rec(cl, A->bundleAlloc, D3D12_COMMAND_LIST_TYPE_BUNDLE, impl);
+			rec.bundle = true;
+			if (!Dx12EnsureRootCbvScratchPage(impl, rec, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT)) {
+				spdlog::error("DX12 create bundle EnsureRootCbvScratchPage failed");
+				out.Reset();
+				RHI_FAIL(Result::Failed);
+			}
+			const auto h = impl->commandLists.alloc(rec);
+			A->lists.push_back(h);
+			CommandList ret{ h };
+			ret.impl = impl;
+			ret.backendState = impl->commandLists.get(h);
+			ret.vt = &g_clvt;
+			out = MakeCommandListPtr(d, ret, impl->selfWeak.lock());
+			return Result::Ok;
+		}
+
 		static Result d_createCommittedBuffer(Device* d, const ResourceDesc& bd, ResourcePtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 			if (!impl || !impl->pNativeDevice || bd.buffer.sizeBytes == 0) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			D3D12_HEAP_PROPERTIES hp{};
-			hp.Type = ToDX(bd.heapType);
-			hp.CreationNodeMask = 1;
-			hp.VisibleNodeMask = 1;
+			const D3D12_HEAP_PROPERTIES hp = ToDxHeapProperties(bd.heapType);
 
 			const auto hf = ToDX(bd.heapFlags);
 
@@ -3629,10 +4446,7 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 
-			D3D12_HEAP_PROPERTIES hp{};
-			hp.Type = ToDX(td.heapType);
-			hp.CreationNodeMask = 1;
-			hp.VisibleNodeMask = 1;
+			const D3D12_HEAP_PROPERTIES hp = ToDxHeapProperties(td.heapType);
 
 			const auto hf = ToDX(td.heapFlags);
 
@@ -3740,12 +4554,7 @@ namespace rhi {
 			if (!impl || !impl->pNativeDevice || hd.sizeBytes == 0) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
-			D3D12_HEAP_PROPERTIES props{};
-			props.Type = ToDX(hd.memory);
-			props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-			props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-			props.CreationNodeMask = 1;
-			props.VisibleNodeMask = 1;
+			const D3D12_HEAP_PROPERTIES props = ToDxHeapProperties(hd.memory);
 
 			D3D12_HEAP_DESC desc{};
 			desc.SizeInBytes = hd.sizeBytes;
@@ -4113,6 +4922,248 @@ namespace rhi {
 			return Dx12BufferAddress(impl, GpuBufferAddress{ as->storage, as->storageOffset });
 		}
 
+		// Layouts the GPU reads directly. A mismatch here fails silently as garbage geometry, so check every field.
+#define BASICRHI_DXR2_FIELD(rhiType, rhiField, nativeType, nativeField) \
+		static_assert(offsetof(rhiType, rhiField) == offsetof(nativeType, nativeField), #rhiType "::" #rhiField " does not match " #nativeType "::" #nativeField)
+		static_assert(sizeof(PackedDxr2ClusterBuildTriangleInfo) == sizeof(D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS));
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, clusterID, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, ClusterID);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, clusterFlags, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, ClusterFlags);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, triangleCount, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, TriangleCount);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, uniqueVertexIndexCount, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, UniqueVertexIndexCount);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, baseGeometryIndexAndFlags, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, BaseGeometryIndexAndFlags);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, opacityMicromapBaseLocation, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, OpacityMicromapBaseLocation);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, vertexBufferStride, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, VertexBufferStride);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, indexBufferStride, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, IndexBufferStride);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, opacityMicromapIndexBufferStride, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, OpacityMicromapIndexBufferStride);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, geometryIndexAndFlagsBufferStride, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, GeometryIndexAndFlagsArrayStride);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, positionTruncateBitCount, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, PositionTruncateBitCount);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, vertexBuffer, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, VertexBuffer);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, indexBuffer, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, IndexBuffer);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, geometryIndexAndFlagsBuffer, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, GeometryIndexAndFlagsArray);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, geometryIndexAndFlagsIndexBuffer, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, GeometryIndexAndFlagsIndexBuffer);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, opacityMicromapArray, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, OpacityMicromapArray);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleInfo, opacityMicromapIndexBuffer, D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS, OpacityMicromapIndexBuffer);
+		static_assert(sizeof(PackedDxr2ClusterBuildTriangleTemplateInfo) == sizeof(D3D12_RTAS_OPERATION_BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES_ARGS));
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleTemplateInfo, instantiationBoundingBoxLimit, D3D12_RTAS_OPERATION_BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES_ARGS, InstantiationBoundingBoxLimit);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterBuildTriangleTemplateInfo, compressed1Header, D3D12_RTAS_OPERATION_BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES_ARGS, Compressed1.Header);
+		static_assert(sizeof(PackedDxr2ClusterInstantiateTemplateInfo) == sizeof(D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS));
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterInstantiateTemplateInfo, geometryIndexOffset, D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS, GeometryIndexOffset);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterInstantiateTemplateInfo, clusterIdOffset, D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS, ClusterIdOffset);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterInstantiateTemplateInfo, clusterTemplateAddress, D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS, ClusterTemplate);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterInstantiateTemplateInfo, vertexBufferStartAddress, D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS, VertexBuffer.StartAddress);
+		BASICRHI_DXR2_FIELD(PackedDxr2ClusterInstantiateTemplateInfo, vertexBufferStrideInBytes, D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS, VertexBuffer.StrideInBytes);
+		static_assert(sizeof(PackedDxr2PartitionedTlasWriteInstanceData) == sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS));
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, transform, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, Transform);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, instanceID, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, InstanceID);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, instanceMask, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, InstanceMask);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, instanceContributionToHitGroupIndex, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, InstanceContributionToHitGroupIndex);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, instanceFlags, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, InstanceFlags);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, accelerationStructure, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, AccelerationStructure);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, instanceIndex, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, InstanceIndex);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, partitionIndex, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, PartitionIndex);
+		BASICRHI_DXR2_FIELD(PackedDxr2PartitionedTlasWriteInstanceData, explicitAabb, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS, ExplicitAABB);
+		// The shared layouts.
+		static_assert(sizeof(PackedRayTracingClusterBuildBottomLevelInfo) == sizeof(D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS));
+		BASICRHI_DXR2_FIELD(PackedRayTracingClusterBuildBottomLevelInfo, clusterReferencesCount, D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS, ClasAddressCount);
+		BASICRHI_DXR2_FIELD(PackedRayTracingClusterBuildBottomLevelInfo, clusterReferencesStride, D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS, ClasAddressStride);
+		BASICRHI_DXR2_FIELD(PackedRayTracingClusterBuildBottomLevelInfo, clusterReferences, D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS, ClasAddressArray);
+		static_assert(sizeof(PackedRayTracingClusterMoveObjectsInfo) == sizeof(D3D12_RTAS_OPERATION_MOVE_CLUSTER_OBJECTS_ARGS));
+		static_assert(sizeof(PackedRayTracingPartitionedTlasIndirectCommand) == sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION));
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasIndirectCommand, operationType, D3D12_RTAS_PARTITIONED_TLAS_OPERATION, Type);
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasIndirectCommand, argumentCount, D3D12_RTAS_PARTITIONED_TLAS_OPERATION, ArgCount);
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasIndirectCommand, argumentDataStartAddress, D3D12_RTAS_PARTITIONED_TLAS_OPERATION, ArgData.StartAddress);
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasIndirectCommand, argumentDataStrideInBytes, D3D12_RTAS_PARTITIONED_TLAS_OPERATION, ArgData.StrideInBytes);
+		static_assert(sizeof(PackedRayTracingPartitionedTlasUpdateInstanceData) == sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_UPDATE_INSTANCE_ARGS));
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasUpdateInstanceData, instanceIndex, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_UPDATE_INSTANCE_ARGS, InstanceIndex);
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasUpdateInstanceData, instanceContributionToHitGroupIndex, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_UPDATE_INSTANCE_ARGS, InstanceContributionToHitGroupIndex);
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasUpdateInstanceData, accelerationStructure, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_UPDATE_INSTANCE_ARGS, AccelerationStructure);
+		static_assert(sizeof(PackedRayTracingPartitionedTlasWritePartitionTranslationData) == sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TRANSLATE_PARTITION_ARGS));
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasWritePartitionTranslationData, partitionIndex, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TRANSLATE_PARTITION_ARGS, PartitionIndex);
+		BASICRHI_DXR2_FIELD(PackedRayTracingPartitionedTlasWritePartitionTranslationData, partitionTranslation, D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TRANSLATE_PARTITION_ARGS, PartitionTranslation);
+#undef BASICRHI_DXR2_FIELD
+		static_assert(static_cast<uint32_t>(RayTracingPartitionedTlasOperationType::WriteInstance) == D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TYPE_WRITE_INSTANCE);
+		static_assert(static_cast<uint32_t>(RayTracingPartitionedTlasOperationType::UpdateInstance) == D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TYPE_UPDATE_INSTANCE);
+		static_assert(static_cast<uint32_t>(RayTracingPartitionedTlasOperationType::WritePartitionTranslation) == D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TYPE_TRANSLATE_PARTITION);
+		static_assert(static_cast<uint32_t>(RTClusterGeometry_Opaque) << 29 == static_cast<uint32_t>(D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE));
+		static_assert(static_cast<uint32_t>(RTClusterGeometry_NoDuplicateAnyHitInvocation) << 29 == static_cast<uint32_t>(D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION));
+		static_assert(static_cast<uint32_t>(RTASAddressResolution_IndirectedDstImplicitData) == D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_INDIRECTED_BATCH_RESULT);
+		static_assert(static_cast<uint32_t>(RTASAddressResolution_IndirectedScratchData) == D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_INDIRECTED_BATCH_SCRATCH);
+		static_assert(static_cast<uint32_t>(RTASAddressResolution_IndirectedDstAddressArray) == D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_INDIRECTED_DESTINATION_ADDRESS_ARRAY);
+		static_assert(static_cast<uint32_t>(RTASAddressResolution_IndirectedDstSizesArray) == D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_INDIRECTED_RESULT_SIZE_ARRAY);
+		static_assert(static_cast<uint32_t>(RTASAddressResolution_IndirectedSrcInfosArray) == D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_INDIRECTED_INDIRECT_ARGUMENT_ARRAY);
+		static_assert(static_cast<uint32_t>(RTASAddressResolution_IndirectedSrcInfosCount) == D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_INDIRECTED_INDIRECT_ARGUMENT_COUNT);
+
+		static D3D12_RTAS_OPERATION_FLAGS Dx12RtasOperationFlags(RayTracingAccelerationStructureBuildFlags flags) noexcept {
+			const uint32_t bits = static_cast<uint32_t>(flags);
+			D3D12_RTAS_OPERATION_FLAGS out = D3D12_RTAS_OPERATION_FLAG_NONE;
+			if ((bits & RTASBuild_PreferFastTrace) != 0) out |= D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+			else if ((bits & RTASBuild_PreferFastBuild) != 0) out |= D3D12_RTAS_OPERATION_FLAG_FAST_OPERATION;
+			return out;
+		}
+
+		static D3D12_RTAS_OPERATION_MODE Dx12RtasOperationMode(RayTracingRtasOperationMode mode) noexcept {
+			switch (mode) {
+			case RayTracingRtasOperationMode::ExplicitDestinations: return D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
+			case RayTracingRtasOperationMode::ComputeSizes: return D3D12_RTAS_OPERATION_MODE_GET_SIZES;
+			case RayTracingRtasOperationMode::ImplicitDestinations:
+			default: return D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
+			}
+		}
+
+		static bool Dx12ClusterVertexFormat(RayTracingClusterVertexFormat format, D3D12_VERTEX_FORMAT& out) noexcept {
+			switch (format) {
+			case RayTracingClusterVertexFormat::Float32x3: out = D3D12_VERTEX_FORMAT_FLOAT32_3; return true;
+			case RayTracingClusterVertexFormat::Float16x3: out = D3D12_VERTEX_FORMAT_FLOAT16_3; return true;
+			case RayTracingClusterVertexFormat::Snorm16x3: out = D3D12_VERTEX_FORMAT_SNORM16_3; return true;
+			case RayTracingClusterVertexFormat::Compressed1: out = D3D12_VERTEX_FORMAT_COMPRESSED1; return true;
+			default: return false; // D3D12 has no four-component position formats.
+			}
+		}
+
+		static bool Dx12ClusterIndexFormat(RayTracingClusterIndexFormat format, D3D12_INDEX_FORMAT& out) noexcept {
+			switch (format) {
+			case RayTracingClusterIndexFormat::Uint8: out = D3D12_INDEX_FORMAT_UINT8; return true;
+			case RayTracingClusterIndexFormat::Uint16: out = D3D12_INDEX_FORMAT_UINT16; return true;
+			case RayTracingClusterIndexFormat::Uint32: out = D3D12_INDEX_FORMAT_UINT32; return true;
+			default: return false; // None is not valid for cluster positions.
+			}
+		}
+
+		static D3D12_RTAS_PARTITIONED_TLAS_FLAGS Dx12PartitionedTlasFlags(const RayTracingPartitionedTlasInputsDesc& inputs) noexcept {
+			const uint32_t bits = static_cast<uint32_t>(inputs.flags);
+			D3D12_RTAS_PARTITIONED_TLAS_FLAGS out = D3D12_RTAS_PARTITIONED_TLAS_FLAG_NONE;
+			if ((bits & RTASBuild_PreferFastTrace) != 0) out |= D3D12_RTAS_PARTITIONED_TLAS_FLAG_FAST_TRACE;
+			else if ((bits & RTASBuild_PreferFastBuild) != 0) out |= D3D12_RTAS_PARTITIONED_TLAS_FLAG_FAST_BUILD;
+			if (inputs.enablePartitionTranslation) out |= D3D12_RTAS_PARTITIONED_TLAS_FLAG_ENABLE_PARTITION_TRANSLATION;
+			return out;
+		}
+
+		// D3D12_RTAS_OPERATION_INPUTS points at one of these, so they have to outlive the call.
+		struct Dx12RtasInputStorage {
+			D3D12_RTAS_OPERATION_INPUTS inputs{};
+			D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC triangles{};
+			D3D12_RTAS_CLUSTER_TEMPLATE_TRIANGLES_INPUTS_DESC templateTriangles{};
+			D3D12_RTAS_INSTANTIATE_CLUSTER_TEMPLATE_INPUTS_DESC instantiate{};
+			D3D12_RTAS_CLAS_INPUTS_DESC bottomLevel{};
+			D3D12_RTAS_CLUSTER_MOVES_DESC moves{};
+			D3D12_RTAS_PARTITIONED_TLAS_INPUTS_DESC partitioned{};
+		};
+
+		// partitionedFallback: the execute path also accepts partitioned inputs from the operation's own data.
+		static bool Dx12FillRtasInputs(const RayTracingRtasOperationInputs& src, const RayTracingPartitionedTlasInputsDesc* partitionedFallback, Dx12RtasInputStorage& out) noexcept {
+			out = {};
+			D3D12_RTAS_OPERATION_FLAGS flags = Dx12RtasOperationFlags(src.flags);
+			if (src.allowOpacityMicromaps) flags |= D3D12_RTAS_OPERATION_FLAG_ALLOW_OMM;
+			const D3D12_RTAS_OPERATION_MODE mode = Dx12RtasOperationMode(src.operationMode);
+			// NONE: no OMM index buffer. A non-null per-argument OpacityMicromapArray then indexes sequentially.
+			const auto ommIndexFormat = [](const RayTracingClusterTriangleInputsDesc& triangles, D3D12_INDEX_FORMAT& out) noexcept {
+				out = D3D12_INDEX_FORMAT_NONE;
+				return triangles.opacityMicromapIndexFormat == RayTracingClusterIndexFormat::None || Dx12ClusterIndexFormat(triangles.opacityMicromapIndexFormat, out);
+			};
+			const auto limits = [&](const RayTracingClusterTriangleInputsDesc& triangles) {
+				D3D12_RTAS_CLUSTER_LIMITS value{};
+				value.MaxArgCount = src.maxAccelerationStructureCount;
+				value.MaxGeometryIndexValue = triangles.maxGeometryIndexValue;
+				value.MaxUniqueGeometryIndexAndFlagsCountPerCluster = triangles.maxClusterUniqueGeometryCount;
+				value.MaxTriangleCountPerCluster = triangles.maxClusterTriangleCount;
+				value.MaxUniqueVertexIndexCountPerCluster = triangles.maxClusterVertexCount;
+				value.MaxTotalTriangleCount = triangles.maxTotalTriangleCount;
+				value.MaxSumOfUniqueVertexIndexCounts = triangles.maxTotalVertexCount;
+				value.MaxOpacityMicromapIndicesPerCluster = triangles.opacityMicromapIndexFormat != RayTracingClusterIndexFormat::None ? triangles.maxOpacityMicromapIndicesPerCluster : 0;
+				return value;
+			};
+
+			switch (src.operationType) {
+			case RayTracingRtasOperationType::BuildTriangleCluster: {
+				if (!src.triangleClusters) return false;
+				const auto& triangles = *src.triangleClusters;
+				out.inputs.Type = D3D12_RTAS_OPERATION_TYPE_BUILD_CLAS_FROM_TRIANGLES;
+				out.triangles.ClusterLimits = limits(triangles);
+				out.triangles.Flags = flags;
+				out.triangles.Mode = mode;
+				out.triangles.GeometryIndexAndFlagsIndexFormat = D3D12_INDEX_FORMAT_NONE;
+				if (!ommIndexFormat(triangles, out.triangles.OpacityMicromapIndexFormat)) return false;
+				// A union in D3D12: the truncation count for uncompressed positions, the block size cap for Compressed1.
+				out.triangles.MinPositionTruncateBitCount = triangles.vertexFormat == RayTracingClusterVertexFormat::Compressed1
+					? triangles.maxCompressedClusterPositionsSize
+					: triangles.minPositionTruncateBitCount;
+				if (!Dx12ClusterVertexFormat(triangles.vertexFormat, out.triangles.VertexFormat)
+					|| !Dx12ClusterIndexFormat(triangles.indexFormat, out.triangles.IndexFormat)) return false;
+				out.inputs.pClusterTrianglesDesc = &out.triangles;
+				return true;
+			}
+			case RayTracingRtasOperationType::BuildTriangleClusterTemplate: {
+				if (!src.triangleClusters) return false;
+				const auto& triangles = *src.triangleClusters;
+				out.inputs.Type = D3D12_RTAS_OPERATION_TYPE_BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES;
+				out.templateTriangles.ClusterLimits = limits(triangles);
+				out.templateTriangles.Flags = flags;
+				out.templateTriangles.Mode = mode;
+				out.templateTriangles.GeometryIndexAndFlagsIndexFormat = D3D12_INDEX_FORMAT_NONE;
+				if (!ommIndexFormat(triangles, out.templateTriangles.OpacityMicromapIndexFormat)) return false;
+				if (!Dx12ClusterVertexFormat(triangles.vertexFormat, out.templateTriangles.VertexInstantiationFormat)
+					|| !Dx12ClusterIndexFormat(triangles.indexFormat, out.templateTriangles.IndexFormat)) return false;
+				out.templateTriangles.VertexHintFormat = out.templateTriangles.VertexInstantiationFormat;
+				out.inputs.pClusterTemplateTrianglesDesc = &out.templateTriangles;
+				return true;
+			}
+			case RayTracingRtasOperationType::InstantiateTriangleCluster: {
+				if (!src.triangleClusters) return false;
+				const auto& triangles = *src.triangleClusters;
+				out.inputs.Type = D3D12_RTAS_OPERATION_TYPE_INSTANTIATE_CLUSTER_TEMPLATES;
+				out.instantiate.ClusterLimits = limits(triangles);
+				out.instantiate.Flags = flags;
+				out.instantiate.Mode = mode;
+				if (!Dx12ClusterVertexFormat(triangles.vertexFormat, out.instantiate.VertexSourceFormat)) return false;
+				out.inputs.pInstantiateClusterTemplateDesc = &out.instantiate;
+				return true;
+			}
+			case RayTracingRtasOperationType::BuildClustersBottomLevel: {
+				if (!src.clustersBottomLevel) return false;
+				out.inputs.Type = D3D12_RTAS_OPERATION_TYPE_BUILD_BLAS_FROM_CLAS;
+				out.bottomLevel.Flags = flags;
+				out.bottomLevel.MaxArgCount = src.maxAccelerationStructureCount;
+				out.bottomLevel.Mode = mode;
+				out.bottomLevel.MaxTotalClasCount = src.clustersBottomLevel->maxTotalClusterCount;
+				out.bottomLevel.MaxClasCountPerArg = src.clustersBottomLevel->maxClusterCountPerAccelerationStructure;
+				out.inputs.pClasDesc = &out.bottomLevel;
+				return true;
+			}
+			case RayTracingRtasOperationType::MoveObjects: {
+				if (!src.moveObjects) return false;
+				out.inputs.Type = D3D12_RTAS_OPERATION_TYPE_MOVE_CLUSTER_OBJECTS;
+				out.moves.Flags = src.moveObjects->noMoveOverlap ? D3D12_RTAS_CLUSTER_MOVE_OPERATION_FLAG_NO_OVERLAP : D3D12_RTAS_CLUSTER_MOVE_OPERATION_FLAG_NONE;
+				if (src.allowOpacityMicromaps) out.moves.Flags |= D3D12_RTAS_CLUSTER_MOVE_OPERATION_FLAG_ALLOW_OMM;
+				out.moves.MaxArgCount = src.maxAccelerationStructureCount;
+				out.moves.Mode = mode;
+				out.moves.MaxBytesMoved = src.moveObjects->maxMovedBytes;
+				switch (src.moveObjects->type) {
+				case RayTracingClusterAccelerationStructureType::ClustersBottomLevel: out.moves.Type = D3D12_RTAS_MOVE_OPERATION_TYPE_CLUSTER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE; break;
+				case RayTracingClusterAccelerationStructureType::TriangleClusterTemplate: out.moves.Type = D3D12_RTAS_MOVE_OPERATION_TYPE_CLUSTER_TEMPLATE; break;
+				case RayTracingClusterAccelerationStructureType::TriangleCluster:
+				default: out.moves.Type = D3D12_RTAS_MOVE_OPERATION_TYPE_CLUSTER_LEVEL_ACCELERATION_STRUCTURE; break;
+				}
+				out.inputs.pClusterMovesDesc = &out.moves;
+				return true;
+			}
+			case RayTracingRtasOperationType::BuildPartitionedTopLevel: {
+				const RayTracingPartitionedTlasInputsDesc* partitioned = src.partitionedTopLevel ? src.partitionedTopLevel : partitionedFallback;
+				if (!partitioned) return false;
+				out.inputs.Type = D3D12_RTAS_OPERATION_TYPE_PARTITIONED_TLAS;
+				out.partitioned.Flags = Dx12PartitionedTlasFlags(*partitioned);
+				out.partitioned.InstanceCount = partitioned->instanceCount;
+				out.partitioned.MaxInstancePerPartitionCount = partitioned->maxInstancePerPartitionCount;
+				out.partitioned.PartitionCount = partitioned->partitionCount;
+				out.partitioned.MaxInstanceInGlobalPartitionCount = partitioned->maxInstanceInGlobalPartitionCount;
+				out.inputs.pPartitionedTLASInputsDesc = &out.partitioned;
+				return true;
+			}
+			case RayTracingRtasOperationType::GetClusterTemplateIndices:
+			default:
+				return false; // No D3D12 equivalent: see RayTracingFeatureInfo::clusterTemplateIndexFetch.
+			}
+		}
+
 		struct Dx12BuildInputsStorage {
 			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
 			std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geometries;
@@ -4237,14 +5288,89 @@ namespace rhi {
 			return Dx12BufferAddress(impl, address);
 		}
 
+		static BufferViewRef d_getBufferViewRef(Device* d, GpuBufferAddress address) noexcept {
+			return Dx12ViewRef(static_cast<Dx12Device*>(d ? d->impl : nullptr), address);
+		}
+
 		static Result d_getRayTracingAccelerationStructureOperationPrebuildInfo(Device* d, const RayTracingRtasOperationInputs& inputs, RayTracingRtasPrebuildInfo* out) noexcept {
-			(void)d;
-			(void)inputs;
-			if (!out) {
+			auto* impl = static_cast<Dx12Device*>(d ? d->impl : nullptr);
+			if (!impl || !out) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 			*out = {};
-			RHI_FAIL(Result::Unsupported);
+			if (!impl->pNativeDeviceRaytracing2) {
+				RHI_FAIL(Result::Unsupported);
+			}
+			Dx12RtasInputStorage storage{};
+			if (!Dx12FillRtasInputs(inputs, nullptr, storage)) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			D3D12_RTAS_OPERATION_PREBUILD_INFO info{};
+			impl->pNativeDeviceRaytracing2->GetRTASOperationPrebuildInfo(&storage.inputs, &info);
+			out->resultDataMaxSizeInBytes = info.ResultDataMaxSizeInBytes;
+			out->scratchDataSizeInBytes = info.ScratchDataSizeInBytes;
+			out->updateScratchDataSizeInBytes = info.ScratchDataSizeInBytes;
+			return info.ScratchDataSizeInBytes != 0 || info.ResultDataMaxSizeInBytes != 0 ? Result::Ok : Result::Unsupported;
+		}
+
+		static_assert(sizeof(RayTracingOpacityMicromapHistogramEntry) == sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY));
+		static_assert(offsetof(RayTracingOpacityMicromapHistogramEntry, count) == offsetof(D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY, Count));
+		static_assert(offsetof(RayTracingOpacityMicromapHistogramEntry, subdivisionLevel) == offsetof(D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY, SubdivisionLevel));
+		static_assert(offsetof(RayTracingOpacityMicromapHistogramEntry, format) == offsetof(D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY, Format));
+		static_assert(sizeof(PackedRayTracingOpacityMicromapDesc) == sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC));
+		static_assert(static_cast<uint32_t>(RayTracingOpacityMicromapFormat::OC1_2State) == D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_2_STATE);
+		static_assert(static_cast<uint32_t>(RayTracingOpacityMicromapFormat::OC1_4State) == D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_4_STATE);
+		static_assert(static_cast<int32_t>(RTOmmSpecialIndex_FullyTransparent) == D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_TRANSPARENT);
+		static_assert(static_cast<int32_t>(RTOmmSpecialIndex_FullyOpaque) == D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_OPAQUE);
+		static_assert(static_cast<int32_t>(RTOmmSpecialIndex_FullyUnknownTransparent) == D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_TRANSPARENT);
+		static_assert(static_cast<int32_t>(RTOmmSpecialIndex_FullyUnknownOpaque) == D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_OPAQUE);
+		static_assert(static_cast<int32_t>(RTOmmSpecialIndex_ClusterSkipOpacityMicromap) == D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_CLUSTER_SKIP_OMM);
+		static_assert(static_cast<uint32_t>(RTInstance_ForceOpacityMicromap2State) == D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OMM_2_STATE);
+		static_assert(static_cast<uint32_t>(RTInstance_DisableOpacityMicromaps) == D3D12_RAYTRACING_INSTANCE_FLAG_DISABLE_OMMS);
+		static_assert(static_cast<uint32_t>(RTCluster_AllowDisableOpacityMicromaps) == D3D12_RTAS_CLUSTER_OPERATION_CLAS_FLAG_ALLOW_DISABLE_OMMS);
+
+		// D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS points at these, so they have to outlive the call.
+		struct Dx12OmmInputsStorage {
+			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+			D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_DESC array{};
+		};
+
+		static bool Dx12FillOmmInputs(const RayTracingOpacityMicromapArrayInputs& src, Dx12OmmInputsStorage& out) noexcept {
+			out = {};
+			if (src.histogram.size == 0 || !src.histogram.data) return false;
+			out.array.NumOmmHistogramEntries = static_cast<UINT>(src.histogram.size);
+			out.array.pOmmHistogram = reinterpret_cast<const D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY*>(src.histogram.data);
+			out.inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY;
+			// OMM arrays cannot be updated in place.
+			out.inputs.Flags = Dx12AsBuildFlags(static_cast<RayTracingAccelerationStructureBuildFlags>(src.flags & ~RTASBuild_AllowUpdate));
+			out.inputs.NumDescs = 1;
+			out.inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+			out.inputs.pOpacityMicromapArrayDesc = &out.array;
+			return true;
+		}
+
+		static Result d_getOpacityMicromapArrayPrebuildInfo(Device* d, const RayTracingOpacityMicromapArrayInputs& inputs, AccelerationStructurePrebuildInfo* out) noexcept {
+			auto* impl = static_cast<Dx12Device*>(d ? d->impl : nullptr);
+			if (!impl || !impl->pNativeDevice || !out) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			*out = {};
+			Dx12OmmInputsStorage storage{};
+			if (!Dx12FillOmmInputs(inputs, storage)) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			// The runtime rejects null InputBuffer / PerOmmDescs even here. The spec (v1.44, prebuild info) allows dummy
+			// non-zero addresses for the prebuild call, since they are inspected for null but never dereferenced.
+			storage.array.InputBuffer = D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_BYTE_ALIGNMENT;
+			storage.array.PerOmmDescs.StartAddress = D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_BYTE_ALIGNMENT;
+			storage.array.PerOmmDescs.StrideInBytes = sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC);
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO native{};
+			impl->pNativeDevice->GetRaytracingAccelerationStructurePrebuildInfo(&storage.inputs, &native);
+			out->resultDataMaxSizeInBytes = native.ResultDataMaxSizeInBytes;
+			out->scratchDataSizeInBytes = native.ScratchDataSizeInBytes;
+			out->updateScratchDataSizeInBytes = native.UpdateScratchDataSizeInBytes;
+			// Zero means the runtime or driver rejected the inputs (or OMMs are unsupported: below raytracing tier 1.2).
+			return native.ResultDataMaxSizeInBytes != 0 ? Result::Ok : Result::Unsupported;
 		}
 
 		static Result d_getRayTracingShaderGroupHandles(Device* d, PipelineHandle pipeline, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept {
@@ -4406,7 +5532,25 @@ namespace rhi {
 			// Out array
 			std::vector<D3D12_RESOURCE_ALLOCATION_INFO1> dxInfos;
 			dxInfos.resize(resourceCount);
-			impl->pNativeDevice->GetResourceAllocationInfo2(0, resourceCount, descs.data(), dxInfos.data());
+			// A resource that lists castable formats is sized with them (GetResourceAllocationInfo3), as it is created.
+			bool castable = false;
+			for (size_t i = 0; i < resourceCount; ++i) castable = castable || resources[i].castableFormats.size != 0;
+			Microsoft::WRL::ComPtr<ID3D12Device12> device12;
+			if (castable && SUCCEEDED(impl->pNativeDevice.As(&device12))) {
+				std::vector<UINT32> castableCounts(resourceCount);
+				std::vector<std::vector<DXGI_FORMAT>> castableFormats(resourceCount);
+				std::vector<const DXGI_FORMAT*> castableLists(resourceCount);
+				for (size_t i = 0; i < resourceCount; ++i) {
+					for (const auto format : resources[i].castableFormats) castableFormats[i].push_back(ToDxgi(format));
+					castableCounts[i] = static_cast<UINT32>(castableFormats[i].size());
+					castableLists[i] = castableFormats[i].empty() ? nullptr : castableFormats[i].data();
+				}
+				device12->GetResourceAllocationInfo3(0, resourceCount, descs.data(), castableCounts.data(), castableLists.data(),
+					dxInfos.data());
+			}
+			else {
+				impl->pNativeDevice->GetResourceAllocationInfo2(0, resourceCount, descs.data(), dxInfos.data());
+			}
 			// Pack back
 			for (size_t i = 0; i < resourceCount; ++i) {
 				outInfos[i].offset = dxInfos[i].Offset;
@@ -4624,7 +5768,7 @@ namespace rhi {
 					tracy::MemWrite(&item->gpuZoneBegin.srcloc, sourceLocation);
 					tracy::MemWrite(&item->gpuZoneBegin.thread, uint32_t{ 0 });
 					tracy::MemWrite(&item->gpuZoneBegin.queryId, static_cast<uint16_t>(event.queryId));
-					tracy::MemWrite(&item->gpuZoneBegin.context, context->GetId());
+					tracy::MemWrite(&item->gpuZoneBegin.context, static_cast<uint8_t>(context->GetId()));
 					tracy::Profiler::QueueSerialFinish();
 				}
 				else {
@@ -4633,7 +5777,7 @@ namespace rhi {
 					tracy::MemWrite(&item->gpuZoneEnd.cpuTime, tracy::Profiler::GetTime());
 					tracy::MemWrite(&item->gpuZoneEnd.thread, uint32_t{ 0 });
 					tracy::MemWrite(&item->gpuZoneEnd.queryId, static_cast<uint16_t>(event.queryId));
-					tracy::MemWrite(&item->gpuZoneEnd.context, context->GetId());
+					tracy::MemWrite(&item->gpuZoneEnd.context, static_cast<uint8_t>(context->GetId()));
 					tracy::Profiler::QueueSerialFinish();
 				}
 			}
@@ -4641,11 +5785,47 @@ namespace rhi {
 		}
 #endif
 
+		static QueueProgress q_progress(const Queue* q) noexcept {
+			auto* qs = dx12_detail::QState(const_cast<Queue*>(q));
+			if (!qs || !qs->dev) return {};
+			std::lock_guard lock(*qs->progressMutex);
+			if (!qs->hasProgress) return {};
+			QueueProgress progress{};
+			progress.timeline = Timeline{ qs->progress };
+			progress.timeline.impl = qs->dev;
+			progress.timeline.vt = &g_tlvt;
+			progress.submitted = qs->progressSubmitted;
+			return progress;
+		}
+
 		static Result q_submit(Queue* q, Span<CommandList> lists, const SubmitDesc& s) noexcept {
 			auto* qs = dx12_detail::QState(q);
 			auto* dev = qs->dev;
 			if (!dev) {
 				RHI_FAIL(Result::InvalidArgument);
+			}
+			std::lock_guard progressLock(*qs->progressMutex);
+			if (!qs->hasProgress) {
+				Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+				if (SUCCEEDED(dev->pNativeDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+					fence->SetName(L"BasicRHI.QueueProgress");
+					Dx12Timeline timeline(fence, dev);
+					timeline.debugName = "BasicRHI.QueueProgress";
+					qs->progress = dev->timelines.alloc(timeline);
+					qs->hasProgress = true;
+				}
+			}
+			for (auto& list : lists) {
+				if (auto* listState = dx12_detail::CL(&list); !listState || listState->bundle) {
+					spdlog::error("D3D12 queue submit rejected a {} command list", listState ? "secondary" : "null");
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				// ExecuteCommandLists on a list that is not closed removes the device: refuse the whole submission, by name.
+				if (auto* listState = dx12_detail::CL(&list); listState->open || listState->closeFailed) {
+					spdlog::error("D3D12 queue submit refused: command list '{}' {}; nothing of this submission runs", listState->debugName,
+						listState->open ? "is still recording (End was not called)" : "failed to close (see its Close error above)");
+					RHI_FAIL(Result::InvalidCall);
+				}
 			}
 #if BASICRHI_ENABLE_TRACY_GPU_PROFILING
 			for (auto& list : lists) {
@@ -4747,6 +5927,15 @@ namespace rhi {
 					RHI_FAIL(ToRHI(hr));
 				}
 				Dx12RecordTimelineSignal(*TL, *q, sgn.value, completedBefore, lists.size, "q_submit");
+			}
+			if (qs->hasProgress) {
+				if (auto* progress = dev->timelines.get(qs->progress)) {
+					const uint64_t value = qs->progressSubmitted + 1;
+					if (SUCCEEDED(qs->pNativeQueue->Signal(progress->fence.Get(), value))) {
+						qs->progressSubmitted = value;
+						progress->lastSubmittedSignalValue = value;
+					}
+				}
 			}
 			return Result::Ok;
 		}
@@ -7447,7 +8636,6 @@ namespace rhi {
 				return;
 			}
 			auto* context = static_cast<tracy::D3D12QueueCtx*>(queueState->tracyGpuContext);
-			context->NewFrame();
 			context->Collect();
 #else
 			(void)queue;
@@ -7463,6 +8651,177 @@ namespace rhi {
 		static inline UINT CalcSubresourceFor(const Dx12Resource& T, UINT mip, UINT arraySlice) {
 			// PlaneSlice = 0 (non-planar). TODO: support planar formats
 			return D3D12CalcSubresource(mip, arraySlice, 0, T.tex.mips, T.tex.arraySize);
+		}
+
+		// A buffer-texture copy's subresource and its placed footprint's format. A colour texture copies its own format from its
+		// one plane. A depth or depth-stencil texture copies one plane (BufferTextureCopyFootprint::plane): depth or stencil, each
+		// its own subresource, in the footprint format the device gives for it (GetCopyableFootprints), not the texture's.
+		static void DxBufferCopyLocation(Dx12Device& impl, const Dx12Resource& T, const BufferTextureCopyFootprint& r, UINT& subresource, DXGI_FORMAT& format) {
+			const UINT slice = T.dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 0u : r.arraySlice;
+			subresource = CalcSubresourceFor(T, r.mip, slice);
+			format = T.fmt;
+			const D3D12_RESOURCE_DESC desc = T.res->GetDesc();
+			bool depth = false;
+			switch (desc.Format) {
+			case DXGI_FORMAT_D16_UNORM:
+			case DXGI_FORMAT_D24_UNORM_S8_UINT:
+			case DXGI_FORMAT_D32_FLOAT:
+			case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+			case DXGI_FORMAT_R24G8_TYPELESS:
+			case DXGI_FORMAT_R32G8X24_TYPELESS:
+				depth = true;
+				break;
+			default:
+				break;
+			}
+			if (!depth) {
+				return;
+			}
+			const UINT planes = D3D12GetFormatPlaneCount(impl.pNativeDevice.Get(), desc.Format);
+			const UINT plane = (std::min)(r.plane, planes ? planes - 1 : 0u);
+			subresource = D3D12CalcSubresource(r.mip, slice, plane, T.tex.mips, T.tex.arraySize);
+			D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed{};
+			impl.pNativeDevice->GetCopyableFootprints(&desc, subresource, 1, 0, &placed, nullptr, nullptr, nullptr);
+			if (placed.Footprint.Format != DXGI_FORMAT_UNKNOWN) {
+				format = placed.Footprint.Format;
+			}
+		}
+
+		// Bundles cannot hold barriers, clears, copies, queries, render-target, viewport or scissor changes: such a command is
+		// not recorded and the bundle fails (End reports it).
+		static bool DxRejectInBundle(CommandList* cl, const char* command) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->bundle) {
+				return false;
+			}
+			spdlog::error("D3D12: {} was recorded into a bundle (a secondary list)", command);
+			if (l->pendingError == Result::Ok) {
+				l->pendingError = Result::InvalidCall;
+			}
+			BreakIfDebugging();
+			return true;
+		}
+
+		// ---- Close diagnostics and debug labels ----
+		// D3D12 reports an invalid command only at Close (E_INVALIDARG), with no word of which one unless the debug layer is on. Each
+		// list keeps its last commands in a small ring and the debug labels open around them, and a failed Close logs both.
+
+		/** @brief Notes a recorded command in the list's ring. kind is a literal that names the command and what a, b and c hold. */
+		static void Dx12NoteCommand(Dx12CommandList* l, const char* kind, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0) noexcept {
+			if (!l)
+				return;
+			auto& entry = l->recorded[l->recordedCount % Dx12CommandList::kRecordedCommands];
+			entry.kind = kind;
+			entry.label = l->openLabels.empty() ? UINT32_MAX : l->openLabels.back();
+			entry.a = a;
+			entry.b = b;
+			entry.c = c;
+			++l->recordedCount;
+		}
+
+		/** @brief The name of the label at index a_label, or a stand-in. */
+		static const char* Dx12LabelName(const Dx12CommandList& l, uint32_t a_label) noexcept {
+			if (a_label == UINT32_MAX)
+				return "(no label)";
+			return a_label < l.labels.size() ? l.labels[a_label].c_str() : "(label past the cap)";
+		}
+
+		/** @brief The innermost open debug label of the list (the graph's pass), or a stand-in. */
+		static const char* Dx12OpenLabel(const Dx12CommandList& l) noexcept {
+			return Dx12LabelName(l, l.openLabels.empty() ? UINT32_MAX : l.openLabels.back());
+		}
+
+		/** @brief A D3D12 object's debug name (SetName), or "(unnamed)". */
+		static std::string Dx12ObjectName(ID3D12Object* a_object) noexcept {
+			wchar_t name[128]{};
+			UINT size = sizeof(name) - sizeof(wchar_t);
+			if (!a_object || FAILED(a_object->GetPrivateData(WKPDID_D3DDebugObjectNameW, &size, name)) || size == 0)
+				return "(unnamed)";
+			try {
+				return Dx12WideToUtf8(name);
+			} catch (...) {
+				return "(unnamed)";
+			}
+		}
+
+		/** @brief Forgets the commands and labels of the last recording: the list starts recording again. */
+		static void Dx12ResetDiagnostics(Dx12CommandList& l) noexcept {
+			l.recordedCount = 0;
+			l.labels.clear();
+			l.openLabels.clear();
+		}
+
+		/**
+		 * @brief An invalid command BasicRHI does not record, because D3D12 would fail the whole list at Close for it: true for the first
+		 * 16 reports of a call site, which the caller logs with Dx12OpenLabel (the pass) and the list's name.
+		 */
+		static bool Dx12ReportSkipped(std::atomic<uint32_t>& a_reports) noexcept {
+			return a_reports.fetch_add(1, std::memory_order_relaxed) < 16;
+		}
+
+		/** @brief After a failed Close: the list's last commands, oldest first, each with the label open around it. */
+		static void Dx12LogRecordedCommands(const Dx12CommandList& l) noexcept {
+			const uint32_t count = (std::min)(l.recordedCount, Dx12CommandList::kRecordedCommands);
+			spdlog::error("D3D12 command-list Close failed: '{}' recorded {} commands since its reset; the last {} follow, oldest first ({} labels open at Close)",
+				l.debugName, l.recordedCount, count, l.openLabels.size());
+			for (uint32_t i = l.recordedCount - count; i < l.recordedCount; ++i) {
+				const auto& entry = l.recorded[i % Dx12CommandList::kRecordedCommands];
+				spdlog::error("D3D12   #{} {} a={} b={} c={} in '{}'", i, entry.kind ? entry.kind : "?", entry.a, entry.b, entry.c, Dx12LabelName(l, entry.label));
+			}
+		}
+
+		/**
+		 * @brief A debug label as PIX, RenderDoc and Nsight read it on D3D12: BeginEvent with metadata 0 (WINPIX_EVENT_UNICODE_VERSION) and
+		 * the name as a null-terminated UTF-16 string, as pix3's PIXBeginEvent falls back to. The colour is not carried.
+		 */
+		static void Dx12LabelEvent(ID3D12GraphicsCommandList* a_list, const char* a_name, bool a_marker) noexcept {
+			wchar_t text[256]{};
+			const char* name = a_name ? a_name : "";
+			int written = MultiByteToWideChar(CP_UTF8, 0, name, -1, text, static_cast<int>(std::size(text)));
+			if (written <= 0) {
+				// Longer than the buffer (or invalid UTF-8): the part that fits.
+				text[std::size(text) - 1] = L'\0';
+				written = static_cast<int>(wcslen(text)) + 1;
+			}
+			const UINT bytes = static_cast<UINT>(written) * sizeof(wchar_t);
+			if (a_marker)
+				a_list->SetMarker(0, text, bytes);
+			else
+				a_list->BeginEvent(0, text, bytes);
+		}
+
+		static void cl_beginDebugLabel(CommandList* cl, const float /*rgba*/[4], const char* name) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl)
+				return;
+			Dx12LabelEvent(l->cl.Get(), name, false);
+			uint32_t index = UINT32_MAX;
+			if (l->labels.size() < Dx12CommandList::kMaxLabels) {
+				try {
+					l->labels.emplace_back(name ? name : "");
+					index = static_cast<uint32_t>(l->labels.size() - 1);
+				} catch (...) {
+				}
+			}
+			try {
+				l->openLabels.push_back(index);
+			} catch (...) {
+			}
+		}
+
+		static void cl_endDebugLabel(CommandList* cl) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl)
+				return;
+			l->cl->EndEvent();
+			if (!l->openLabels.empty())
+				l->openLabels.pop_back();
+		}
+
+		static void cl_insertDebugLabel(CommandList* cl, const float /*rgba*/[4], const char* name) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (l && l->cl)
+				Dx12LabelEvent(l->cl.Get(), name, true);
 		}
 
 		static Result cl_endChecked(CommandList* cl) noexcept {
@@ -7489,17 +8848,67 @@ namespace rhi {
 				w->tracyGpuZoneStack.pop_back();
 			}
 			const auto closeResult = w->cl->Close();
+			w->open = false;
+			w->closeFailed = FAILED(closeResult);
 			if (FAILED(closeResult) && w->dev && w->dev->pNativeDevice) {
 				const auto messageCount = Dx12GetInfoQueueMessageCount(w->dev->pNativeDevice.Get());
 				Dx12LogInfoQueueMessagesSince(w->dev->pNativeDevice.Get(),
 					messageCount > 64 ? messageCount - 64 : 0, 64);
 				spdlog::error("D3D12 command-list Close failed: hr=0x{:08x} type={} name='{}'",
 					static_cast<uint32_t>(closeResult), static_cast<uint32_t>(w->type), w->debugName);
+				Dx12LogRecordedCommands(*w);
 				spdlog::default_logger()->flush();
+			}
+			if (SUCCEEDED(closeResult) && w->pendingError != Result::Ok) {
+				return w->pendingError;
 			}
 			return ToRHI(closeResult);
 		}
 		static void cl_end(CommandList* cl) noexcept { (void)cl_endChecked(cl); }
+		/** @brief BASICRHI_D3D12_RESET_TRACE=1: each list keeps the stack of its last reset, logged with a reset of it while it records. */
+		static bool Dx12ResetTrace() noexcept {
+			static const bool enabled = [] {
+				char* value = nullptr;
+				size_t length = 0;
+				const bool on = _dupenv_s(&value, &length, "BASICRHI_D3D12_RESET_TRACE") == 0 && value && std::strcmp(value, "1") == 0;
+				std::free(value);
+				return on;
+			}();
+			return enabled;
+		}
+
+		/** @brief "module+0xoffset" for a code address. */
+		static std::string Dx12DescribeAddress(void* a_address) noexcept {
+			HMODULE module = nullptr;
+			if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(a_address), &module) || !module)
+				return fmt::format("{}", a_address);
+			char path[MAX_PATH]{};
+			GetModuleFileNameA(module, path, MAX_PATH);
+			const char* name = std::strrchr(path, '\\');
+			return fmt::format("{}+{:#x}", name ? name + 1 : path, reinterpret_cast<uintptr_t>(a_address) - reinterpret_cast<uintptr_t>(module));
+		}
+
+		/** @brief Records the caller's stack as the list's last reset (BASICRHI_D3D12_RESET_TRACE=1). */
+		static void Dx12NoteReset(Dx12CommandList& a_list) noexcept {
+			if (Dx12ResetTrace())
+				a_list.resetDepth = CaptureStackBackTrace(2, static_cast<DWORD>(a_list.resetStack.size()), a_list.resetStack.data(), nullptr);
+		}
+
+		/** @brief Closes a list that is still recording, so it or its allocator can be reset (its commands are dropped). Logged once. */
+		static void Dx12CloseRecording(Dx12CommandList& a_list) noexcept {
+			if (!a_list.open || !a_list.cl)
+				return;
+			a_list.cl->Close();
+			a_list.open = false;
+			static std::atomic_flag logged;
+			if (!logged.test_and_set()) {
+				spdlog::warn("D3D12: '{}' was reset while it recorded; it was closed first and its commands dropped (logged once{})", a_list.debugName,
+					Dx12ResetTrace() ? "; its previous reset's stack follows" : "; BASICRHI_D3D12_RESET_TRACE=1 logs the stack of the reset that began it");
+				for (uint16_t i = 0; i < a_list.resetDepth; ++i)
+					spdlog::warn("D3D12:   #{} {}", i, Dx12DescribeAddress(a_list.resetStack[i]));
+			}
+		}
+
 		static void cl_reset(CommandList* cl, const CommandAllocator& ca) noexcept {
 			auto* l = dx12_detail::CL(cl);
 			auto* a = dx12_detail::Alloc(&ca);
@@ -7516,20 +8925,59 @@ namespace rhi {
 #endif
 			l->boundLayout = {};
 			l->boundLayoutPtr = nullptr;
+			l->rootConstantValues.clear();
 			l->activeRootCbvShadowStateCount = 0;
+			l->stencilRef = 0;
+			l->stencilRefApplied = false;
+			std::fill(std::begin(l->blendFactor), std::end(l->blendFactor), 1.0f);
+			l->blendFactorApplied = false;
 			for (auto& page : l->rootCbvScratchPages) {
 				page.cursor = 0;
 			}
 			l->tracyGpuZoneStack.clear();
 			l->tracyGpuZoneEvents.clear();
 			l->tracyGpuZoneEventsSubmitted = false;
-			const HRESULT resetResult = l->cl->Reset(a->alloc.Get(), nullptr);
+			l->pendingError = Result::Ok;
+			Dx12ResetDiagnostics(*l);
+			ID3D12CommandAllocator* resetAllocator = l->bundle ? a->bundleAlloc.Get() : a->alloc.Get();
+			if (!resetAllocator) {
+				spdlog::error("D3D12 command list Reset for '{}': the allocator has no bundle allocator (not the one the secondary was made from)", l->debugName);
+				l->pendingError = Result::InvalidArgument;
+				BreakIfDebugging();
+				return;
+			}
+			// The RHI lets a list be reset while it records (Vulkan resets a recording command buffer). D3D12 resets only a closed
+			// list, so a list still recording is closed first and its commands are dropped.
+			Dx12CloseRecording(*l);
+			// A secondary (a bundle) does not record after Recycle, as on Vulkan: D3D12's Reset would open it, so the Reset waits for
+			// BeginSecondary, which makes it record. Recycle -> not recording, BeginSecondary -> recording, End -> closed.
+			if (l->bundle) {
+				l->pendingReset = resetAllocator;
+				l->closeFailed = false;
+				const auto handle = cl->GetHandle();
+				auto* mutableAllocator = const_cast<Dx12Allocator*>(a);
+				if (std::find_if(mutableAllocator->lists.begin(), mutableAllocator->lists.end(),
+						[&](const CommandListHandle& h) { return h.index == handle.index && h.generation == handle.generation; }) == mutableAllocator->lists.end())
+					mutableAllocator->lists.push_back(handle);
+				return;
+			}
+			const HRESULT resetResult = l->cl->Reset(resetAllocator, nullptr);
 			if (FAILED(resetResult)) {
 				spdlog::error(
 					"D3D12 command list Reset failed for '{}': HRESULT 0x{:08X}",
 					l->debugName,
 					static_cast<unsigned>(resetResult));
 				BreakIfDebugging();
+			} else {
+				l->open = true;
+				l->closeFailed = false;
+				Dx12NoteReset(*l);
+				// Reset onto another allocator: that allocator's Reset closes it too.
+				const auto handle = cl->GetHandle();
+				auto* mutableAllocator = const_cast<Dx12Allocator*>(a);
+				if (std::find_if(mutableAllocator->lists.begin(), mutableAllocator->lists.end(),
+						[&](const CommandListHandle& h) { return h.index == handle.index && h.generation == handle.generation; }) == mutableAllocator->lists.end())
+					mutableAllocator->lists.push_back(handle);
 			}
 		}
 
@@ -7540,7 +8988,7 @@ namespace rhi {
 			if (!listState || !listState->cl || !queueState || !queueState->tracyGpuContext || !name) {
 				return Result::InvalidArgument;
 			}
-			if (listState->dev != queueState->dev || listState->type != queueState->pNativeQueue->GetDesc().Type) {
+			if (listState->dev != queueState->dev || listState->type != queueState->pNativeQueue->GetDesc().Type || listState->bundle) {
 				return Result::InvalidArgument;
 			}
 #ifdef TRACY_ON_DEMAND
@@ -7635,11 +9083,15 @@ namespace rhi {
 		}
 
 		static void cl_beginPass(CommandList* cl, const PassBeginInfo& p) noexcept {
+			if (DxRejectInBundle(cl, "BeginPass")) {
+				return;
+			}
 			auto* l = dx12_detail::CL(cl);
 			if (!l) {
 				BreakIfDebugging();
 				return;
 			}
+			Dx12NoteCommand(l, "BeginPass(colours, -, -)", p.colors.size);
 
 			std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;
 			rtvs.reserve(p.colors.size);
@@ -7730,6 +9182,7 @@ namespace rhi {
 
 			switch (impl->type) {
 			case D3D12_COMMAND_LIST_TYPE_DIRECT:
+			case D3D12_COMMAND_LIST_TYPE_BUNDLE:  // a secondary binds its own, as on Vulkan
 				impl->cl->SetGraphicsRootSignature(L->root.Get());
 				impl->cl->SetComputeRootSignature(L->root.Get());
 				break;
@@ -7744,6 +9197,7 @@ namespace rhi {
 
 			if (impl->boundLayout.index != layoutH.index || impl->boundLayout.generation != layoutH.generation) {
 				impl->activeRootCbvShadowStateCount = 0;
+				impl->rootConstantValues.clear();
 			}
 			impl->boundLayout = layoutH;
 			impl->boundLayoutPtr = L;
@@ -7770,6 +9224,14 @@ namespace rhi {
 					return;
 				}
 				l->cl->SetPipelineState(P->pso.Get());
+				if (P->readsStencilRef && !l->stencilRefApplied) {
+					l->cl->OMSetStencilRef(l->stencilRef);
+					l->stencilRefApplied = true;
+				}
+				if (P->readsBlendFactor && !l->blendFactorApplied) {
+					l->cl->OMSetBlendFactor(l->blendFactor);
+					l->blendFactorApplied = true;
+				}
 				#if BASICRHI_ENABLE_RESHAPE
 				if (dev->debugInstrumentation.state.active && P->pso) {
 					::PipelineState* pipelineState = nullptr;
@@ -7807,6 +9269,12 @@ namespace rhi {
 			BreakIfDebugging();
 			#endif
 		}
+		// A vertex or index buffer view of size 0 covers the rest of the buffer from its offset, as on Vulkan (VK_WHOLE_SIZE). D3D12 reads
+		// a view of size 0 as empty: every index fetched is 0 (each triangle degenerate, nothing rasterized).
+		static UINT Dx12WholeViewBytes(ID3D12Resource& a_buffer, uint64_t a_offset) noexcept {
+			const uint64_t width = a_buffer.GetDesc().Width;
+			return a_offset < width ? static_cast<UINT>((std::min<uint64_t>)(width - a_offset, UINT32_MAX)) : 0u;
+		}
 		static void cl_setVB(CommandList* cl, uint32_t startSlot, uint32_t numViews, VertexBufferView* pBufferViews) noexcept {
 			auto* l = dx12_detail::CL(cl);
 			std::vector<D3D12_VERTEX_BUFFER_VIEW> views; views.resize(numViews);
@@ -7814,7 +9282,7 @@ namespace rhi {
 			for (uint32_t i = 0; i < numViews; ++i) {
 				if (auto* B = dev->resources.get(pBufferViews[i].buffer)) {
 					views[i].BufferLocation = B->res->GetGPUVirtualAddress() + pBufferViews[i].offset;
-					views[i].SizeInBytes = pBufferViews[i].sizeBytes;
+					views[i].SizeInBytes = pBufferViews[i].sizeBytes ? pBufferViews[i].sizeBytes : Dx12WholeViewBytes(*B->res.Get(), pBufferViews[i].offset);
 					views[i].StrideInBytes = pBufferViews[i].stride;
 				}
 			}
@@ -7826,25 +9294,31 @@ namespace rhi {
 			if (auto* B = dev->resources.get(view.buffer)) {
 				D3D12_INDEX_BUFFER_VIEW ibv{};
 				ibv.BufferLocation = B->res->GetGPUVirtualAddress() + view.offset;
-				ibv.SizeInBytes = view.sizeBytes;
+				ibv.SizeInBytes = view.sizeBytes ? view.sizeBytes : Dx12WholeViewBytes(*B->res.Get(), view.offset);
 				ibv.Format = ToDxgi(view.format);
 				l->cl->IASetIndexBuffer(&ibv);
 			}
 		}
 		static void cl_draw(CommandList* cl, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) noexcept {
 			auto* l = dx12_detail::CL(cl);
+			Dx12NoteCommand(l, "Draw(vertices, instances, firstVertex)", vc, ic, fv);
 			l->cl->DrawInstanced(vc, ic, fv, fi);
 		}
 		static void cl_drawIndexed(CommandList* cl, uint32_t ic, uint32_t inst, uint32_t firstIdx, int32_t vtxOff, uint32_t firstInst) noexcept {
 			auto* l = dx12_detail::CL(cl);
+			Dx12NoteCommand(l, "DrawIndexed(indices, instances, firstIndex)", ic, inst, firstIdx);
 			l->cl->DrawIndexedInstanced(ic, inst, firstIdx, vtxOff, firstInst);
 		}
 		static void cl_dispatch(CommandList* cl, uint32_t x, uint32_t y, uint32_t z) noexcept {
 			auto* l = dx12_detail::CL(cl);
+			Dx12NoteCommand(l, "Dispatch(x, y, z)", x, y, z);
 			l->cl->Dispatch(x, y, z);
 		}
 
 		static void cl_buildAccelerationStructures(CommandList* cl, const AccelerationStructureBuildDesc* descs, uint32_t count) noexcept {
+			if (DxRejectInBundle(cl, "an acceleration structure operation")) {
+				return;
+			}
 			auto* list = dx12_detail::CL(cl);
 			if (!list || !list->cl || (!descs && count != 0)) {
 				BreakIfDebugging();
@@ -7880,7 +9354,48 @@ namespace rhi {
 			}
 		}
 
+		static void cl_buildOpacityMicromapArrays(CommandList* cl, const RayTracingOpacityMicromapArrayBuildDesc* descs, uint32_t count) noexcept {
+			if (DxRejectInBundle(cl, "an opacity micromap array build")) {
+				return;
+			}
+			auto* list = dx12_detail::CL(cl);
+			if (!list || !list->cl || (!descs && count != 0)) {
+				BreakIfDebugging();
+				return;
+			}
+
+			for (uint32_t index = 0; index < count; ++index) {
+				const RayTracingOpacityMicromapArrayBuildDesc& desc = descs[index];
+				Dx12OmmInputsStorage storage{};
+				if (!Dx12FillOmmInputs(desc.inputs, storage)) {
+					spdlog::error("DX12 BuildOpacityMicromapArrays: empty histogram");
+					BreakIfDebugging();
+					return;
+				}
+				storage.array.InputBuffer = Dx12BufferAddress(list->dev, desc.inputBuffer);
+				storage.array.PerOmmDescs.StartAddress = Dx12BufferAddress(list->dev, GpuBufferAddress{ desc.perOmmDescs.buffer, desc.perOmmDescs.offset });
+				storage.array.PerOmmDescs.StrideInBytes = desc.perOmmDescs.stride != 0 ? desc.perOmmDescs.stride : sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC);
+
+				D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC native{};
+				native.Inputs = storage.inputs;
+				native.DestAccelerationStructureData = Dx12BufferAddress(list->dev, desc.destination);
+				native.ScratchAccelerationStructureData = Dx12BufferAddress(list->dev, desc.scratch);
+				if (storage.array.InputBuffer == 0 || storage.array.PerOmmDescs.StartAddress == 0 || native.DestAccelerationStructureData == 0 || native.ScratchAccelerationStructureData == 0
+					|| (native.DestAccelerationStructureData % D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_BYTE_ALIGNMENT) != 0
+					|| (storage.array.InputBuffer % D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_BYTE_ALIGNMENT) != 0
+					|| (storage.array.PerOmmDescs.StartAddress % D3D12_RAYTRACING_OPACITY_MICROMAP_DESCS_BYTE_ALIGNMENT) != 0) {
+					spdlog::error("DX12 BuildOpacityMicromapArrays: missing or misaligned address (destination and input 128-byte, descs 4-byte)");
+					BreakIfDebugging();
+					return;
+				}
+				list->cl->BuildRaytracingAccelerationStructure(&native, 0, nullptr);
+			}
+		}
+
 		static void cl_copyAccelerationStructure(CommandList* cl, const AccelerationStructureCopyDesc& desc) noexcept {
+			if (DxRejectInBundle(cl, "an acceleration structure operation")) {
+				return;
+			}
 			auto* list = dx12_detail::CL(cl);
 			if (!list || !list->cl) {
 				BreakIfDebugging();
@@ -7914,6 +9429,9 @@ namespace rhi {
 		}
 
 		static void cl_writeAccelerationStructureProperties(CommandList* cl, const AccelerationStructurePropertiesDesc& desc) noexcept {
+			if (DxRejectInBundle(cl, "an acceleration structure operation")) {
+				return;
+			}
 			auto* list = dx12_detail::CL(cl);
 			if (!list || !list->cl || desc.accelerationStructures.size == 0) {
 				BreakIfDebugging();
@@ -8001,13 +9519,64 @@ namespace rhi {
 			list->cl->ExecuteIndirect(signature, 1, argumentBuffer->res.Get(), desc.dispatchRaysDescBuffer.offset, nullptr, 0);
 		}
 
+		static D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE Dx12BufferAddressAndStride(Dx12Device* impl, GpuBufferStridedRange range) noexcept {
+			D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE out{};
+			out.StartAddress = Dx12BufferAddress(impl, GpuBufferAddress{ range.buffer, range.offset });
+			out.StrideInBytes = range.stride;
+			return out;
+		}
+
 		static void cl_executeIndirectRtasOperations(CommandList* cl, const RayTracingRtasOperationDesc* descs, uint32_t count) noexcept {
-			(void)cl;
-			(void)descs;
-			(void)count;
+			auto* list = dx12_detail::CL(cl);
+			auto* impl = list ? list->dev : nullptr;
+			if (!list || !impl || (!descs && count != 0) || !list->clRaytracing2) {
+				BreakIfDebugging();
+				return;
+			}
+			if (DxRejectInBundle(cl, "ExecuteIndirectRtasOperations")) {
+				return;
+			}
+
+			for (uint32_t operationIndex = 0; operationIndex < count; ++operationIndex) {
+				const RayTracingRtasOperationDesc& desc = descs[operationIndex];
+				Dx12RtasInputStorage storage{};
+				if (!Dx12FillRtasInputs(desc.inputs, &desc.partitionedTopLevel.input, storage)) {
+					spdlog::error("DX12 ExecuteIndirectRtasOperations: invalid inputs for operation type {}", static_cast<uint32_t>(desc.inputs.operationType));
+					BreakIfDebugging();
+					return;
+				}
+
+				D3D12_RTAS_OPERATION_DESC native{};
+				native.Inputs = storage.inputs;
+				D3D12_RTAS_BATCHED_OPERATION_DATA batched{};
+				D3D12_RTAS_PARTITIONED_TLAS_OPERATION_DATA partitioned{};
+				if (desc.inputs.operationType == RayTracingRtasOperationType::BuildPartitionedTopLevel) {
+					partitioned.SourceAccelerationStructureData = Dx12BufferAddress(impl, desc.partitionedTopLevel.srcAccelerationStructureData);
+					partitioned.DestAccelerationStructureData = Dx12BufferAddress(impl, desc.partitionedTopLevel.dstAccelerationStructureData);
+					partitioned.ScratchAccelerationStructureData = Dx12BufferAddress(impl, desc.partitionedTopLevel.scratchData);
+					partitioned.IndirectPartitionedTlasOps = Dx12BufferAddress(impl, desc.partitionedTopLevel.srcInfos);
+					partitioned.IndirectPartitionedTlasOpCount = Dx12BufferAddress(impl, desc.partitionedTopLevel.srcInfosCount);
+					native.pPartitionedTlasOperationData = &partitioned;
+				}
+				else {
+					batched.AddressResolutionFlags = static_cast<D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAGS>(desc.batched.addressResolutionFlags);
+					batched.BatchResultData = Dx12BufferAddress(impl, desc.batched.dstImplicitData);
+					batched.BatchScratchData = Dx12BufferAddress(impl, desc.batched.scratchData);
+					batched.ResultAddressArray = Dx12BufferAddressAndStride(impl, desc.batched.dstAddressesArray);
+					batched.ResultSizeArray = Dx12BufferAddressAndStride(impl, desc.batched.dstSizesArray);
+					batched.IndirectArgumentArray = Dx12BufferAddressAndStride(impl, desc.batched.srcInfosArray);
+					batched.IndirectArgumentArraySize = Dx12BufferAddress(impl, desc.batched.srcInfosCount);
+					batched.ToolsInfo = 0;
+					native.pBatchedOperationData = &batched;
+				}
+				list->clRaytracing2->ExecuteIndirectRTASOperations(1u, &native, D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
+			}
 		}
 
 		static void cl_clearRTV_slot(CommandList* c, DescriptorSlot s, const rhi::ClearValue& cv) noexcept {
+			if (DxRejectInBundle(c, "a clear")) {
+				return;
+			}
 			auto* impl = dx12_detail::CL(c);
 			if (!impl) {
 				BreakIfDebugging();
@@ -8020,6 +9589,7 @@ namespace rhi {
 			}
 
 			float rgba[4] = { cv.rgba[0], cv.rgba[1], cv.rgba[2], cv.rgba[3] };
+			Dx12NoteCommand(impl, "ClearRenderTargetView(descriptor, -, -)", cpu.ptr);
 			impl->cl->ClearRenderTargetView(cpu, rgba, 0, nullptr);
 		}
 
@@ -8027,6 +9597,9 @@ namespace rhi {
 			bool clearDepth, bool clearStencil,
 			float depth, uint8_t stencil) noexcept
 		{
+			if (DxRejectInBundle(c, "a clear")) {
+				return;
+			}
 			auto* impl = dx12_detail::CL(c);
 			if (!impl) {
 				BreakIfDebugging();
@@ -8042,6 +9615,7 @@ namespace rhi {
 			if (clearDepth)   flags |= D3D12_CLEAR_FLAG_DEPTH;
 			if (clearStencil) flags |= D3D12_CLEAR_FLAG_STENCIL;
 
+			Dx12NoteCommand(impl, "ClearDepthStencilView(descriptor, flags, -)", cpu.ptr, static_cast<uint64_t>(flags));
 			impl->cl->ClearDepthStencilView(cpu, flags, depth, stencil, 0, nullptr);
 		}
 		static void cl_executeIndirect(
@@ -8079,6 +9653,14 @@ namespace rhi {
 			if (cntBufH.valid()) {
 				auto* c = dev->resources.get(cntBufH);
 				if (c && c->res) cntRes = c->res.Get();
+				// The count is a 32-bit value at cntOff, on 4 bytes, inside the buffer; anything else fails the list at Close.
+				if (c && c->res && (c->kind != Dx12ResourceKind::Buffer || cntOff % 4 != 0 || cntOff > c->buf.size || c->buf.size - cntOff < 4)) {
+					static std::atomic<uint32_t> reports{ 0 };
+					if (Dx12ReportSkipped(reports))
+						spdlog::error("DX12 ExecuteIndirect skipped: the count buffer '{}' ({} bytes) cannot hold a count at offset {}; list '{}', label '{}'",
+							Dx12ObjectName(c->res.Get()), c->kind == Dx12ResourceKind::Buffer ? c->buf.size : 0, cntOff, l->debugName, Dx12OpenLabel(*l));
+					return;
+				}
 			}
 
 			// D3D12 rejects the entire command list at Close when an indirect
@@ -8099,11 +9681,27 @@ namespace rhi {
 			}
 #endif
 
+			Dx12NoteCommand(l, "ExecuteIndirect(argument offset, max count, count offset)", argOff, maxCount, cntRes ? cntOff : UINT64_MAX);
 			l->cl->ExecuteIndirect(
 				S->sig.Get(),
 				maxCount,
 				argB->res.Get(), argOff,
 				cntRes, cntOff);
+			// A signature that sets root constants leaves the root arguments undefined after the call (the D3D12 spec): the 32-bit
+			// constants pushed under the layout are set again, so the next draw reads what was pushed, not what the last command set.
+			if (S->setsRootConstants) {
+				for (const auto& entry : l->rootConstantValues) {
+					if (entry.values.empty()) {
+						continue;
+					}
+					if (entry.graphics) {
+						l->cl->SetGraphicsRoot32BitConstants(entry.rootIndex, static_cast<UINT>(entry.values.size()), entry.values.data(), 0);
+					}
+					if (entry.compute) {
+						l->cl->SetComputeRoot32BitConstants(entry.rootIndex, static_cast<UINT>(entry.values.size()), entry.values.data(), 0);
+					}
+				}
+			}
 		}
 		static void cl_setDescriptorHeaps(CommandList* cl, DescriptorHeapHandle csu, std::optional<DescriptorHeapHandle> samp) noexcept {
 			auto* l = dx12_detail::CL(cl);
@@ -8125,6 +9723,9 @@ namespace rhi {
 		}
 
 		static void cl_barrier(CommandList* cl, const BarrierBatch& b) noexcept {
+			if (DxRejectInBundle(cl, "a barrier")) {
+				return;
+			}
 			if (!cl || !cl->impl) {
 				BreakIfDebugging();
 				return;
@@ -8140,6 +9741,14 @@ namespace rhi {
 			// command lists do not accept the generic COPY_SOURCE/COPY_DEST layouts;
 			// textures copied by a copy queue remain in COMMON.  The access/sync
 			// scopes still describe the ordering of the copy operation.
+			// Enhanced barriers take no access with no sync: a side whose sync is NONE gets NO_ACCESS (a return to Common for no
+			// later user, a first use after nothing), as the debug layer requires.
+			const auto noSyncNoAccess = [](auto& barrier) noexcept {
+				if (barrier.SyncBefore == D3D12_BARRIER_SYNC_NONE)
+					barrier.AccessBefore = D3D12_BARRIER_ACCESS_NO_ACCESS;
+				if (barrier.SyncAfter == D3D12_BARRIER_SYNC_NONE)
+					barrier.AccessAfter = D3D12_BARRIER_ACCESS_NO_ACCESS;
+			};
 			auto textureLayout = [l](ResourceLayout layout) noexcept {
 				if (l->type == D3D12_COMMAND_LIST_TYPE_COPY &&
 					(layout == ResourceLayout::CopySource || layout == ResourceLayout::CopyDest)) {
@@ -8162,6 +9771,60 @@ namespace rhi {
 			buf.reserve(b.buffers.size);
 			glob.reserve(b.globals.size);
 
+			// A compute or copy list rejects graphics-only accesses and syncs at Close (E_INVALIDARG; the debug layer's id 1332).
+			// The graph names a resource's next use whatever queue records the barrier (a buffer a later draw reads as vertices),
+			// so the bits this list type cannot take are dropped: the queue that draws orders its own use.
+			const auto listTypeScope = [&](auto& barrier) {
+				D3D12_BARRIER_SYNC syncAllowed = static_cast<D3D12_BARRIER_SYNC>(~0u);
+				D3D12_BARRIER_ACCESS accessAllowed = static_cast<D3D12_BARRIER_ACCESS>(~0u);
+				if (l->type == D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+					syncAllowed = static_cast<D3D12_BARRIER_SYNC>(~(D3D12_BARRIER_SYNC_DRAW | D3D12_BARRIER_SYNC_INDEX_INPUT | D3D12_BARRIER_SYNC_VERTEX_SHADING |
+						D3D12_BARRIER_SYNC_PIXEL_SHADING | D3D12_BARRIER_SYNC_DEPTH_STENCIL | D3D12_BARRIER_SYNC_RENDER_TARGET | D3D12_BARRIER_SYNC_RESOLVE));
+					accessAllowed = static_cast<D3D12_BARRIER_ACCESS>(~(D3D12_BARRIER_ACCESS_VERTEX_BUFFER | D3D12_BARRIER_ACCESS_INDEX_BUFFER |
+						D3D12_BARRIER_ACCESS_RENDER_TARGET | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE |
+						D3D12_BARRIER_ACCESS_STREAM_OUTPUT | D3D12_BARRIER_ACCESS_RESOLVE_SOURCE | D3D12_BARRIER_ACCESS_RESOLVE_DEST |
+						D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE));
+				} else if (l->type == D3D12_COMMAND_LIST_TYPE_COPY) {
+					syncAllowed = static_cast<D3D12_BARRIER_SYNC>(D3D12_BARRIER_SYNC_ALL | D3D12_BARRIER_SYNC_COPY);
+					accessAllowed = static_cast<D3D12_BARRIER_ACCESS>(D3D12_BARRIER_ACCESS_COPY_SOURCE | D3D12_BARRIER_ACCESS_COPY_DEST);
+				} else {
+					return;
+				}
+				const auto scope = [&](D3D12_BARRIER_SYNC& sync, D3D12_BARRIER_ACCESS& access) {
+					const auto before = std::pair{ sync, access };
+					if (sync != D3D12_BARRIER_SYNC_NONE && (sync & ~syncAllowed)) {
+						const auto kept = static_cast<D3D12_BARRIER_SYNC>(sync & syncAllowed);
+						// Nothing left of a graphics-only sync: the list's whole scope stands in for it.
+						sync = kept ? kept : D3D12_BARRIER_SYNC_ALL;
+					}
+					if (access != D3D12_BARRIER_ACCESS_NO_ACCESS && access != D3D12_BARRIER_ACCESS_COMMON && (access & ~accessAllowed)) {
+						const auto kept = static_cast<D3D12_BARRIER_ACCESS>(access & accessAllowed);
+						access = kept ? kept : D3D12_BARRIER_ACCESS_NO_ACCESS;
+					}
+					if (before != std::pair{ sync, access }) {
+						static std::atomic_flag logged;
+						if (!logged.test_and_set())
+							spdlog::warn("D3D12 barrier: sync {:#x} / access {:#x} on a {} list scoped to {:#x} / {:#x} (bits that list type cannot take; logged once)",
+								static_cast<uint32_t>(before.first), static_cast<uint32_t>(before.second), l->type == D3D12_COMMAND_LIST_TYPE_COPY ? "copy" : "compute",
+								static_cast<uint32_t>(sync), static_cast<uint32_t>(access));
+					}
+				};
+				scope(barrier.SyncBefore, barrier.AccessBefore);
+				scope(barrier.SyncAfter, barrier.AccessAfter);
+			};
+
+			// BASICRHI_DX12_FULL_BARRIERS=1, a diagnostic: every barrier waits for and blocks all work (SYNC_ALL on each side that
+			// has an access), so a missing or too narrow sync scope shows as a change in what the frame draws.
+			static const bool fullBarriers = [] { const char* v = std::getenv("BASICRHI_DX12_FULL_BARRIERS"); return v && *v == '1'; }();
+			const auto fullSync = [](auto& barrier) {
+				if (!fullBarriers)
+					return;
+				if (barrier.AccessBefore != D3D12_BARRIER_ACCESS_NO_ACCESS || barrier.SyncBefore != D3D12_BARRIER_SYNC_NONE)
+					barrier.SyncBefore = D3D12_BARRIER_SYNC_ALL;
+				if (barrier.AccessAfter != D3D12_BARRIER_ACCESS_NO_ACCESS || barrier.SyncAfter != D3D12_BARRIER_SYNC_NONE)
+					barrier.SyncAfter = D3D12_BARRIER_SYNC_ALL;
+			};
+
 			// Textures
 			for (uint32_t i = 0; i < b.textures.size; ++i) {
 				const auto& t = b.textures.data[i];
@@ -8171,6 +9834,10 @@ namespace rhi {
 					BreakIfDebugging();
 					continue;
 				}
+				// D3D12 has no queue-family ownership. An acquire that repeats its release (to Common; Vulkan pairs them exactly)
+				// has nothing left to do: the release made the transition. Any other acquire carries the consumer's own transition
+				// out of Common and records as an ordinary barrier.
+				if (t.queueOwnership == QueueOwnership::Acquire && t.afterLayout == ResourceLayout::Common) continue;
 
 				// Enhanced DISCARD applies to the affected subresource range, not only
 				// to a whole texture. Suppressing it for a mip/layer subset leaves an
@@ -8179,7 +9846,9 @@ namespace rhi {
 					&& t.beforeLayout == ResourceLayout::Undefined;
 
 				D3D12_TEXTURE_BARRIER tb{};
-				tb.SyncBefore = ToDX(nativeDiscard ? ResourceSyncState::None : t.beforeSync);
+				// A discard keeps its before sync: an aliased texture's first use waits for the memory's previous occupant
+				// (D3D12 allows a sync with NO_ACCESS). A discard with no before sync still waits for nothing.
+				tb.SyncBefore = ToDX(t.beforeSync);
 				tb.SyncAfter = ToDX(t.afterSync);
 				tb.AccessBefore = ToDX(nativeDiscard ? ResourceAccessType::None : t.beforeAccess);
 				tb.AccessAfter = ToDX(t.afterAccess);
@@ -8187,7 +9856,36 @@ namespace rhi {
 				tb.LayoutAfter = textureLayout(t.afterLayout);
 				tb.pResource = T->res.Get();
 				tb.Subresources = ToDX(t.range);
+				// A depth-stencil format's stencil is plane 1, with a layout of its own. A barrier on the texture's first plane alone
+				// (the RHI's default range, one plane) moves the depth and leaves the stencil behind, which a stencil test or write
+				// then finds in the old layout. It covers both planes.
+				if (tb.Subresources.FirstPlane == 0 && tb.Subresources.NumPlanes == 1 &&
+					(T->fmt == DXGI_FORMAT_D24_UNORM_S8_UINT || T->fmt == DXGI_FORMAT_R24G8_TYPELESS || T->fmt == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
+						T->fmt == DXGI_FORMAT_R32G8X24_TYPELESS))
+					tb.Subresources.NumPlanes = 2;
 				tb.Flags = nativeDiscard ? D3D12_TEXTURE_BARRIER_FLAG_DISCARD : D3D12_TEXTURE_BARRIER_FLAG_NONE;
+				fullSync(tb);
+				noSyncNoAccess(tb);
+				listTypeScope(tb);
+				// The COMMON layout takes shader reads and copies only (a simultaneous-access texture takes any but the attachment
+				// layouts'). An access it cannot take means the texture is used in COMMON where it needs a layout of its own: the bit
+				// is dropped so the barrier is valid, and the first such use is logged with the texture.
+				if (!(T->res->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) {
+					const auto commonAccess = [&](D3D12_BARRIER_LAYOUT layout, D3D12_BARRIER_ACCESS& access, const char* side) {
+						constexpr D3D12_BARRIER_ACCESS allowed = D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_COPY_SOURCE | D3D12_BARRIER_ACCESS_COPY_DEST;
+						if (layout != D3D12_BARRIER_LAYOUT_COMMON || access == D3D12_BARRIER_ACCESS_NO_ACCESS || !(access & ~allowed))
+							return;
+						static std::atomic_flag logged;
+						if (!logged.test_and_set()) {
+							spdlog::error("D3D12 barrier: access {:#x} {} of texture {} is not allowed in the COMMON layout; dropped to {:#x} (the texture needs its own "
+								"layout for that use; logged once)",
+								static_cast<uint32_t>(access), side, static_cast<const void*>(T->res.Get()), static_cast<uint32_t>(access & allowed));
+						}
+						access = static_cast<D3D12_BARRIER_ACCESS>(access & allowed);
+					};
+					commonAccess(tb.LayoutBefore, tb.AccessBefore, "before");
+					commonAccess(tb.LayoutAfter, tb.AccessAfter, "after");
+				}
 				tex.push_back(tb);
 			}
 
@@ -8227,6 +9925,24 @@ namespace rhi {
 				bb.pResource = B->res.Get();
 				bb.Offset = br.offset;
 				bb.Size = br.size;
+				// A buffer made without unordered access cannot name it in a barrier (E_INVALIDARG at Close; the debug layer's id
+				// 1332). The graph names a buffer's uses whatever its flags, so the bit is dropped and the first such buffer logged.
+				if (!(bufferDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+					const auto noUav = [&](D3D12_BARRIER_ACCESS& access) {
+						if (access == D3D12_BARRIER_ACCESS_NO_ACCESS || !(access & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS))
+							return;
+						static std::atomic_flag logged;
+						if (!logged.test_and_set())
+							spdlog::warn("D3D12 barrier: buffer {} has no unordered access; the access bit is dropped from its barrier (logged once)",
+								static_cast<const void*>(B->res.Get()));
+						access = static_cast<D3D12_BARRIER_ACCESS>(access & ~D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+					};
+					noUav(bb.AccessBefore);
+					noUav(bb.AccessAfter);
+				}
+				fullSync(bb);
+				noSyncNoAccess(bb);
+				listTypeScope(bb);
 				buf.push_back(bb);
 			}
 
@@ -8238,6 +9954,22 @@ namespace rhi {
 				gb.SyncAfter = ToDX(g.afterSync);
 				gb.AccessBefore = ToDX(g.beforeAccess);
 				gb.AccessAfter = ToDX(g.afterAccess);
+				fullSync(gb);
+				noSyncNoAccess(gb);
+				// A global barrier names no texture, so it cannot take the accesses bound to a layout (attachments, resolves, shading
+				// rate): those images are ordered by their own texture barriers. What is left orders buffers, UAVs and copies.
+				const auto globalAccess = [](D3D12_BARRIER_ACCESS& access) {
+					constexpr D3D12_BARRIER_ACCESS layoutBound = D3D12_BARRIER_ACCESS_RENDER_TARGET | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ |
+						D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE | D3D12_BARRIER_ACCESS_RESOLVE_SOURCE | D3D12_BARRIER_ACCESS_RESOLVE_DEST |
+						D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE;
+					if (access == D3D12_BARRIER_ACCESS_NO_ACCESS || !(access & layoutBound))
+						return;
+					const auto kept = static_cast<D3D12_BARRIER_ACCESS>(access & ~layoutBound);
+					access = kept ? kept : D3D12_BARRIER_ACCESS_NO_ACCESS;
+				};
+				globalAccess(gb.AccessBefore);
+				globalAccess(gb.AccessAfter);
+				listTypeScope(gb);
 				glob.push_back(gb);
 			}
 
@@ -8269,6 +10001,7 @@ namespace rhi {
 			}
 
 			if (groupCount != 0) {
+				Dx12NoteCommand(l, "Barrier(textures, buffers, globals)", tex.size(), buf.size(), glob.size());
 				l->cl->Barrier(groupCount, groups.data());
 			}
 		}
@@ -8277,6 +10010,9 @@ namespace rhi {
 			const UavClearInfo& u,
 			const UavClearUint& v) noexcept
 		{
+			if (DxRejectInBundle(cl, "a clear")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!rec || !impl) {
@@ -8311,6 +10047,7 @@ namespace rhi {
 
 			// NOTE: caller must have bound the shader-visible heap via SetDescriptorHeaps()
 			// and transitioned 'res' to UAV/UNORDERED_ACCESS
+			Dx12NoteCommand(rec, "ClearUnorderedAccessViewUint(gpu descriptor, cpu descriptor, -)", gpu.ptr, cpu.ptr);
 			rec->cl->ClearUnorderedAccessViewUint(gpu, cpu, res, v.v, 0, nullptr);
 		}
 
@@ -8318,6 +10055,9 @@ namespace rhi {
 			const UavClearInfo& u,
 			const UavClearFloat& v) noexcept
 		{
+			if (DxRejectInBundle(cl, "a clear")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!rec || !impl) {
@@ -8354,7 +10094,28 @@ namespace rhi {
 		static UINT Align256(UINT x) { return (x + 255u) & ~255u; }
 
 		// texture -> buffer
+		/**
+		 * @brief Notes a copy between a buffer footprint and a texture, and logs a footprint D3D12 may refuse at Close (an offset not on 512
+		 * bytes, a row pitch not on 256, or a start past the buffer). It is still recorded: runtimes with unrestricted copy pitches take it.
+		 */
+		static void Dx12NoteFootprintCopy(Dx12CommandList& a_list, const char* a_kind, const BufferTextureCopyFootprint& a_copy, UINT a_subresource,
+			const Dx12Resource& a_buffer) noexcept {
+			Dx12NoteCommand(&a_list, a_kind, a_copy.footprint.offset, a_copy.footprint.rowPitch, a_subresource);
+			const bool misaligned = a_copy.footprint.offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT != 0 || a_copy.footprint.rowPitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT != 0;
+			const bool outside = a_buffer.kind == Dx12ResourceKind::Buffer && a_copy.footprint.offset >= a_buffer.buf.size;
+			if (!misaligned && !outside)
+				return;
+			static std::atomic<uint32_t> reports{ 0 };
+			if (Dx12ReportSkipped(reports))
+				spdlog::warn("DX12 {}: footprint offset {} row pitch {} ({}) in buffer '{}' ({} bytes); D3D12 may fail the list '{}' at Close; label '{}'", a_kind,
+					a_copy.footprint.offset, a_copy.footprint.rowPitch, outside ? "starts past the buffer" : "not aligned to 512 / 256 bytes",
+					Dx12ObjectName(a_buffer.res.Get()), a_buffer.kind == Dx12ResourceKind::Buffer ? a_buffer.buf.size : 0, a_list.debugName, Dx12OpenLabel(a_list));
+		}
+
 		static void cl_copyTextureToBuffer(rhi::CommandList* cl, const rhi::BufferTextureCopyFootprint& r) noexcept {
+			if (DxRejectInBundle(cl, "a copy")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!rec || !impl) {
@@ -8372,8 +10133,11 @@ namespace rhi {
 			D3D12_TEXTURE_COPY_LOCATION dst{};
 			dst.pResource = B->res.Get();
 			dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			UINT subresource = 0;
+			DXGI_FORMAT format = T->fmt;
+			DxBufferCopyLocation(*impl, *T, r, subresource, format);
 			dst.PlacedFootprint.Offset = r.footprint.offset;
-			dst.PlacedFootprint.Footprint.Format = T->fmt;     // texture s actual DXGI format
+			dst.PlacedFootprint.Footprint.Format = format;
 			dst.PlacedFootprint.Footprint.Width = r.footprint.width;
 			dst.PlacedFootprint.Footprint.Height = r.footprint.height;
 			dst.PlacedFootprint.Footprint.Depth = r.footprint.depth;
@@ -8382,15 +10146,25 @@ namespace rhi {
 			D3D12_TEXTURE_COPY_LOCATION src{};
 			src.pResource = T->res.Get();
 			src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			src.SubresourceIndex = CalcSubresourceFor(*T, r.mip,
-				(T->dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? 0u : r.arraySlice);
+			src.SubresourceIndex = subresource;
 
-			// Full subresource copy (nullptr box) at (x,y,z) inside the texture
-			rec->cl->CopyTextureRegion(&dst, r.x, r.y, r.z, &src, nullptr);
+			// The texture's region at (x, y, z) of the footprint's extent, into the footprint's start: the Vulkan backend's meaning of
+			// the offset (vkCmdCopyImageToBuffer's imageOffset). A full-subresource copy has offset 0 and the subresource's extent.
+			// Clamped to the mip: a block-compressed footprint rounds its extent up to whole blocks, past a small mip's edge.
+			const uint32_t mipWidth = (std::max)(T->tex.w >> r.mip, 1u);
+			const uint32_t mipHeight = (std::max)(T->tex.h >> r.mip, 1u);
+			const uint32_t mipDepth = T->dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? (std::max)(uint32_t(T->tex.depth) >> r.mip, 1u) : 1u;
+			const D3D12_BOX box{ r.x, r.y, r.z, (std::min)(r.x + r.footprint.width, mipWidth), (std::min)(r.y + r.footprint.height, mipHeight),
+				(std::min)(r.z + (std::max)(r.footprint.depth, 1u), mipDepth) };
+			Dx12NoteFootprintCopy(*rec, "CopyTextureToBuffer(buffer offset, row pitch, subresource)", r, src.SubresourceIndex, *B);
+			rec->cl->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
 		}
 
 		// buffer -> texture (symmetric)
 		static void cl_copyBufferToTexture(rhi::CommandList* cl, const rhi::BufferTextureCopyFootprint& r) noexcept {
+			if (DxRejectInBundle(cl, "a copy")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!rec || !impl) {
@@ -8408,8 +10182,11 @@ namespace rhi {
 			D3D12_TEXTURE_COPY_LOCATION src{};
 			src.pResource = B->res.Get();
 			src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			UINT subresource = 0;
+			DXGI_FORMAT format = T->fmt;
+			DxBufferCopyLocation(*impl, *T, r, subresource, format);
 			src.PlacedFootprint.Offset = r.footprint.offset;
-			src.PlacedFootprint.Footprint.Format = T->fmt;
+			src.PlacedFootprint.Footprint.Format = format;
 			src.PlacedFootprint.Footprint.Width = r.footprint.width;
 			src.PlacedFootprint.Footprint.Height = r.footprint.height;
 			src.PlacedFootprint.Footprint.Depth = r.footprint.depth;
@@ -8418,9 +10195,9 @@ namespace rhi {
 			D3D12_TEXTURE_COPY_LOCATION dst{};
 			dst.pResource = T->res.Get();
 			dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			dst.SubresourceIndex = CalcSubresourceFor(*T, r.mip,
-				(T->dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? 0u : r.arraySlice);
+			dst.SubresourceIndex = subresource;
 
+			Dx12NoteFootprintCopy(*rec, "CopyBufferToTexture(buffer offset, row pitch, subresource)", r, dst.SubresourceIndex, *B);
 			rec->cl->CopyTextureRegion(&dst, r.x, r.y, r.z, &src, nullptr);
 		}
 
@@ -8429,6 +10206,9 @@ namespace rhi {
 			const TextureCopyRegion& dst,
 			const TextureCopyRegion& src) noexcept
 		{
+			if (DxRejectInBundle(cl, "a copy")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!rec || !impl) {
@@ -8473,6 +10253,8 @@ namespace rhi {
 			srcBox.bottom = src.y + srcH;
 			srcBox.back = src.z + srcD;
 
+			Dx12NoteCommand(rec, "CopyTextureRegion(dst subresource, src subresource, width << 32 | height)", dxDst.SubresourceIndex, dxSrc.SubresourceIndex,
+				(uint64_t(srcW) << 32) | srcH);
 			// Perform the copy
 			// NOTE: Resources must already be in COPY_SOURCE / COPY_DEST layouts respectively.
 			rec->cl->CopyTextureRegion(
@@ -8487,6 +10269,9 @@ namespace rhi {
 			ResourceHandle src, uint64_t srcOffset,
 			uint64_t numBytes) noexcept
 		{
+			if (DxRejectInBundle(cl, "a copy")) {
+				return;
+			}
 			if (!cl || !cl->IsValid() || numBytes == 0) {
 				BreakIfDebugging();
 				return;
@@ -8507,7 +10292,17 @@ namespace rhi {
 				return;
 			}
 
-			// We don't validate bounds here (we don't store sizes). DX12 will validate.
+			// Out of either buffer's bounds, D3D12 fails the whole list at Close: skipped and named instead.
+			if (D->kind == Dx12ResourceKind::Buffer && S->kind == Dx12ResourceKind::Buffer &&
+				(dstOffset > D->buf.size || numBytes > D->buf.size - dstOffset || srcOffset > S->buf.size || numBytes > S->buf.size - srcOffset)) {
+				static std::atomic<uint32_t> reports{ 0 };
+				if (Dx12ReportSkipped(reports))
+					spdlog::error("DX12 CopyBufferRegion skipped: {} bytes from '{}' ({} bytes) at {} into '{}' ({} bytes) at {} leave a buffer; list '{}', label '{}'",
+						numBytes, Dx12ObjectName(S->res.Get()), S->buf.size, srcOffset, Dx12ObjectName(D->res.Get()), D->buf.size, dstOffset, rec->debugName,
+						Dx12OpenLabel(*rec));
+				return;
+			}
+			Dx12NoteCommand(rec, "CopyBufferRegion(dstOffset, srcOffset, bytes)", dstOffset, srcOffset, numBytes);
 			// Required states (caller's responsibility via barriers):
 			//   src:  COPY_SOURCE   (ResourceAccessType::CopySource / Layout::CopySource)
 			//   dst:  COPY_DEST     (ResourceAccessType::CopyDest   / Layout::CopyDest)
@@ -8542,6 +10337,9 @@ namespace rhi {
 		}
 
 		static void cl_writeTimestamp(CommandList* cl, QueryPoolHandle pool, uint32_t index, Stage /*ignored*/) noexcept {
+			if (DxRejectInBundle(cl, "a query")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!impl) {
@@ -8554,11 +10352,20 @@ namespace rhi {
 				BreakIfDebugging();
 				return;
 			}
-
+			if (index >= P->count) {
+				static std::atomic<uint32_t> reports{ 0 };
+				if (Dx12ReportSkipped(reports))
+					spdlog::error("DX12 timestamp skipped: index {} past its heap of {}; list '{}', label '{}'", index, P->count, rec->debugName, Dx12OpenLabel(*rec));
+				return;
+			}
+			Dx12NoteCommand(rec, "WriteTimestamp(index, heap size, -)", index, P->count);
 			rec->cl->EndQuery(P->heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, index);
 		}
 
 		static void cl_beginQuery(CommandList* cl, QueryPoolHandle pool, uint32_t index) noexcept {
+			if (DxRejectInBundle(cl, "a query")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!impl) {
@@ -8571,6 +10378,13 @@ namespace rhi {
 				BreakIfDebugging();
 				return;
 			}
+			if (index >= P->count) {
+				static std::atomic<uint32_t> reports{ 0 };
+				if (Dx12ReportSkipped(reports))
+					spdlog::error("DX12 BeginQuery skipped: index {} past its heap of {}; list '{}', label '{}'", index, P->count, rec->debugName, Dx12OpenLabel(*rec));
+				return;
+			}
+			Dx12NoteCommand(rec, "BeginQuery(index, heap type, -)", index, static_cast<uint64_t>(P->type));
 
 			if (P->type == D3D12_QUERY_HEAP_TYPE_OCCLUSION) {
 				rec->cl->BeginQuery(P->heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, index);
@@ -8584,6 +10398,9 @@ namespace rhi {
 		}
 
 		static void cl_endQuery(CommandList* cl, QueryPoolHandle pool, uint32_t index) noexcept {
+			if (DxRejectInBundle(cl, "a query")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!impl) {
@@ -8596,6 +10413,13 @@ namespace rhi {
 				BreakIfDebugging();
 				return;
 			}
+			if (index >= P->count) {
+				static std::atomic<uint32_t> reports{ 0 };
+				if (Dx12ReportSkipped(reports))
+					spdlog::error("DX12 EndQuery skipped: index {} past its heap of {}; list '{}', label '{}'", index, P->count, rec->debugName, Dx12OpenLabel(*rec));
+				return;
+			}
+			Dx12NoteCommand(rec, "EndQuery(index, heap type, -)", index, static_cast<uint64_t>(P->type));
 
 			if (P->type == D3D12_QUERY_HEAP_TYPE_OCCLUSION) {
 				rec->cl->EndQuery(P->heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, index);
@@ -8616,6 +10440,9 @@ namespace rhi {
 			uint32_t firstQuery, uint32_t queryCount,
 			ResourceHandle dst, uint64_t dstOffset) noexcept
 		{
+			if (DxRejectInBundle(cl, "a query")) {
+				return;
+			}
 			auto* rec = dx12_detail::CL(cl);
 			auto* impl = rec ? rec->dev : nullptr;
 			if (!impl) {
@@ -8645,6 +10472,20 @@ namespace rhi {
 			default: return;
 			}
 
+			// The range inside the heap, the destination on 8 bytes and inside the buffer; anything else fails the list at Close.
+			const uint64_t resultBytes = type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS ? sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) :
+				type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS1 ? sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1) : sizeof(uint64_t);
+			const uint64_t bytes = resultBytes * queryCount;
+			if (uint64_t(firstQuery) + queryCount > P->count || dstOffset % 8 != 0 ||
+				(B->kind == Dx12ResourceKind::Buffer && (dstOffset > B->buf.size || bytes > B->buf.size - dstOffset))) {
+				static std::atomic<uint32_t> reports{ 0 };
+				if (Dx12ReportSkipped(reports))
+					spdlog::error("DX12 ResolveQueryData skipped: queries {}..{} of a heap of {} into '{}' ({} bytes) at {}; list '{}', label '{}'", firstQuery,
+						uint64_t(firstQuery) + queryCount, P->count, Dx12ObjectName(B->res.Get()), B->kind == Dx12ResourceKind::Buffer ? B->buf.size : 0, dstOffset,
+						rec->debugName, Dx12OpenLabel(*rec));
+				return;
+			}
+			Dx12NoteCommand(rec, "ResolveQueryData(first, count, dstOffset)", firstQuery, queryCount, dstOffset);
 			rec->cl->ResolveQueryData(P->heap.Get(), type, firstQuery, queryCount, B->res.Get(), dstOffset);
 		}
 
@@ -8678,15 +10519,29 @@ namespace rhi {
 			if (dstOffset32 >= maxAvail) return;
 			if (dstOffset32 + num32 > maxAvail) num32 = maxAvail - dstOffset32;
 
-			// Write to requested stages. On DX12, graphics/compute have distinct root constant slots.
+			// Write to requested stages. On DX12, graphics/compute have distinct root constant slots, and raytracing shaders read the compute ones.
 			const auto* p32 = static_cast<const uint32_t*>(data);
 			if (rc->type == PushConstantRangeType::RootConstants32) {
-				if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::Compute)) {
+				const bool compute = static_cast<uint32_t>(stages) & (static_cast<uint32_t>(ShaderStage::Compute) | static_cast<uint32_t>(ShaderStage::AllRayTracing));
+				const bool graphics = static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::AllGraphics);
+				if (compute) {
 					impl->cl->SetComputeRoot32BitConstants(rc->rootIndex, num32, p32, dstOffset32);
 				}
-				if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::AllGraphics)) {
+				if (graphics) {
 					impl->cl->SetGraphicsRoot32BitConstants(rc->rootIndex, num32, p32, dstOffset32);
 				}
+				// Kept for an ExecuteIndirect that sets root constants (cl_executeIndirect sets them again after it).
+				auto found = std::find_if(impl->rootConstantValues.begin(), impl->rootConstantValues.end(),
+					[&](const auto& entry) { return entry.rootIndex == rc->rootIndex; });
+				if (found == impl->rootConstantValues.end()) {
+					found = impl->rootConstantValues.insert(impl->rootConstantValues.end(), Dx12CommandList::RootConstantValues{ rc->rootIndex });
+				}
+				if (found->values.size() < maxAvail) {
+					found->values.resize(maxAvail, 0u);
+				}
+				std::memcpy(found->values.data() + dstOffset32, p32, static_cast<size_t>(num32) * sizeof(uint32_t));
+				found->graphics = found->graphics || graphics;
+				found->compute = found->compute || compute;
 				return;
 			}
 
@@ -8711,7 +10566,7 @@ namespace rhi {
 			}
 			std::memcpy(cpuAddress, shadowState->values.data(), uploadBytes);
 
-			if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::Compute)) {
+			if (static_cast<uint32_t>(stages) & (static_cast<uint32_t>(ShaderStage::Compute) | static_cast<uint32_t>(ShaderStage::AllRayTracing))) {
 				impl->cl->SetComputeRootConstantBufferView(rc->rootIndex, gpuAddress);
 			}
 			if (static_cast<uint32_t>(stages) & static_cast<uint32_t>(ShaderStage::AllGraphics)) {
@@ -8738,6 +10593,9 @@ namespace rhi {
 		}
 
 		static void cl_setWorkGraph(CommandList* cl, const WorkGraphHandle& h, const ResourceHandle& backingMemory, bool resetBackingMemory) noexcept {
+			if (DxRejectInBundle(cl, "a work graph")) {
+				return;
+			}
 			auto* l = dx12_detail::CL(cl);
 			if (!l) {
 				BreakIfDebugging();
@@ -8763,6 +10621,9 @@ namespace rhi {
 		}
 
 		static void cl_dispatchWorkGraph(CommandList* cl, const WorkGraphDispatchDesc& desc) noexcept {
+			if (DxRejectInBundle(cl, "a work graph")) {
+				return;
+			}
 			auto* l = dx12_detail::CL(cl);
 			if (!l) {
 				BreakIfDebugging();
@@ -8807,10 +10668,32 @@ namespace rhi {
 		static ResourceHandle sc_img(Swapchain* sc, uint32_t i) noexcept { return dx12_detail::SC(sc)->imageHandles[i]; }
 		static Result sc_present(Swapchain* sc, bool vsync, const PresentSyncDesc* presentSync) noexcept {
 			auto* s = dx12_detail::SC(sc);
+			// The present goes out on the graphics queue the swapchain was made on. A frame finished on another queue is
+			// waited for there, on the GPU.
+			if (presentSync && presentSync->queue && presentSync->wait.value != 0 && !HandleEqual<QueueHandle>{}(presentSync->queue.GetQueueHandle(), s->dev->gfxHandle)) {
+				auto* gfxState = s->dev->queues.get(s->dev->gfxHandle);
+				auto* timeline = s->dev->timelines.get(presentSync->wait.t);
+				if (!gfxState || !timeline || !timeline->fence) {
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				if (FAILED(gfxState->pNativeQueue->Wait(timeline->fence.Get(), presentSync->wait.value))) {
+					RHI_FAIL(Result::Failed);
+				}
+			}
 			UINT syncInterval = vsync ? 1 : 0; UINT flags = 0;
+			// Tearing needs the swapchain flag, vsync off, and no exclusive fullscreen.
+			if (!vsync && (s->flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)) {
+				BOOL fullscreen = FALSE;
+				if (FAILED(s->pSlProxySC->GetFullscreenState(&fullscreen, nullptr)) || !fullscreen) {
+					flags |= DXGI_PRESENT_ALLOW_TEARING;
+				}
+			}
 			const UINT64 infoQueueStart = Dx12GetInfoQueueMessageCount(s->dev->pNativeDevice.Get());
 			const HRESULT hr = s->pSlProxySC->Present(syncInterval, flags);
 			Dx12LogInfoQueueMessagesSince(s->dev->pNativeDevice.Get(), infoQueueStart, 64);
+			if (SUCCEEDED(hr)) {
+				++s->presentCount;
+			}
 			if (FAILED(hr)) {
 				const uint64_t waitValue = presentSync ? presentSync->wait.value : 0;
 				const auto queueKind = presentSync ? presentSync->queue.GetKind() : QueueKind::Graphics;
@@ -8923,6 +10806,7 @@ namespace rhi {
 			s->fmt = newFmt;
 			s->count = (UINT)newCount;
 			s->flags = resizeFlags;
+			if (newFormat != Format::Unknown && s->colorSpace == SwapchainColorSpace::SrgbNonlinear) s->sdrFormat = newFormat;
 
 			// Adjust handle arrays (free excess if shrinking, alloc new if growing).
 			if (newCount < s->imageHandles.size())
@@ -8994,6 +10878,157 @@ namespace rhi {
 			return Result::Ok;
 		}
 		static void sc_setName(Swapchain* sc, const char* n) noexcept {} // Cannot name IDXGISwapChain
+
+		static DXGI_COLOR_SPACE_TYPE Dx12ColorSpace(SwapchainColorSpace colorSpace) noexcept {
+			switch (colorSpace) {
+			case SwapchainColorSpace::Hdr10St2084: return DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+			case SwapchainColorSpace::ScRgbLinear: return DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+			case SwapchainColorSpace::SrgbNonlinear: break;
+			}
+			return DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+		}
+
+		static void Dx12ApplyHdrMetadata(Dx12Swapchain& s) noexcept {
+			ComPtr<IDXGISwapChain4> sc4;
+			if (FAILED(s.pSlProxySC.As(&sc4))) return;
+			if (!s.hasHdrMetadata || s.colorSpace == SwapchainColorSpace::SrgbNonlinear) {
+				sc4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr);
+				return;
+			}
+			// DXGI units: chromaticity in 0.00002 steps, minimum mastering luminance in 0.0001 nits, the rest in nits.
+			auto xy = [](float value) { return static_cast<UINT16>(std::clamp(value, 0.0f, 1.0f) * 50000.0f + 0.5f); };
+			auto nits = [](float value) { return static_cast<UINT16>(std::clamp(value, 0.0f, 65535.0f) + 0.5f); };
+			const HdrMetadata& m = s.hdrMetadata;
+			DXGI_HDR_METADATA_HDR10 metadata{};
+			metadata.RedPrimary[0] = xy(m.redPrimary[0]);
+			metadata.RedPrimary[1] = xy(m.redPrimary[1]);
+			metadata.GreenPrimary[0] = xy(m.greenPrimary[0]);
+			metadata.GreenPrimary[1] = xy(m.greenPrimary[1]);
+			metadata.BluePrimary[0] = xy(m.bluePrimary[0]);
+			metadata.BluePrimary[1] = xy(m.bluePrimary[1]);
+			metadata.WhitePoint[0] = xy(m.whitePoint[0]);
+			metadata.WhitePoint[1] = xy(m.whitePoint[1]);
+			metadata.MaxMasteringLuminance = static_cast<UINT>((std::max)(m.maxLuminance, 0.0f) + 0.5f);
+			metadata.MinMasteringLuminance = static_cast<UINT>((std::max)(m.minLuminance, 0.0f) * 10000.0f + 0.5f);
+			metadata.MaxContentLightLevel = nits(m.maxContentLightLevel);
+			metadata.MaxFrameAverageLightLevel = nits(m.maxFrameAverageLightLevel);
+			sc4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, sizeof(metadata), &metadata);
+		}
+
+		static SwapchainCaps sc_caps(Swapchain* sc) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			if (!s) return {};
+			SwapchainCaps caps{};
+			caps.tearing = (s->flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+			caps.presentModeSwitch = true;
+			caps.presentWait = false;
+			ComPtr<IDXGISwapChain4> sc4;
+			caps.hdrMetadata = SUCCEEDED(s->pSlProxySC.As(&sc4));
+			return caps;
+		}
+
+		static bool sc_isColorSpaceSupported(Swapchain* sc, SwapchainColorSpace colorSpace) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			if (!s) return false;
+			if (colorSpace != SwapchainColorSpace::SrgbNonlinear) {
+				// HDR needs the output itself in HDR mode (Windows HDR on), not only a swapchain that accepts the colour space.
+				ComPtr<IDXGIOutput> output;
+				ComPtr<IDXGIOutput6> output6;
+				DXGI_OUTPUT_DESC1 outputDesc{};
+				if (FAILED(s->pSlProxySC->GetContainingOutput(&output)) || FAILED(output.As(&output6)) || FAILED(output6->GetDesc1(&outputDesc)) ||
+					outputDesc.ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+					return false;
+				}
+			}
+			UINT support = 0;
+			return SUCCEEDED(s->pSlProxySC->CheckColorSpaceSupport(Dx12ColorSpace(colorSpace), &support)) &&
+				(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0;
+		}
+
+		static Result sc_setColorSpace(Swapchain* sc, SwapchainColorSpace colorSpace) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			if (!s) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (colorSpace == s->colorSpace) return Result::Ok;
+			if (!sc_isColorSpaceSupported(sc, colorSpace)) return Result::Unsupported;
+			const Format sdrFormat = s->sdrFormat;
+			const Format format = colorSpace == SwapchainColorSpace::Hdr10St2084 ? Format::R10G10B10A2_UNorm
+				: colorSpace == SwapchainColorSpace::ScRgbLinear ? Format::R16G16B16A16_Float
+				: sdrFormat;
+			if (const Result resizeResult = sc_resizeBuffers(sc, 0, s->w, s->h, format, 0); resizeResult != Result::Ok) {
+				return resizeResult;
+			}
+			s->sdrFormat = sdrFormat;  // resizing to an HDR format does not change the SDR one
+			if (const HRESULT hr = s->pSlProxySC->SetColorSpace1(Dx12ColorSpace(colorSpace)); FAILED(hr)) {
+				return ToRHI(hr);
+			}
+			s->colorSpace = colorSpace;
+			Dx12ApplyHdrMetadata(*s);
+			return Result::Ok;
+		}
+
+		static SwapchainColorSpace sc_colorSpace(Swapchain* sc) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			return s ? s->colorSpace : SwapchainColorSpace::SrgbNonlinear;
+		}
+
+		static Result sc_setHdrMetadata(Swapchain* sc, const HdrMetadata& metadata) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			if (!s) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			ComPtr<IDXGISwapChain4> sc4;
+			if (FAILED(s->pSlProxySC.As(&sc4))) return Result::Unsupported;
+			s->hdrMetadata = metadata;
+			s->hasHdrMetadata = true;
+			// Sent now in HDR; an SDR swapchain sends it when it switches.
+			if (s->colorSpace != SwapchainColorSpace::SrgbNonlinear) Dx12ApplyHdrMetadata(*s);
+			return Result::Ok;
+		}
+
+		static Result sc_setMaximumFrameLatency(Swapchain* sc, uint32_t frames) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			if (!s || frames == 0) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			ComPtr<IDXGISwapChain2> sc2;
+			if (FAILED(s->pSlProxySC.As(&sc2))) return Result::Unsupported;
+			return ToRHI(sc2->SetMaximumFrameLatency(frames));
+		}
+
+		static Result sc_waitForFrameLatency(Swapchain* sc, uint64_t timeoutNs) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			if (!s) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (!s->frameLatencyWaitable) return Result::Unsupported;
+			const DWORD timeoutMs = timeoutNs == UINT64_MAX ? INFINITE
+				: static_cast<DWORD>((std::min)((timeoutNs + 999'999ull) / 1'000'000ull, static_cast<uint64_t>(INFINITE - 1)));
+			const DWORD waitResult = WaitForSingleObjectEx(s->frameLatencyWaitable, timeoutMs, TRUE);
+			if (waitResult == WAIT_OBJECT_0) return Result::Ok;
+			if (waitResult == WAIT_TIMEOUT) return Result::WaitTimeout;
+			return Result::Failed;
+		}
+
+		static void* sc_frameLatencyWaitableObject(Swapchain* sc) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			return s ? s->frameLatencyWaitable : nullptr;
+		}
+
+		static uint64_t sc_presentCount(Swapchain* sc) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			return s ? s->presentCount : 0;
+		}
+
+		static Result sc_waitForPresent(Swapchain*, uint64_t, uint64_t) noexcept {
+			return Result::Unsupported;
+		}
+
+		// DXGI orders the back buffer on the swapchain's queue: there is no acquire to wait on.
+		static TimelinePoint sc_acquirePoint(Swapchain*) noexcept {
+			return {};
+		}
 		// ---------------- Resource vtable funcs ----------------
 
 		static void buf_map(Resource* r, void** data, uint64_t offset, uint64_t size) noexcept {
@@ -9109,12 +11144,26 @@ namespace rhi {
 		}
 
 		// ------------------ Allocator vtable funcs ----------------
+		// D3D12 has no trim. An allocator's memory is freed by its Reset.
+		static void ca_trim(CommandAllocator*) noexcept {}
+
 		static void ca_reset(CommandAllocator* ca) noexcept {
 			if (!ca || !ca->impl) {
 				BreakIfDebugging();
 				return;
 			}
 			auto* A = dx12_detail::Alloc(ca);
+			// D3D12 resets an allocator only while none of its lists records (the RHI does not ask that: Vulkan resets a pool's
+			// recording buffers with it). Close any still recording, and forget the lists that are gone.
+			if (A->dev) {
+				std::erase_if(A->lists, [&](const CommandListHandle& h) {
+					auto* list = A->dev->commandLists.get(h);
+					if (!list)
+						return true;
+					Dx12CloseRecording(*list);
+					return false;
+				});
+			}
 			const HRESULT resetResult = A->alloc->Reset();
 			if (FAILED(resetResult)) {
 				spdlog::error(
@@ -9122,6 +11171,139 @@ namespace rhi {
 					static_cast<unsigned>(resetResult));
 				BreakIfDebugging();
 			}
+			if (A->bundleAlloc) {
+				if (const HRESULT bundleResult = A->bundleAlloc->Reset(); FAILED(bundleResult)) {
+					spdlog::error("D3D12 bundle allocator Reset failed: HRESULT 0x{:08X}", static_cast<unsigned>(bundleResult));
+					BreakIfDebugging();
+				}
+			}
+		}
+
+		// A secondary is a bundle: it inherits the executing list's render targets, viewport and scissor, so there is nothing to
+		// begin beyond the Reset that opened it. A bundle can hold neither copies nor barriers: a secondary outside rendering is unsupported.
+		static Result cl_beginSecondary(CommandList* cl, const SecondaryInheritance& inheritance) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl || !l->bundle) {
+				RHI_FAIL(Result::InvalidCall);
+			}
+			if (!inheritance.insideRendering) {
+				RHI_FAIL(Result::Unsupported);
+			}
+			if (l->pendingError != Result::Ok) {
+				return l->pendingError;  // Recycle failed
+			}
+			// The Reset Recycle left for here (or the first one of a bundle made closed): it opens the bundle.
+			if (!l->open) {
+				ID3D12CommandAllocator* allocator = l->pendingReset ? l->pendingReset.Get() : l->alloc.Get();
+				if (const HRESULT hr = l->cl->Reset(allocator, nullptr); FAILED(hr)) {
+					spdlog::error("D3D12 bundle Reset failed for '{}': HRESULT 0x{:08X}", l->debugName, static_cast<unsigned>(hr));
+					RHI_FAIL(ToRHI(hr));
+				}
+				l->open = true;
+				l->closeFailed = false;
+				l->pendingReset.Reset();
+				Dx12NoteReset(*l);
+				Dx12ResetDiagnostics(*l);
+			}
+			if (inheritance.debugName) {
+				cl_setName(cl, inheritance.debugName);
+			}
+			return Result::Ok;
+		}
+
+		static void cl_executeCommands(CommandList* cl, Span<CommandList* const> lists) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl) {
+				BreakIfDebugging();
+				return;
+			}
+			if (DxRejectInBundle(cl, "ExecuteCommands")) {
+				return;
+			}
+			for (uint32_t index = 0; index < lists.size; ++index) {
+				auto* bundle = lists.data[index] ? dx12_detail::CL(lists.data[index]) : nullptr;
+				if (!bundle || !bundle->bundle || !bundle->cl || bundle->pendingError != Result::Ok) {
+					spdlog::error("D3D12 ExecuteCommands: list {} of {} is not a valid secondary", index, lists.size);
+					BreakIfDebugging();
+					return;
+				}
+				Dx12NoteCommand(l, "ExecuteBundle(index, of, -)", index, lists.size);
+				l->cl->ExecuteBundle(bundle->cl.Get());
+			}
+			// A bundle's state changes carry back into this list: set the list's values again before they are read.
+			l->stencilRefApplied = false;
+			l->blendFactorApplied = false;
+		}
+
+		static void cl_setStencilRef(CommandList* cl, uint32_t reference) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl) {
+				BreakIfDebugging();
+				return;
+			}
+			l->cl->OMSetStencilRef(reference);
+			l->stencilRef = reference;
+			l->stencilRefApplied = true;
+		}
+
+		static void cl_setViewports(CommandList* cl, Span<const Viewport> viewports) noexcept {
+			if (DxRejectInBundle(cl, "SetViewports")) {
+				return;
+			}
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl || viewports.size == 0) {
+				BreakIfDebugging();
+				return;
+			}
+			if (viewports.size > MAX_VIEWPORTS) {
+				spdlog::error("D3D12 SetViewports: {} viewports, the device takes {}", viewports.size, MAX_VIEWPORTS);
+				if (l->pendingError == Result::Ok) l->pendingError = Result::Unsupported;
+				BreakIfDebugging();
+				return;
+			}
+			std::array<D3D12_VIEWPORT, MAX_VIEWPORTS> native{};
+			for (uint32_t i = 0; i < viewports.size; ++i) {
+				const Viewport& v = viewports.data[i];
+				native[i] = { v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth };
+			}
+			l->cl->RSSetViewports(viewports.size, native.data());
+		}
+
+		static void cl_setScissors(CommandList* cl, Span<const ScissorRect> scissors) noexcept {
+			if (DxRejectInBundle(cl, "SetScissors")) {
+				return;
+			}
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl || scissors.size == 0) {
+				BreakIfDebugging();
+				return;
+			}
+			if (scissors.size > MAX_VIEWPORTS) {
+				spdlog::error("D3D12 SetScissors: {} scissors, the device takes {}", scissors.size, MAX_VIEWPORTS);
+				if (l->pendingError == Result::Ok) l->pendingError = Result::Unsupported;
+				BreakIfDebugging();
+				return;
+			}
+			std::array<D3D12_RECT, MAX_VIEWPORTS> native{};
+			for (uint32_t i = 0; i < scissors.size; ++i) {
+				const ScissorRect& s = scissors.data[i];
+				// The right and bottom edges stop at INT32_MAX, as on Vulkan, rather than wrapping.
+				native[i] = { static_cast<LONG>(s.x), static_cast<LONG>(s.y),
+					static_cast<LONG>((std::min)(static_cast<int64_t>(s.x) + s.width, int64_t{ INT32_MAX })),
+					static_cast<LONG>((std::min)(static_cast<int64_t>(s.y) + s.height, int64_t{ INT32_MAX })) };
+			}
+			l->cl->RSSetScissorRects(scissors.size, native.data());
+		}
+
+		static void cl_setBlendFactor(CommandList* cl, const float rgba[4]) noexcept {
+			auto* l = dx12_detail::CL(cl);
+			if (!l || !l->cl || !rgba) {
+				BreakIfDebugging();
+				return;
+			}
+			std::copy(rgba, rgba + 4, l->blendFactor);
+			l->cl->OMSetBlendFactor(l->blendFactor);
+			l->blendFactorApplied = true;
 		}
 
 		// ------------------ QueryPool vtable funcs ----------------
@@ -9381,6 +11563,94 @@ namespace rhi {
 			}
 			return Result::Ok;
 		}
+		class Dx12CompletionWait final : public CompletionWait {
+			struct Registration {
+				ComPtr<ID3D12Fence> fence;
+				HANDLE event = nullptr;
+				uint64_t value = 0;
+			};
+		public:
+			explicit Dx12CompletionWait(Dx12Device* device) : m_device(device) {
+				m_control = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+			}
+			bool Valid() const noexcept { return m_control != nullptr; }
+			~Dx12CompletionWait() override {
+				// Event registrations cannot be cancelled. Destruction is a teardown
+				// boundary: retain each event until its registered fence has completed.
+				for (auto& registration : m_registrations) if (registration.event) {
+					if (registration.fence->GetCompletedValue() < registration.value)
+						WaitForSingleObject(registration.event, INFINITE);
+					CloseHandle(registration.event);
+				}
+				if (m_control) CloseHandle(m_control);
+			}
+			uint64_t WakeVersion() const noexcept override { return m_version.load(std::memory_order_acquire); }
+			Result Notify() noexcept override {
+				std::lock_guard lock(m_mutex);
+				m_version.fetch_add(1, std::memory_order_release);
+				return SetEvent(m_control) ? Result::Ok : Result::Failed;
+			}
+			Result Wait(Span<TimelinePoint> points, uint64_t observed) noexcept override {
+				if (points.size > MaxTimelines || (points.size && !points.data)) return Result::InvalidArgument;
+				std::array<HANDLE, MaxTimelines + 1> events{};
+				events[0] = m_control;
+				uint32_t eventCount = 1;
+				for (const auto& point : points) {
+					auto* timeline = m_device->timelines.get(point.t);
+					if (!timeline || !timeline->fence || !point.value || point.value == UINT64_MAX) return Result::InvalidArgument;
+					const auto completed = timeline->fence->GetCompletedValue();
+					if (completed == UINT64_MAX) return Result::Failed;
+					if (completed >= point.value) return Result::Ok;
+					Registration* entry = nullptr;
+					for (auto& candidate : m_registrations)
+						if (candidate.fence.Get() == timeline->fence.Get()) { entry = &candidate; break; }
+					if (!entry) {
+						for (auto& candidate : m_registrations) {
+							if (!candidate.fence || candidate.fence->GetCompletedValue() >= candidate.value) {
+								if (candidate.event) CloseHandle(candidate.event);
+								candidate = {};
+								candidate.fence = timeline->fence;
+								entry = &candidate;
+								break;
+							}
+						}
+					}
+					if (!entry) return Result::Failed;
+					if (!entry->event || completed >= entry->value) {
+						if (!entry->event) entry->event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+						if (!entry->event) return Result::Failed;
+						ResetEvent(entry->event);
+						const auto result = entry->fence->SetEventOnCompletion(point.value, entry->event);
+						if (FAILED(result)) return Result::Failed;
+						entry->value = point.value;
+					} else if (point.value < entry->value) return Result::InvalidArgument;
+					// A previous lower value may wake us first; caller rechecks/rearms.
+					events[eventCount++] = entry->event;
+				}
+				{
+					std::lock_guard lock(m_mutex);
+					if (observed != m_version.load(std::memory_order_acquire)) return Result::Ok;
+					ResetEvent(m_control);
+				}
+				const auto result = WaitForMultipleObjects(eventCount, events.data(), FALSE, INFINITE);
+				return result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + eventCount ? Result::Ok : Result::Failed;
+			}
+		private:
+			Dx12Device* m_device;
+			HANDLE m_control = nullptr;
+			std::array<Registration, MaxTimelines> m_registrations;
+			std::atomic<uint64_t> m_version{0};
+			std::mutex m_mutex;
+		};
+		static Result d_createCompletionWait(Device* device, std::unique_ptr<CompletionWait>& out) noexcept {
+			try {
+				auto result = std::make_unique<Dx12CompletionWait>(static_cast<Dx12Device*>(device->impl));
+				if (!result->Valid()) return Result::Failed;
+				out = std::move(result);
+				return Result::Ok;
+			} catch (...) { return Result::Failed; }
+		}
+
 		static void tl_setName(Timeline* tl, const char* n) noexcept {
 			if (!n) {
 				BreakIfDebugging();
@@ -9447,6 +11717,55 @@ namespace rhi {
 		void SlLogMessageCallback(sl::LogType level, const char* message) {
 			//spdlog::info("Streamline Log: {}", message);
 		}
+
+		// Streamline's resources, and DLSS's through it, are allocated here so they get high residency priority: over the
+		// OS budget, video memory otherwise demotes them like anything else, and upscaling from system memory was 14 ms.
+		std::atomic<uint64_t> g_slAllocatedBytes{ 0u };
+		sl::Resource SlAllocateResource(const sl::ResourceAllocationDesc* desc, void* device) {
+			sl::Resource out(desc ? desc->type : sl::ResourceType::eUnknown, nullptr, desc ? desc->state : 0u);
+			auto* d3d = static_cast<ID3D12Device*>(device);
+			if (!desc || !desc->desc || !d3d || (desc->type != sl::ResourceType::eTex2d && desc->type != sl::ResourceType::eBuffer)) {
+				spdlog::error("Streamline asked for an allocation the host can't make (type {})", desc ? static_cast<int>(desc->type) : -1);
+				return out;
+			}
+			D3D12_HEAP_PROPERTIES heap{};
+			heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+			if (desc->heap) heap = *static_cast<const D3D12_HEAP_PROPERTIES*>(desc->heap);
+			const auto& resourceDesc = *static_cast<const D3D12_RESOURCE_DESC*>(desc->desc);
+			ID3D12Resource* resource = nullptr;
+			const HRESULT hr = d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &resourceDesc,
+				static_cast<D3D12_RESOURCE_STATES>(desc->state), nullptr, IID_PPV_ARGS(&resource));
+			if (FAILED(hr) || !resource) {
+				spdlog::error("Streamline allocation failed: {:#x}", static_cast<uint32_t>(hr));
+				return out;
+			}
+			if (heap.Type == D3D12_HEAP_TYPE_DEFAULT) {
+				Microsoft::WRL::ComPtr<ID3D12Device1> device1;
+				if (SUCCEEDED(d3d->QueryInterface(IID_PPV_ARGS(&device1)))) {
+					ID3D12Pageable* pageable = resource;
+					const D3D12_RESIDENCY_PRIORITY priority = D3D12_RESIDENCY_PRIORITY_HIGH;
+					device1->SetResidencyPriority(1u, &pageable, &priority);
+				}
+			}
+			const uint64_t bytes = d3d->GetResourceAllocationInfo(0u, 1u, &resourceDesc).SizeInBytes;
+			const uint64_t total = g_slAllocatedBytes.fetch_add(bytes) + bytes;
+			if (bytes >= (1ull << 20)) {
+				spdlog::info("Streamline allocated {:.1f} MiB ({}x{}), {:.1f} MiB in all", double(bytes) / 1048576.0,
+					resourceDesc.Width, resourceDesc.Height, double(total) / 1048576.0);
+			}
+			out.native = resource;
+			return out;
+		}
+		void SlReleaseResource(sl::Resource* resource, void* device) {
+			if (!resource || !resource->native) return;
+			auto* native = static_cast<ID3D12Resource*>(resource->native);
+			if (auto* d3d = static_cast<ID3D12Device*>(device)) {
+				const D3D12_RESOURCE_DESC resourceDesc = native->GetDesc();
+				g_slAllocatedBytes.fetch_sub(d3d->GetResourceAllocationInfo(0u, 1u, &resourceDesc).SizeInBytes);
+			}
+			native->Release();
+			resource->native = nullptr;
+		}
 		std::wstring GetExePath() {
 			WCHAR buffer[MAX_PATH] = { 0 };
 			GetModuleFileNameW(NULL, buffer, MAX_PATH);
@@ -9482,10 +11801,12 @@ namespace rhi {
 			pref.numPathsToPlugins = 1; // change this if Streamline plugins are not located next to the executable
 			pref.pathToLogsAndData = {}; // change this to enable logging to a file
 			pref.logMessageCallback = SlLogMessageCallback; // highly recommended to track warning/error messages in your callback
+			pref.allocateCallback = SlAllocateResource;
+			pref.releaseCallback = SlReleaseResource;
 			pref.engine = sl::EngineType::eCustom; // If using UE or Unity
 			pref.engineVersion = "0.0.1"; // Optional version
 			pref.projectId = "72a89ee2-1139-4cc5-8daa-d27189bed781"; // Optional project id
-			sl::Feature myFeatures[] = { sl::kFeatureDLSS };
+			sl::Feature myFeatures[] = { sl::kFeatureDLSS, sl::kFeatureDLSS_RR };
 			pref.featuresToLoad = myFeatures;
 			pref.numFeaturesToLoad = _countof(myFeatures);
 			pref.renderAPI = sl::RenderAPI::eD3D12;
@@ -9506,6 +11827,22 @@ namespace rhi {
 		}
 	#endif
 
+		// slInit needs no device, and takes about a second. PrewarmD3D12Streamline starts it early; the next
+		// Streamline device creation takes the result. Both run on the thread that creates the device.
+		std::future<bool>& StreamlinePrewarm() noexcept
+		{
+			static std::future<bool> prewarm;
+			return prewarm;
+		}
+
+		bool TakeOrInitSL() noexcept
+		{
+			if (auto& prewarm = StreamlinePrewarm(); prewarm.valid()) {
+				return prewarm.get();
+			}
+			return InitSL();
+		}
+
 	}
 
 	void Dx12Device::Shutdown() noexcept {
@@ -9524,6 +11861,11 @@ namespace rhi {
 		}
 		for (auto& slot : queues.slots) {
 			if (slot.alive) Dx12DestroyTracyGpuContext(slot.obj);
+		}
+		if (pipelineCache.library) {
+			Dx12SavePipelineCache(this);
+			const std::unique_lock lock(pipelineCache.mutex);
+			Dx12ClosePipelineCacheLocked(this);
 		}
 
 		swapchains.clear();
@@ -9553,7 +11895,7 @@ namespace rhi {
 		pSLProxyFactory.Reset();
 
 	#if BASICRHI_ENABLE_STREAMLINE
-		if (steamlineInitialized) {
+		if (steamlineInitialized && !streamlineHostOwned) {
 			slShutdown();
 		}
 	#endif
@@ -9598,9 +11940,11 @@ namespace rhi {
 		&d_createAccelerationStructure,
 		&d_getAccelerationStructureDeviceAddress,
 		&d_getBufferDeviceAddress,
+		&d_getBufferViewRef,
 		&d_getRayTracingShaderGroupHandles,
 		&d_setRayTracingPipelineStackSize,
 		&d_getRayTracingAccelerationStructureOperationPrebuildInfo,
+		&d_getOpacityMicromapArrayPrebuildInfo,
 
 		&d_destroySampler,
 		&d_destroyPipelineLayout,
@@ -9662,7 +12006,14 @@ namespace rhi {
 		&d_destroyIndirectPipelineSet,
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
-		11u
+		16u,
+		&d_createCompletionWait,
+		&d_createCommandAllocatorForQueue,
+		&d_createSecondaryCommandList,
+		&d_openPipelineCache,
+		&d_savePipelineCache,
+		&d_getPipelineCacheStats,
+		&d_queryFormatSupport
 	};
 
 	const QueueVTable g_qvt = {
@@ -9674,11 +12025,14 @@ namespace rhi {
 		&q_initializeTracyGpuContext,
 		&q_hasTracyGpuContext,
 		&q_tracyGpuFrameBegin,
-		3u };
+		4u,
+		&q_progress };
 
 	const CommandAllocatorVTable g_calvt = {
 		&ca_reset,
-		1u
+		2u,
+		&ca_trim,
+		false
 	};
 
 	const CommandListVTable g_clvt = {
@@ -9700,6 +12054,7 @@ namespace rhi {
 		&cl_traceRays,
 		&cl_traceRaysIndirect,
 		&cl_executeIndirectRtasOperations,
+		&cl_buildOpacityMicromapArrays,
 		cl_clearRTV_slot,
 		cl_clearDSV_slot,
 		&cl_executeIndirect,
@@ -9724,8 +12079,18 @@ namespace rhi {
 		&cl_setDebugInstrumentationContext,
 		&cl_beginTracyGpuZone,
 		&cl_endTracyGpuZone,
-		6u,
-		&cl_endChecked
+		9u,
+		&cl_endChecked,
+		&cl_beginDebugLabel,  // PIX events (BeginEvent with a UTF-16 name)
+		&cl_endDebugLabel,
+		&cl_insertDebugLabel,
+		nullptr,  // preprocessIndirect: the driver preprocesses inside ExecuteIndirect
+		&cl_beginSecondary,
+		&cl_executeCommands,
+		&cl_setStencilRef,
+		&cl_setBlendFactor,
+		&cl_setViewports,
+		&cl_setScissors
 	};
 	const SwapchainVTable g_scvt = {
 		&sc_count,
@@ -9735,7 +12100,18 @@ namespace rhi {
 		&sc_present,
 		&sc_resizeBuffers,
 		&sc_setName,
-		1u };
+		3u,
+		&sc_caps,
+		&sc_isColorSpaceSupported,
+		&sc_setColorSpace,
+		&sc_colorSpace,
+		&sc_setHdrMetadata,
+		&sc_setMaximumFrameLatency,
+		&sc_waitForFrameLatency,
+		&sc_frameLatencyWaitableObject,
+		&sc_presentCount,
+		&sc_waitForPresent,
+		&sc_acquirePoint };
 	const ResourceVTable g_buf_rvt = {
 		&buf_map,
 		&buf_unmap,
@@ -9794,18 +12170,57 @@ namespace rhi {
 		1u
 	};
 
+	void PrewarmD3D12Streamline() noexcept
+	{
+	#if BASICRHI_ENABLE_STREAMLINE
+		auto& prewarm = StreamlinePrewarm();
+		if (prewarm.valid()) {
+			return;
+		}
+		try {
+			prewarm = std::async(std::launch::async, [] { return InitSL(); });
+		} catch (...) {
+			// No thread: device creation initializes Streamline itself.
+		}
+	#endif
+	}
+
+	// The runtime's configuration interfaces (debug layer, DRED settings). With a host's device factory they come from
+	// the factory's runtime, else from the process's. CLSIDs from d3d12.h, spelled out so no GUID library is needed.
+	static HRESULT Dx12GetConfigurationInterface(ID3D12DeviceFactory* factory, bool dred, REFIID riid, void** out) noexcept
+	{
+		static constexpr GUID kDebug = { 0xf2352aeb, 0xdd84, 0x49fe, { 0xb9, 0x7b, 0xa9, 0xdc, 0xfd, 0xcc, 0x1b, 0x4f } };
+		static constexpr GUID kDred = { 0x4a75bbc4, 0x9ff4, 0x4ad8, { 0x9f, 0x18, 0xab, 0xae, 0x84, 0xdc, 0x5f, 0xf2 } };
+		if (factory)
+			return factory->GetConfigurationInterface(dred ? kDred : kDebug, riid, out);
+		return D3D12GetDebugInterface(riid, out);
+	}
+
 	rhi::Result CreateD3D12Device(const DeviceCreateInfo& ci, DevicePtr& outPtr, bool enableStreamlineInterposer) noexcept
 	{
-		bool l_enableStreamline = enableStreamlineInterposer;
+		bool l_enableStreamline = enableStreamlineInterposer || ci.streamlineHost != nullptr;
 	#if !BASICRHI_ENABLE_STREAMLINE
 		l_enableStreamline = false;
 	#endif
+
+		// The host's Agility SDK factory, when it passed one.
+		ComPtr<ID3D12DeviceFactory> deviceFactory;
+		if (ci.d3d12DeviceFactory) {
+			const HRESULT factoryHr = static_cast<IUnknown*>(ci.d3d12DeviceFactory)->QueryInterface(IID_PPV_ARGS(&deviceFactory));
+			if (FAILED(factoryHr)) {
+				spdlog::error("DX12 device setup: d3d12DeviceFactory is not an ID3D12DeviceFactory hr=0x{:08X}", static_cast<uint32_t>(factoryHr));
+				RHI_FAIL(ToRHI(factoryHr));
+			}
+		}
+
+		// Experimental features apply to devices created afterwards, so this comes first.
+		const bool previewRayTracingEnabled = ci.enablePreviewRayTracing && Dx12EnablePreviewRayTracing();
 
 		UINT flags = 0;
 		if (ci.enableDebug)
 		{
 			ComPtr<ID3D12Debug> dbg;
-			if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
+			if (SUCCEEDED(Dx12GetConfigurationInterface(deviceFactory.Get(), false, IID_PPV_ARGS(&dbg)))) {
 				dbg->EnableDebugLayer(), flags |= DXGI_CREATE_FACTORY_DEBUG;
 				char* gpuValidation = nullptr;
 				size_t gpuValidationLength = 0;
@@ -9827,7 +12242,8 @@ namespace rhi {
 		// DRED auto-breadcrumbs instrument command recording inside the D3D12
 		// runtime. Allow profiling to distinguish that instrumentation from the
 		// native driver path without changing the system-wide d3dconfig state.
-		bool enableDred = ci.enableDebug;
+		// The debug layer and crash markers both ask for DRED.
+		bool enableDred = ci.enableDebug || ci.enableCrashMarkers;
 		char* dredEnvironment = nullptr;
 		size_t dredEnvironmentLength = 0;
 		if (_dupenv_s(&dredEnvironment, &dredEnvironmentLength, "SARP_D3D12_DRED") == 0 && dredEnvironment) {
@@ -9838,7 +12254,7 @@ namespace rhi {
 		std::free(dredEnvironment);
 
 		ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> dredSettings;
-		if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings)))) {
+		if (SUCCEEDED(Dx12GetConfigurationInterface(deviceFactory.Get(), true, IID_PPV_ARGS(&dredSettings)))) {
 			const auto dredEnablement = enableDred
 				? D3D12_DRED_ENABLEMENT_FORCED_ON
 				: D3D12_DRED_ENABLEMENT_FORCED_OFF;
@@ -9850,6 +12266,7 @@ namespace rhi {
 
 		auto impl = std::make_shared<Dx12Device>();
 		impl->selfWeak = impl;
+		impl->deviceFactory = deviceFactory;
 		Dx12Device* pImpl = impl.get();
 		Dx12InitializeDebugInstrumentation(pImpl, ci);
 
@@ -9913,10 +12330,12 @@ namespace rhi {
 			// silent, which hid the validation reason for command-list Close failures.
 			if (ci.enableDebug) {
 				ComPtr<ID3D12Debug> debugController;
-				if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController))))
+				if (SUCCEEDED(Dx12GetConfigurationInterface(deviceFactory.Get(), false, IID_PPV_ARGS(&debugController))))
 					debugController->EnableDebugLayer();
 			}
-			const HRESULT createDeviceHr = D3D12CreateDevice(impl->adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&base));
+			const HRESULT createDeviceHr = deviceFactory ?
+				deviceFactory->CreateDevice(impl->adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&base)) :
+				D3D12CreateDevice(impl->adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&base));
 			if (FAILED(createDeviceHr)) {
 				spdlog::error(
 					"DX12 device setup: D3D12CreateDevice failed for adapter '{}' hr=0x{:08X}",
@@ -9927,7 +12346,19 @@ namespace rhi {
 
 			auto hasDevice10 = base.As(&impl->pNativeDevice);
 			if (FAILED(hasDevice10)) {
+				// Enhanced barriers and the newer interfaces come with ID3D12Device10: an Agility SDK or a recent Windows runtime.
+				spdlog::error("DX12 device setup: the D3D12 runtime has no ID3D12Device10 (needs Agility SDK 1.7 or newer, or a Windows runtime "
+					"with enhanced barriers) hr=0x{:08X}", static_cast<uint32_t>(hasDevice10));
 				RHI_FAIL(ToRHI(hasDevice10));
+			}
+		}
+
+		// Queried on the native device: the Streamline proxy doesn't need to know these interfaces.
+		if (previewRayTracingEnabled && impl->pNativeDevice) {
+			impl->previewRayTracingEnabled = true;
+			const HRESULT raytracing2Hr = impl->pNativeDevice.As(&impl->pNativeDeviceRaytracing2);
+			if (FAILED(raytracing2Hr)) {
+				spdlog::warn("DX12 device setup: ID3D12DeviceRaytracing2 unavailable hr=0x{:08X}", static_cast<uint32_t>(raytracing2Hr));
 			}
 		}
 
@@ -9939,13 +12370,20 @@ namespace rhi {
 				DebugInstrumentationDiagnosticSeverity::Warning,
 				"Streamline is disabled while GPU-Reshape instrumentation is active on the same device.");
 			l_enableStreamline = false;
+		#if BASICRHI_ENABLE_STREAMLINE
+			// A prewarmed slInit this device was meant to take is not used.
+			if (auto& prewarm = StreamlinePrewarm(); prewarm.valid() && prewarm.get()) {
+				slShutdown();
+			}
+		#endif
 		}
 
 		// Streamline manual hooking setup
 		if (l_enableStreamline)
 		{
 	#if BASICRHI_ENABLE_STREAMLINE
-			if (!InitSL())
+			// The host's Streamline is initialized already (DeviceCreateInfo::streamlineHost).
+			if (!ci.streamlineHost && !TakeOrInitSL())
 			{
 				spdlog::error("Failed to initialize NVIDIA Streamline. DLSS will not be available.");
 				l_enableStreamline = false;
@@ -9979,6 +12417,7 @@ namespace rhi {
 				impl->pSLProxyDevice.Attach(dev);
 			}
 			impl->steamlineInitialized = true;
+			impl->streamlineHostOwned = ci.streamlineHost != nullptr;
 	#else
 			l_enableStreamline = false;
 			impl->pSLProxyDevice = impl->pNativeDevice;
@@ -10075,6 +12514,12 @@ namespace rhi {
 		impl->gfxHandle  = makeQ(D3D12_COMMAND_LIST_TYPE_DIRECT,  L"DX12 Graphics Queue");
 		impl->compHandle = makeQ(D3D12_COMMAND_LIST_TYPE_COMPUTE, L"DX12 Compute Queue");
 		impl->copyHandle = makeQ(D3D12_COMMAND_LIST_TYPE_COPY,    L"DX12 Copy Queue");
+		Dx12InitViewRefs(pImpl);
+
+		if (ci.pipelineCachePath) {
+			// A cache that cannot open leaves pipelines uncached; the device still works.
+			Dx12OpenPipelineCache(pImpl, ci.pipelineCachePath);
+		}
 
 		Device d{ pImpl, &g_devvt };
 		outPtr = MakeDevicePtr(&d, impl);

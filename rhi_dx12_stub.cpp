@@ -6,6 +6,7 @@ namespace rhi {
         out.Reset();
         return Result::Unsupported;
     }
+    void PrewarmD3D12Streamline() noexcept {}
 }
 
 namespace rhi::dx12 {

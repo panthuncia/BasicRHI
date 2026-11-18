@@ -1,8 +1,8 @@
-# Build-time counterpart of rhi::AppendVulkanDxcSpirvArguments (rhi.h).
+# Build-time counterpart of rhi::AppendVulkanDxcSpirvArguments (rhi_shader_abi.h).
 #
 # Sets BASICRHI_VULKAN_DXC_FLAGS to the DXC arguments every SPIR-V shader consumed by
 # BasicRHI's Vulkan backend must be compiled with. The descriptor-heap bindings are read
-# from rhi.h so the header stays the single source of truth.
+# from rhi_shader_abi.h so the header stays the single source of truth.
 #
 # Also provides:
 #   basicrhi_compile_spirv(OUTPUT <file.spv> SOURCE <file.hlsl> ENTRY <name> PROFILE <cs_6_6>
@@ -13,7 +13,7 @@
 
 include_guard(GLOBAL)
 
-set(_basicrhi_rhi_header "${CMAKE_CURRENT_LIST_DIR}/../rhi.h")
+set(_basicrhi_rhi_header "${CMAKE_CURRENT_LIST_DIR}/../rhi_shader_abi.h")
 file(STRINGS "${_basicrhi_rhi_header}" _basicrhi_heap_lines REGEX "VULKAN_[A-Z_]*(HEAP_SET|HEAP_BINDING) = [0-9]+;")
 foreach(_line IN LISTS _basicrhi_heap_lines)
     if(_line MATCHES "(VULKAN_[A-Z_]+) = ([0-9]+);")
@@ -30,10 +30,14 @@ endforeach()
 set(BASICRHI_VULKAN_DXC_FLAGS
     -spirv
     -fvk-use-dx-layout
+    -fvk-use-dx-position-w
     -fspv-target-env=vulkan1.3
     -fvk-bind-resource-heap ${_basicrhi_VULKAN_RESOURCE_DESCRIPTOR_HEAP_BINDING} ${_basicrhi_VULKAN_DESCRIPTOR_HEAP_SET}
     -fvk-bind-sampler-heap ${_basicrhi_VULKAN_SAMPLER_DESCRIPTOR_HEAP_BINDING} ${_basicrhi_VULKAN_DESCRIPTOR_HEAP_SET}
     -fvk-bind-counter-heap ${_basicrhi_VULKAN_COUNTER_DESCRIPTOR_HEAP_BINDING} ${_basicrhi_VULKAN_DESCRIPTOR_HEAP_SET})
+# The include guard skips this file in every later directory that includes it, where the variable above is not visible;
+# basicrhi_compile_spirv reads the flags from here instead.
+set_property(GLOBAL PROPERTY BASICRHI_VULKAN_DXC_FLAGS "${BASICRHI_VULKAN_DXC_FLAGS}")
 
 # -fvk-bind-*-heap needs a recent DXC; the Vulkan SDK's copy is the default.
 find_program(BASICRHI_DXC_EXECUTABLE dxc
@@ -56,7 +60,8 @@ function(basicrhi_compile_spirv)
     if(NOT _dxc)
         message(FATAL_ERROR "basicrhi_compile_spirv: DXC not found; install the Vulkan SDK or set BASICRHI_DXC_EXECUTABLE")
     endif()
-    set(_args -nologo -HV 2021 -E ${ARG_ENTRY} -T ${ARG_PROFILE} ${BASICRHI_VULKAN_DXC_FLAGS} -D BASICRHI_SHADER_API_VULKAN=1)
+    get_property(_flags GLOBAL PROPERTY BASICRHI_VULKAN_DXC_FLAGS)
+    set(_args -nologo -HV 2021 -E ${ARG_ENTRY} -T ${ARG_PROFILE} ${_flags} -D BASICRHI_SHADER_API_VULKAN=1)
     if(BASICRHI_SPIRV_DEBUG_INFO)
         list(APPEND _args -Zi)
     endif()

@@ -10,8 +10,8 @@ include(GNUInstallDirs)
 option(BASICRHI_ENABLE_STREAMLINE "Enable Streamline integration in BasicRHI" ON)
 option(BASICRHI_ENABLE_PIX "Enable PIX integration in BasicRHI" ON)
 option(BASICRHI_ENABLE_RESHAPE "Enable GPU-Reshape debug instrumentation scaffolding in BasicRHI" OFF)
-option(BASICRHI_ENABLE_DXR2_HEADERS "Enable native DXR 2.0 header-dependent code paths in BasicRHI" OFF)
 option(BASICRHI_ENABLE_TRACY_GPU_PROFILING "Enable Tracy GPU timeline support in BasicRHI" ON)
+option(BASICRHI_ENABLE_TRACY_CPU_PROFILING "Enable Tracy CPU recording zones in BasicRHI" OFF)
 option(BASICRHI_ENABLE_D3D12 "Build the D3D12 backend" ON)
 option(BASICRHI_ENABLE_VULKAN "Build the Vulkan backend" OFF)
 option(BASICRHI_ENABLE_IMGUI "Build ImGui instrumentation widgets" OFF)
@@ -24,7 +24,9 @@ find_package(spdlog CONFIG REQUIRED)
 # otherwise the header-only definitions compiled into BasicRHI collide with theirs at link time.
 set(BASICRHI_SPDLOG_TARGET "spdlog::spdlog_header_only" CACHE STRING "spdlog target linked by BasicRHI")
 find_package(fmt CONFIG REQUIRED)
-if(BASICRHI_ENABLE_D3D12)
+# D3D12 types also back the shared allocator and format helpers; off Windows, DirectX-Headers
+# supplies them (and its WSL adapter the Win32 scalar types).
+if(BASICRHI_ENABLE_D3D12 OR NOT WIN32)
     find_package(DirectX-Headers CONFIG REQUIRED)
 endif()
 if(BASICRHI_ENABLE_VULKAN)
@@ -45,12 +47,12 @@ endif()
 if(BASICRHI_ENABLE_IMGUI)
     find_package(imgui CONFIG REQUIRED)
 endif()
-if(BASICRHI_ENABLE_TRACY_GPU_PROFILING)
+if(BASICRHI_ENABLE_TRACY_GPU_PROFILING OR BASICRHI_ENABLE_TRACY_CPU_PROFILING)
     find_package(Tracy REQUIRED CONFIG)
 endif()
 if(COMMAND basicrenderer_use_release_library_for_debug)
     basicrenderer_use_release_library_for_debug(fmt::fmt)
-    if(BASICRHI_ENABLE_TRACY_GPU_PROFILING)
+    if(BASICRHI_ENABLE_TRACY_GPU_PROFILING OR BASICRHI_ENABLE_TRACY_CPU_PROFILING)
         basicrenderer_use_release_library_for_debug(Tracy::TracyClient)
     endif()
 endif()
@@ -122,10 +124,13 @@ add_library(BasicRHI STATIC
     "rhi_debug.h"
     "rhi_colors.h"
     "rhi_allocator.h" 
-    "rhi_allocator.cpp" "rhi_feature_info.h" "rhi_dx12_casting.h")
+    "rhi_allocator.cpp" "rhi_feature_info.h" "rhi_dx12_casting.h"
+    "rhi_pipeline_cache.h")
 
-target_compile_options(BasicRHI PRIVATE $<$<NOT:$<CXX_COMPILER_ID:Clang>>:/WX>)
+target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/WX>)
 target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+# rhi_vulkan.cpp is past the default section limit in Debug builds.
+target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
 target_compile_options(BasicRHI PRIVATE $<$<CXX_COMPILER_ID:Clang>:
     -Wno-error=switch
     -Wno-error=reorder-ctor
@@ -272,6 +277,7 @@ set(_basicrhi_public_headers
     "rhi_colors.h"
     "rhi_allocator.h"
     "rhi_helpers.h"
+    "rhi_shader_abi.h"
     "rhi_c.h")
 if(BASICRHI_ENABLE_IMGUI)
     list(APPEND _basicrhi_public_headers "rhi_imgui_widgets.h")
@@ -288,7 +294,24 @@ else()
     target_sources(BasicRHI PRIVATE rhi_dx12_stub.cpp)
 endif()
 if(BASICRHI_ENABLE_VULKAN)
-    target_sources(BasicRHI PRIVATE rhi_vulkan.cpp)
+    target_sources(BasicRHI PRIVATE rhi_vulkan.cpp rhi_vulkan_spirv_lowering.cpp)
+    # The descriptor-buffer binding model lowers shaders with a SPIRV-Tools optimizer pass (rhi_vulkan_spirv_lowering.h), which
+    # needs SPIRV-Tools' internal IR (source/opt): neither the Vulkan SDK nor vcpkg ships it, so SPIRV-Tools and SPIRV-Headers
+    # are submodules pinned to the Vulkan SDK 1.4.357 release (SPIRV-Tools v2026.3, SPIRV-Headers at its DEPS commit).
+    if(NOT TARGET SPIRV-Tools-opt)
+        set(SPIRV-Headers_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SPIRV-Headers")
+        set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+        set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
+        set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
+        set(SPIRV_TOOLS_BUILD_STATIC ON CACHE BOOL "" FORCE)
+        set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
+        add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/third_party/SPIRV-Tools" "${CMAKE_CURRENT_BINARY_DIR}/_deps/SPIRV-Tools" EXCLUDE_FROM_ALL)
+    endif()
+    set(BASICRHI_SPIRV_TOOLS_INTERNAL_INCLUDE_DIRS
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SPIRV-Tools"
+        "${CMAKE_CURRENT_BINARY_DIR}/_deps/SPIRV-Tools")
+    set_source_files_properties(rhi_vulkan_spirv_lowering.cpp PROPERTIES INCLUDE_DIRECTORIES "${BASICRHI_SPIRV_TOOLS_INTERNAL_INCLUDE_DIRS}")
+    target_link_libraries(BasicRHI PRIVATE $<BUILD_INTERFACE:SPIRV-Tools-opt>)
     # volk owns Vulkan dispatch. Linking vulkan-1 as well can resolve volk's
     # function-pointer globals to loader import thunks in a mixed DX12/Vulkan
     # executable, making volkInitialize write through an invalid address.
@@ -351,27 +374,34 @@ install(FILES
 
 target_link_libraries(BasicRHI
 PUBLIC
-    $<$<BOOL:${BASICRHI_ENABLE_TRACY_GPU_PROFILING}>:Tracy::TracyClient>
+    $<$<OR:$<BOOL:${BASICRHI_ENABLE_TRACY_GPU_PROFILING}>,$<BOOL:${BASICRHI_ENABLE_TRACY_CPU_PROFILING}>>:Tracy::TracyClient>
 PRIVATE 
     fmt::fmt
     ${BASICRHI_SPDLOG_TARGET}
 )
 if(BASICRHI_ENABLE_D3D12)
     target_link_libraries(BasicRHI PUBLIC Microsoft::DirectX-Headers PRIVATE d3d12 dxgi dxguid)
+elseif(NOT WIN32)
+    target_link_libraries(BasicRHI PUBLIC Microsoft::DirectX-Headers)
 endif()
 
 target_compile_definitions(BasicRHI PUBLIC
     BASICRHI_ENABLE_STREAMLINE=$<IF:$<BOOL:${_basicrhi_streamline_available}>,1,0>
     BASICRHI_ENABLE_PIX=$<IF:$<BOOL:${_basicrhi_pix_available}>,1,0>
     BASICRHI_ENABLE_RESHAPE=$<IF:$<BOOL:${_basicrhi_reshape_available}>,1,0>
-    BASICRHI_HAS_DXR2_HEADERS=$<IF:$<BOOL:${BASICRHI_ENABLE_DXR2_HEADERS}>,1,0>
     BASICRHI_ENABLE_TRACY_GPU_PROFILING=$<IF:$<BOOL:${BASICRHI_ENABLE_TRACY_GPU_PROFILING}>,1,0>
+    BASICRHI_ENABLE_TRACY_CPU_PROFILING=$<BOOL:${BASICRHI_ENABLE_TRACY_CPU_PROFILING}>
     BASICRHI_ENABLE_D3D12=$<IF:$<BOOL:${BASICRHI_ENABLE_D3D12}>,1,0>
     BASICRHI_ENABLE_VULKAN=$<IF:$<BOOL:${BASICRHI_ENABLE_VULKAN}>,1,0>
 )
 target_compile_definitions(BasicRHI PUBLIC NOMINMAX)
 
 if(BASICRHI_BUILD_TESTS)
+    # Registers the smokes with ctest when BasicRHI is the top-level project. A parent project calls enable_testing()
+    # itself, so nothing changes for one that includes BasicRHI.
+    if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+        enable_testing()
+    endif()
     if(BASICRHI_ENABLE_VULKAN)
         add_executable(BasicRHIVulkanSmoke tests/VulkanSmoke.cpp)
         set_target_properties(BasicRHIVulkanSmoke PROPERTIES OUTPUT_NAME "BasicRHIVulkanSmoke_v2")
@@ -389,11 +419,89 @@ if(BASICRHI_BUILD_TESTS)
         endif()
         add_test(NAME BasicRHIVulkanAdoptionSmoke COMMAND BasicRHIVulkanAdoptionSmoke)
         add_test(NAME BasicRHIVulkanAdoptionSmoke.HostSubmit COMMAND BasicRHIVulkanAdoptionSmoke submit)
-        add_test(NAME BasicRHIVulkanAdoptionSmoke.ResourceSubmit COMMAND BasicRHIVulkanAdoptionSmoke resources)
+        # Both binding models on one GPU (BASICRHI_VK_BINDING forces the model of a device BasicRHI creates).
+        add_test(NAME BasicRHIVulkanSmoke.DescriptorHeap COMMAND BasicRHIVulkanSmoke)
+        set_tests_properties(BasicRHIVulkanSmoke.DescriptorHeap PROPERTIES ENVIRONMENT "BASICRHI_VK_BINDING=heap")
+        add_test(NAME BasicRHIVulkanSmoke.DescriptorBuffer COMMAND BasicRHIVulkanSmoke)
+        set_tests_properties(BasicRHIVulkanSmoke.DescriptorBuffer PROPERTIES ENVIRONMENT "BASICRHI_VK_BINDING=buffer")
+
+        # The descriptor-buffer lowering on HLSL fixtures (tests/lowering: compiled with the shader ABI's DXC flags, lowered,
+        # validated). No GPU needed.
+        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BasicRHIShaderFlags.cmake")
+        add_executable(BasicRHISpirvLoweringTests tests/SpirvLoweringTests.cpp)
+        target_link_libraries(BasicRHISpirvLoweringTests PRIVATE BasicRHI::BasicRHI SPIRV-Tools-opt)
+        target_include_directories(BasicRHISpirvLoweringTests PRIVATE ${BASICRHI_SPIRV_TOOLS_INTERNAL_INCLUDE_DIRS})
+        add_subdirectory(tests/lowering)
+        add_test(NAME BasicRHISpirvLoweringTests COMMAND BasicRHISpirvLoweringTests)
+
+        # Stencil, blend factor, dynamic viewport/scissor and depth clip draws (the twin of BasicRHID3D12FixedFunctionSmoke).
+        set(_basicrhi_ff_spirv "${CMAKE_CURRENT_BINARY_DIR}/fixed_function_spirv")
+        set(_basicrhi_ff_source "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixed_function/FixedFunctionSmoke.hlsl")
+        basicrhi_compile_spirv(OUTPUT "${_basicrhi_ff_spirv}/VSMain.spv" SOURCE "${_basicrhi_ff_source}" ENTRY VSMain PROFILE vs_6_6)
+        basicrhi_compile_spirv(OUTPUT "${_basicrhi_ff_spirv}/VSFar.spv" SOURCE "${_basicrhi_ff_source}" ENTRY VSFar PROFILE vs_6_6)
+        basicrhi_compile_spirv(OUTPUT "${_basicrhi_ff_spirv}/PSMain.spv" SOURCE "${_basicrhi_ff_source}" ENTRY PSMain PROFILE ps_6_6)
+        add_executable(BasicRHIVulkanFixedFunctionSmoke tests/VulkanFixedFunctionSmoke.cpp
+            "${_basicrhi_ff_spirv}/VSMain.spv" "${_basicrhi_ff_spirv}/VSFar.spv" "${_basicrhi_ff_spirv}/PSMain.spv")
+        target_link_libraries(BasicRHIVulkanFixedFunctionSmoke PRIVATE BasicRHI::BasicRHI)
+        target_compile_definitions(BasicRHIVulkanFixedFunctionSmoke PRIVATE BASICRHI_FIXED_FUNCTION_SPIRV_DIR="${_basicrhi_ff_spirv}")
+        add_test(NAME BasicRHIVulkanFixedFunctionSmoke COMMAND BasicRHIVulkanFixedFunctionSmoke)
+        set_tests_properties(BasicRHIVulkanFixedFunctionSmoke PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     if(BASICRHI_ENABLE_D3D12 AND WIN32)
         add_executable(BasicRHID3D12AliasingSmoke tests/D3D12AliasingSmoke.cpp)
         target_link_libraries(BasicRHID3D12AliasingSmoke PRIVATE BasicRHI::BasicRHI)
+        # Stencil, blend factor and dynamic viewport/scissor draws; the shaders are compiled at run time (d3dcompiler).
+        add_executable(BasicRHID3D12FixedFunctionSmoke tests/D3D12FixedFunctionSmoke.cpp)
+        target_link_libraries(BasicRHID3D12FixedFunctionSmoke PRIVATE BasicRHI::BasicRHI d3dcompiler)
+        add_test(NAME BasicRHID3D12FixedFunctionSmoke COMMAND BasicRHID3D12FixedFunctionSmoke)
+
+        # Clustered raytracing needs the preview runtime and SM 6.10 compiler the renderer ships beside BasicRHI.
+        set(_basicrhi_rt_tools "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer")
+        if(EXISTS "${_basicrhi_rt_tools}/dxc.exe" AND EXISTS "${_basicrhi_rt_tools}/D3D/D3D12Core.dll")
+            set(_basicrhi_rt_generated "${CMAKE_CURRENT_BINARY_DIR}/rt_smoke_shaders")
+            file(MAKE_DIRECTORY "${_basicrhi_rt_generated}")
+            set(_basicrhi_rt_source "${CMAKE_CURRENT_SOURCE_DIR}/tests/D3D12RaytracingSmoke.hlsl")
+            add_custom_command(
+                OUTPUT "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_cs.h"
+                COMMAND "${_basicrhi_rt_tools}/dxc.exe" -nologo -T cs_6_10 -E CSMain -D RAY_QUERY_PATH=1 -Vn g_rayQueryCS
+                    -Fh "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_cs.h" "${_basicrhi_rt_source}"
+                DEPENDS "${_basicrhi_rt_source}" VERBATIM)
+            add_custom_command(
+                OUTPUT "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_omm_cs.h"
+                COMMAND "${_basicrhi_rt_tools}/dxc.exe" -nologo -T cs_6_10 -E CSOmm -D RAY_QUERY_PATH=1 -Vn g_ommQueryCS
+                    -Fh "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_omm_cs.h" "${_basicrhi_rt_source}"
+                DEPENDS "${_basicrhi_rt_source}" VERBATIM)
+            add_custom_command(
+                OUTPUT "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_lib.h"
+                COMMAND "${_basicrhi_rt_tools}/dxc.exe" -nologo -T lib_6_10 -Vn g_traceLibrary
+                    -Fh "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_lib.h" "${_basicrhi_rt_source}"
+                DEPENDS "${_basicrhi_rt_source}" VERBATIM)
+            add_executable(BasicRHID3D12RaytracingSmoke tests/D3D12RaytracingSmoke.cpp
+                "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_cs.h" "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_omm_cs.h"
+                "${_basicrhi_rt_generated}/D3D12RaytracingSmoke_lib.h")
+            target_include_directories(BasicRHID3D12RaytracingSmoke PRIVATE "${_basicrhi_rt_generated}")
+            target_link_libraries(BasicRHID3D12RaytracingSmoke PRIVATE BasicRHI::BasicRHI)
+            if(_basicrhi_streamline_available)
+                # BasicRHI references the Streamline C API; the test doesn't load the interposer.
+                target_sources(BasicRHID3D12RaytracingSmoke PRIVATE tests/StreamlineStubs.cpp)
+                if(TARGET Streamline::headers)
+                    target_link_libraries(BasicRHID3D12RaytracingSmoke PRIVATE Streamline::headers)
+                else()
+                    target_include_directories(BasicRHID3D12RaytracingSmoke PRIVATE "${_basicrhi_streamline_manual_include}")
+                endif()
+            endif()
+            add_custom_command(TARGET BasicRHID3D12RaytracingSmoke POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_directory "${_basicrhi_rt_tools}/D3D" "$<TARGET_FILE_DIR:BasicRHID3D12RaytracingSmoke>/D3D" VERBATIM)
+            add_test(NAME BasicRHID3D12RaytracingSmoke COMMAND BasicRHID3D12RaytracingSmoke)
+            set_tests_properties(BasicRHID3D12RaytracingSmoke PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+    endif()
+    if(WIN32 AND (BASICRHI_ENABLE_D3D12 OR BASICRHI_ENABLE_VULKAN))
+        # A window, a swapchain and a few hundred presents per backend: vsync, HDR colour spaces, frame latency.
+        add_executable(BasicRHIPresentSmoke tests/PresentSmoke.cpp)
+        target_link_libraries(BasicRHIPresentSmoke PRIVATE BasicRHI::BasicRHI)
+        add_test(NAME BasicRHIPresentSmoke COMMAND BasicRHIPresentSmoke)
+        set_tests_properties(BasicRHIPresentSmoke PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     if(BASICRHI_ENABLE_D3D12 AND BASICRHI_ENABLE_VULKAN AND WIN32)
         add_executable(BasicRHIWin32InteropSmoke tests/Win32InteropSmoke.cpp tests/StreamlineStubs.cpp)
@@ -402,5 +510,42 @@ if(BASICRHI_BUILD_TESTS)
             target_link_libraries(BasicRHIWin32InteropSmoke PRIVATE Streamline::headers)
         endif()
         add_test(NAME BasicRHIWin32InteropSmoke COMMAND BasicRHIWin32InteropSmoke)
+        add_executable(BasicRHIWin32SharedHeapAliasSmoke tests/Win32SharedHeapAliasSmoke.cpp tests/StreamlineStubs.cpp)
+        target_link_libraries(BasicRHIWin32SharedHeapAliasSmoke PRIVATE BasicRHI::BasicRHI)
+        if(TARGET Streamline::headers)
+            target_link_libraries(BasicRHIWin32SharedHeapAliasSmoke PRIVATE Streamline::headers)
+        endif()
+        add_test(NAME BasicRHIWin32SharedHeapAliasSmoke COMMAND BasicRHIWin32SharedHeapAliasSmoke)
+    endif()
+    if(WIN32 AND (BASICRHI_ENABLE_VULKAN OR BASICRHI_ENABLE_D3D12))
+        # The on-disk pipeline cache, and the allocator's owner labels and spillable placement; the backend is the argument.
+        set(_basicrhi_pc_source "${CMAKE_CURRENT_SOURCE_DIR}/tests/pipeline_cache/PipelineCacheSmoke.hlsl")
+        add_executable(BasicRHIPipelineCacheSmoke tests/PipelineCacheSmoke.cpp)
+        target_link_libraries(BasicRHIPipelineCacheSmoke PRIVATE BasicRHI::BasicRHI)
+        target_compile_definitions(BasicRHIPipelineCacheSmoke PRIVATE BASICRHI_PIPELINE_CACHE_HLSL="${_basicrhi_pc_source}")
+        add_executable(BasicRHIAllocatorPlacementSmoke tests/AllocatorPlacementSmoke.cpp)
+        target_link_libraries(BasicRHIAllocatorPlacementSmoke PRIVATE BasicRHI::BasicRHI)
+        if(BASICRHI_ENABLE_VULKAN)
+            set(_basicrhi_pc_spirv "${CMAKE_CURRENT_BINARY_DIR}/pipeline_cache_spirv")
+            set(_basicrhi_pc_outputs)
+            foreach(_threads 1 2 4 8)
+                basicrhi_compile_spirv(OUTPUT "${_basicrhi_pc_spirv}/CSMain${_threads}.spv" SOURCE "${_basicrhi_pc_source}"
+                    ENTRY CSMain PROFILE cs_6_6 DEFINES THREADS=${_threads})
+                list(APPEND _basicrhi_pc_outputs "${_basicrhi_pc_spirv}/CSMain${_threads}.spv")
+            endforeach()
+            basicrhi_compile_spirv(OUTPUT "${_basicrhi_pc_spirv}/VSMain.spv" SOURCE "${_basicrhi_pc_source}" ENTRY VSMain PROFILE vs_6_6)
+            basicrhi_compile_spirv(OUTPUT "${_basicrhi_pc_spirv}/PSMain.spv" SOURCE "${_basicrhi_pc_source}" ENTRY PSMain PROFILE ps_6_6)
+            list(APPEND _basicrhi_pc_outputs "${_basicrhi_pc_spirv}/VSMain.spv" "${_basicrhi_pc_spirv}/PSMain.spv")
+            target_sources(BasicRHIPipelineCacheSmoke PRIVATE ${_basicrhi_pc_outputs})
+            target_compile_definitions(BasicRHIPipelineCacheSmoke PRIVATE BASICRHI_PIPELINE_CACHE_SPIRV_DIR="${_basicrhi_pc_spirv}")
+            add_test(NAME BasicRHIPipelineCacheSmoke.Vulkan COMMAND BasicRHIPipelineCacheSmoke vulkan)
+            add_test(NAME BasicRHIAllocatorPlacementSmoke.Vulkan COMMAND BasicRHIAllocatorPlacementSmoke vulkan)
+        endif()
+        if(BASICRHI_ENABLE_D3D12)
+            # The D3D12 shaders are compiled at run time (d3dcompiler).
+            target_link_libraries(BasicRHIPipelineCacheSmoke PRIVATE d3dcompiler)
+            add_test(NAME BasicRHIPipelineCacheSmoke.D3D12 COMMAND BasicRHIPipelineCacheSmoke d3d12)
+            add_test(NAME BasicRHIAllocatorPlacementSmoke.D3D12 COMMAND BasicRHIAllocatorPlacementSmoke d3d12)
+        endif()
     endif()
 endif()

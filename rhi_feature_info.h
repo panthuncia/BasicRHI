@@ -12,6 +12,9 @@ enum class FeatureInfoStructType : uint64_t {
 	ResourceAllocation = 8,
 	WorkGraphs = 9,
 	IndirectCommands = 10,
+	FixedFunction = 11,
+	CommandMemory = 12,
+	LiveMemory = 13,
 };
 
 struct FeatureInfoHeader {
@@ -52,14 +55,17 @@ struct AdapterFeatureInfo {
 struct ArchitectureFeatureInfo {
     FeatureInfoHeader header{ FeatureInfoStructType::Architecture, nullptr, sizeof(ArchitectureFeatureInfo), 1 };
 
+    // Video memory and system memory are one pool (an integrated GPU). A discrete GPU with resizable BAR is not UMA,
+    // even though it has host-visible device-local memory.
     bool uma = false;
+    // UMA, and the CPU's caches are coherent with the GPU. Never true without uma.
     bool cacheCoherentUMA = false;
     bool isolatedMMU = false;
     bool tileBasedRenderer = false;
 };
 
 struct ShaderFeatureInfo {
-    FeatureInfoHeader header{ FeatureInfoStructType::Features, nullptr, sizeof(ShaderFeatureInfo), 1 };
+    FeatureInfoHeader header{ FeatureInfoStructType::Features, nullptr, sizeof(ShaderFeatureInfo), 2 };
 
     // "How modern is the shader compiler/runtime path?"
     ShaderModel maxShaderModel = ShaderModel::Unknown;
@@ -76,6 +82,11 @@ struct ShaderFeatureInfo {
     bool atomicInt64OnGroupShared = false;
     bool atomicInt64OnTypedResource = false;
     bool atomicInt64OnDescriptorHeapResources = false;
+
+    // (structVersion 2) The largest shader-visible descriptor heaps the device was set up for (DescriptorHeapCapacities):
+    // creating a larger one fails. 0: not reported (size heaps at DescriptorHeapCapacities' preferred values).
+    uint32_t maxShaderVisibleResourceDescriptors = 0;
+    uint32_t maxShaderVisibleSamplerDescriptors = 0;
 };
 
 struct MeshShaderFeatureInfo {
@@ -115,6 +126,7 @@ struct RayTracingFeatureInfo {
     // Optional/newer features. These are false unless the backend can expose a real native path.
     bool opacityMicromap = false;
     bool shaderExecutionReordering = false;
+    bool shaderExecutionReorderingActuallyReorders = false; // False means the calls are valid but do nothing.
     bool gpuRtasOperations = false;
     bool clusterAccelerationStructure = false;
     bool clusterTemplates = false;
@@ -188,6 +200,11 @@ struct ResourceAllocationFeatureInfo {
     bool tightAlignmentSupported = false;    // D3D12_TIGHT_ALIGNMENT tier >= 1
 
     bool createNotZeroedHeapSupported = false; // "heap flag create_not_zeroed" proxy (D3D12MA-style)
+
+    // Whether the driver packs small committed buffers together. D3D12 does, so the allocator makes buffers up to 32 KiB
+    // committed (placed ones need 64 KiB alignment). On Vulkan a committed buffer is its own vkAllocateMemory, rounded up to the
+    // driver's allocation granularity, so small buffers are placed in the allocator's blocks instead.
+    bool committedSmallBuffersPacked = false;
 };
 
 struct WorkGraphFeatureInfo {
@@ -203,7 +220,7 @@ struct WorkGraphFeatureInfo {
 };
 
 struct IndirectCommandsFeatureInfo {
-    FeatureInfoHeader header{ FeatureInfoStructType::IndirectCommands, nullptr, sizeof(IndirectCommandsFeatureInfo), 1 };
+    FeatureInfoHeader header{ FeatureInfoStructType::IndirectCommands, nullptr, sizeof(IndirectCommandsFeatureInfo), 3 };
 
     bool constantArguments = false;    // Constant arguments in a command signature
     bool indexBufferArguments = false; // IndexBuffer arguments (D3D12 index buffer view layout)
@@ -211,4 +228,57 @@ struct IndirectCommandsFeatureInfo {
     uint32_t maxPipelineSetCount = 0;  // largest IndirectPipelineSetDesc::maxPipelineCount
     bool vertexBufferArguments = false; // VertexBuffer arguments (D3D12 vertex buffer view layout)
     bool indirectBindings = false;     // LayoutRangeSource::IndirectIndex / IndirectAddress
+    uint32_t maxSequenceCount = 0;     // largest max count of one ExecuteIndirect (Vulkan maxIndirectSequenceCount)
+    // (structVersion 2) Bytes of a layout's root constants, counted from its first range in declaration order, that Constant
+    // arguments may write. Vulkan's descriptor-buffer model pushes only that much (base-spec push constants) and keeps the rest
+    // of a larger layout's constants in memory, so a command signature whose Constant argument reaches past it is refused.
+    // 0: no limit beyond the layout's own.
+    uint32_t constantArgumentBytes = 0;
+    // (structVersion 3) ExecuteIndirect with a count buffer draws the count it reads (Vulkan's drawIndirectCount). Without it, a
+    // single-draw signature draws its max count.
+    bool countedDraws = false;
+};
+
+// Optional fixed-function pipeline and command list state (D3D11-style state that Vulkan gates behind features).
+// Not a capability: what command recording holds now (Device::CommandMemoryStats). Each kind of scratch page is "held" while
+// a list that recorded into it has not been reset, and "pooled" once a reset gave it back to the device for other lists.
+// Zero where a backend does not count it (D3D12).
+struct CommandMemoryFeatureInfo {
+    FeatureInfoHeader header{ FeatureInfoStructType::CommandMemory, nullptr, sizeof(CommandMemoryFeatureInfo), 1 };
+
+    uint64_t commandPools = 0;     // command allocators alive (VkCommandPool)
+    uint64_t commandLists = 0;     // command lists alive (VkCommandBuffer)
+    // Emulated root constants' spilled data (host-visible pages a list pushes its constants into when they do not fit).
+    uint64_t scratchPagesHeld = 0, scratchBytesHeld = 0;
+    uint64_t scratchPagesPooled = 0, scratchBytesPooled = 0;
+    // Device-generated commands' preprocess memory.
+    uint64_t dgcPagesHeld = 0, dgcBytesHeld = 0;
+    uint64_t dgcPagesPooled = 0, dgcBytesPooled = 0;
+};
+
+// Not a capability: the device memory the backend has allocated and not freed (Device::LiveMemoryStats), by where it was
+// allocated and by memory kind. Process-wide. Zero where a backend does not count it (D3D12): check `counted`.
+enum class LiveMemorySite : uint32_t { RootConstants, Preprocess, DescriptorHeaps, Buffers, Textures, Heaps, Imports, Other, Count };
+enum class LiveMemoryKind : uint32_t { DeviceLocal, DeviceLocalHostVisible, System, Count };
+struct LiveMemoryFeatureInfo {
+    FeatureInfoHeader header{ FeatureInfoStructType::LiveMemory, nullptr, sizeof(LiveMemoryFeatureInfo), 1 };
+
+    bool counted = false;  // the backend keeps the ledger
+    uint64_t bytes[static_cast<uint32_t>(LiveMemorySite::Count)][static_cast<uint32_t>(LiveMemoryKind::Count)]{};
+    uint64_t allocations[static_cast<uint32_t>(LiveMemorySite::Count)][static_cast<uint32_t>(LiveMemoryKind::Count)]{};
+};
+
+struct FixedFunctionFeatureInfo {
+    FeatureInfoHeader header{ FeatureInfoStructType::FixedFunction, nullptr, sizeof(FixedFunctionFeatureInfo), 3 };
+
+    bool dualSourceBlend = false;  // BlendFactor::Src1* (Vulkan dualSrcBlend)
+    bool logicOp = false;          // BlendState::logicOpEnable (D3D12 OutputMergerLogicOp, Vulkan logicOp)
+    bool depthClipDisable = false; // RasterState::depthClip = false (Vulkan depthClamp)
+    uint32_t maxViewports = 1;     // CommandList::SetViewports / SetScissors count (Vulkan multiViewport, at most 16)
+    // (structVersion 2) A secondary list may call SetViewports and SetScissors. Vulkan: true. D3D12: false (bundles inherit
+    // them). Without it, record a pass that needs its own viewports or scissors inline rather than in secondaries.
+    bool secondaryViewportScissor = false;
+    // (structVersion 3) A pixel shader may write SV_StencilRef. Vulkan: VK_EXT_shader_stencil_export. D3D12:
+    // PSSpecifiedStencilRefSupported.
+    bool stencilExport = false;
 };
