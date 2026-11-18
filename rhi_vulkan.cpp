@@ -25,6 +25,54 @@
 
 #ifdef _WIN32
 #include <Windows.h>
+#else
+#include <cstdlib>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <time.h>
+#include <unistd.h>
+// POSIX stand-ins for the Win32 calls the diagnostics use: environment switches, thread ids, the trace clock and stacks.
+namespace {
+	inline DWORD GetEnvironmentVariableA(const char* name, char* buffer, DWORD size) noexcept {
+		const char* value = std::getenv(name);
+		if (!value) return 0;
+		const size_t length = std::strlen(value);
+		if (length >= size) return static_cast<DWORD>(length + 1);
+		std::memcpy(buffer, value, length + 1);
+		return static_cast<DWORD>(length);
+	}
+	inline DWORD GetCurrentThreadId() noexcept { return static_cast<DWORD>(gettid()); }
+	inline bool QueryPerformanceCounter(LARGE_INTEGER* counter) noexcept {
+		timespec now{};
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		counter->QuadPart = static_cast<int64_t>(now.tv_sec) * 1000000000 + now.tv_nsec;
+		return true;
+	}
+	inline bool QueryPerformanceFrequency(LARGE_INTEGER* frequency) noexcept {
+		frequency->QuadPart = 1000000000;
+		return true;
+	}
+	inline USHORT RtlCaptureStackBackTrace(DWORD skip, DWORD count, void** frames, void*) noexcept {
+		void* all[128]{};
+		const int captured = backtrace(all, static_cast<int>(std::min<DWORD>(128, skip + count + 1)));
+		const int first = static_cast<int>(skip) + 1;  // and this function's own frame
+		if (captured <= first) return 0;
+		const int copied = std::min(captured - first, static_cast<int>(count));
+		std::memcpy(frames, all + first, sizeof(void*) * copied);
+		return static_cast<USHORT>(copied);
+	}
+	inline std::string FrameModuleText(void* address) {
+		Dl_info info{};
+		if (!dladdr(address, &info) || !info.dli_fname) return std::format("{:#x}", reinterpret_cast<uintptr_t>(address));
+		const char* base = std::strrchr(info.dli_fname, '/');
+		std::string text = std::format("{}+{:#x}", base ? base + 1 : info.dli_fname,
+			reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(info.dli_fbase));
+		if (info.dli_sname)
+			text += std::format(" ({}+{:#x})", info.dli_sname,
+				reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(info.dli_saddr));
+		return text;
+	}
+}
 #endif
 
 #include <spdlog/spdlog.h>
@@ -310,6 +358,7 @@ namespace rhi {
 					void* frames[48]{};
 					const USHORT count = RtlCaptureStackBackTrace(1, 48, frames, nullptr);
 					diagnostic += "\n  stack:";
+#ifdef _WIN32
 					for (USHORT i = 0; i < count; ++i) {
 						HMODULE module = nullptr;
 						char name[MAX_PATH] = "?";
@@ -323,6 +372,9 @@ namespace rhi {
 							diagnostic += std::format(" 0x{:x}", reinterpret_cast<uintptr_t>(frames[i]));
 						}
 					}
+#else
+					for (USHORT i = 0; i < count; ++i) diagnostic += " " + FrameModuleText(frames[i]);
+#endif
 				}
 				VkQueueValidationMessage(static_cast<VulkanDevice*>(userData), severity, std::move(diagnostic));
 			} catch (...) {
@@ -1682,6 +1734,9 @@ namespace rhi {
 			else g_poolSites.erase(pool);
 		}
 		static std::string VkFrameText(void* address) noexcept {
+#ifndef _WIN32
+			return FrameModuleText(address);
+#else
 			using SymFromAddrFn = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD64, void*);
 			using SymInitializeFn = BOOL(WINAPI*)(HANDLE, PCSTR, BOOL);
 			using SymSetOptionsFn = DWORD(WINAPI*)(DWORD);
@@ -1711,6 +1766,7 @@ namespace rhi {
 					text += std::format(" ({}+{:#x})", info.Name, displacement);
 			}
 			return text;
+#endif
 		}
 		static void VkLogPoolSites() noexcept {
 			if (!CommandPoolSitesRequested()) return;
