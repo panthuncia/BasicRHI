@@ -2201,23 +2201,38 @@ namespace rhi {
 			impl->queues.free(h);
 		}
 
-		static Result d_waitIdle(Device* d) noexcept {
-			auto* impl = static_cast<Dx12Device*>(d->impl);
+		static void Dx12WaitDeviceIdle(Dx12Device* impl) noexcept {
 			for (auto& slot : impl->queues.slots) {
 				if (slot.alive) Dx12WaitQueueIdle(slot.obj);
 			}
+		}
+
+		static Result d_waitIdle(Device* d) noexcept {
+			Dx12WaitDeviceIdle(static_cast<Dx12Device*>(d->impl));
 			return Result::Ok;
 		}
 		static void   d_flushDeletionQueue(Device*) noexcept {}
 
 		// Swapchain create/destroy
-		static Result d_createSwapchain(Device* d, void* hwnd, const uint32_t w, const uint32_t h, const Format fmt, const uint32_t bufferCount, const bool allowTearing, SwapchainPtr& out) noexcept {
+		static bool sc_isColorSpaceSupported(Swapchain* sc, SwapchainColorSpace colorSpace) noexcept;
+		static DXGI_COLOR_SPACE_TYPE Dx12ColorSpace(SwapchainColorSpace colorSpace) noexcept;
+
+		static Result d_createSwapchainFromDesc(Device* d, const SwapchainDesc& scDesc, SwapchainPtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
+			void* const hwnd = scDesc.hwnd;
+			const uint32_t w = scDesc.width;
+			const uint32_t h = scDesc.height;
+			const Format fmt = scDesc.format;
+			const uint32_t bufferCount = scDesc.bufferCount;
+			const bool allowTearing = scDesc.allowTearing;
+			const Format createFormat = scDesc.colorSpace == SwapchainColorSpace::Hdr10St2084 ? Format::R10G10B10A2_UNorm
+				: scDesc.colorSpace == SwapchainColorSpace::ScRgbLinear ? Format::R16G16B16A16_Float
+				: fmt;
 			DXGI_SWAP_CHAIN_DESC1 desc{};
 			desc.BufferCount = bufferCount;
 			desc.Width = w;
 			desc.Height = h;
-			desc.Format = ToDxgi(fmt);
+			desc.Format = ToDxgi(createFormat);
 			desc.SampleDesc = { 1,0 };
 			desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
 			desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
@@ -2257,8 +2272,10 @@ namespace rhi {
 			std::vector<ComPtr<ID3D12Resource>> imgs(bufferCount);
 			std::vector<ResourceHandle> imgHandles(bufferCount);
 
+			// A presentation layer hands out its own images through the proxy.
+			IDXGISwapChain3* const imageSource = scDesc.presentationLayer ? proxySc3.Get() : nativeSc3.Get();
 			for (UINT i = 0; i < bufferCount; i++) {
-				auto hr = nativeSc3->GetBuffer(i, IID_PPV_ARGS(&imgs[i]));
+				auto hr = imageSource->GetBuffer(i, IID_PPV_ARGS(&imgs[i]));
 				if (FAILED(hr)) {
 					RHI_FAIL(ToRHI(hr));
 				}
@@ -2277,9 +2294,11 @@ namespace rhi {
 				impl
 			);
 			scWrap.sdrFormat = fmt;
+			scWrap.presentationLayer = scDesc.presentationLayer;
 			if (ComPtr<IDXGISwapChain2> sc2; SUCCEEDED(proxySc3.As(&sc2))) {
 				scWrap.frameLatencyWaitable = sc2->GetFrameLatencyWaitableObject();
 			}
+			scWrap.current = proxySc3->GetCurrentBackBufferIndex();
 
 			auto scHandle = impl->swapchains.alloc(scWrap);
 
@@ -2287,7 +2306,30 @@ namespace rhi {
 			ret.impl = impl;
 			ret.vt = &g_scvt;
 			out = MakeSwapchainPtr(d, ret, static_cast<Dx12Device*>(d->impl)->selfWeak.lock());
+			if (scDesc.colorSpace != SwapchainColorSpace::SrgbNonlinear) {
+				Dx12Swapchain* const s = impl->swapchains.get(scHandle);
+				if (!sc_isColorSpaceSupported(&out.Get(), scDesc.colorSpace)) {
+					out.Reset();
+					return Result::Unsupported;
+				}
+				if (const HRESULT hr = proxySc3->SetColorSpace1(Dx12ColorSpace(scDesc.colorSpace)); FAILED(hr)) {
+					out.Reset();
+					return ToRHI(hr);
+				}
+				s->colorSpace = scDesc.colorSpace;
+			}
 			return Result::Ok;
+		}
+
+		static Result d_createSwapchain(Device* d, void* hwnd, const uint32_t w, const uint32_t h, const Format fmt, const uint32_t bufferCount, const bool allowTearing, SwapchainPtr& out) noexcept {
+			SwapchainDesc desc{};
+			desc.hwnd = hwnd;
+			desc.width = w;
+			desc.height = h;
+			desc.format = fmt;
+			desc.bufferCount = bufferCount;
+			desc.allowTearing = allowTearing;
+			return d_createSwapchainFromDesc(d, desc, out);
 		}
 
 		static void d_destroySwapchain(DeviceDeletionContext*, Swapchain* sc) noexcept {
@@ -2299,8 +2341,8 @@ namespace rhi {
 			}
 
 			// Ensure GPU is idle before ripping out backbuffers.
-			if (s->dev && s->dev->self.vt && s->dev->self.vt->deviceWaitIdle) {
-				(void)s->dev->self.vt->deviceWaitIdle(&s->dev->self);
+			if (s->dev) {
+				Dx12WaitDeviceIdle(s->dev);
 			}
 
 			if (s->dev)
@@ -10749,8 +10791,7 @@ namespace rhi {
 			const UINT resizeFlags = s->flags | static_cast<UINT>(flags);
 
 			// Ensure nothing is using the old backbuffers.
-			if (dev->self.vt && dev->self.vt->deviceWaitIdle)
-				(void)dev->self.vt->deviceWaitIdle(&dev->self);
+			Dx12WaitDeviceIdle(dev);
 
 			// Release all refs to old backbuffers.
 			for (uint32_t i = 0; i < oldCount; ++i)
@@ -10841,11 +10882,21 @@ namespace rhi {
 
 			s->images.resize(newCount);
 
+			// A presentation layer replaces its images and its waitable object when it resizes.
+			if (s->presentationLayer) {
+				if (ComPtr<IDXGISwapChain2> sc2; SUCCEEDED(s->pSlProxySC.As(&sc2))) {
+					const HANDLE waitable = sc2->GetFrameLatencyWaitableObject();
+					if (s->frameLatencyWaitable && s->frameLatencyWaitable != waitable) CloseHandle(s->frameLatencyWaitable);
+					s->frameLatencyWaitable = waitable;
+				}
+			}
+			IDXGISwapChain3* const imageSource = s->presentationLayer ? s->pSlProxySC.Get() : s->pNativeSC.Get();
+
 			// Reacquire and re-register/update resources.
 			for (uint32_t i = 0; i < newCount; ++i)
 			{
 				ComPtr<ID3D12Resource> img;
-				hr = s->pNativeSC->GetBuffer((UINT)i, IID_PPV_ARGS(&img));
+				hr = imageSource->GetBuffer((UINT)i, IID_PPV_ARGS(&img));
 				if (FAILED(hr)) {
 					spdlog::critical(
 						"DX12 resizeBuffers: GetBuffer failed index={} hr=0x{:08X} nativeSc={}",
@@ -10935,6 +10986,7 @@ namespace rhi {
 			caps.presentWait = false;
 			ComPtr<IDXGISwapChain4> sc4;
 			caps.hdrMetadata = SUCCEEDED(s->pSlProxySC.As(&sc4));
+			caps.presentationLayer = s->presentationLayer;
 			return caps;
 		}
 
@@ -12017,14 +12069,15 @@ namespace rhi {
 		&d_destroyIndirectPipelineSet,
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
-		16u,
+		17u,
 		&d_createCompletionWait,
 		&d_createCommandAllocatorForQueue,
 		&d_createSecondaryCommandList,
 		&d_openPipelineCache,
 		&d_savePipelineCache,
 		&d_getPipelineCacheStats,
-		&d_queryFormatSupport
+		&d_queryFormatSupport,
+		&d_createSwapchainFromDesc
 	};
 
 	const QueueVTable g_qvt = {

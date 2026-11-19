@@ -288,6 +288,8 @@ namespace rhi {
 		uint32_t imageCount = 0;
 		uint32_t currentImageIndex = 0;
 		bool allowTearing = false;
+		// SwapchainDesc::presentationLayer: no pNext chains, no present mode switch, destroy before create.
+		bool presentationLayer = false;
 		// The mode the swapchain was created with, or the last one a present switched to.
 		VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
 		// The surface's modes, and those a present can switch to without recreation (VK_EXT_swapchain_maintenance1;

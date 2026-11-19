@@ -2867,6 +2867,25 @@ namespace rhi {
 		float maxFrameAverageLightLevel = 400.0f;
 	};
 
+	// A swapchain to create. A presentation layer is a swap chain that wraps BasicRHI's and replaces its images and its
+	// presents (a frame generation swap chain made through Streamline: FidelityFX's or DLSS-G's).
+	struct SwapchainDesc {
+		void* hwnd = nullptr;
+		uint32_t width = 0;
+		uint32_t height = 0;
+		// The SDR format. An HDR colour space fixes its own (see SwapchainColorSpace).
+		Format format = Format::Unknown;
+		uint32_t bufferCount = 0;
+		bool allowTearing = false;
+		// The colour space the swapchain is created in. Unsupported when the output cannot show it.
+		SwapchainColorSpace colorSpace = SwapchainColorSpace::SrgbNonlinear;
+		// A presentation layer may wrap this swapchain. Vulkan: no pNext chain at create or present, no present mode switch
+		// in a present (a vsync change recreates and returns ModeChanged), and a recreation destroys the old swapchain
+		// before it creates the new one. D3D12: the images come from the Streamline proxy swapchain, and the images, the
+		// waitable object and the current index are read again after every create and resize.
+		bool presentationLayer = false;
+	};
+
 	// What a swapchain can do on its device and output.
 	struct SwapchainCaps {
 		// Present(vsync = false) may tear: the swapchain was created with allowTearing and the platform supports it.
@@ -2878,6 +2897,8 @@ namespace rhi {
 		bool presentWait = false;
 		// SetHdrMetadata reaches the display.
 		bool hdrMetadata = false;
+		// Created with SwapchainDesc::presentationLayer.
+		bool presentationLayer = false;
 	};
 
 	struct ResourceVTable {
@@ -3551,6 +3572,8 @@ namespace rhi {
 		Result(*getPipelineCacheStats)(const Device*, PipelineCacheStats&) noexcept = nullptr;
 		// abi_version 16: format support and the formats a backend stores in another.
 		Result(*queryFormatSupport)(const Device*, Format, FormatSupport&) noexcept = nullptr;
+		// abi_version 17: a swapchain from a SwapchainDesc.
+		Result(*createSwapchainFromDesc)(Device*, const SwapchainDesc&, SwapchainPtr&) noexcept = nullptr;
 	};
 
 
@@ -3654,6 +3677,13 @@ namespace rhi {
 		}
 		void FlushDeletionQueue() noexcept { vt->flushDeletionQueue(this); }
 		Result CreateSwapchain(void* hwnd, const uint32_t w, const uint32_t h, const Format fmt, const uint32_t buffers, const bool allowTearing, SwapchainPtr& out) noexcept { return vt->createSwapchain(this, hwnd, w, h, fmt, buffers, allowTearing, out); }
+		/// Creates a swapchain from a desc (SwapchainDesc: the colour space, a presentation layer). A backend without it
+		/// takes only an SDR desc without a presentation layer, through the older overload.
+		Result CreateSwapchain(const SwapchainDesc& desc, SwapchainPtr& out) noexcept {
+			if (vt->abi_version >= 17 && vt->createSwapchainFromDesc) return vt->createSwapchainFromDesc(this, desc, out);
+			if (desc.presentationLayer || desc.colorSpace != SwapchainColorSpace::SrgbNonlinear) return Result::Unsupported;
+			return vt->createSwapchain(this, desc.hwnd, desc.width, desc.height, desc.format, desc.bufferCount, desc.allowTearing, out);
+		}
 		void DestroySwapchain(Swapchain* sc) noexcept { deletionContext.DestroySwapchain(sc); }
 		Result CreatePipelineLayout(const PipelineLayoutDesc& d, PipelineLayoutPtr& out) noexcept { return vt->createPipelineLayout(this, d, out); }
 		void DestroyPipelineLayout(PipelineLayoutHandle h) noexcept { deletionContext.DestroyPipelineLayout(h); }

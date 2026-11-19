@@ -5728,7 +5728,21 @@ namespace rhi {
 			const VkExtent2D extent = VkChooseSwapchainExtent(capabilities, width, height);
 			std::vector<VkPresentModeKHR> switchableModes;
 			uint32_t switchableMinImageCount = 0;
-			VkQuerySwitchablePresentModes(impl, swapchain.surface, presentMode, switchableModes, switchableMinImageCount);
+			// A presentation layer drops the create info's pNext, so a present could name modes its swapchain never declared.
+			if (!swapchain.presentationLayer) {
+				VkQuerySwitchablePresentModes(impl, swapchain.surface, presentMode, switchableModes, switchableMinImageCount);
+			}
+
+			// A presentation layer wraps one swapchain at a time, so the old one goes before the new one is made. The caller
+			// found the device idle. A failure after this leaves the swapchain without images.
+			if (swapchain.presentationLayer && swapchain.swapchain != VK_NULL_HANDLE) {
+				VkReleaseSwapchainImageHandles(impl, swapchain);
+				VkReleaseSwapchainPresentSemaphores(impl, swapchain);
+				swapchain.imageNeedsInitialLayout.clear();
+				swapchain.imageCount = 0;
+				VkDestroySwapchainKHRHooked(impl->device, swapchain.swapchain, nullptr);
+				swapchain.swapchain = VK_NULL_HANDLE;
+			}
 			const uint32_t imageCount = (std::max)(VkClampSwapchainImageCount(capabilities, bufferCount),
 				capabilities.maxImageCount != 0 ? (std::min)(switchableMinImageCount, capabilities.maxImageCount) : switchableMinImageCount);
 
@@ -5824,9 +5838,9 @@ namespace rhi {
 			}
 
 			VkApplyHdrMetadata(impl, swapchain);
-			spdlog::info("Vulkan swapchain: {}x{} images={} format={} colorSpace={} presentMode={} switchableModes={}",
+			spdlog::info("Vulkan swapchain: {}x{} images={} format={} colorSpace={} presentMode={} switchableModes={} presentationLayer={}",
 				extent.width, extent.height, swapchain.imageCount, static_cast<int>(surfaceFormat.format), static_cast<int>(surfaceFormat.colorSpace),
-				static_cast<int>(presentMode), swapchain.switchablePresentModes.size());
+				static_cast<int>(presentMode), swapchain.switchablePresentModes.size(), swapchain.presentationLayer);
 			return VkAcquireNextSwapchainImage(impl, swapchain);
 		}
 
@@ -10057,7 +10071,7 @@ namespace rhi {
 				}
 				const uint64_t presentId = swapchainState->presentCount + 1;
 				VkPresentIdKHR presentIdInfo{ VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
-				if (impl->presentIdEnabled) {
+				if (impl->presentIdEnabled && !swapchainState->presentationLayer) {
 					presentIdInfo.swapchainCount = 1;
 					presentIdInfo.pPresentIds = &presentId;
 					*next = &presentIdInfo;
@@ -10149,8 +10163,9 @@ namespace rhi {
 			SwapchainCaps caps{};
 			caps.tearing = swapchainState->allowTearing && VkHasPresentMode(swapchainState->surfacePresentModes, VK_PRESENT_MODE_IMMEDIATE_KHR);
 			caps.presentModeSwitch = !swapchainState->switchablePresentModes.empty();
-			caps.presentWait = impl->presentIdEnabled && impl->presentWaitEnabled;
+			caps.presentWait = impl->presentIdEnabled && impl->presentWaitEnabled && !swapchainState->presentationLayer;
 			caps.hdrMetadata = impl->hdrMetadataEnabled;
+			caps.presentationLayer = swapchainState->presentationLayer;
 			return caps;
 		}
 
@@ -11614,7 +11629,13 @@ namespace rhi {
 			VkIgnoreUnused(device);
 		}
 
-		static Result d_createSwapchain(Device* device, void* windowHandle, uint32_t width, uint32_t height, Format format, uint32_t bufferCount, bool allowTearing, SwapchainPtr& out) noexcept {
+		static Result d_createSwapchainFromDesc(Device* device, const SwapchainDesc& desc, SwapchainPtr& out) noexcept {
+			void* const windowHandle = desc.hwnd;
+			const uint32_t width = desc.width;
+			const uint32_t height = desc.height;
+			const Format format = desc.format;
+			const uint32_t bufferCount = desc.bufferCount;
+			const bool allowTearing = desc.allowTearing;
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || impl->instance == VK_NULL_HANDLE || impl->device == VK_NULL_HANDLE || !windowHandle || width == 0 || height == 0) {
 				out.Reset();
@@ -11644,6 +11665,8 @@ namespace rhi {
 		#endif
 
 			swapchainState.presentQueue = VkPrimaryQueueHandleForKind(impl, QueueKind::Graphics);
+			swapchainState.colorSpace = desc.colorSpace;
+			swapchainState.presentationLayer = desc.presentationLayer;
 			const Result createResult = VkCreateOrResizeSwapchain(impl, swapchainState, width, height, format, bufferCount, allowTearing);
 			if (createResult != Result::Ok) {
 				(void)VkWaitDeviceIdle(impl);
@@ -11666,6 +11689,17 @@ namespace rhi {
 			swapchain.vt = &g_vkscvt;
 			out = MakeSwapchainPtr(device, swapchain, impl->selfWeak.lock());
 			return Result::Ok;
+		}
+
+		static Result d_createSwapchain(Device* device, void* windowHandle, uint32_t width, uint32_t height, Format format, uint32_t bufferCount, bool allowTearing, SwapchainPtr& out) noexcept {
+			SwapchainDesc desc{};
+			desc.hwnd = windowHandle;
+			desc.width = width;
+			desc.height = height;
+			desc.format = format;
+			desc.bufferCount = bufferCount;
+			desc.allowTearing = allowTearing;
+			return d_createSwapchainFromDesc(device, desc, out);
 		}
 
 		static void d_destroySwapchain(DeviceDeletionContext* context, Swapchain* swapchain) noexcept {
@@ -15069,14 +15103,15 @@ namespace rhi {
 		&d_destroyIndirectPipelineSet,
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
-		16u,
+		17u,
 		&d_createCompletionWait,
 		&d_createCommandAllocatorForQueue,
 		&d_createSecondaryCommandList,
 		&d_openPipelineCache,
 		&d_savePipelineCache,
 		&d_getPipelineCacheStats,
-		&d_queryFormatSupport
+		&d_queryFormatSupport,
+		&d_createSwapchainFromDesc
 	};
 
 	const QueueVTable g_vkqvt = {

@@ -431,6 +431,9 @@ namespace rhi {
 		// DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT's object. The swapchain owns it; it is closed with the swapchain.
 		HANDLE frameLatencyWaitable = nullptr;
 		uint64_t presentCount = 0;
+		// SwapchainDesc::presentationLayer: the images come from the proxy swapchain, and are read again with the waitable
+		// object after every create and resize.
+		bool presentationLayer = false;
 	};
 
 	struct Dx12Heap {
