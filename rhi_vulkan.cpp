@@ -16317,10 +16317,48 @@ namespace rhi {
 			}
 		}
 
+		// Native optical flow for DLSS-G (Streamline's manual hooking guide, 5.2.1): the first queue of the first optical flow
+		// family, which must be none of BasicRHI's own families. Without it DLSS-G runs its optical flow through CUDA interop.
+		uint32_t nativeOpticalFlowFamily = kVkInvalidQueueFamily;
+#if BASICRHI_ENABLE_STREAMLINE && defined(VK_NV_optical_flow)
+		if (streamlineInitialized && g_vkSlDlssRequirementsValid && g_vkSlDlssRequirements.vkNumOpticalFlowQueuesRequired > 0) {
+			VkPhysicalDeviceOpticalFlowFeaturesNV opticalFlow{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV };
+			VkPhysicalDeviceSynchronization2Features synchronization2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES, &opticalFlow };
+			VkPhysicalDeviceFeatures2 query{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &synchronization2 };
+			vkGetPhysicalDeviceFeatures2(physicalDevice, &query);
+			const char* why = nullptr;
+			if (!VkHasDeviceExtension(physicalDevice, VK_NV_OPTICAL_FLOW_EXTENSION_NAME)) {
+				why = "the device has no VK_NV_optical_flow";
+			} else if (opticalFlow.opticalFlow != VK_TRUE || synchronization2.synchronization2 != VK_TRUE) {
+				why = "the device lacks the opticalFlow or synchronization2 feature";
+			} else {
+				uint32_t family = 0;
+				while (family < queueFamilyProperties.size() && (queueFamilyProperties[family].queueFlags & VK_QUEUE_OPTICAL_FLOW_BIT_NV) == 0) {
+					++family;
+				}
+				if (family == queueFamilyProperties.size()) {
+					why = "no queue family has the optical flow bit";
+				} else if (std::find(selectedQueueFamilies.begin(), selectedQueueFamilies.end(), family) != selectedQueueFamilies.end()) {
+					why = "the first optical flow family is one of BasicRHI's own";
+				} else if (queueFamilyProperties[family].queueCount < g_vkSlDlssRequirements.vkNumOpticalFlowQueuesRequired) {
+					why = "the optical flow family has too few queues";
+				} else {
+					nativeOpticalFlowFamily = family;
+				}
+			}
+			if (why) {
+				spdlog::info("CreateVulkanDevice: Streamline's optical flow runs through interop: {}.", why);
+			} else {
+				spdlog::info("CreateVulkanDevice: Streamline's optical flow is native, {} queue(s) of family {}.",
+					g_vkSlDlssRequirements.vkNumOpticalFlowQueuesRequired, nativeOpticalFlowFamily);
+			}
+		}
+#endif
+
 		std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
-		queueCreateInfos.reserve(uniqueQueueFamilies.size());
+		queueCreateInfos.reserve(uniqueQueueFamilies.size() + 1);
 		std::vector<std::vector<float>> queuePriorities;
-		queuePriorities.reserve(uniqueQueueFamilies.size());
+		queuePriorities.reserve(uniqueQueueFamilies.size() + 1);
 		std::vector<uint32_t> requestedQueueCounts(queueFamilyProperties.size(), 0u);
 		uint32_t streamlineGraphicsQueueFamily = kVkInvalidQueueFamily;
 		uint32_t streamlineGraphicsQueueIndex = 0;
@@ -16354,7 +16392,7 @@ namespace rhi {
 						streamlineComputeQueueCount = g_vkSlDlssRequirements.vkNumComputeQueuesRequired;
 						nextStreamlineQueueIndex += g_vkSlDlssRequirements.vkNumComputeQueuesRequired;
 					}
-					if (g_vkSlDlssRequirements.vkNumOpticalFlowQueuesRequired > 0) {
+					if (g_vkSlDlssRequirements.vkNumOpticalFlowQueuesRequired > 0 && nativeOpticalFlowFamily == kVkInvalidQueueFamily) {
 						streamlineOpticalFlowQueueFamily = familyIndex;
 						streamlineOpticalFlowQueueIndex = nextStreamlineQueueIndex;
 						streamlineOpticalFlowQueueCount = g_vkSlDlssRequirements.vkNumOpticalFlowQueuesRequired;
@@ -16844,6 +16882,30 @@ namespace rhi {
 		if (enableBufferMarkers) appendUniqueName(enabledDeviceExtensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
 		if (enableCheckpoints) appendUniqueName(enabledDeviceExtensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
 
+#if BASICRHI_ENABLE_STREAMLINE && defined(VK_NV_optical_flow)
+		// Last, so a Streamline that was turned off above takes no optical flow queue.
+		VkPhysicalDeviceOpticalFlowFeaturesNV enabledOpticalFlowFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV };
+		if (!streamlineInitialized) {
+			nativeOpticalFlowFamily = kVkInvalidQueueFamily;
+		}
+		if (nativeOpticalFlowFamily != kVkInvalidQueueFamily) {
+			const uint32_t count = g_vkSlDlssRequirements.vkNumOpticalFlowQueuesRequired;
+			queuePriorities.emplace_back(count, 1.0f);
+			VkDeviceQueueCreateInfo opticalFlowQueue{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
+			opticalFlowQueue.queueFamilyIndex = nativeOpticalFlowFamily;
+			opticalFlowQueue.queueCount = count;
+			opticalFlowQueue.pQueuePriorities = queuePriorities.back().data();
+			queueCreateInfos.push_back(opticalFlowQueue);
+			requestedQueueCounts[nativeOpticalFlowFamily] = count;
+			streamlineOpticalFlowQueueFamily = nativeOpticalFlowFamily;
+			streamlineOpticalFlowQueueIndex = 0;
+			streamlineOpticalFlowQueueCount = count;
+			appendUniqueName(enabledDeviceExtensions, VK_NV_OPTICAL_FLOW_EXTENSION_NAME);
+			enabledOpticalFlowFeatures.opticalFlow = VK_TRUE;
+			enabledVulkan13Features.synchronization2 = VK_TRUE;
+		}
+#endif
+
 		VkDeviceCreateInfo deviceCreateInfo{};
 		deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		deviceCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
@@ -16854,6 +16916,12 @@ namespace rhi {
 			enabledFaultFeatures.pNext = const_cast<void*>(deviceCreateInfo.pNext);
 			deviceCreateInfo.pNext = &enabledFaultFeatures;
 		}
+#if BASICRHI_ENABLE_STREAMLINE && defined(VK_NV_optical_flow)
+		if (enabledOpticalFlowFeatures.opticalFlow == VK_TRUE) {
+			enabledOpticalFlowFeatures.pNext = const_cast<void*>(deviceCreateInfo.pNext);
+			deviceCreateInfo.pNext = &enabledOpticalFlowFeatures;
+		}
+#endif
 		if (presentExtensions.featureChain) {
 			*presentExtensions.featureChainTail = const_cast<void*>(deviceCreateInfo.pNext);
 			deviceCreateInfo.pNext = presentExtensions.featureChain;
@@ -16927,6 +16995,7 @@ namespace rhi {
 			vulkanInfo.computeQueueIndex = streamlineComputeQueueIndex;
 			vulkanInfo.opticalFlowQueueFamily = streamlineOpticalFlowQueueFamily != kVkInvalidQueueFamily ? streamlineOpticalFlowQueueFamily : vulkanInfo.computeQueueFamily;
 			vulkanInfo.opticalFlowQueueIndex = streamlineOpticalFlowQueueIndex;
+			vulkanInfo.useNativeOpticalFlowMode = nativeOpticalFlowFamily != kVkInvalidQueueFamily;
 			if (SL_FAILED(result, g_vkSlSetVulkanInfo(vulkanInfo))) {
 				spdlog::error("CreateVulkanDevice: slSetVulkanInfo failed with result {}; disabling Streamline.", static_cast<int>(result));
 				streamlineInitialized = false;
