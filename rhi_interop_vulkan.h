@@ -134,6 +134,8 @@ namespace rhi::vulkan {
             void* user = nullptr;
             const void* (*registerMarker)(void* user, const char* name) noexcept = nullptr;
             bool detailedCommands = false;
+            // BasicRHI's own crash markers in its lists, as BASICRHI_VK_CRASH_MARKERS=1 turns them on.
+            bool crashMarkers = false;
         } diagnostics{};
         // The loader entry point the host used (it may be an interposer's).
         PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;

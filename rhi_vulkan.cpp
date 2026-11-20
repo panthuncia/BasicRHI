@@ -17428,12 +17428,13 @@ namespace rhi {
 			vkGetPhysicalDeviceProperties(info.physicalDevice, &impl->physicalDeviceProperties);
 			vkGetPhysicalDeviceMemoryProperties(info.physicalDevice, &impl->memoryProperties);
 			impl->supportedFeatures = coreFeatures;
-			// Native crash markers on an adopted device (BASICRHI_VK_CRASH_MARKERS=1): VK_AMD_buffer_marker markers in BasicRHI's own
+			// Native crash markers on an adopted device (diagnostics.crashMarkers or BASICRHI_VK_CRASH_MARKERS=1): VK_AMD_buffer_marker markers in BasicRHI's own
 			// lists, when the host enabled the extension (DXVK does under DXVK_DEBUG=hang). The host's markers cover only its own
 			// commands: without these a device lost in the graph's work names no pass.
 			// With them, VK_EXT_device_fault's report at the loss, when the host enabled it (CS's DXVK does under DXVK_DEBUG=hang, with
 			// its deviceFault feature whenever the device has it).
-			if (const char* value = std::getenv("BASICRHI_VK_CRASH_MARKERS"); value && std::strcmp(value, "1") == 0) {
+			const char* crashMarkersValue = std::getenv("BASICRHI_VK_CRASH_MARKERS");
+			if (info.diagnostics.crashMarkers || (crashMarkersValue && std::strcmp(crashMarkersValue, "1") == 0)) {
 				VkInitCrashMarkers(impl.get(),
 					VkNameListContains(info.enabledDeviceExtensions, info.enabledDeviceExtensionCount, VK_EXT_DEVICE_FAULT_EXTENSION_NAME),
 					VkNameListContains(info.enabledDeviceExtensions, info.enabledDeviceExtensionCount, VK_AMD_BUFFER_MARKER_EXTENSION_NAME), false);
