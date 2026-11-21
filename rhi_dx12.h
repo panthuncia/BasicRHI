@@ -21,6 +21,7 @@
 #include <cstddef>  // offsetof
 #include <type_traits>
 #include <cstdint>
+#include <memory>
 
 #include "rhi_interop_dx12.h"
 #include "rhi_conversions_dx12.h"
@@ -40,6 +41,14 @@ inline std::wstring s2ws(const std::string& s) {
 }
 
 namespace rhi {
+	/**
+	 * @brief The live ledger LiveMemoryFeatureInfo reports. An owned allocation keeps the token, copies share it, and the last
+	 * release takes its bytes off. Site and kind are LiveMemorySite's and LiveMemoryKind's values. Any thread.
+	 */
+	std::shared_ptr<void> Dx12TrackLive(uint32_t site, uint32_t kind, uint64_t bytes);
+	/** @brief The LiveMemoryKind of memory with these heap properties. */
+	uint32_t Dx12LiveKind(const D3D12_HEAP_PROPERTIES& props) noexcept;
+
 	using Microsoft::WRL::ComPtr;
 	struct Dx12Device;
 
@@ -78,6 +87,7 @@ namespace rhi {
 
 		D3D12_RESOURCE_DIMENSION dim = D3D12_RESOURCE_DIMENSION_UNKNOWN;
 		Dx12Device* dev = nullptr;
+		std::shared_ptr<void> live;  // the live ledger's token, for a committed resource (it owns its memory)
 	};
 
 	struct Dx12Sampler {
@@ -198,6 +208,7 @@ namespace rhi {
 			D3D12_GPU_VIRTUAL_ADDRESS gpuBase = 0;
 			size_t capacity = 0;
 			size_t cursor = 0;
+			std::shared_ptr<void> live;  // the live ledger's token
 		};
 
 		struct RootCbvShadowState {
@@ -334,6 +345,7 @@ namespace rhi {
 		D3D12_CPU_DESCRIPTOR_HANDLE cpuStart{};
 		D3D12_GPU_DESCRIPTOR_HANDLE gpuStart{};
 		Dx12Device* dev = nullptr;
+		std::shared_ptr<void> live;  // the live ledger's token
 	};
 
 	/**
@@ -442,6 +454,7 @@ namespace rhi {
 		Microsoft::WRL::ComPtr<ID3D12Heap> heap;
 		uint64_t size{};
 		Dx12Device* dev = nullptr;
+		std::shared_ptr<void> live;  // the live ledger's token
 	};
 
 	struct Dx12QueryPool {

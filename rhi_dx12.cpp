@@ -71,6 +71,34 @@
 
 namespace rhi {
 	namespace {
+		constexpr uint32_t kLiveSites = static_cast<uint32_t>(LiveMemorySite::Count);
+		constexpr uint32_t kLiveKinds = static_cast<uint32_t>(LiveMemoryKind::Count);
+		std::atomic<uint64_t> g_dx12LiveBytes[kLiveSites][kLiveKinds]{};
+		std::atomic<uint64_t> g_dx12LiveCount[kLiveSites][kLiveKinds]{};
+	}
+
+	std::shared_ptr<void> Dx12TrackLive(uint32_t site, uint32_t kind, uint64_t bytes) {
+		if (site >= kLiveSites || kind >= kLiveKinds || bytes == 0) return {};
+		g_dx12LiveBytes[site][kind].fetch_add(bytes, std::memory_order_relaxed);
+		g_dx12LiveCount[site][kind].fetch_add(1, std::memory_order_relaxed);
+		// The pointer only carries the deleter: the last copy's release takes the bytes off.
+		return std::shared_ptr<void>(reinterpret_cast<void*>(uintptr_t{ 1 }), [site, kind, bytes](void*) {
+			g_dx12LiveBytes[site][kind].fetch_sub(bytes, std::memory_order_relaxed);
+			g_dx12LiveCount[site][kind].fetch_sub(1, std::memory_order_relaxed);
+		});
+	}
+
+	uint32_t Dx12LiveKind(const D3D12_HEAP_PROPERTIES& props) noexcept {
+		switch (props.Type) {
+		case D3D12_HEAP_TYPE_DEFAULT: return static_cast<uint32_t>(LiveMemoryKind::DeviceLocal);
+		case D3D12_HEAP_TYPE_GPU_UPLOAD: return static_cast<uint32_t>(LiveMemoryKind::DeviceLocalHostVisible);
+		case D3D12_HEAP_TYPE_CUSTOM:
+			if (props.MemoryPoolPreference == D3D12_MEMORY_POOL_L0) return static_cast<uint32_t>(LiveMemoryKind::System);
+			return static_cast<uint32_t>(props.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE ? LiveMemoryKind::DeviceLocal : LiveMemoryKind::DeviceLocalHostVisible);
+		default: return static_cast<uint32_t>(LiveMemoryKind::System);  // upload and readback
+		}
+	}
+	namespace {
 		static void Dx12PollReShapeMessages(Dx12Device* impl) noexcept;
 		static Result Dx12RefreshReShapeFeatures(Dx12Device* impl) noexcept;
 		static void Dx12EnsureReShapeFeatureList(Dx12Device* impl) noexcept;
@@ -2431,6 +2459,7 @@ namespace rhi {
 			page.cursor = 0;
 			page.mapped = static_cast<uint8_t*>(mapped);
 			page.resource = std::move(resource);
+			page.live = Dx12TrackLive(static_cast<uint32_t>(LiveMemorySite::RootConstants), Dx12LiveKind(hp), capacity);
 			list.rootCbvScratchPages.push_back(std::move(page));
 			return true;
 		}
@@ -3194,6 +3223,18 @@ namespace rhi {
 					if (h->structVersion >= 3)
 						out->stencilExport = opt0.PSSpecifiedStencilRefSupported != 0;
 				} break;
+				case FeatureInfoStructType::LiveMemory: {
+					if (h->structSize < sizeof(LiveMemoryFeatureInfo)) return Result::InvalidArgument;
+					// What the backend created with memory of its own: committed resources, heaps, descriptor heaps and root
+					// constant pages. Command allocators and pipelines are the driver's and are not counted.
+					auto* out = reinterpret_cast<LiveMemoryFeatureInfo*>(h);
+					out->counted = true;
+					for (uint32_t site = 0; site < kLiveSites; ++site)
+						for (uint32_t kind = 0; kind < kLiveKinds; ++kind) {
+							out->bytes[site][kind] = g_dx12LiveBytes[site][kind].load(std::memory_order_relaxed);
+							out->allocations[site][kind] = g_dx12LiveCount[site][kind].load(std::memory_order_relaxed);
+						}
+				} break;
 				default:
 					// Unknown sType: ignore
 					break;
@@ -3557,7 +3598,10 @@ namespace rhi {
 			}
 
 			const auto descriptorSize = impl->pNativeDevice->GetDescriptorHandleIncrementSize(desc.Type);
-			const Dx12DescriptorHeap H(heap, desc.Type, descriptorSize, (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0, impl);
+			Dx12DescriptorHeap H(heap, desc.Type, descriptorSize, (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0, impl);
+			// A shader-visible heap lives in video memory; a CPU-only heap in system memory.
+			H.live = Dx12TrackLive(static_cast<uint32_t>(LiveMemorySite::DescriptorHeaps),
+				static_cast<uint32_t>(H.shaderVisible ? LiveMemoryKind::DeviceLocal : LiveMemoryKind::System), uint64_t(desc.NumDescriptors) * descriptorSize);
 
 			const auto handle = impl->descHeaps.alloc(H);
 			DescriptorHeap ret(handle);
@@ -4484,6 +4528,8 @@ namespace rhi {
 			}
 
 			Dx12Resource B(std::move(res), bd.buffer.sizeBytes, impl);
+			B.live = Dx12TrackLive(static_cast<uint32_t>(LiveMemorySite::Buffers), Dx12LiveKind(hp),
+				impl->pNativeDevice->GetResourceAllocationInfo2(0, 1, &desc, nullptr).SizeInBytes);
 			const auto handle = impl->resources.alloc(B);
 
 			Resource ret{ handle, false };
@@ -4544,6 +4590,8 @@ namespace rhi {
 				? D3D12_RESOURCE_DIMENSION_TEXTURE3D
 				: (td.type == ResourceType::Texture2D ? D3D12_RESOURCE_DIMENSION_TEXTURE2D
 					: D3D12_RESOURCE_DIMENSION_TEXTURE1D), depth, impl);
+			T.live = Dx12TrackLive(static_cast<uint32_t>(LiveMemorySite::Textures), Dx12LiveKind(hp),
+				impl->pNativeDevice->GetResourceAllocationInfo2(0, 1, &desc, nullptr).SizeInBytes);
 
 			auto handle = impl->resources.alloc(T);
 
@@ -4624,7 +4672,8 @@ namespace rhi {
 			if (hd.debugName) { const std::wstring w(hd.debugName, hd.debugName + ::strlen(hd.debugName)); heap->SetName(w.c_str()); }
 #endif
 
-			const Dx12Heap H(heap, hd.sizeBytes, impl);
+			Dx12Heap H(heap, hd.sizeBytes, impl);
+			H.live = Dx12TrackLive(static_cast<uint32_t>(LiveMemorySite::Heaps), Dx12LiveKind(props), hd.sizeBytes);
 			const auto h = impl->heaps.alloc(H);
 			Heap ret{ h };
 			ret.impl = impl;
