@@ -195,6 +195,8 @@ namespace rhi {
 		Dx12Device* dev = nullptr;
 		// Its arguments set root constants: after an ExecuteIndirect with it, D3D12 leaves the root arguments undefined.
 		bool setsRootConstants = false;
+		// The bytes one command's arguments take, at most the stride.
+		uint32_t commandBytes = 0;
 	};
 
 	struct Dx12Allocator {

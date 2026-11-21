@@ -3310,6 +3310,24 @@ namespace rhi {
 			dx12_detail::Dev(d)->pipelineLayouts.free(h);
 		}
 
+		/** @brief The bytes one indirect argument takes in a command. */
+		static uint32_t Dx12IndirectArgBytes(const D3D12_INDIRECT_ARGUMENT_DESC& a_arg) noexcept {
+			switch (a_arg.Type) {
+			case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: return sizeof(D3D12_DRAW_ARGUMENTS);
+			case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: return sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
+			case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: return sizeof(D3D12_DISPATCH_ARGUMENTS);
+			case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: return sizeof(D3D12_VERTEX_BUFFER_VIEW);
+			case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: return sizeof(D3D12_INDEX_BUFFER_VIEW);
+			case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: return 4u * a_arg.Constant.Num32BitValuesToSet;
+			case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+			case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+			case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: return sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
+			case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS: return sizeof(D3D12_DISPATCH_RAYS_DESC);
+			case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH: return sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
+			default: return 0;
+			}
+		}
+
 		static bool FillDx12Arg(const IndirectArg& a, D3D12_INDIRECT_ARGUMENT_DESC& out) {
 			switch (a.kind) {
 			case IndirectArgKind::Constant:
@@ -3457,6 +3475,8 @@ namespace rhi {
 			for (uint32_t i = 0; i < cd.args.size; ++i)
 				if (cd.args.data[i].kind == IndirectArgKind::Constant)
 					s.setsRootConstants = true;
+			for (const auto& arg : dxArgs)
+				s.commandBytes += Dx12IndirectArgBytes(arg);
 			const auto handle = impl->commandSignatures.alloc(s);
 			CommandSignature ret(handle);
 			ret.vt = &g_csvt;
@@ -9968,7 +9988,9 @@ namespace rhi {
 			// packet describes no complete command.  Empty producer buffers are a
 			// normal result for culled/bootstrapping frames, so make that packet a
 			// no-op at the backend boundary and diagnose genuinely bad offsets.
-			const uint64_t argumentBytes = static_cast<uint64_t>(S->stride) * maxCount;
+			// The last command needs only its own arguments, not a whole stride: D3D12 reads the arguments from the start of
+			// each stride, so a record may keep other data after them.
+			const uint64_t argumentBytes = maxCount == 0 ? 0 : static_cast<uint64_t>(S->stride) * (maxCount - 1) + S->commandBytes;
 			if (argOff > argB->buf.size || argumentBytes > argB->buf.size - argOff) {
 				spdlog::warn(
 					"DX12 ExecuteIndirect skipped undersized argument buffer: handle={} generation={} size={} offset={} stride={} count={}",
