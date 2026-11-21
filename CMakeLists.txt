@@ -450,6 +450,10 @@ if(BASICRHI_BUILD_TESTS)
     if(BASICRHI_ENABLE_D3D12 AND WIN32)
         add_executable(BasicRHID3D12AliasingSmoke tests/D3D12AliasingSmoke.cpp)
         target_link_libraries(BasicRHID3D12AliasingSmoke PRIVATE BasicRHI::BasicRHI)
+        # Small placed buffers as ranges of a buffer over their heap: placement, addresses, maps, copies and views.
+        add_executable(BasicRHID3D12PackedBufferSmoke tests/D3D12PackedBufferSmoke.cpp)
+        target_link_libraries(BasicRHID3D12PackedBufferSmoke PRIVATE BasicRHI::BasicRHI)
+        add_test(NAME BasicRHID3D12PackedBufferSmoke COMMAND BasicRHID3D12PackedBufferSmoke)
         # Stencil, blend factor and dynamic viewport/scissor draws; the shaders are compiled at run time (d3dcompiler).
         add_executable(BasicRHID3D12FixedFunctionSmoke tests/D3D12FixedFunctionSmoke.cpp)
         target_link_libraries(BasicRHID3D12FixedFunctionSmoke PRIVATE BasicRHI::BasicRHI d3dcompiler)

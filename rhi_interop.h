@@ -90,6 +90,9 @@ namespace rhi {
 	// Streamline manual-hooking proxy. Engine and other native interop callers must
 	// continue to request RHI_IID_D3D12_CMD_LIST.
 	constexpr uint32_t RHI_IID_D3D12_STREAMLINE_CMD_LIST = 0x100E;
+	// A buffer as a range of an ID3D12Resource (D3D12BufferRangeInfo). A small D3D12 buffer may be packed: a range of a resource it
+	// shares with other buffers, which RHI_IID_D3D12_RESOURCE refuses to hand out. Callers that honour the offset ask for this.
+	constexpr uint32_t RHI_IID_D3D12_BUFFER_RANGE = 0x100F;
 
 	constexpr uint32_t RHI_IID_VK_DEVICE = 0x2001;
 	constexpr uint32_t RHI_IID_VK_QUEUE = 0x2002;
@@ -112,6 +115,8 @@ namespace rhi {
 	struct D3D12CmdListInfo { void* cmdList; void* allocator; uint32_t version; };
 	struct D3D12SwapchainInfo { void* swapchain; uint32_t version; };
 	struct D3D12ResourceInfo { void* resource; uint32_t version; };
+	// The buffer is bytes [offset, offset + size) of resource. offset is 0 for a buffer with a resource of its own.
+	struct D3D12BufferRangeInfo { void* resource; uint64_t offset; uint64_t size; uint32_t version; };
 	struct D3D12HeapInfo { void* heap; uint32_t version; };
 	struct D3D12QueryPoolInfo { void* queryPool; uint32_t version; };
 	struct D3D12PipelineInfo { void* pipeline; uint32_t version; };

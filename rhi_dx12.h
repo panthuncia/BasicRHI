@@ -51,6 +51,7 @@ namespace rhi {
 
 	using Microsoft::WRL::ComPtr;
 	struct Dx12Device;
+	struct Dx12HeapSpan;
 
 	enum class Dx12ResourceKind : uint8_t { Buffer, Texture };
 
@@ -72,6 +73,7 @@ namespace rhi {
 		//uint16_t mips = 1, arraySize = 1, depth = 1;
 		struct Buffer { // for buffers
 			uint64_t size = 0;
+			uint64_t offset = 0;  // a packed buffer's start in res; 0 otherwise
 		};
 		struct Texture { // for textures
 			uint32_t w = 0, h = 0;
@@ -88,6 +90,32 @@ namespace rhi {
 		D3D12_RESOURCE_DIMENSION dim = D3D12_RESOURCE_DIMENSION_UNKNOWN;
 		Dx12Device* dev = nullptr;
 		std::shared_ptr<void> live;  // the live ledger's token, for a committed resource (it owns its memory)
+
+		// A packed buffer is a byte range of its heap's shared buffer (Dx12HeapSpan), not a resource of its own. res is the shared
+		// buffer, buf.offset the range's start. Its heap's memory is counted once, by the heap.
+		bool packed = false;
+		D3D12_RESOURCE_FLAGS packedFlags = D3D12_RESOURCE_FLAG_NONE;  // the flags it was asked for (the shared buffer may have more)
+		std::shared_ptr<Dx12HeapSpan> span;  // the heap's shared buffers, for a packed buffer
+		std::string name;  // a packed buffer's name: the shared buffer cannot carry it
+
+		/** @brief Where the buffer starts in res. 0 for a texture or a buffer of its own. */
+		uint64_t BufferOffset() const noexcept { return kind == Dx12ResourceKind::Buffer ? buf.offset : 0; }
+		/** @brief The buffer's GPU virtual address. */
+		D3D12_GPU_VIRTUAL_ADDRESS BufferAddress() const noexcept { return res->GetGPUVirtualAddress() + BufferOffset(); }
+	};
+
+	/**
+	 * @brief A heap's shared buffers, for the packed buffers placed in it. Each covers the whole heap. The second one aliases the
+	 * first and is made only when a copy runs between two packed buffers of the heap: D3D12 copies only between two resources.
+	 */
+	struct Dx12HeapSpan {
+		std::mutex lock;
+		Microsoft::WRL::ComPtr<ID3D12Heap> heap;
+		Microsoft::WRL::ComPtr<ID3D12Resource> primary;
+		Microsoft::WRL::ComPtr<ID3D12Resource> alias;
+		D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE;
+		uint64_t size = 0;
+		uint8_t* mapped = nullptr;  // the primary's lasting mapping, for a host-visible heap
 	};
 
 	struct Dx12Sampler {
@@ -455,6 +483,7 @@ namespace rhi {
 		uint64_t size{};
 		Dx12Device* dev = nullptr;
 		std::shared_ptr<void> live;  // the live ledger's token
+		std::shared_ptr<Dx12HeapSpan> span = std::make_shared<Dx12HeapSpan>();  // made empty; filled by the first packed buffer
 	};
 
 	struct Dx12QueryPool {

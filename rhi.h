@@ -2161,7 +2161,11 @@ namespace rhi {
 		RF_VideoEncodeReferenceOnly = 1 << 7,
 		RF_RaytracingAccelerationStructure = 1 << 8,
 		RF_UseTightAlignment = 1 << 9,
-		RF_TextureCubeCompatible = 1 << 10
+		RF_TextureCubeCompatible = 1 << 10,
+		// A buffer that needs a D3D12 resource of its own. D3D12 packs small buffers as ranges of a shared resource, at 512-byte
+		// starts. Such a buffer cannot take a structured view whose stride does not divide 512, or a UAV counter (4096-byte
+		// placement). Vulkan ignores it.
+		RF_OwnResource = 1 << 11
 	};
 	// Define |= for ResourceFlags
 	inline ResourceFlags operator|(ResourceFlags a, ResourceFlags b) {

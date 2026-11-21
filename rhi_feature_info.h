@@ -201,9 +201,10 @@ struct ResourceAllocationFeatureInfo {
 
     bool createNotZeroedHeapSupported = false; // "heap flag create_not_zeroed" proxy (D3D12MA-style)
 
-    // Whether the driver packs small committed buffers together. D3D12 does, so the allocator makes buffers up to 32 KiB
-    // committed (placed ones need 64 KiB alignment). On Vulkan a committed buffer is its own vkAllocateMemory, rounded up to the
-    // driver's allocation granularity, so small buffers are placed in the allocator's blocks instead.
+    // Whether small committed buffers are packed together, so the allocator makes buffers up to 32 KiB committed. No backend
+    // sets it now. On Vulkan a committed buffer is its own vkAllocateMemory, rounded up to the driver's allocation granularity.
+    // A committed D3D12 buffer is an implicit heap of 64 KiB or more; the D3D12 backend packs small placed buffers itself, as
+    // ranges of a buffer over their heap, so on both the allocator places small buffers in its blocks.
     bool committedSmallBuffersPacked = false;
 };
 

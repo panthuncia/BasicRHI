@@ -98,6 +98,25 @@ namespace rhi {
 		default: return static_cast<uint32_t>(LiveMemoryKind::System);  // upload and readback
 		}
 	}
+
+	// Packed buffers. A placed buffer needs 64 KiB alignment on D3D12 (without tight alignment), so a buffer of a few KiB took
+	// 64 KiB. A small buffer is instead a byte range of a buffer that covers its whole heap, as a VkBuffer binds at a small offset
+	// in a shared block on Vulkan. The allocator places it like any other resource, at the alignment reported here.
+	namespace {
+		// Larger buffers keep a resource of their own: the 64 KiB rounding costs them little, and their barriers and residency stay
+		// their own.
+		constexpr uint64_t kPackedBufferMaxBytes = 256ull * 1024;
+		// Covers constant buffer views (256), texture copy footprints (512) and the structured strides that divide it.
+		constexpr uint64_t kPackedBufferAlignment = 512;
+
+		/** @brief Whether a buffer made from this description is packed when placed. Committed buffers never are. */
+		bool Dx12Packs(const ResourceDesc& d) noexcept {
+			constexpr uint32_t shared = static_cast<uint32_t>(HeapFlags::Shared) | static_cast<uint32_t>(HeapFlags::SharedCrossAdapter);
+			return d.type == ResourceType::Buffer && d.buffer.sizeBytes != 0 && d.buffer.sizeBytes <= kPackedBufferMaxBytes &&
+				(static_cast<uint32_t>(d.resourceFlags) & ~static_cast<uint32_t>(RF_AllowUnorderedAccess)) == 0 &&
+				(static_cast<uint32_t>(d.heapFlags) & shared) == 0 && d.castableFormats.size == 0;
+		}
+	}
 	namespace {
 		static void Dx12PollReShapeMessages(Dx12Device* impl) noexcept;
 		static Result Dx12RefreshReShapeFeatures(Dx12Device* impl) noexcept;
@@ -3183,7 +3202,14 @@ namespace rhi {
 					out->gpuUploadHeapSupported = gpuUploadHeapSupported;
 					out->tightAlignmentSupported = tightAlignmentSupported;
 					out->createNotZeroedHeapSupported = createNotZeroedSupported;
-					out->committedSmallBuffersPacked = true;
+					// Small buffers are packed when placed (Dx12Packs), so the allocator places them like any other resource. A committed
+					// one would take 64 KiB.
+					out->committedSmallBuffersPacked = false;
+					static std::atomic_flag logged;
+					if (!logged.test_and_set())
+						spdlog::info("DX12 resource allocation: tight alignment {}, GPU upload heaps {}; buffers up to {} KiB are packed at {}-byte starts",
+							tightAlignmentSupported ? "supported" : "not supported", gpuUploadHeapSupported ? "supported" : "not supported",
+							kPackedBufferMaxBytes / 1024, kPackedBufferAlignment);
 				} break;
 				case FeatureInfoStructType::WorkGraphs: {
 					if (h->structSize < sizeof(WorkGraphFeatureInfo)) return Result::InvalidArgument;
@@ -3443,20 +3469,107 @@ namespace rhi {
 			dx12_detail::Dev(d)->commandSignatures.free(h);
 		}
 
+		// ---- Packed buffers (Dx12Packs) ----
+
+		static std::string Dx12ObjectName(ID3D12Object* a_object) noexcept;
+
+		/** @brief A buffer's name for logs: a packed buffer's rhi name, else its resource's. */
+		static std::string Dx12BufferName(const Dx12Resource& a_buffer) noexcept {
+			if (a_buffer.packed)
+				return a_buffer.name.empty() ? std::string("(unnamed packed buffer)") : a_buffer.name;
+			return Dx12ObjectName(a_buffer.res.Get());
+		}
+
+		/**
+		 * @brief One of a heap's shared buffers, made the first time a packed buffer asks. a_alias picks the second one, for copies
+		 * between two packed buffers of the heap. Null when the heap cannot hold one.
+		 */
+		static ID3D12Resource* Dx12HeapSpanBuffer(Dx12Device* impl, Dx12HeapSpan& a_span, bool a_alias) noexcept {
+			std::scoped_lock lock(a_span.lock);
+			auto& slot = a_alias ? a_span.alias : a_span.primary;
+			if (slot)
+				return slot.Get();
+			if (!a_span.heap)
+				return nullptr;
+			const D3D12_HEAP_DESC heapDesc = a_span.heap->GetDesc();
+			if (heapDesc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) {
+				spdlog::error("DX12 packed buffers: a heap that denies buffers was asked for a packed buffer");
+				return nullptr;
+			}
+			// Upload and readback heaps take no unordered access. Elsewhere the shared buffer allows it, for the buffers that ask.
+			const D3D12_HEAP_TYPE type = heapDesc.Properties.Type;
+			const D3D12_RESOURCE_FLAGS flags = (type == D3D12_HEAP_TYPE_UPLOAD || type == D3D12_HEAP_TYPE_READBACK) ? D3D12_RESOURCE_FLAG_NONE
+			                                                                                                         : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+			// A heap is a whole number of 64 KiB pages; the shared buffer covers those.
+			const uint64_t width = heapDesc.SizeInBytes & ~uint64_t(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT - 1);
+			const D3D12_RESOURCE_DESC1 desc = MakeBufferDesc1(width, flags);
+			Microsoft::WRL::ComPtr<ID3D12Resource> res;
+			const HRESULT hr = impl->pNativeDevice->CreatePlacedResource2(a_span.heap.Get(), 0, &desc, D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, 0, nullptr,
+				IID_PPV_ARGS(&res));
+			if (FAILED(hr)) {
+				spdlog::error("DX12 packed buffers: the shared buffer of a {} MiB heap could not be made (hr 0x{:08X})", width >> 20, static_cast<uint32_t>(hr));
+				return nullptr;
+			}
+			res->SetName(a_alias ? L"BasicRHI packed buffers (copy source alias)" : L"BasicRHI packed buffers");
+			// A host-visible heap stays mapped for its shared buffer's life. A packed buffer's Map is then its start in that mapping:
+			// mapping and unmapping the heap's whole buffer on each small buffer's upload would map the whole heap each time.
+			const bool hostVisible = type == D3D12_HEAP_TYPE_UPLOAD || type == D3D12_HEAP_TYPE_READBACK || type == D3D12_HEAP_TYPE_GPU_UPLOAD ||
+				(type == D3D12_HEAP_TYPE_CUSTOM && heapDesc.Properties.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE);
+			if (!a_alias && hostVisible) {
+				void* mapped = nullptr;
+				if (FAILED(res->Map(0, nullptr, &mapped)) || !mapped) {
+					spdlog::error("DX12 packed buffers: the shared buffer of a host-visible heap could not be mapped");
+					return nullptr;
+				}
+				a_span.mapped = static_cast<uint8_t*>(mapped);
+			}
+			a_span.flags = flags;
+			a_span.size = width;
+			slot = std::move(res);
+			return slot.Get();
+		}
+
+		/** @brief The second shared buffer of a packed buffer's heap, to copy from when the destination is in the same heap. */
+		static ID3D12Resource* Dx12HeapSpanAlias(Dx12Device* impl, const Dx12Resource& a_buffer) noexcept {
+			return a_buffer.packed && a_buffer.span ? Dx12HeapSpanBuffer(impl, *a_buffer.span, true) : nullptr;
+		}
+
+		/**
+		 * @brief The elements a view of a packed buffer starts past, for its start in the shared buffer: views count in elements, so
+		 * the start must be a whole number of them. False (and logged) when it is not. 0 for a buffer of its own.
+		 */
+		static bool Dx12PackedFirstElement(const Dx12Resource& a_buffer, BufferViewKind a_kind, uint32_t a_stride, Format a_format, const char* a_view,
+			uint64_t& a_first) noexcept {
+			a_first = 0;
+			const uint64_t base = a_buffer.BufferOffset();
+			if (base == 0)
+				return true;
+			const uint64_t unit = a_kind == BufferViewKind::Raw ? 4u : a_kind == BufferViewKind::Structured ? a_stride : FormatByteSize(a_format);
+			if (unit == 0 || base % unit != 0) {
+				spdlog::error("DX12 {} of packed buffer '{}': its start {} is not a whole number of {}-byte elements; make it with RF_OwnResource", a_view,
+					Dx12BufferName(a_buffer), base, unit);
+				return false;
+			}
+			a_first = base / unit;
+			return true;
+		}
+
 		// ---- Buffer view refs (rhi_shader_abi.h, BUFFER_VIEW_REF_*) ----
 
 		static void Dx12RawBufferViews(Dx12Device* impl, ID3D12Resource* resource, uint64_t bytes, bool unordered,
-			D3D12_CPU_DESCRIPTOR_HANDLE srv, D3D12_CPU_DESCRIPTOR_HANDLE uav) noexcept {
+			D3D12_CPU_DESCRIPTOR_HANDLE srv, D3D12_CPU_DESCRIPTOR_HANDLE uav, uint64_t start = 0) noexcept {
 			D3D12_SHADER_RESOURCE_VIEW_DESC s{};
 			s.Format = DXGI_FORMAT_R32_TYPELESS;
 			s.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
 			s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			s.Buffer.FirstElement = start / 4;
 			s.Buffer.NumElements = static_cast<UINT>((std::min<uint64_t>)(bytes / 4, UINT32_MAX));
 			s.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
 			impl->pNativeDevice->CreateShaderResourceView(resource, &s, srv);
 			D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
 			u.Format = DXGI_FORMAT_R32_TYPELESS;
 			u.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+			u.Buffer.FirstElement = s.Buffer.FirstElement;
 			u.Buffer.NumElements = s.Buffer.NumElements;
 			u.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
 			// Without UAV access the slot holds a null view, so every slot of the region is a valid descriptor to copy.
@@ -3519,9 +3632,10 @@ namespace rhi {
 			if (SUCCEEDED(resource->res->GetHeapProperties(&heapProperties, &heapFlags)) && heapProperties.Type == D3D12_HEAP_TYPE_READBACK)
 				return {};
 			const D3D12_RESOURCE_DESC desc = resource->res->GetDesc();
-			if (desc.Width == 0)
+			const uint64_t width = resource->packed ? resource->buf.size : desc.Width;
+			if (width == 0)
 				return {};
-			const bool unordered = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+			const bool unordered = ((resource->packed ? resource->packedFlags : desc.Flags) & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
 
 			std::unique_lock write(r.lock);
 			if (const auto found = r.pairByResource.find(key); found != r.pairByResource.end())
@@ -3539,7 +3653,8 @@ namespace rhi {
 				}
 				return {};
 			}
-			Dx12RawBufferViews(impl, resource->res.Get(), desc.Width, unordered, Dx12ViewRefStaging(r, 2 * pair), Dx12ViewRefStaging(r, 2 * pair + 1));
+			Dx12RawBufferViews(impl, resource->res.Get(), width, unordered, Dx12ViewRefStaging(r, 2 * pair), Dx12ViewRefStaging(r, 2 * pair + 1),
+				resource->BufferOffset());
 			Dx12PublishViewRefPair(impl, pair);
 			r.pairByResource.emplace(key, pair);
 			return refAt(pair);
@@ -3729,6 +3844,9 @@ namespace rhi {
 				}
 
 				desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+				uint64_t first = 0;
+				if (!Dx12PackedFirstElement(*B, dv.buffer.kind, dv.buffer.structureByteStride, dv.formatOverride, "SRV", first))
+					return Result::InvalidArgument;
 				switch (dv.buffer.kind) {
 				case BufferViewKind::Raw:
 					desc.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -3752,6 +3870,7 @@ namespace rhi {
 					desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
 					break;
 				}
+				desc.Buffer.FirstElement += first;
 				impl->pNativeDevice->CreateShaderResourceView(B->res.Get(), &desc, dst);
 				return Result::Ok;
 			}
@@ -3908,11 +4027,12 @@ namespace rhi {
 				return Result::InvalidArgument;
 			}
 			const auto nativeDesc = nativeResource->res->GetDesc();
-			if ((nativeDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+			const D3D12_RESOURCE_FLAGS askedFlags = nativeResource->packed ? nativeResource->packedFlags : nativeDesc.Flags;
+			if ((askedFlags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
 				spdlog::error(
 					"DX12 CreateUnorderedAccessView rejected resource without ALLOW_UNORDERED_ACCESS: handle=({}, {}) dimension={} nativeFlags=0x{:X}",
 					resource.index, resource.generation, static_cast<uint32_t>(dv.dimension),
-					static_cast<uint32_t>(nativeDesc.Flags));
+					static_cast<uint32_t>(askedFlags));
 				return Result::InvalidArgument;
 			}
 
@@ -3927,9 +4047,17 @@ namespace rhi {
 					return Result::InvalidArgument;
 				}
 
+				uint64_t first = 0;
+				if (!Dx12PackedFirstElement(*B, dv.buffer.kind, dv.buffer.structureByteStride, dv.formatOverride, "UAV", first))
+					return Result::InvalidArgument;
+				if (B->packed && dv.buffer.counterOffsetInBytes != 0) {
+					spdlog::error("DX12 CreateUnorderedAccessView: buffer '{}' is packed and cannot hold a UAV counter; make it with RF_OwnResource",
+						Dx12BufferName(*B));
+					return Result::InvalidArgument;
+				}
 				pResource = B->res.Get();
 				desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-				desc.Buffer.FirstElement = (UINT)dv.buffer.firstElement;
+				desc.Buffer.FirstElement = dv.buffer.firstElement + first;
 				desc.Buffer.NumElements = dv.buffer.numElements;
 				desc.Buffer.CounterOffsetInBytes = (UINT)dv.buffer.counterOffsetInBytes;
 
@@ -4096,7 +4224,7 @@ namespace rhi {
 			}
 
 			D3D12_CONSTANT_BUFFER_VIEW_DESC desc{};
-			desc.BufferLocation = B->res->GetGPUVirtualAddress() + dv.byteOffset;
+			desc.BufferLocation = B->BufferAddress() + dv.byteOffset;
 			desc.SizeInBytes = (UINT)((dv.byteSize + 255) & ~255u);
 			impl->pNativeDevice->CreateConstantBufferView(&desc, dst);
 			return Result::Ok;
@@ -4693,6 +4821,11 @@ namespace rhi {
 			}
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 			if (auto* B = impl->resources.get(b)) {
+				// A packed buffer's resource is its heap's: the name stays on the rhi side.
+				if (B->packed) {
+					B->name = n;
+					return;
+				}
 				std::wstring w(n, n + ::strlen(n));
 				B->res->SetName(w.c_str());
 			}
@@ -4832,6 +4965,47 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		/** @brief A packed buffer: a range of the heap's shared buffer at a_offset, which the allocator chose (Dx12Packs). */
+		static Result Dx12CreatePackedBuffer(Device* d, const HeapHandle hh, const uint64_t offset, const ResourceDesc& bd, D3D12_RESOURCE_FLAGS flags,
+			ResourcePtr& out) noexcept {
+			auto* impl = static_cast<Dx12Device*>(d->impl);
+			auto* H = impl->heaps.get(hh);
+			if (!H || !H->heap || !H->span) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			{
+				std::scoped_lock lock(H->span->lock);
+				if (!H->span->heap)
+					H->span->heap = H->heap;
+			}
+			ID3D12Resource* span = Dx12HeapSpanBuffer(impl, *H->span, false);
+			if (!span) {
+				RHI_FAIL(Result::Failed);
+			}
+			if (offset % kPackedBufferAlignment != 0 || offset > H->span->size || bd.buffer.sizeBytes > H->span->size - offset) {
+				spdlog::error("DX12 packed buffer '{}' ({} bytes) at {} does not fit its heap's shared buffer ({} bytes, 512-byte starts)",
+					bd.debugName ? bd.debugName : "", bd.buffer.sizeBytes, offset, H->span->size);
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if ((flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !(H->span->flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+				spdlog::error("DX12 packed buffer '{}' asks for unordered access in a heap that has none", bd.debugName ? bd.debugName : "");
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			Dx12Resource B(Microsoft::WRL::ComPtr<ID3D12Resource>(span), bd.buffer.sizeBytes, impl);
+			B.buf.offset = offset;
+			B.packed = true;
+			B.packedFlags = flags;
+			B.span = H->span;
+			if (bd.debugName)
+				B.name = bd.debugName;
+			const auto handle = impl->resources.alloc(std::move(B));
+			Resource ret{ handle, false };
+			ret.impl = impl;
+			ret.vt = &g_buf_rvt;
+			out = MakeBufferPtr(d, ret, impl->selfWeak.lock());
+			return Result::Ok;
+		}
+
 		static Result d_createPlacedBuffer(Device* d, const HeapHandle hh, const uint64_t offset, const ResourceDesc& bd, ResourcePtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
 			if (!impl) {
@@ -4844,6 +5018,8 @@ namespace rhi {
 				return Result::InvalidArgument;
 			}
 			const D3D12_RESOURCE_FLAGS flags = ToDX(bd.resourceFlags);
+			if (Dx12Packs(bd))
+				return Dx12CreatePackedBuffer(d, hh, offset, bd, flags, out);
 			const D3D12_RESOURCE_DESC1  desc = MakeBufferDesc1(bd.buffer.sizeBytes, flags);
 			// Buffers must use UNDEFINED layout per spec
 			const D3D12_BARRIER_LAYOUT initialLayout = D3D12_BARRIER_LAYOUT_UNDEFINED;
@@ -5010,7 +5186,7 @@ namespace rhi {
 			if (!impl || !address.buffer.valid()) return 0;
 			Dx12Resource* resource = impl->resources.get(address.buffer);
 			if (!resource || !resource->res || resource->kind != Dx12ResourceKind::Buffer) return 0;
-			return resource->res->GetGPUVirtualAddress() + address.offset;
+			return resource->BufferAddress() + address.offset;
 		}
 
 		static D3D12_GPU_VIRTUAL_ADDRESS Dx12BufferAddress(Dx12Device* impl, GpuBufferRange range) noexcept {
@@ -5373,7 +5549,7 @@ namespace rhi {
 			AccelerationStructure ret{ handle };
 			ret.impl = impl;
 			ret.vt = &g_asvt;
-			if (desc.debugName) {
+			if (desc.debugName && !storage->packed) {
 				storage->res->SetName(s2ws(desc.debugName).c_str());
 			}
 			out = MakeAccelerationStructurePtr(d, ret, impl->selfWeak.lock());
@@ -5654,10 +5830,26 @@ namespace rhi {
 				impl->pNativeDevice->GetResourceAllocationInfo2(0, resourceCount, descs.data(), dxInfos.data());
 			}
 			// Pack back
+			bool packs = false;
 			for (size_t i = 0; i < resourceCount; ++i) {
 				outInfos[i].offset = dxInfos[i].Offset;
 				outInfos[i].alignment = dxInfos[i].Alignment;
 				outInfos[i].sizeInBytes = dxInfos[i].SizeInBytes;
+				// A packed buffer takes its own bytes at a 512-byte start, not 64 KiB (Dx12Packs).
+				if (Dx12Packs(resources[i])) {
+					packs = true;
+					outInfos[i].alignment = kPackedBufferAlignment;
+					outInfos[i].sizeInBytes = (resources[i].buffer.sizeBytes + kPackedBufferAlignment - 1) & ~(kPackedBufferAlignment - 1);
+				}
+			}
+			// The offsets of a set laid out one after another, at the alignments above.
+			if (packs) {
+				uint64_t end = 0;
+				for (size_t i = 0; i < resourceCount; ++i) {
+					const uint64_t a = outInfos[i].alignment ? outInfos[i].alignment : 1;
+					outInfos[i].offset = (end + a - 1) / a * a;
+					end = outInfos[i].offset + outInfos[i].sizeInBytes;
+				}
 			}
 			return Result::Ok;
 		}
@@ -5693,6 +5885,9 @@ namespace rhi {
 					if (!R || !R->res) {
 						RHI_FAIL(Result::InvalidArgument);
 					}
+					// A packed buffer's memory is its heap's, whose priority is the heap's own.
+					if (R->packed)
+						continue;
 					native = R->res.Get(); // ID3D12Resource* -> ID3D12Pageable*
 				} break;
 
@@ -9373,8 +9568,8 @@ namespace rhi {
 		}
 		// A vertex or index buffer view of size 0 covers the rest of the buffer from its offset, as on Vulkan (VK_WHOLE_SIZE). D3D12 reads
 		// a view of size 0 as empty: every index fetched is 0 (each triangle degenerate, nothing rasterized).
-		static UINT Dx12WholeViewBytes(ID3D12Resource& a_buffer, uint64_t a_offset) noexcept {
-			const uint64_t width = a_buffer.GetDesc().Width;
+		static UINT Dx12WholeViewBytes(const Dx12Resource& a_buffer, uint64_t a_offset) noexcept {
+			const uint64_t width = a_buffer.packed ? a_buffer.buf.size : a_buffer.res->GetDesc().Width;
 			return a_offset < width ? static_cast<UINT>((std::min<uint64_t>)(width - a_offset, UINT32_MAX)) : 0u;
 		}
 		static void cl_setVB(CommandList* cl, uint32_t startSlot, uint32_t numViews, VertexBufferView* pBufferViews) noexcept {
@@ -9383,8 +9578,8 @@ namespace rhi {
 			auto* dev = l->dev;
 			for (uint32_t i = 0; i < numViews; ++i) {
 				if (auto* B = dev->resources.get(pBufferViews[i].buffer)) {
-					views[i].BufferLocation = B->res->GetGPUVirtualAddress() + pBufferViews[i].offset;
-					views[i].SizeInBytes = pBufferViews[i].sizeBytes ? pBufferViews[i].sizeBytes : Dx12WholeViewBytes(*B->res.Get(), pBufferViews[i].offset);
+					views[i].BufferLocation = B->BufferAddress() + pBufferViews[i].offset;
+					views[i].SizeInBytes = pBufferViews[i].sizeBytes ? pBufferViews[i].sizeBytes : Dx12WholeViewBytes(*B, pBufferViews[i].offset);
 					views[i].StrideInBytes = pBufferViews[i].stride;
 				}
 			}
@@ -9395,8 +9590,8 @@ namespace rhi {
 			auto* dev = l->dev;
 			if (auto* B = dev->resources.get(view.buffer)) {
 				D3D12_INDEX_BUFFER_VIEW ibv{};
-				ibv.BufferLocation = B->res->GetGPUVirtualAddress() + view.offset;
-				ibv.SizeInBytes = view.sizeBytes ? view.sizeBytes : Dx12WholeViewBytes(*B->res.Get(), view.offset);
+				ibv.BufferLocation = B->BufferAddress() + view.offset;
+				ibv.SizeInBytes = view.sizeBytes ? view.sizeBytes : Dx12WholeViewBytes(*B, view.offset);
 				ibv.Format = ToDxgi(view.format);
 				l->cl->IASetIndexBuffer(&ibv);
 			}
@@ -9618,7 +9813,7 @@ namespace rhi {
 				return;
 			}
 
-			list->cl->ExecuteIndirect(signature, 1, argumentBuffer->res.Get(), desc.dispatchRaysDescBuffer.offset, nullptr, 0);
+			list->cl->ExecuteIndirect(signature, 1, argumentBuffer->res.Get(), argumentBuffer->BufferOffset() + desc.dispatchRaysDescBuffer.offset, nullptr, 0);
 		}
 
 		static D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE Dx12BufferAddressAndStride(Dx12Device* impl, GpuBufferStridedRange range) noexcept {
@@ -9752,15 +9947,19 @@ namespace rhi {
 			}
 
 			ID3D12Resource* cntRes = nullptr;
+			uint64_t cntBase = 0;
 			if (cntBufH.valid()) {
 				auto* c = dev->resources.get(cntBufH);
-				if (c && c->res) cntRes = c->res.Get();
+				if (c && c->res) {
+					cntRes = c->res.Get();
+					cntBase = c->BufferOffset();
+				}
 				// The count is a 32-bit value at cntOff, on 4 bytes, inside the buffer; anything else fails the list at Close.
 				if (c && c->res && (c->kind != Dx12ResourceKind::Buffer || cntOff % 4 != 0 || cntOff > c->buf.size || c->buf.size - cntOff < 4)) {
 					static std::atomic<uint32_t> reports{ 0 };
 					if (Dx12ReportSkipped(reports))
 						spdlog::error("DX12 ExecuteIndirect skipped: the count buffer '{}' ({} bytes) cannot hold a count at offset {}; list '{}', label '{}'",
-							Dx12ObjectName(c->res.Get()), c->kind == Dx12ResourceKind::Buffer ? c->buf.size : 0, cntOff, l->debugName, Dx12OpenLabel(*l));
+							Dx12BufferName(*c), c->kind == Dx12ResourceKind::Buffer ? c->buf.size : 0, cntOff, l->debugName, Dx12OpenLabel(*l));
 					return;
 				}
 			}
@@ -9787,8 +9986,8 @@ namespace rhi {
 			l->cl->ExecuteIndirect(
 				S->sig.Get(),
 				maxCount,
-				argB->res.Get(), argOff,
-				cntRes, cntOff);
+				argB->res.Get(), argB->BufferOffset() + argOff,
+				cntRes, cntBase + cntOff);
 			// A signature that sets root constants leaves the root arguments undefined after the call (the D3D12 spec): the 32-bit
 			// constants pushed under the layout are set again, so the next draw reads what was pushed, not what the last command set.
 			if (S->setsRootConstants) {
@@ -10027,6 +10226,11 @@ namespace rhi {
 				bb.pResource = B->res.Get();
 				bb.Offset = br.offset;
 				bb.Size = br.size;
+				// A packed buffer's barrier covers its heap's shared buffer: D3D12 takes only whole buffers.
+				if (B->packed) {
+					bb.Offset = 0;
+					bb.Size = UINT64_MAX;
+				}
 				// A buffer made without unordered access cannot name it in a barrier (E_INVALIDARG at Close; the debug layer's id
 				// 1332). The graph names a buffer's uses whatever its flags, so the bit is dropped and the first such buffer logged.
 				if (!(bufferDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
@@ -10211,7 +10415,7 @@ namespace rhi {
 			if (Dx12ReportSkipped(reports))
 				spdlog::warn("DX12 {}: footprint offset {} row pitch {} ({}) in buffer '{}' ({} bytes); D3D12 may fail the list '{}' at Close; label '{}'", a_kind,
 					a_copy.footprint.offset, a_copy.footprint.rowPitch, outside ? "starts past the buffer" : "not aligned to 512 / 256 bytes",
-					Dx12ObjectName(a_buffer.res.Get()), a_buffer.kind == Dx12ResourceKind::Buffer ? a_buffer.buf.size : 0, a_list.debugName, Dx12OpenLabel(a_list));
+					Dx12BufferName(a_buffer), a_buffer.kind == Dx12ResourceKind::Buffer ? a_buffer.buf.size : 0, a_list.debugName, Dx12OpenLabel(a_list));
 		}
 
 		static void cl_copyTextureToBuffer(rhi::CommandList* cl, const rhi::BufferTextureCopyFootprint& r) noexcept {
@@ -10238,7 +10442,7 @@ namespace rhi {
 			UINT subresource = 0;
 			DXGI_FORMAT format = T->fmt;
 			DxBufferCopyLocation(*impl, *T, r, subresource, format);
-			dst.PlacedFootprint.Offset = r.footprint.offset;
+			dst.PlacedFootprint.Offset = B->BufferOffset() + r.footprint.offset;
 			dst.PlacedFootprint.Footprint.Format = format;
 			dst.PlacedFootprint.Footprint.Width = r.footprint.width;
 			dst.PlacedFootprint.Footprint.Height = r.footprint.height;
@@ -10287,7 +10491,7 @@ namespace rhi {
 			UINT subresource = 0;
 			DXGI_FORMAT format = T->fmt;
 			DxBufferCopyLocation(*impl, *T, r, subresource, format);
-			src.PlacedFootprint.Offset = r.footprint.offset;
+			src.PlacedFootprint.Offset = B->BufferOffset() + r.footprint.offset;
 			src.PlacedFootprint.Footprint.Format = format;
 			src.PlacedFootprint.Footprint.Width = r.footprint.width;
 			src.PlacedFootprint.Footprint.Height = r.footprint.height;
@@ -10400,7 +10604,7 @@ namespace rhi {
 				static std::atomic<uint32_t> reports{ 0 };
 				if (Dx12ReportSkipped(reports))
 					spdlog::error("DX12 CopyBufferRegion skipped: {} bytes from '{}' ({} bytes) at {} into '{}' ({} bytes) at {} leave a buffer; list '{}', label '{}'",
-						numBytes, Dx12ObjectName(S->res.Get()), S->buf.size, srcOffset, Dx12ObjectName(D->res.Get()), D->buf.size, dstOffset, rec->debugName,
+						numBytes, Dx12BufferName(*S), S->buf.size, srcOffset, Dx12BufferName(*D), D->buf.size, dstOffset, rec->debugName,
 						Dx12OpenLabel(*rec));
 				return;
 			}
@@ -10408,9 +10612,22 @@ namespace rhi {
 			// Required states (caller's responsibility via barriers):
 			//   src:  COPY_SOURCE   (ResourceAccessType::CopySource / Layout::CopySource)
 			//   dst:  COPY_DEST     (ResourceAccessType::CopyDest   / Layout::CopyDest)
+			// D3D12 copies only between two resources. Two packed buffers of one heap share one, so the source is read through the
+			// heap's second shared buffer, which aliases the first.
+			ID3D12Resource* source = S->res.Get();
+			if (S->packed && D->res.Get() == source) {
+				source = Dx12HeapSpanAlias(dev, *S);
+				if (!source) {
+					static std::atomic<uint32_t> reports{ 0 };
+					if (Dx12ReportSkipped(reports))
+						spdlog::error("DX12 CopyBufferRegion skipped: '{}' and '{}' share a heap with no alias buffer; list '{}', label '{}'", Dx12BufferName(*S),
+							Dx12BufferName(*D), rec->debugName, Dx12OpenLabel(*rec));
+					return;
+				}
+			}
 			rec->cl->CopyBufferRegion(
-				D->res.Get(), dstOffset,
-				S->res.Get(), srcOffset,
+				D->res.Get(), D->BufferOffset() + dstOffset,
+				source, S->BufferOffset() + srcOffset,
 				numBytes);
 		}
 
@@ -10583,12 +10800,12 @@ namespace rhi {
 				static std::atomic<uint32_t> reports{ 0 };
 				if (Dx12ReportSkipped(reports))
 					spdlog::error("DX12 ResolveQueryData skipped: queries {}..{} of a heap of {} into '{}' ({} bytes) at {}; list '{}', label '{}'", firstQuery,
-						uint64_t(firstQuery) + queryCount, P->count, Dx12ObjectName(B->res.Get()), B->kind == Dx12ResourceKind::Buffer ? B->buf.size : 0, dstOffset,
+						uint64_t(firstQuery) + queryCount, P->count, Dx12BufferName(*B), B->kind == Dx12ResourceKind::Buffer ? B->buf.size : 0, dstOffset,
 						rec->debugName, Dx12OpenLabel(*rec));
 				return;
 			}
 			Dx12NoteCommand(rec, "ResolveQueryData(first, count, dstOffset)", firstQuery, queryCount, dstOffset);
-			rec->cl->ResolveQueryData(P->heap.Get(), type, firstQuery, queryCount, B->res.Get(), dstOffset);
+			rec->cl->ResolveQueryData(P->heap.Get(), type, firstQuery, queryCount, B->res.Get(), B->BufferOffset() + dstOffset);
 		}
 
 		static void cl_resetQueries(CommandList* /*cl*/, QueryPoolHandle /*pool*/, uint32_t /*first*/, uint32_t /*count*/) noexcept {
@@ -10716,7 +10933,7 @@ namespace rhi {
 			desc.WorkGraph.NodeLocalRootArgumentsTable = D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE(0); // TODO?
 			desc.WorkGraph.ProgramIdentifier = wg->programIdentifier;
 			D3D12_GPU_VIRTUAL_ADDRESS_RANGE bgMemRange{};
-			bgMemRange.StartAddress = backingMem->res->GetGPUVirtualAddress();
+			bgMemRange.StartAddress = backingMem->BufferAddress();
 			bgMemRange.SizeInBytes = wg->memoryRequirements.MaxSizeInBytes;
 			desc.WorkGraph.BackingMemory = bgMemRange;
 			l->cl->SetProgram(&desc);
@@ -10741,7 +10958,7 @@ namespace rhi {
 				return;
 			} break;
 			case WorkGraphDispatchMode::NodeGpuInput: {
-				d.NodeGPUInput = l->dev->resources.get(desc.nodeGpuInput.inputBuffer)->res->GetGPUVirtualAddress() + desc.nodeGpuInput.inputAddressOffset;
+				d.NodeGPUInput = l->dev->resources.get(desc.nodeGpuInput.inputBuffer)->BufferAddress() + desc.nodeGpuInput.inputAddressOffset;
 				l->cl->DispatchGraph(&d);
 				return;
 			} break;
@@ -10754,7 +10971,7 @@ namespace rhi {
 				return;
 			} break;
 			case WorkGraphDispatchMode::MultiNodeGpuInput: {
-				d.MultiNodeGPUInput = l->dev->resources.get(desc.multiNodeGpuInput.inputBuffer)->res->GetGPUVirtualAddress() + desc.multiNodeGpuInput.inputAddressOffset;
+				d.MultiNodeGPUInput = l->dev->resources.get(desc.multiNodeGpuInput.inputBuffer)->BufferAddress() + desc.multiNodeGpuInput.inputAddressOffset;
 				l->cl->DispatchGraph(&d);
 			} break;
 			default:
@@ -11155,18 +11372,28 @@ namespace rhi {
 				return;
 			}
 
+			// A packed buffer in a host-visible heap is its start in the heap's lasting mapping (Dx12HeapSpanBuffer).
+			const uint64_t base = B->BufferOffset();
+			if (B->packed && B->span && B->span->mapped) {
+				*data = B->span->mapped + size_t(base + offset);
+				return;
+			}
 			D3D12_RANGE readRange{};
 			D3D12_RANGE* pRange = nullptr;
 			if (size != ~0ull) {
-				readRange.Begin = SIZE_T(offset);
-				readRange.End = SIZE_T(offset + size);
+				readRange.Begin = SIZE_T(base + offset);
+				readRange.End = SIZE_T(base + offset + size);
+				pRange = &readRange;
+			} else if (B->packed) {
+				readRange.Begin = SIZE_T(base);
+				readRange.End = SIZE_T(base + B->buf.size);
 				pRange = &readRange;
 			}
 
 			void* ptr = nullptr;
 			HRESULT hr = B->res->Map(0, pRange, &ptr);
 			if (SUCCEEDED(hr)) {
-				*data = static_cast<uint8_t*>(ptr) + size_t(offset);
+				*data = static_cast<uint8_t*>(ptr) + size_t(base + offset);
 			}
 			else {
 				*data = nullptr;
@@ -11179,12 +11406,19 @@ namespace rhi {
 				BreakIfDebugging();
 				return;
 			}
+			// A packed buffer's heap stays mapped: nothing to unmap.
+			if (B->packed && B->span && B->span->mapped)
+				return;
+			const uint64_t base = B->BufferOffset();
 			D3D12_RANGE range{};
 			if (writeSize != ~0ull) {
-				range.Begin = SIZE_T(writeOffset);
-				range.End = SIZE_T(writeOffset + writeSize);
+				range.Begin = SIZE_T(base + writeOffset);
+				range.End = SIZE_T(base + writeOffset + writeSize);
+			} else if (B->packed) {
+				range.Begin = SIZE_T(base);
+				range.End = SIZE_T(base + B->buf.size);
 			}
-			B->res->Unmap(0, (writeSize != ~0ull) ? &range : nullptr);
+			B->res->Unmap(0, (writeSize != ~0ull || B->packed) ? &range : nullptr);
 		}
 
 		static void buf_setName(Resource* r, const char* n) noexcept {
@@ -11195,6 +11429,10 @@ namespace rhi {
 			auto* B = dx12_detail::Res(r);
 			if (!B || !B->res) {
 				BreakIfDebugging();
+				return;
+			}
+			if (B->packed) {
+				B->name = n;
 				return;
 			}
 			B->res->SetName(s2ws(n).c_str());
@@ -12687,6 +12925,8 @@ namespace rhi {
 			auto* impl = static_cast<Dx12Device*>(device.impl);
 			auto* native = impl->resources.get(resource.GetHandle());
 			if (!native || !native->res) return Result::InvalidArgument;
+			// A packed buffer has no resource of its own to share (shared buffers are never packed).
+			if (native->packed) return Result::InvalidArgument;
 			HANDLE handle = nullptr;
 			const HRESULT hr = impl->pNativeDevice->CreateSharedHandle(native->res.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
 			if (FAILED(hr)) return ToRHI(hr);

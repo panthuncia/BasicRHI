@@ -225,12 +225,29 @@ namespace rhi {
 #endif
 #if BASICRHI_ENABLE_D3D12
         if (!IsDx12Resource(h)) return false;
+        if (iid == RHI_IID_D3D12_BUFFER_RANGE) {
+            if (outSize < sizeof(D3D12BufferRangeInfo)) return false;
+            Dx12Resource* rec = dx12_detail::Res(&h);
+            if (!rec || !rec->res || rec->kind != Dx12ResourceKind::Buffer) return false;
+            auto* out = reinterpret_cast<D3D12BufferRangeInfo*>(outStruct);
+            out->resource = rec->res.Get();
+            out->offset = rec->BufferOffset();
+            out->size = rec->buf.size;
+            out->version = 1;
+            return true;
+        }
         if (iid != RHI_IID_D3D12_RESOURCE) return false;
         if (outSize < sizeof(D3D12ResourceInfo)) return false;
 		// Cast to Dx12Buffer or Dx12Texture based on h.IsTexture()
 		Dx12Resource* resRec = nullptr;
         resRec = dx12_detail::Res(&h);
         if (!resRec || !resRec->res) {
+            return false;
+        }
+        // A packed buffer is a range of a shared resource, which is not its own to hand out.
+        if (resRec->packed) {
+            spdlog::error("D3D12 QueryNativeResource: buffer '{}' is packed and has no resource of its own; ask for RHI_IID_D3D12_BUFFER_RANGE",
+                resRec->name);
             return false;
         }
         auto* out = reinterpret_cast<D3D12ResourceInfo*>(outStruct);

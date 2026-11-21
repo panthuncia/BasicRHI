@@ -84,6 +84,14 @@ namespace rhi::dx12 {
 		if (!QueryNativeResource(h, RHI_IID_D3D12_RESOURCE, &info, sizeof(info))) return nullptr;
 		return static_cast<ID3D12Resource*>(info.resource);
 	}
+	/** @brief A buffer's resource and the byte offset where the buffer starts in it (a packed buffer shares its resource). */
+	inline ID3D12Resource* get_buffer_range(rhi::Resource h, uint64_t& offset) {
+		D3D12BufferRangeInfo info{};
+		offset = 0;
+		if (!QueryNativeResource(h, RHI_IID_D3D12_BUFFER_RANGE, &info, sizeof(info))) return nullptr;
+		offset = info.offset;
+		return static_cast<ID3D12Resource*>(info.resource);
+	}
     inline ID3D12Heap* get_heap(rhi::Heap h) {
         D3D12HeapInfo info{};
 		if (!QueryNativeHeap(h, RHI_IID_D3D12_HEAP, &info, sizeof(info))) return nullptr;
