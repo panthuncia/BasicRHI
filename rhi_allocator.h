@@ -380,9 +380,15 @@ namespace rhi::ma
     {
         Copy = 0,
         Ignore = 1,
-        Destroy = 2
+        Destroy = 2,
+        /** Like Copy, but EndPass does not free the old memory. The source allocation names the new resource and range
+        afterwards. The old resource and range come back in DefragmentationPassMoveInfo::pRetained, and stay allocated
+        until the caller drops them. Use it when the GPU may still read the old resource. */
+        CopyRetain = 3
     };
 
+    /** heapsFreed and bytesFreed count only the blocks EndPass frees itself. A block emptied by CopyRetain is freed
+    later, when its last retained allocation goes, and is not counted here. */
     struct DefragmentationStats
     {
         uint64_t bytesMoved = 0;
@@ -495,6 +501,14 @@ namespace rhi::ma
         void SetPrivateData(void* p) noexcept { m_privateData = p; }
         void* GetPrivateData() const noexcept { return m_privateData; };
 
+        /** Typed access to the private data, for an owner record the caller keeps there.
+        A defragmentation move keeps the source allocation's record. */
+        template<class T> void SetOwnerRecord(T* record) noexcept { m_privateData = record; }
+        template<class T> T* GetOwnerRecord() const noexcept { return static_cast<T*>(m_privateData); }
+
+        /// True for an allocation a CopyRetain move handed back. The defragmenter never moves it again.
+        bool IsDefragmentationRetained() const noexcept { return m_defragRetained; }
+
         void SetName(const char* n) noexcept;
         const char* GetName() const noexcept { return m_name; }
 
@@ -581,6 +595,8 @@ namespace rhi::ma
         // The owner's report row; null for allocations not made through Allocator::CreateResource or AllocateMemory.
         OwnerMemoryReport* m_owner = nullptr;
         AllocationPlacement m_placement{};
+        // Set when a CopyRetain move hands this allocation back: it holds an old range until the caller frees it.
+        bool m_defragRetained = false;
 
         Allocation(AllocatorPimpl* allocator, UINT64 size, UINT64 alignment);
         virtual ~Allocation();
@@ -595,6 +611,8 @@ namespace rhi::ma
         void FreeName();
         D3D12MA_CLASS_NO_COPY(Allocation)
     };
+
+    using AllocationPtr = Unique<Allocation, detail::Releaser<Allocation>>;
 
     /// Single move of an allocation to be done for defragmentation.
     struct DefragmentationMove
@@ -611,6 +629,9 @@ namespace rhi::ma
 
         \warning Do not store this allocation in your data structures! It exists only temporarily, for the duration of the defragmentation pass,
         to be used for storing newly created resource. DefragmentationContext::EndPass() will destroy it and make `pSrcAllocation` point to this memory.
+
+        With DefragmentationMoveOperation::CopyRetain, EndPass makes `pSrcAllocation` point to this memory and hands this
+        object back in DefragmentationPassMoveInfo::pRetained, now naming the old resource and range.
         */
         Allocation* pDstTmpAllocation;
     };
@@ -643,8 +664,19 @@ namespace rhi::ma
         Alternatively, if you decide you want to completely remove the allocation,
         set DEFRAGMENTATION_MOVE::Operation to D3D12MA::DEFRAGMENTATION_MOVE_OPERATION_DESTROY.
         Then, after DefragmentationContext::EndPass() the allocation will be released.
+
+        With DefragmentationMoveOperation::CopyRetain, step 4 is not needed before EndPass. The copy only has to be
+        submitted before the GPU next reads the source allocation's resource.
         */
         DefragmentationMove* pMoves;
+        /** rief Caller-owned array of at least `moveCount` elements, set before DefragmentationContext::EndPass().
+
+        Needed when any move uses DefragmentationMoveOperation::CopyRetain; EndPass fails with InvalidArgument and
+        changes nothing otherwise. For a CopyRetain move at index i, EndPass stores the old resource and range in
+        element i. Other elements are left as they are. Dropping an element frees its range, and its block when the
+        block is empty then, by the block vector's usual empty-block rule. BeginPass does not touch it.
+        */
+        AllocationPtr* pRetained = nullptr;
     };
 
     class Pool
@@ -715,7 +747,6 @@ namespace rhi::ma
         bool isTightAlignmentSupported = false;
     };
 
-    using AllocationPtr = Unique<Allocation, detail::Releaser<Allocation>>;
 
     class Allocator
     {
@@ -779,7 +810,6 @@ namespace rhi::ma
         D3D12MA_CLASS_NO_COPY(Allocator)
     };
 
-    using AllocationPtr = Unique<Allocation, detail::Releaser<Allocation>>;
 	
 	// ---------------- Creation entry points ----------------
 

@@ -5797,6 +5797,11 @@ Synchronized internally with a mutex.
         void* m_AlgorithmState = NULL;
 
         static MoveAllocationData GetMoveData(AllocHandle handle, BlockMetadata* metadata);
+        // False for a destination this context made and for an old range a CopyRetain move handed back.
+        bool IsMoveSource(const Allocation* allocation) const
+        {
+            return allocation->GetPrivateData() != this && !allocation->IsDefragmentationRetained();
+        }
         CounterStatus CheckCounters(UINT64 bytes);
         bool IncrementCounters(UINT64 bytes);
         bool ReallocWithinBlock(BlockVector& vector, NormalBlock* block);
@@ -8572,6 +8577,18 @@ Synchronized internally with a mutex.
     {
         D3D12MA_ASSERT(moveInfo.moveCount > 0 ? moveInfo.pMoves != NULL : true);
 
+        // CopyRetain hands old ranges back through pRetained. Check before changing anything.
+        if (!moveInfo.pRetained)
+        {
+            for (uint32_t i = 0; i < moveInfo.moveCount; ++i)
+            {
+                if (moveInfo.pMoves[i].operation == DefragmentationMoveOperation::CopyRetain)
+                {
+                    return Result::InvalidArgument;
+                }
+            }
+        }
+
         Result result = Result::Ok;
         Vector<FragmentedBlock> immovableBlocks(m_Moves.GetAllocs());
 
@@ -8612,6 +8629,21 @@ Synchronized internally with a mutex.
                     MutexLockRead lock(vector->GetMutex(), vector->m_hAllocator->UseMutex());
                     currentCount = vector->GetBlockCount();
                 }
+
+                result = Result::False;
+                break;
+            }
+            case DefragmentationMoveOperation::CopyRetain:
+            {
+                // The swap gives the source the new range and resource. The temporary allocation keeps the old ones
+                // and stays allocated in its block, so the block cannot be freed or the range reused until the caller
+                // drops it. No block is freed here, so the pass stats count none.
+                move.pSrcAllocation->SwapBlockAllocation(move.pDstTmpAllocation);
+                Allocation* const retained = move.pDstTmpAllocation;
+                // BeginPass stored the vector index here. The caller gets a clean allocation.
+                retained->SetPrivateData(nullptr);
+                retained->m_defragRetained = true;
+                moveInfo.pRetained[i] = AllocationPtr(retained);
 
                 result = Result::False;
                 break;
@@ -8774,8 +8806,8 @@ Synchronized internally with a mutex.
             handle = metadata->GetNextAllocation(handle))
         {
             MoveAllocationData moveData = GetMoveData(handle, metadata);
-            // Ignore newly created allocations by defragmentation algorithm
-            if (moveData.move.pSrcAllocation->GetPrivateData() == this)
+            // Skip allocations this pass made, and old ranges CopyRetain handed back.
+            if (!IsMoveSource(moveData.move.pSrcAllocation))
                 continue;
             switch (CheckCounters(moveData.move.pSrcAllocation->GetSize()))
             {
@@ -8860,8 +8892,8 @@ Synchronized internally with a mutex.
                 handle = metadata->GetNextAllocation(handle))
             {
                 MoveAllocationData moveData = GetMoveData(handle, metadata);
-                // Ignore newly created allocations by defragmentation algorithm
-                if (moveData.move.pSrcAllocation->GetPrivateData() == this)
+                // Skip allocations this pass made, and old ranges CopyRetain handed back.
+                if (!IsMoveSource(moveData.move.pSrcAllocation))
                     continue;
                 switch (CheckCounters(moveData.move.pSrcAllocation->GetSize()))
                 {
@@ -8907,8 +8939,8 @@ Synchronized internally with a mutex.
                 handle = metadata->GetNextAllocation(handle))
             {
                 MoveAllocationData moveData = GetMoveData(handle, metadata);
-                // Ignore newly created allocations by defragmentation algorithm
-                if (moveData.move.pSrcAllocation->GetPrivateData() == this)
+                // Skip allocations this pass made, and old ranges CopyRetain handed back.
+                if (!IsMoveSource(moveData.move.pSrcAllocation))
                     continue;
                 switch (CheckCounters(moveData.move.pSrcAllocation->GetSize()))
                 {
@@ -8992,8 +9024,8 @@ Synchronized internally with a mutex.
                 handle = metadata->GetNextAllocation(handle))
             {
                 MoveAllocationData moveData = GetMoveData(handle, metadata);
-                // Ignore newly created allocations by defragmentation algorithm
-                if (moveData.move.pSrcAllocation->GetPrivateData() == this)
+                // Skip allocations this pass made, and old ranges CopyRetain handed back.
+                if (!IsMoveSource(moveData.move.pSrcAllocation))
                     continue;
                 switch (CheckCounters(moveData.move.pSrcAllocation->GetSize()))
                 {
