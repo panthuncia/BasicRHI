@@ -1928,14 +1928,19 @@ namespace rhi {
 			return text;
 		}
 		// One line of live memory by site and kind. BASICRHI_MEMORY_DUMP=<file>: also every live allocation, largest first.
+		// A "{n}" in the path is replaced by the report's number, so each report keeps its own files.
 		static void VkLogLiveMemory(VulkanDevice* impl) noexcept {
 			static const char* const names[kAllocSites] = { "root-constant pages", "preprocess pages", "descriptor heaps", "buffers", "textures", "heaps", "imports", "other" };
 			static const char* const kinds[3] = { "device-local", "ReBAR", "system" };
-			static const std::string dumpPath = [] {
+			static const std::string dumpPattern = [] {
 				char value[512]{};
 				const DWORD n = GetEnvironmentVariableA("BASICRHI_MEMORY_DUMP", value, sizeof(value));
 				return n > 0 && n < sizeof(value) ? std::string(value) : std::string();
 			}();
+			static uint32_t reportNumber = 0;
+			std::string dumpPath = dumpPattern;
+			if (const size_t at = dumpPath.find("{n}"); at != std::string::npos) dumpPath.replace(at, 3, std::format("{:03}", reportNumber));
+			++reportNumber;
 			std::string text;
 			std::vector<VkLiveMemory> all;
 			{
