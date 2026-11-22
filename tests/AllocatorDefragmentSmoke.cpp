@@ -3,6 +3,8 @@
 // survivors into one block. The moved buffers keep their owner records and contents. The old buffers come back as
 // retained allocations and stay readable. The emptied blocks are freed only once the retained allocations are dropped,
 // and then by the block vector's usual rule (it may keep one empty block).
+// Each live buffer also has a buffer view ref. Every move hands the ref to the new buffer (Device::RetargetBufferViewRef),
+// so the slot stays the same and the old buffer's destruction frees nothing.
 #include "rhi.h"
 #include "rhi_allocator.h"
 #include "rhi_helpers.h"
@@ -187,6 +189,26 @@ namespace {
 		}
 		if (!Expect(live.size() == 4 && BlockCount(pool) == kBlockCount, "four buffers left over three blocks")) return false;
 
+		// A view ref per live buffer, by seed. A device without view refs gives {0, 0} and skips those checks.
+		std::vector<rhi::BufferViewRef> refs(kBufferCount);
+		bool withRefs = true;
+		for (const auto& buffer : live) {
+			const rhi::ResourceHandle handle = buffer->GetResource().GetHandle();
+			const rhi::BufferViewRef ref = device.GetBufferViewRef({ handle, 0 });
+			withRefs = withRefs && ref && device.HasBufferViewRef(handle);
+			refs[buffer->GetOwnerRecord<OwnerRecord>()->seed] = ref;
+		}
+		if (!withRefs) std::printf("  no buffer view refs on this device; retarget checks skipped\n");
+		if (withRefs) {
+			// A buffer that already has a pair takes no other.
+			const rhi::ResourceHandle a = live[0]->GetResource().GetHandle();
+			const rhi::ResourceHandle b = live[1]->GetResource().GetHandle();
+			if (!Expect(device.RetargetBufferViewRef(a, b) == rhi::Result::InvalidArgument && device.HasBufferViewRef(a) && device.HasBufferViewRef(b),
+					"a retarget onto a buffer with a pair is refused and changes nothing")) {
+				return false;
+			}
+		}
+
 		// Full passes with CopyRetain until nothing moves.
 		rhi::ma::DefragmentationDesc defragDesc{};
 		defragDesc.flags = rhi::ma::DefragmentationFlagsAlgorithmFull;
@@ -244,6 +266,14 @@ namespace {
 			info.pRetained = passRetained.data();
 			context->EndPass(&info);
 
+			for (uint32_t i = 0; ok && withRefs && i < moveCount; ++i) {
+				const rhi::ResourceHandle from = passRetained[i]->GetResource().GetHandle();
+				const rhi::ResourceHandle to = sources[i]->GetResource().GetHandle();
+				ok = Check(device.RetargetBufferViewRef(from, to), "RetargetBufferViewRef") &&
+					Expect(!device.HasBufferViewRef(from) && device.HasBufferViewRef(to), "the pair moves to the new buffer") &&
+					Expect(device.GetBufferViewRef({ to, 0 }) == refs[pending[i].seed], "the moved buffer keeps its view ref slot") &&
+					Expect(device.RetargetBufferViewRef(from, to) == rhi::Result::Ok, "a retarget from a buffer without a pair does nothing");
+			}
 			for (uint32_t i = 0; ok && i < moveCount; ++i) {
 				const AllocationPtr& old = passRetained[i];
 				ok = Expect(old && old->IsDefragmentationRetained() && old->GetPrivateData() == nullptr, "a CopyRetain move hands its old range back") &&
@@ -285,6 +315,13 @@ namespace {
 
 		// Dropping the retained allocations frees the emptied blocks. The vector may keep one empty block.
 		retained.clear();
+		for (const auto& buffer : live) {
+			const rhi::ResourceHandle handle = buffer->GetResource().GetHandle();
+			if (withRefs && !Expect(device.HasBufferViewRef(handle) && device.GetBufferViewRef({ handle, 0 }) == refs[buffer->GetOwnerRecord<OwnerRecord>()->seed],
+					"the old buffers' destruction leaves the moved buffers' view refs")) {
+				return false;
+			}
+		}
 		const uint32_t afterRetained = BlockCount(pool);
 		std::printf("  blocks: %u while retained, %u after release\n", kBlockCount, afterRetained);
 		if (!Expect(afterRetained < kBlockCount && afterRetained >= 1 && afterRetained <= 2, "the emptied blocks go with the retained allocations") ||

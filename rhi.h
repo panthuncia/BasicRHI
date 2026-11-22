@@ -3578,6 +3578,9 @@ namespace rhi {
 		Result(*queryFormatSupport)(const Device*, Format, FormatSupport&) noexcept = nullptr;
 		// abi_version 17: a swapchain from a SwapchainDesc.
 		Result(*createSwapchainFromDesc)(Device*, const SwapchainDesc&, SwapchainPtr&) noexcept = nullptr;
+		// abi_version 18: a buffer view ref pair handed from one buffer to another (a moved buffer keeps its slot).
+		Result(*retargetBufferViewRef)(Device*, ResourceHandle from, ResourceHandle to) noexcept = nullptr;
+		bool(*hasBufferViewRef)(Device*, ResourceHandle) noexcept = nullptr;
 	};
 
 
@@ -3739,6 +3742,24 @@ namespace rhi {
 		// freed with the buffer. {0, 0} when the buffer has none (no reserved region, the region full, a readback buffer, an offset
 		// past 4 GiB).
 		BufferViewRef GetBufferViewRef(GpuBufferAddress address) noexcept { return vt->getBufferViewRef ? vt->getBufferViewRef(this, address) : BufferViewRef{}; }
+		/**
+		 * @brief Gives `from`'s buffer view ref pair to `to`, for a buffer moved to new memory.
+		 *
+		 * The slot stays the same, so refs already handed out keep working. The pair's descriptors are written again for `to`
+		 * wherever they live. Afterwards `from` has no pair, and destroying it frees none.
+		 *
+		 * The caller guarantees that no GPU work reads the slot while this runs (an idle GPU): the descriptors change in place.
+		 *
+		 * @return Ok when the pair moved or `from` had none (nothing to do). InvalidArgument when `to` is not a live buffer, has
+		 * no device address (Vulkan), or already has a pair. Unsupported when the backend has no view refs.
+		 */
+		Result RetargetBufferViewRef(ResourceHandle from, ResourceHandle to) noexcept {
+			return vt->abi_version >= 18 && vt->retargetBufferViewRef ? vt->retargetBufferViewRef(this, from, to) : Result::Unsupported;
+		}
+		/** @brief True when the buffer has a view ref pair (GetBufferViewRef made one and it was not retargeted away). */
+		bool HasBufferViewRef(ResourceHandle buffer) noexcept {
+			return vt->abi_version >= 18 && vt->hasBufferViewRef ? vt->hasBufferViewRef(this, buffer) : false;
+		}
 		Result GetRayTracingShaderGroupHandles(PipelineHandle p, uint32_t firstGroup, uint32_t groupCount, void* outData, uint32_t outDataBytes) noexcept { return vt->getRayTracingShaderGroupHandles(this, p, firstGroup, groupCount, outData, outDataBytes); }
 		Result SetRayTracingPipelineStackSize(PipelineHandle p, uint64_t stackSizeBytes) noexcept { return vt->setRayTracingPipelineStackSize(this, p, stackSizeBytes); }
 		Result GetRayTracingAccelerationStructureOperationPrebuildInfo(const RayTracingRtasOperationInputs& inputs, RayTracingRtasPrebuildInfo& out) noexcept { return vt->getRayTracingAccelerationStructureOperationPrebuildInfo ? vt->getRayTracingAccelerationStructureOperationPrebuildInfo(this, inputs, &out) : Result::Unsupported; }

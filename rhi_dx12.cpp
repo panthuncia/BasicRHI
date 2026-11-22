@@ -3632,30 +3632,50 @@ namespace rhi {
 			}
 		}
 
+		static uint64_t Dx12ViewRefKey(ResourceHandle handle) noexcept {
+			return (uint64_t(handle.generation) << 32) | handle.index;
+		}
+
+		/** @brief What a buffer's pair describes. */
+		struct Dx12ViewRefSource {
+			ID3D12Resource* resource = nullptr;
+			uint64_t width = 0;
+			uint64_t start = 0;
+			bool unordered = false;
+		};
+
+		/** @brief The views a buffer's pair holds. False for a buffer that gets no pair: not a live buffer, a readback buffer, empty. */
+		static bool Dx12ViewRefSourceOf(Dx12Device* impl, ResourceHandle handle, Dx12ViewRefSource& out) noexcept {
+			Dx12Resource* resource = impl->resources.get(handle);
+			if (!resource || !resource->res || resource->kind != Dx12ResourceKind::Buffer)
+				return false;
+			D3D12_HEAP_PROPERTIES heapProperties{};
+			D3D12_HEAP_FLAGS heapFlags{};
+			if (SUCCEEDED(resource->res->GetHeapProperties(&heapProperties, &heapFlags)) && heapProperties.Type == D3D12_HEAP_TYPE_READBACK)
+				return false;
+			const D3D12_RESOURCE_DESC desc = resource->res->GetDesc();
+			out.resource = resource->res.Get();
+			out.width = resource->packed ? resource->buf.size : desc.Width;
+			out.start = resource->BufferOffset();
+			out.unordered = ((resource->packed ? resource->packedFlags : desc.Flags) & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+			return out.width != 0;
+		}
+
 		/** @brief A buffer's pair, made the first time it is asked for. Readback buffers have no shader views and get none. */
 		static BufferViewRef Dx12ViewRef(Dx12Device* impl, GpuBufferAddress address) noexcept {
 			if (!impl || !impl->viewRefs.ready || !address.buffer.valid() || address.offset > UINT32_MAX)
 				return {};
 			auto& r = impl->viewRefs;
-			const uint64_t key = (uint64_t(address.buffer.generation) << 32) | address.buffer.index;
+			const uint64_t key = Dx12ViewRefKey(address.buffer);
 			const auto refAt = [&](uint32_t pair) { return BufferViewRef{ r.firstSlot + 2 * pair, static_cast<uint32_t>(address.offset) }; };
 			{
 				std::shared_lock read(r.lock);
 				if (const auto found = r.pairByResource.find(key); found != r.pairByResource.end())
 					return refAt(found->second);
 			}
-			Dx12Resource* resource = impl->resources.get(address.buffer);
-			if (!resource || !resource->res || resource->kind != Dx12ResourceKind::Buffer)
+			Dx12ViewRefSource source{};
+			if (!Dx12ViewRefSourceOf(impl, address.buffer, source))
 				return {};
-			D3D12_HEAP_PROPERTIES heapProperties{};
-			D3D12_HEAP_FLAGS heapFlags{};
-			if (SUCCEEDED(resource->res->GetHeapProperties(&heapProperties, &heapFlags)) && heapProperties.Type == D3D12_HEAP_TYPE_READBACK)
-				return {};
-			const D3D12_RESOURCE_DESC desc = resource->res->GetDesc();
-			const uint64_t width = resource->packed ? resource->buf.size : desc.Width;
-			if (width == 0)
-				return {};
-			const bool unordered = ((resource->packed ? resource->packedFlags : desc.Flags) & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
 
 			std::unique_lock write(r.lock);
 			if (const auto found = r.pairByResource.find(key); found != r.pairByResource.end())
@@ -3673,11 +3693,56 @@ namespace rhi {
 				}
 				return {};
 			}
-			Dx12RawBufferViews(impl, resource->res.Get(), width, unordered, Dx12ViewRefStaging(r, 2 * pair), Dx12ViewRefStaging(r, 2 * pair + 1),
-				resource->BufferOffset());
+			Dx12RawBufferViews(impl, source.resource, source.width, source.unordered, Dx12ViewRefStaging(r, 2 * pair),
+				Dx12ViewRefStaging(r, 2 * pair + 1), source.start);
 			Dx12PublishViewRefPair(impl, pair);
 			r.pairByResource.emplace(key, pair);
 			return refAt(pair);
+		}
+
+		/**
+		 * @brief Gives `from`'s pair to `to`. The views are written for `to` in staging and copied into every full-size heap, and the
+		 * key moves. The caller guarantees no GPU work reads the pair meanwhile.
+		 */
+		static Result Dx12RetargetViewRef(Dx12Device* impl, ResourceHandle from, ResourceHandle to) noexcept {
+			if (!impl || !impl->viewRefs.ready)
+				return Result::Unsupported;
+			if (!from.valid() || !to.valid())
+				return Result::InvalidArgument;
+			auto& r = impl->viewRefs;
+			const uint64_t fromKey = Dx12ViewRefKey(from);
+			const uint64_t toKey = Dx12ViewRefKey(to);
+			if (fromKey == toKey)
+				return Result::Ok;
+			Dx12ViewRefSource source{};
+			const bool sourced = Dx12ViewRefSourceOf(impl, to, source);
+			std::unique_lock write(r.lock);
+			const auto found = r.pairByResource.find(fromKey);
+			if (found == r.pairByResource.end())
+				return Result::Ok;
+			if (!sourced) {
+				spdlog::error("DX12 buffer view refs: retarget to a buffer that cannot have views; pair {} stays with the old buffer", found->second);
+				return Result::InvalidArgument;
+			}
+			if (r.pairByResource.contains(toKey)) {
+				spdlog::error("DX12 buffer view refs: retarget to a buffer that already has a pair; pair {} stays with the old buffer", found->second);
+				return Result::InvalidArgument;
+			}
+			const uint32_t pair = found->second;
+			r.pairByResource.erase(found);
+			Dx12RawBufferViews(impl, source.resource, source.width, source.unordered, Dx12ViewRefStaging(r, 2 * pair),
+				Dx12ViewRefStaging(r, 2 * pair + 1), source.start);
+			Dx12PublishViewRefPair(impl, pair);
+			r.pairByResource.emplace(toKey, pair);
+			return Result::Ok;
+		}
+
+		static bool Dx12HasViewRef(Dx12Device* impl, ResourceHandle handle) noexcept {
+			if (!impl || !impl->viewRefs.ready || !handle.valid())
+				return false;
+			auto& r = impl->viewRefs;
+			std::shared_lock read(r.lock);
+			return r.pairByResource.contains(Dx12ViewRefKey(handle));
 		}
 
 		/** @brief A destroyed buffer's pair goes back, null again. The deferred destruction has waited for the frames that read it. */
@@ -5589,6 +5654,14 @@ namespace rhi {
 
 		static BufferViewRef d_getBufferViewRef(Device* d, GpuBufferAddress address) noexcept {
 			return Dx12ViewRef(static_cast<Dx12Device*>(d ? d->impl : nullptr), address);
+		}
+
+		static Result d_retargetBufferViewRef(Device* d, ResourceHandle from, ResourceHandle to) noexcept {
+			return Dx12RetargetViewRef(static_cast<Dx12Device*>(d ? d->impl : nullptr), from, to);
+		}
+
+		static bool d_hasBufferViewRef(Device* d, ResourceHandle handle) noexcept {
+			return Dx12HasViewRef(static_cast<Dx12Device*>(d ? d->impl : nullptr), handle);
 		}
 
 		static Result d_getRayTracingAccelerationStructureOperationPrebuildInfo(Device* d, const RayTracingRtasOperationInputs& inputs, RayTracingRtasPrebuildInfo* out) noexcept {
@@ -12379,7 +12452,7 @@ namespace rhi {
 		&d_destroyIndirectPipelineSet,
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
-		17u,
+		18u,
 		&d_createCompletionWait,
 		&d_createCommandAllocatorForQueue,
 		&d_createSecondaryCommandList,
@@ -12387,7 +12460,9 @@ namespace rhi {
 		&d_savePipelineCache,
 		&d_getPipelineCacheStats,
 		&d_queryFormatSupport,
-		&d_createSwapchainFromDesc
+		&d_createSwapchainFromDesc,
+		&d_retargetBufferViewRef,
+		&d_hasBufferViewRef
 	};
 
 	const QueueVTable g_qvt = {

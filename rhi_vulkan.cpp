@@ -2539,6 +2539,53 @@ namespace rhi {
 			r.freePairs.push_back(pair);
 		}
 
+		// Gives `from`'s pair to `to`: both descriptors are written over `to`'s address range in staging and copied into every
+		// full-capacity heap, and the key moves. The caller guarantees no GPU work reads the pair meanwhile.
+		static Result VkRetargetViewRef(VulkanDevice* impl, ResourceHandle from, ResourceHandle to) noexcept {
+			if (!impl || !impl->viewRefs.ready)
+				return Result::Unsupported;
+			if (!from.valid() || !to.valid())
+				return Result::InvalidArgument;
+			auto& r = impl->viewRefs;
+			const uint64_t fromKey = (uint64_t(from.generation) << 32) | from.index;
+			const uint64_t toKey = (uint64_t(to.generation) << 32) | to.index;
+			if (fromKey == toKey)
+				return Result::Ok;
+			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
+			std::unique_lock write(r.lock);
+			const auto found = r.pairByResource.find(fromKey);
+			if (found == r.pairByResource.end())
+				return Result::Ok;
+			const VulkanResource* resource = VkResourceState(impl, to);
+			if (!resource || resource->type != ResourceType::Buffer || resource->deviceAddress == 0 || resource->bufferSize == 0) {
+				spdlog::error("Vulkan buffer view refs: retarget to a buffer without a device address; pair {} stays with the old buffer", found->second);
+				return Result::InvalidArgument;
+			}
+			if (r.pairByResource.find(toKey) != r.pairByResource.end()) {
+				spdlog::error("Vulkan buffer view refs: retarget to a buffer that already has a pair; pair {} stays with the old buffer", found->second);
+				return Result::InvalidArgument;
+			}
+			const uint32_t pair = found->second;
+			r.pairByResource.erase(found);
+			const VkDeviceSize maxRange = impl->physicalDeviceProperties.limits.maxStorageBufferRange;
+			const VkDeviceSize range = (std::min)(static_cast<VkDeviceSize>(resource->bufferSize), maxRange);
+			std::byte* srv = r.staging.data() + static_cast<size_t>(2 * pair * r.stride);
+			VkWriteViewRefDescriptor(impl, srv, resource->deviceAddress, range);
+			std::memcpy(srv + r.stride, srv, static_cast<size_t>(r.stride));
+			VkPublishViewRefPair(impl, pair);
+			r.pairByResource.emplace(toKey, pair);
+			r.pairs[pair] = { resource->deviceAddress, range, toKey, true };
+			return Result::Ok;
+		}
+
+		static bool VkHasViewRef(VulkanDevice* impl, ResourceHandle handle) noexcept {
+			if (!impl || !impl->viewRefs.ready || !handle.valid())
+				return false;
+			auto& r = impl->viewRefs;
+			std::shared_lock read(r.lock);
+			return r.pairByResource.find((uint64_t(handle.generation) << 32) | handle.index) != r.pairByResource.end();
+		}
+
 		static bool VkIsSpirvBytecode(const ShaderBinary& bytecode) noexcept {
 			static constexpr uint32_t kSpirvMagic = 0x07230203u;
 			if (!bytecode.data || bytecode.size < sizeof(uint32_t) || (bytecode.size % sizeof(uint32_t)) != 0) {
@@ -14446,6 +14493,14 @@ namespace rhi {
 			return VkViewRef(device ? static_cast<VulkanDevice*>(device->impl) : nullptr, address);
 		}
 
+		static Result d_retargetBufferViewRef(Device* device, ResourceHandle from, ResourceHandle to) noexcept {
+			return VkRetargetViewRef(device ? static_cast<VulkanDevice*>(device->impl) : nullptr, from, to);
+		}
+
+		static bool d_hasBufferViewRef(Device* device, ResourceHandle handle) noexcept {
+			return VkHasViewRef(device ? static_cast<VulkanDevice*>(device->impl) : nullptr, handle);
+		}
+
 		static Result d_getRayTracingAccelerationStructureOperationPrebuildInfo(Device* device, const RayTracingRtasOperationInputs& inputs, RayTracingRtasPrebuildInfo* out) noexcept {
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || !out) {
@@ -15108,7 +15163,7 @@ namespace rhi {
 		&d_destroyIndirectPipelineSet,
 		&d_setNameIndirectPipelineSet,
 		&d_destroyDevice,
-		17u,
+		18u,
 		&d_createCompletionWait,
 		&d_createCommandAllocatorForQueue,
 		&d_createSecondaryCommandList,
@@ -15116,7 +15171,9 @@ namespace rhi {
 		&d_savePipelineCache,
 		&d_getPipelineCacheStats,
 		&d_queryFormatSupport,
-		&d_createSwapchainFromDesc
+		&d_createSwapchainFromDesc,
+		&d_retargetBufferViewRef,
+		&d_hasBufferViewRef
 	};
 
 	const QueueVTable g_vkqvt = {
