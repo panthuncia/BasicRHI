@@ -270,6 +270,13 @@ namespace rhi {
 		uint64_t descriptorBaseOffset = 0;
 		VkBufferUsageFlags descriptorBufferUsage = 0;
 		std::vector<std::byte> hostDescriptors;
+		// Descriptor-sets model: a shader-visible heap's update-after-bind set and the pool it came from, the elements each of its
+		// bindings has, and for a resource heap the kind each element's descriptor was last written as
+		// (VulkanDescriptorSetsModel::Kind), so that a change of kind nulls the old binding's element.
+		VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+		VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+		uint32_t setElements = 0;
+		std::vector<uint8_t> setKinds;
 		std::vector<VulkanImageViewSlot> imageViewSlots;
 		// A full-capacity shader-visible resource heap's buffer view ref slots, past `capacity` (VulkanDevice::ViewRefRegion).
 		uint32_t viewRefSlots = 0;
@@ -610,6 +617,21 @@ namespace rhi {
 		None,              // neither: pipelines and pipeline layouts are unsupported
 		DescriptorHeap,    // VK_EXT_descriptor_heap: heaps are bound as they are, shaders keep DXC's bindings (set/binding mappings)
 		DescriptorBuffer,  // VK_EXT_descriptor_buffer + VK_EXT_mutable_descriptor_type: one universal pipeline layout, shaders lowered
+		DescriptorSets,    // update-after-bind descriptor sets, one binding per descriptor kind: the same universal layout shape, shaders
+		                   // lowered per type (devices without mutable descriptors)
+	};
+
+	// The descriptor-sets model's device state (VulkanBindingModel::DescriptorSets). It shares VulkanDescriptorBufferModel's
+	// universal-layout state (push constants, the sampler set, static samplers, the sampler cache, the pipeline layout); this is
+	// what differs. Set 0 has one update-after-bind binding per descriptor kind, each resourceCapacity elements long and indexed by
+	// the heap slot. A slot's descriptor sits in its kind's binding only.
+	struct VulkanDescriptorSetsModel {
+		// The kinds of set 0's bindings, in binding order. A heap's per-slot kind byte holds one of these, or kNoKind.
+		enum Kind : uint8_t { SampledImage, StorageImage, UniformTexelBuffer, StorageTexelBuffer, StorageBuffer, AccelerationStructure, KindCount };
+		static constexpr uint8_t kNoKind = 0xFF;
+		static constexpr uint32_t kBinding[KindCount] = { 0, 1, 2, 3, 4, 5 };
+		// Binding 5 exists only when acceleration structures are enabled.
+		bool accelerationStructures = false;
 	};
 
 	// The descriptor-buffer model's device state (VulkanBindingModel::DescriptorBuffer), set up once the VkDevice exists.
@@ -779,6 +801,7 @@ namespace rhi {
 		uint32_t shaderVisibleResourceCapacity = 0;
 		uint32_t shaderVisibleSamplerCapacity = 0;
 		VulkanDescriptorBufferModel descriptorBuffer;
+		VulkanDescriptorSetsModel descriptorSets;
 		// Buffer view refs (rhi_shader_abi.h, BUFFER_VIEW_REF_*): BUFFER_VIEW_REF_SLOTS slots past shaderVisibleResourceCapacity in
 		// every shader-visible resource heap of that capacity. A pair is two storage buffer descriptors over the buffer's address
 		// range, written once into `staging` and copied into each heap. Heaps and staging under descriptorViewsMutex; the map
@@ -818,6 +841,9 @@ namespace rhi {
 			uint64_t next = 0;
 		} retiredBuffers;
 		bool nullDescriptorEnabled = false;  // VK_EXT_robustness2 nullDescriptor: views with no resource
+		// Every feature the descriptor-sets model needs: update-after-bind and non-uniform indexing for each kind, partially bound,
+		// update unused while pending, null descriptors, buffer device address, runtime arrays and scalar block layout.
+		bool descriptorSetsFeaturesEnabled = false;
 		bool descriptorHeapCaptureReplayEnabled = false;
 		bool meshShaderEnabled = false;
 		bool taskShaderEnabled = false;

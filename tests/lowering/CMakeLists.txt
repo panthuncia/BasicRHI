@@ -36,6 +36,8 @@ _basicrhi_lowering_fixture(spill cs_6_6)
 _basicrhi_lowering_fixture(indirect ps_6_6)
 _basicrhi_lowering_fixture(heap_slots cs_6_6)
 _basicrhi_lowering_fixture(combined_sampler ps_6_6)
+# Heap-indexed constant buffers (cbvAsStorageBuffer).
+_basicrhi_lowering_fixture(cbv_heap cs_6_6)
 # A library with two entry points (-E is ignored for lib targets).
 _basicrhi_lowering_fixture(two_entries lib_6_6)
 # NonSemantic.Shader.DebugInfo.100 debug info referencing the resource variables.

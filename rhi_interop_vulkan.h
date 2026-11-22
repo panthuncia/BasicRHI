@@ -99,11 +99,13 @@ namespace rhi::vulkan {
     };
 
     // The binding models BasicRHI's Vulkan backend can run on. The model is fixed for a device: an adopted device uses the one
-    // whose features the host enabled (descriptorHeap; or descriptorBuffer + mutableDescriptorType), and a host that records
-    // BasicRHI work into its own command buffers must use the same model itself.
+    // whose features the host enabled (descriptorHeap; or descriptorBuffer + mutableDescriptorType; or every update-after-bind
+    // feature the descriptor-sets model needs), and a host that records BasicRHI work into its own command buffers must use the
+    // same model itself.
     enum BindingModelBits : uint32_t {
         BindingModel_DescriptorHeap = 1u << 0,    // VK_EXT_descriptor_heap
         BindingModel_DescriptorBuffer = 1u << 1,  // VK_EXT_descriptor_buffer + VK_EXT_mutable_descriptor_type, shaders lowered
+        BindingModel_DescriptorSets = 1u << 2,    // update-after-bind descriptor sets, one binding per kind, shaders lowered per type
     };
 
     // What the client will create on the device, for the descriptor-buffer model's limit checks.
@@ -123,6 +125,7 @@ namespace rhi::vulkan {
         // The capacities each supported model would set the device up with (0 for an unsupported model).
         uint32_t heapModelResources = 0, heapModelSamplers = 0;
         uint32_t bufferModelResources = 0, bufferModelSamplers = 0;
+        uint32_t setsModelResources = 0, setsModelSamplers = 0;
         // One line per check, required against the device's value, for the log.
         std::vector<std::string> checks;
     };

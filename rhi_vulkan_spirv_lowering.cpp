@@ -16,6 +16,12 @@
 //     BufferIndirectAddress's read from the record once per function, in its entry block, as HeapIndirect's index is); access chains
 //     and loads are retyped through a worklist and every load carries Aligned (see Walk).
 // Address arithmetic stays 32-bit (uvec2 + OpIAddCarry), so no Int64 capability is needed.
+//
+// Two target options change the heap bindings (LoweringTarget):
+//   perType: each heap resource goes to its kind's binding (kindBindings) instead of the one mutable binding. Typed buffers
+//     (image Dim Buffer) are texel buffers; the counter heap's buffers are storage buffers. Samplers keep their own binding.
+//   cbvAsStorageBuffer: a heap ConstantBuffer (Heap or HeapIndirect) becomes a NonWritable StorageBuffer variable before the
+//     rewrite, its access chains and loads retyped. The block type and its layout decorations stay as they are.
 
 #include <algorithm>
 #include <cstring>
@@ -245,6 +251,7 @@ namespace rhi::vulkan_binding {
 			uint32_t pushVar = 0;
 			bool usesPhysicalPointers = false;
 			bool usesHeapAliases = false;
+			bool usesStorageBufferCbvs = false;
 
 			// Type and constant caches (the type manager is not used: the pass adds raw types it would not know).
 			uint32_t uintType = 0, uvec2Type = 0, carryType = 0;
@@ -723,6 +730,71 @@ namespace rhi::vulkan_binding {
 				}
 			}
 
+			// The per-type binding kind of a resource (not a sampler) Classify has classified.
+			LoweringTarget::Kind KindOf(const Resource& a_resource) const {
+				using Kind = LoweringTarget::Kind;
+				switch (a_resource.kind) {
+				case VK_SPIRV_RESOURCE_TYPE_SAMPLED_IMAGE_BIT_EXT:
+				case VK_SPIRV_RESOURCE_TYPE_READ_ONLY_IMAGE_BIT_EXT:
+				case VK_SPIRV_RESOURCE_TYPE_READ_WRITE_IMAGE_BIT_EXT: {
+					// Typed buffers are texel buffers: Sampled 2 a storage texel buffer, else a uniform texel buffer.
+					const Instruction* image = Def(a_resource.element);
+					const bool storage = InOp(image, 5) == 2;
+					if (spv::Dim(InOp(image, 1)) == spv::Dim::Buffer) {
+						return storage ? Kind::StorageTexelBuffer : Kind::UniformTexelBuffer;
+					}
+					return storage ? Kind::StorageImage : Kind::SampledImage;
+				}
+				case VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT:
+					return Kind::UniformBuffer;
+				case VK_SPIRV_RESOURCE_TYPE_READ_ONLY_STORAGE_BUFFER_BIT_EXT:
+				case VK_SPIRV_RESOURCE_TYPE_READ_WRITE_STORAGE_BUFFER_BIT_EXT:
+					return Kind::StorageBuffer;
+				case VK_SPIRV_RESOURCE_TYPE_ACCELERATION_STRUCTURE_BIT_EXT:
+					return Kind::AccelerationStructure;
+				default:
+					Fail(a_resource.description, ": no per-type heap binding for this kind");
+				}
+			}
+
+			// The resource heap binding a heap resource lowers onto: the mutable binding, or its kind's binding with perType.
+			uint32_t ResourceBindingOf(const Resource& a_resource) const {
+				return target.perType ? target.kindBindings[uint32_t(KindOf(a_resource))] : target.resourceBinding;
+			}
+
+			// cbvAsStorageBuffer: a heap ConstantBuffer becomes a read-only storage buffer. The variable moves to the StorageBuffer
+			// storage class with NonWritable, and its access chains and loads are retyped. The Block type keeps its Offset,
+			// ArrayStride, MatrixStride and RowMajor decorations: dx-layout offsets are valid storage-buffer offsets under scalar
+			// block layout.
+			void ConvertToStorageBuffer(Resource& a_resource) {
+				Instruction* var = a_resource.var;
+				const uint32_t id = var->result_id();
+				const uint32_t pointer = Pointer(a_resource.pointee, spv::StorageClass::StorageBuffer);
+				// The pointer type must come before the variable. A type Pointer() adds goes at the end of the globals.
+				Instruction* pointerType = Def(pointer);
+				for (Instruction* next = var->NextNode(); next; next = next->NextNode()) {
+					if (next == pointerType) {
+						pointerType->InsertBefore(var);
+						break;
+					}
+				}
+				var->SetInOperand(0, { uint32_t(spv::StorageClass::StorageBuffer) });
+				var->SetResultType(pointer);
+				Update(var);
+				a_resource.storage = spv::StorageClass::StorageBuffer;
+				if (!Decoration(id, spv::Decoration::NonWritable)) {
+					Decorate(id, spv::Decoration::NonWritable);
+				}
+				FollowPointer(a_resource, var, a_resource.pointee, Walk{}, Retarget{ .storage = spv::StorageClass::StorageBuffer });
+				a_resource.kind = Classify(a_resource);
+				if (a_resource.kind != VK_SPIRV_RESOURCE_TYPE_READ_ONLY_STORAGE_BUFFER_BIT_EXT) {
+					Fail(a_resource.description, ": did not become a read-only storage buffer (internal error)");
+				}
+				a_resource.description = Cat("'", NameOf(id), "' (set ", a_resource.set, ", binding ", a_resource.binding, ", ", KindName(a_resource.kind),
+					", was a uniform buffer)");
+				usesStorageBufferCbvs = true;
+			}
+
 			void CollectResources() {
 				std::vector<Instruction*> variables;
 				for (Instruction& inst : get_module()->types_values()) {
@@ -811,6 +883,12 @@ namespace rhi::vulkan_binding {
 						if (resource.mapping->staticSampler >= target.staticSamplerElements.size()) {
 							Fail(resource.description, ": static sampler ", resource.mapping->staticSampler, " has no sampler heap element (LoweringTarget::staticSamplerElements has ",
 								target.staticSamplerElements.size(), ")");
+						}
+						break;
+					case BindingSource::Heap:
+					case BindingSource::HeapIndirect:
+						if (target.cbvAsStorageBuffer && resource.kind == VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT) {
+							ConvertToStorageBuffer(resource);
 						}
 						break;
 					default:
@@ -1145,11 +1223,11 @@ namespace rhi::vulkan_binding {
 				a_resource.keep = true;
 			}
 
-			// The typed alias of a heap binding for a descriptor type: a runtime array variable at the heap binding, with the variable's
-			// own decorations (NonWritable, Coherent, ...) other than its set and binding.
+			// The typed alias of a heap binding for a descriptor type: a runtime array variable at the heap binding (the resource's kind
+			// binding with perType), with the variable's own decorations (NonWritable, Coherent, ...) other than its set and binding.
 			uint32_t HeapAlias(const Resource& a_resource, bool a_sampler) {
 				const uint32_t set = a_sampler ? target.samplerSet : target.resourceSet;
-				const uint32_t binding = a_sampler ? target.samplerBinding : target.resourceBinding;
+				const uint32_t binding = a_sampler ? target.samplerBinding : ResourceBindingOf(a_resource);
 				std::vector<uint32_t> key{ a_resource.element, uint32_t(a_resource.storage), set, binding };
 				std::vector<Instruction*> decorations;
 				for (Instruction& annotation : get_module()->annotations()) {
@@ -1487,7 +1565,7 @@ namespace rhi::vulkan_binding {
 					const uint32_t element = mapping.source == BindingSource::Heap ? mapping.heapElement + a_resource.index
 					                                                               : target.staticSamplerElements[mapping.staticSampler] + a_resource.index;
 					if (element == 0) {
-						Redecorate(a_resource, sampler ? target.samplerSet : target.resourceSet, sampler ? target.samplerBinding : target.resourceBinding);
+						Redecorate(a_resource, sampler ? target.samplerSet : target.resourceSet, sampler ? target.samplerBinding : ResourceBindingOf(a_resource));
 					}
 					else {
 						RewriteDescriptor(a_resource);
@@ -1531,6 +1609,16 @@ namespace rhi::vulkan_binding {
 					}
 					context()->AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
 					get_module()->GetMemoryModel()->SetInOperand(0, { uint32_t(spv::AddressingModel::PhysicalStorageBuffer64) });
+				}
+				if (usesStorageBufferCbvs && get_module()->version() < 0x00010300u) {
+					// The StorageBuffer storage class is core in SPIR-V 1.3; older modules need the extension.
+					bool declared = false;
+					for (Instruction& extension : get_module()->extensions()) {
+						declared = declared || extension.GetInOperand(0).AsString() == "SPV_KHR_storage_buffer_storage_class";
+					}
+					if (!declared) {
+						context()->AddExtension("SPV_KHR_storage_buffer_storage_class");
+					}
 				}
 				if (usesHeapAliases) {
 					context()->AddCapability(spv::Capability::RuntimeDescriptorArray);

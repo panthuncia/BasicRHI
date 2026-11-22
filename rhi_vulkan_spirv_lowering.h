@@ -39,6 +39,17 @@ namespace rhi::vulkan_binding {
 		uint32_t spillAlignment = 16;
 		// Sampler heap element of each layout static sampler's first element (BindingMapping::staticSampler indexes this).
 		std::span<const uint32_t> staticSamplerElements;
+		// The heap's descriptor kinds, for the per-type layout (perType).
+		enum class Kind : uint32_t { SampledImage, StorageImage, UniformTexelBuffer, StorageTexelBuffer, StorageBuffer, UniformBuffer, AccelerationStructure, Count };
+		// False: every heap resource lowers onto resourceBinding, one binding of mutable descriptors. True: for models without
+		// mutable descriptors, each kind has a binding of its own in resourceSet (kindBindings), all indexed by the same heap slot,
+		// so a resource's slot holds it in its kind's binding only. Typed buffers (Buffer<T>, RWBuffer<T>) are texel buffers.
+		bool perType = false;
+		uint32_t kindBindings[static_cast<uint32_t>(Kind::Count)] = { 0, 1, 2, 3, 4, 5, 6 };
+		// Heap-indexed ConstantBuffers become read-only storage buffers (StorageBuffer storage class, NonWritable, the same
+		// offsets and strides), for a heap whose model has no uniform buffers: the per-type layout, or a device whose uniform
+		// buffer limits are below the heap's capacity. Register-bound cbuffers keep their push or device-address paths.
+		bool cbvAsStorageBuffer = false;
 	};
 
 	// Lowers one stage's module. False (and a message in a_error) when the module cannot be lowered: a binding the plan does not

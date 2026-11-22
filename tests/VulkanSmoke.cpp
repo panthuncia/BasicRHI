@@ -242,10 +242,16 @@ namespace {
 	// used by the cases whose expectations differ between the models.
 	uint32_t g_bindingModel = 0;
 
+	// The lowered models share one universal pipeline layout and the push data rules (pushed prefix, spill).
+	bool UniversalLayoutModel(uint32_t model) {
+		return model == rhi::vulkan::BindingModel_DescriptorBuffer || model == rhi::vulkan::BindingModel_DescriptorSets;
+	}
+
 	const char* BindingModelName(uint32_t model) {
 		switch (model) {
 		case rhi::vulkan::BindingModel_DescriptorHeap: return "descriptor heap";
 		case rhi::vulkan::BindingModel_DescriptorBuffer: return "descriptor buffer";
+		case rhi::vulkan::BindingModel_DescriptorSets: return "descriptor sets";
 		default: return "unknown model";
 		}
 	}
@@ -953,7 +959,7 @@ namespace {
 			constexpr uint32_t kPassWords = 32;  // 128 B
 			const uint32_t model = g_bindingModel;
 			std::printf("BasicRHIVulkanSmoke [%s]: constantArgumentBytes = %u\n", BindingModelName(model), indirect.constantArgumentBytes);
-			if (model == rhi::vulkan::BindingModel_DescriptorBuffer &&
+			if (UniversalLayoutModel(model) &&
 				(indirect.constantArgumentBytes < kDrawWords * 4u || indirect.constantArgumentBytes > 128u)) {
 				std::fprintf(stderr, "[%s] DGC push spill: constantArgumentBytes = %u, expected %u..128 (the pushed prefix of the 128 B budget)\n",
 					BindingModelName(model), indirect.constantArgumentBytes, kDrawWords * 4u);
@@ -1030,7 +1036,7 @@ namespace {
 			intoPassDesc.args = { intoPassArgs, 3 };
 			rhi::CommandSignaturePtr intoPassSignature;
 			const rhi::Result intoPassResult = device.CreateCommandSignature(intoPassDesc, spillLayout->GetHandle(), intoPassSignature);
-			const bool expectRefusal = model == rhi::vulkan::BindingModel_DescriptorBuffer;
+			const bool expectRefusal = UniversalLayoutModel(model);
 			if ((intoPassResult == rhi::Result::Ok) == expectRefusal) {
 				std::fprintf(stderr, "[%s] DGC push spill: a Constant argument at byte %u of a 224 B layout (constantArgumentBytes %u) returned result %u, expected %s\n",
 					BindingModelName(model), (kDrawWords + kPassWords - 1) * 4u, indirect.constantArgumentBytes, static_cast<unsigned>(intoPassResult),
@@ -3036,11 +3042,13 @@ namespace {
 		}
 		const rhi::vulkan::BindingRequirements requirements{};
 		auto print = [&](const char* label, const rhi::vulkan::BindingModelReport& report) {
-			std::printf("BasicRHIVulkanSmoke [%s]: EvaluateBindingModels (%s): heap %s, descriptor buffer %s\n", model, label,
+			std::printf("BasicRHIVulkanSmoke [%s]: EvaluateBindingModels (%s): heap %s, descriptor buffer %s, descriptor sets %s\n", model, label,
 				(report.supportedModels & rhi::vulkan::BindingModel_DescriptorHeap) != 0 ? "supported" : "unsupported",
-				(report.supportedModels & rhi::vulkan::BindingModel_DescriptorBuffer) != 0 ? "supported" : "unsupported");
-			std::printf("    capacities: heap model %u resources / %u samplers, descriptor-buffer model %u resources / %u samplers\n",
-				report.heapModelResources, report.heapModelSamplers, report.bufferModelResources, report.bufferModelSamplers);
+				(report.supportedModels & rhi::vulkan::BindingModel_DescriptorBuffer) != 0 ? "supported" : "unsupported",
+				(report.supportedModels & rhi::vulkan::BindingModel_DescriptorSets) != 0 ? "supported" : "unsupported");
+			std::printf("    capacities: heap model %u resources / %u samplers, descriptor-buffer model %u resources / %u samplers, "
+				"descriptor-sets model %u resources / %u samplers\n", report.heapModelResources, report.heapModelSamplers, report.bufferModelResources,
+				report.bufferModelSamplers, report.setsModelResources, report.setsModelSamplers);
 			for (const std::string& line : report.checks) {
 				std::printf("    %s\n", line.c_str());
 			}
@@ -3084,14 +3092,18 @@ namespace {
 			return report;
 		};
 		auto ownModelResources = [&](const rhi::vulkan::BindingModelReport& report) {
-			return g_bindingModel == rhi::vulkan::BindingModel_DescriptorBuffer ? report.bufferModelResources : report.heapModelResources;
+			return g_bindingModel == rhi::vulkan::BindingModel_DescriptorBuffer ? report.bufferModelResources
+				: g_bindingModel == rhi::vulkan::BindingModel_DescriptorSets ? report.setsModelResources : report.heapModelResources;
 		};
 		{
 			constexpr uint32_t kSmaller = 500000;
+			// The descriptor-sets model has five bindings of every slot: with every count at n, the per-stage resource limit holds n / 5
+			// slots, which it rounds down to a power of two (65536 here).
+			const uint32_t expected = g_bindingModel == rhi::vulkan::BindingModel_DescriptorSets ? 65536u : kSmaller;
 			const rhi::vulkan::BindingModelReport report = evaluateClamped(kSmaller);
-			if ((report.supportedModels & g_bindingModel) == 0 || ownModelResources(report) != kSmaller) {
+			if ((report.supportedModels & g_bindingModel) == 0 || ownModelResources(report) != expected) {
 				std::fprintf(stderr, "[%s] binding model limits: BASICRHI_VK_MAX_DESCRIPTORS=%u gave supported 0x%x with %u resources for the device's model, "
-					"expected supported with %u\n", model, kSmaller, report.supportedModels, ownModelResources(report), kSmaller);
+					"expected supported with %u\n", model, kSmaller, report.supportedModels, ownModelResources(report), expected);
 				return rhi::Result::InvalidArgument;
 			}
 			const std::string capacityText = std::to_string(kSmaller);
@@ -3208,7 +3220,7 @@ int main() {
 	createInfo.backend = rhi::Backend::Vulkan;
 	createInfo.enableDebug = true;
 
-	// BASICRHI_VK_BINDING=heap|buffer forces the binding model of a device BasicRHI creates (the CTest variants): the device
+	// BASICRHI_VK_BINDING=heap|buffer|sets forces the binding model of a device BasicRHI creates (the CTest variants): the device
 	// must come up on exactly that model, or the run fails rather than passing on the other one.
 	bool bindingRequested = false;
 	const std::string requestedBinding = ReadEnvironment("BASICRHI_VK_BINDING", bindingRequested);
@@ -3223,15 +3235,17 @@ int main() {
 
 	g_bindingModel = rhi::vulkan::GetBindingModel(device.Get());
 	std::printf("BasicRHIVulkanSmoke: binding model %s (BASICRHI_VK_BINDING=%s)\n", BindingModelName(g_bindingModel), requestedLabel);
-	if (g_bindingModel != rhi::vulkan::BindingModel_DescriptorHeap && g_bindingModel != rhi::vulkan::BindingModel_DescriptorBuffer) {
+	if (g_bindingModel != rhi::vulkan::BindingModel_DescriptorHeap && g_bindingModel != rhi::vulkan::BindingModel_DescriptorBuffer &&
+		g_bindingModel != rhi::vulkan::BindingModel_DescriptorSets) {
 		std::fprintf(stderr, "BasicRHIVulkanSmoke: GetBindingModel returned 0x%x, expected exactly one binding model\n", g_bindingModel);
 		return 1;
 	}
 	if (bindingRequested) {
 		const uint32_t requestedModel = requestedBinding == "buffer" ? rhi::vulkan::BindingModel_DescriptorBuffer
-			: requestedBinding == "heap" ? rhi::vulkan::BindingModel_DescriptorHeap : 0u;
+			: requestedBinding == "heap" ? rhi::vulkan::BindingModel_DescriptorHeap
+			: requestedBinding == "sets" ? rhi::vulkan::BindingModel_DescriptorSets : 0u;
 		if (requestedModel == 0) {
-			std::fprintf(stderr, "BasicRHIVulkanSmoke: BASICRHI_VK_BINDING=%s is neither heap nor buffer\n", requestedLabel);
+			std::fprintf(stderr, "BasicRHIVulkanSmoke: BASICRHI_VK_BINDING=%s is not heap, buffer or sets\n", requestedLabel);
 			return 1;
 		}
 		if (g_bindingModel != requestedModel) {

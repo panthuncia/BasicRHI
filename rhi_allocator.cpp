@@ -5883,7 +5883,9 @@ Synchronized internally with a mutex.
         //const D3D12_FEATURE_DATA_D3D12_OPTIONS& GetD3D12Options() const { return m_D3D12Options; }
         BOOL IsUMA() const { return m_UMA; }
         BOOL IsCacheCoherentUMA() const { return m_CacheCoherentUMA; }
-        //bool SupportsResourceHeapTier2() const { return m_D3D12Options.ResourceHeapTier >= D3D12_RESOURCE_HEAP_TIER_2; }
+        // Tier 2 heaps can hold any resource. Tier 1 heaps hold one class only: buffers, render-target or depth textures, or
+        // other textures. Vulkan reports unified heaps.
+        bool SupportsResourceHeapTier2() const { return m_UnifiedResourceHeaps; }
         bool IsGPUUploadHeapSupported() const { return m_GPUUploadHeapSupported != FALSE; }
         // Whether the driver packs small committed resources together (D3D12). Where it does not (Vulkan), a committed resource is a
         // device allocation of its own, rounded up to the driver's granularity.
@@ -5915,8 +5917,7 @@ Synchronized internally with a mutex.
         */
         UINT GetDefaultPoolCount() const
         {
-            return 4; // TODO
-	        //return SupportsResourceHeapTier2() ? 4 : 12;
+            return SupportsResourceHeapTier2() ? 4 : 12;
         }
         BlockVector** GetDefaultPools() { return m_BlockVectors; }
 
@@ -6209,7 +6210,7 @@ Synchronized internally with a mutex.
         }
 
         // --- Create default block vectors ---
-        const uint32_t defaultPoolCount = GetDefaultPoolCount(); // update this to use m_UnifiedResourceHeaps
+        const uint32_t defaultPoolCount = GetDefaultPoolCount();
         for (uint32_t i = 0; i < defaultPoolCount; ++i)
         {
             rhi::HeapType heapType{};
@@ -6265,7 +6266,7 @@ Synchronized internally with a mutex.
 
     bool AllocatorPimpl::HeapFlagsFulfillResourceHeapTier(HeapFlags flags) const
     {
-        if (true/*SupportsResourceHeapTier2()*/)
+        if (SupportsResourceHeapTier2())
         {
             return true;
         }
@@ -6565,7 +6566,7 @@ Synchronized internally with a mutex.
         }
 
         // Process default pools. 4 standard heap types only. Add them to outStats.HeapType[i].
-        if (true/*(SupportsResourceHeapTier2()*/) // TODO: How to tell in a cross-API way?
+        if (SupportsResourceHeapTier2())
         {
             // DEFAULT, UPLOAD, READBACK, GPU_UPLOAD.
             for (size_t heapTypeIndex = 0; heapTypeIndex < STANDARD_HEAP_TYPE_COUNT; ++heapTypeIndex)
@@ -7002,7 +7003,7 @@ Synchronized internally with a mutex.
                 json.WriteString("DefaultPools");
                 json.BeginObject();
                 {
-                    if (true/*SupportsResourceHeapTier2()*/) // TODO
+                    if (SupportsResourceHeapTier2())
                     {
                         for (uint8_t heapType = 0; heapType < STANDARD_HEAP_TYPE_COUNT; ++heapType)
                         {
@@ -7334,7 +7335,7 @@ Synchronized internally with a mutex.
         default: D3D12MA_ASSERT(0);
         }
 
-        if (true/*SupportsResourceHeapTier2()*/) // TODO
+        if (SupportsResourceHeapTier2())
             return poolIndex;
         else
         {
@@ -7357,7 +7358,7 @@ Synchronized internally with a mutex.
         outHeapType = HeapType::DeviceLocal;
         outHeapFlags = HeapFlags::None;
 
-		if (!true/*SupportsResourceHeapTier2()*/)// TODO
+		if (!SupportsResourceHeapTier2())
         {
             switch (index % 3)
             {

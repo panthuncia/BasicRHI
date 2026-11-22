@@ -4,13 +4,17 @@
 
 #include "rhi_vulkan_spirv_lowering.h"
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "spirv-tools/libspirv.hpp"
@@ -107,6 +111,47 @@ namespace {
 		return count;
 	}
 
+	// Every descriptor variable's (set, binding), keyed by its descriptor type's name (the variable's pointee without its array).
+	std::map<std::string, std::set<std::pair<uint32_t, uint32_t>>> BindingsByType(const std::string& a_text) {
+		const std::regex pointer(R"(^\s*(%\S+) = OpTypePointer \S+ (%\S+)$)");
+		const std::regex array(R"(^\s*(%\S+) = OpType(?:Runtime)?Array (%\S+))");
+		const std::regex variable(R"(^\s*(%\S+) = OpVariable (%\S+) (UniformConstant|Uniform|StorageBuffer)$)");
+		const std::regex decoration(R"(^\s*OpDecorate (%\S+) (DescriptorSet|Binding) ([0-9]+)$)");
+		std::map<std::string, std::string> pointees, elements, variables;
+		std::map<std::string, uint32_t> sets, bindings;
+		std::istringstream lines(a_text);
+		for (std::string line; std::getline(lines, line);) {
+			if (!line.empty() && line.back() == '\r') {
+				line.pop_back();
+			}
+			std::smatch match;
+			if (std::regex_search(line, match, pointer)) {
+				pointees[match[1]] = match[2];
+			}
+			else if (std::regex_search(line, match, array)) {
+				elements[match[1]] = match[2];
+			}
+			else if (std::regex_search(line, match, variable)) {
+				variables[match[1]] = match[2];
+			}
+			else if (std::regex_search(line, match, decoration)) {
+				(match[2] == "Binding" ? bindings : sets)[match[1]] = uint32_t(std::stoul(match[3]));
+			}
+		}
+		std::map<std::string, std::set<std::pair<uint32_t, uint32_t>>> result;
+		for (const auto& [name, pointerType] : variables) {
+			if (!bindings.count(name)) {
+				continue;
+			}
+			std::string type = pointees[pointerType];
+			if (const auto element = elements.find(type); element != elements.end()) {
+				type = element->second;
+			}
+			result[type.substr(1)].insert({ sets[name], bindings[name] });
+		}
+		return result;
+	}
+
 	struct Checks {
 		std::vector<std::string> failures;
 		void That(bool a_condition, const std::string& a_what) {
@@ -119,6 +164,19 @@ namespace {
 		void Count(const std::string& a_text, const char* a_pattern, size_t a_expected, const char* a_what) {
 			const size_t count = CountLines(a_text, a_pattern);
 			That(count == a_expected, std::string(a_what) + " (found " + std::to_string(count) + ", expected " + std::to_string(a_expected) + ")");
+		}
+		// Every variable of descriptor type a_type is at (a_set, a_binding).
+		void BoundAt(const std::string& a_text, const std::string& a_type, uint32_t a_set, uint32_t a_binding) {
+			const auto all = BindingsByType(a_text);
+			const auto found = all.find(a_type);
+			std::string where;
+			if (found != all.end()) {
+				for (const auto& [set, binding] : found->second) {
+					where += " (" + std::to_string(set) + ", " + std::to_string(binding) + ")";
+				}
+			}
+			That(found != all.end() && found->second == std::set<std::pair<uint32_t, uint32_t>>{ { a_set, a_binding } },
+				a_type + " not only at (" + std::to_string(a_set) + ", " + std::to_string(a_binding) + "); found at" + (where.empty() ? " nothing" : where));
 		}
 	};
 
@@ -133,6 +191,8 @@ namespace {
 		std::function<void(Checks&, const std::string&)> expect;  // successful cases
 		const char* errorContains = nullptr;                       // negative cases: the error must contain this
 	};
+
+	const char* g_dumpDir = nullptr;  // main's --dump
 
 	// Checks every lowered module must pass.
 	void CommonChecks(Checks& a_checks, const std::string& a_text) {
@@ -188,7 +248,43 @@ namespace {
 			std::printf("---- lowered module ----\n%s------------------------\n", text.c_str());
 			return false;
 		}
+		if (g_dumpDir) {
+			std::string file = a_case.name;
+			for (char& ch : file) {
+				ch = std::isalnum(static_cast<unsigned char>(ch)) ? ch : '_';
+			}
+			std::ofstream(std::string(g_dumpDir) + "/" + file + ".spvasm", std::ios::binary) << text;
+		}
 		std::printf("ok   %s (%zu words)\n", a_case.name, lowered.size());
+		return true;
+	}
+
+	// perType with every kind on resourceBinding (cbvAsStorageBuffer off) must lower to the same words as the default target:
+	// the per-type routing only picks bindings.
+	bool RunMutableIdentity(Case& a_case) {
+		std::vector<uint32_t> spirv;
+		if (!LoadFixture(a_case.fixture, spirv)) {
+			std::printf("FAIL %s (mutable identity): fixture %s missing\n", a_case.name, a_case.fixture);
+			return false;
+		}
+		a_case.target.staticSamplerElements = a_case.staticSamplerElements;
+		LoweringTarget perType = a_case.target;
+		perType.perType = true;
+		for (uint32_t& binding : perType.kindBindings) {
+			binding = perType.resourceBinding;
+		}
+		std::vector<uint32_t> expected, lowered;
+		std::string error;
+		if (!LowerForDescriptorBuffer(spirv, a_case.plan, a_case.stage, a_case.target, expected, error, a_case.entryPoint) ||
+			!LowerForDescriptorBuffer(spirv, a_case.plan, a_case.stage, perType, lowered, error, a_case.entryPoint)) {
+			std::printf("FAIL %s (mutable identity): %s\n", a_case.name, error.c_str());
+			return false;
+		}
+		if (lowered != expected) {
+			std::printf("FAIL %s (mutable identity): per-type lowering on one binding differs from the default\n", a_case.name);
+			return false;
+		}
+		std::printf("ok   %s (mutable identity)\n", a_case.name);
 		return true;
 	}
 
@@ -379,6 +475,186 @@ namespace {
 			cases.push_back(std::move(c));
 		}
 
+		// Per-type heaps and constant buffers as storage buffers (LoweringTarget::perType, cbvAsStorageBuffer).
+		const auto perTypeTarget = [](LoweringTarget& a_target) {
+			a_target.perType = true;
+			for (uint32_t k = 0; k < uint32_t(LoweringTarget::Kind::Count); ++k) {
+				a_target.kindBindings[k] = 10 + k;  // 10 sampled image ... 14 storage buffer, 15 uniform buffer, 16 acceleration structure
+			}
+		};
+		{
+			// Every resource type through the ABI heaps onto its kind's binding. Typed buffers are texel buffers; the counter heap's
+			// buffer is a storage buffer.
+			Case c{ .name = "per-type heap resource types", .fixture = "heap_types", .stage = VK_SHADER_STAGE_COMPUTE_BIT };
+			AddAbiHeaps(c.plan);
+			perTypeTarget(c.target);
+			c.expect = [](Checks& a_checks, const std::string& a_text) {
+				a_checks.BoundAt(a_text, "type_2d_image", 0, 10);
+				a_checks.BoundAt(a_text, "type_2d_image_0", 0, 11);         // RWTexture2D
+				a_checks.BoundAt(a_text, "type_buffer_image", 0, 12);       // Buffer<float4>
+				a_checks.BoundAt(a_text, "type_buffer_image_0", 0, 13);     // RWBuffer<float4>
+				a_checks.BoundAt(a_text, "type_ByteAddressBuffer", 0, 14);
+				a_checks.BoundAt(a_text, "type_RWStructuredBuffer_Item", 0, 14);
+				a_checks.BoundAt(a_text, "type_ACSBuffer_counter", 0, 14);  // the counter heap
+				a_checks.BoundAt(a_text, "type_RWByteAddressBuffer", 0, 14);
+				a_checks.BoundAt(a_text, "type_ConstantBuffer_Params", 0, 15);
+				a_checks.BoundAt(a_text, "accelerationStructureNV", 0, 16);
+				a_checks.BoundAt(a_text, "type_sampler", 1, 0);
+				a_checks.Count(a_text, "= OpVariable %\\S+ Uniform$", 1, "uniform variables (the constant buffer)");
+			};
+			cases.push_back(std::move(c));
+		}
+		{
+			// The same with cbvAsStorageBuffer: the ConstantBuffer joins the storage buffers, read-only.
+			Case c{ .name = "per-type heap with constant buffers as storage buffers", .fixture = "heap_types", .stage = VK_SHADER_STAGE_COMPUTE_BIT };
+			AddAbiHeaps(c.plan);
+			perTypeTarget(c.target);
+			c.target.cbvAsStorageBuffer = true;
+			c.expect = [](Checks& a_checks, const std::string& a_text) {
+				a_checks.BoundAt(a_text, "type_ConstantBuffer_Params", 0, 14);
+				a_checks.BoundAt(a_text, "type_buffer_image", 0, 12);
+				a_checks.BoundAt(a_text, "type_buffer_image_0", 0, 13);
+				a_checks.Count(a_text, "= OpVariable %\\S+ Uniform$", 0, "uniform variables");
+				a_checks.HasNo(a_text, "OpTypePointer Uniform ", "Uniform pointers left");
+				a_checks.HasNo(a_text, "Binding 15$", "something on the uniform buffer binding");
+				a_checks.Count(a_text, "OpDecorate %\\S+ NonWritable$", 1, "NonWritable variables (the constant buffer)");
+			};
+			cases.push_back(std::move(c));
+		}
+		{
+			// Heap slot aliases (elements 10 + i and 5) and a re-decorated element 0 on their kinds' bindings; samplers unchanged.
+			Case c{ .name = "per-type heap slots", .fixture = "heap_slots", .stage = VK_SHADER_STAGE_COMPUTE_BIT };
+			AddAbiHeaps(c.plan);
+			c.plan.mappings.push_back(HeapSlot(1, 10, 4));
+			c.plan.mappings.push_back(HeapSlot(3, 0, 1));
+			c.plan.mappings.push_back(HeapSlot(3, 5, 1));
+			c.plan.mappings.push_back(StaticSampler(2, 0, 1, 0));
+			c.plan.mappings.push_back(StaticSampler(2, 1, 2, 1));
+			c.staticSamplerElements = { 2048, 2049 };
+			perTypeTarget(c.target);
+			c.expect = [](Checks& a_checks, const std::string& a_text) {
+				a_checks.BoundAt(a_text, "type_2d_image", 0, 10);
+				a_checks.Has(a_text, "OpDecorate %output Binding 11$", "heap slot 0 (a storage image) not on the storage image binding");
+				a_checks.BoundAt(a_text, "type_RWByteAddressBuffer", 0, 14);
+				a_checks.BoundAt(a_text, "type_sampler", 1, 0);
+				a_checks.Has(a_text, "OpConstant %uint 2048$", "static sampler element 2048 missing");
+			};
+			cases.push_back(std::move(c));
+		}
+		{
+			// IndirectIndex textures: the alias is on the sampled image binding. Register-bound cbuffers on the push and address
+			// paths are unchanged by cbvAsStorageBuffer.
+			Case c{ .name = "per-type indirect bindings", .fixture = "indirect", .stage = VK_SHADER_STAGE_FRAGMENT_BIT };
+			AddAbiHeaps(c.plan);
+			c.plan.mappings.push_back(IndirectIndex(1, 0, 3, 0, 0, false));
+			c.plan.mappings.push_back(IndirectIndex(2, 0, 2, 0, 16, true));
+			c.plan.mappings.push_back(IndirectAddress(0, 1, 2, 0, 32));
+			c.plan.mappings.push_back(PushAddress(0, 3, 1, 8));
+			c.plan.mappings.push_back(PushData(0, 0, 0, 20));
+			c.plan.pushDataBytes = 20;
+			c.target.pushedBytes = 20;
+			perTypeTarget(c.target);
+			c.target.cbvAsStorageBuffer = true;
+			c.expect = [](Checks& a_checks, const std::string& a_text) {
+				a_checks.BoundAt(a_text, "type_2d_image", 0, 10);
+				a_checks.BoundAt(a_text, "type_sampler", 1, 0);
+				a_checks.Count(a_text, "= OpVariable %\\S+ PushConstant$", 1, "push constant variables");
+				a_checks.Count(a_text, "= OpVariable %\\S+ StorageBuffer$", 0, "storage buffer variables (no heap constant buffer here)");
+				a_checks.Has(a_text, "OpMemoryModel PhysicalStorageBuffer64", "no PhysicalStorageBuffer64 addressing");
+			};
+			cases.push_back(std::move(c));
+		}
+
+		// cbv_heap's plan: Root pushed, Material at heap slot 4 (an alias), indirect through the record at push byte 16.
+		const auto cbvPlan = [](Case& a_case) {
+			AddAbiHeaps(a_case.plan);
+			a_case.plan.mappings.push_back(PushData(0, 0, 0, 24));
+			a_case.plan.mappings.push_back(BindingMapping{ .set = 1, .firstBinding = 1, .bindingCount = 1, .resourceMask = VK_SPIRV_RESOURCE_TYPE_ALL_EXT,
+				.source = BindingSource::Heap, .heapElement = 4 });
+			a_case.plan.mappings.push_back(IndirectIndex(2, 0, 1, 16, 0, false));
+			a_case.plan.pushDataBytes = 24;
+			a_case.target.pushedBytes = 24;
+		};
+		const auto cbvLayout = [](Checks& a_checks, const std::string& a_text) {
+			a_checks.Count(a_text, "= OpVariable %\\S+ Uniform$", 0, "uniform variables");
+			a_checks.HasNo(a_text, "OpTypePointer Uniform ", "Uniform pointers left");
+			a_checks.Count(a_text, "= OpVariable %\\S+ PushConstant$", 1, "push constant variables (Root)");
+			a_checks.Has(a_text, "OpDecorate %OrgConstantBuffers_lens NonWritable$", "ORG's constant buffer array is not NonWritable");
+			a_checks.Has(a_text, "OpDecorate %ResourceDescriptorHeap NonWritable$", "the static ConstantBuffer's heap variable is not NonWritable");
+			a_checks.Count(a_text, "OpDecorate %BasicRHIResourceHeap(_[0-9]+)? NonWritable$", 2, "NonWritable heap aliases (Material, indirect)");
+			// The layout decorations stay: dx-layout offsets, array strides, matrix strides and majorness.
+			a_checks.Has(a_text, "OpDecorate %type_ConstantBuffer_Lens Block$", "Lens lost Block");
+			a_checks.Has(a_text, "OpMemberDecorate %type_ConstantBuffer_Lens 1 RowMajor$", "Lens.skew lost RowMajor");
+			a_checks.Has(a_text, "OpMemberDecorate %type_ConstantBuffer_Lens 1 MatrixStride 16$", "Lens.skew lost MatrixStride");
+			a_checks.Has(a_text, "OpMemberDecorate %type_ConstantBuffer_Lens 2 Offset 188$", "Lens.flags lost its dx-layout offset");
+			a_checks.Has(a_text, "OpDecorate %_arr_v4float_uint_8 ArrayStride 16$", "Lens.weights lost ArrayStride");
+			a_checks.Has(a_text, "OpMemberDecorate %type_ConstantBuffer_Frame 0 ColMajor$", "Frame.viewProjection lost its majorness");
+			a_checks.Has(a_text, "OpMemberDecorate %type_Material 1 MatrixStride 16$", "Material.rotation lost MatrixStride");
+			// Dynamic indexing into an array inside the buffer reads it in place.
+			a_checks.Has(a_text, "OpAccessChain %_ptr_StorageBuffer_v4float\\S* %OrgConstantBuffers_lens %\\S+ %\\S+ %\\S+$",
+				"no in-place dynamic access chain into Lens.weights");
+			a_checks.HasNo(a_text, "OpVariable %_ptr_Function_type_ConstantBuffer", "a constant buffer copied into function memory");
+		};
+		{
+			Case c{ .name = "constant buffers as storage buffers", .fixture = "cbv_heap", .stage = VK_SHADER_STAGE_COMPUTE_BIT };
+			cbvPlan(c);
+			c.target.cbvAsStorageBuffer = true;
+			c.expect = [cbvLayout](Checks& a_checks, const std::string& a_text) {
+				cbvLayout(a_checks, a_text);
+				// Without perType they stay on the mutable binding, typed as storage buffers.
+				a_checks.BoundAt(a_text, "type_ConstantBuffer_Lens", 0, 0);
+				a_checks.BoundAt(a_text, "type_ConstantBuffer_Frame", 0, 0);
+				a_checks.BoundAt(a_text, "type_Material", 0, 0);
+				a_checks.BoundAt(a_text, "type_ConstantBuffer_Indirect", 0, 0);
+				a_checks.Count(a_text, "= OpVariable %\\S+ StorageBuffer$", 5, "storage buffer variables (four constant buffers and the output)");
+			};
+			cases.push_back(std::move(c));
+		}
+		{
+			Case c{ .name = "per-type constant buffers as storage buffers", .fixture = "cbv_heap", .stage = VK_SHADER_STAGE_COMPUTE_BIT };
+			cbvPlan(c);
+			perTypeTarget(c.target);
+			c.target.cbvAsStorageBuffer = true;
+			c.expect = [cbvLayout](Checks& a_checks, const std::string& a_text) {
+				cbvLayout(a_checks, a_text);
+				a_checks.BoundAt(a_text, "type_ConstantBuffer_Lens", 0, 14);
+				a_checks.BoundAt(a_text, "type_ConstantBuffer_Frame", 0, 14);
+				a_checks.BoundAt(a_text, "type_Material", 0, 14);
+				a_checks.BoundAt(a_text, "type_ConstantBuffer_Indirect", 0, 14);
+				a_checks.BoundAt(a_text, "type_RWByteAddressBuffer", 0, 14);
+				a_checks.HasNo(a_text, "Binding 15$", "something on the uniform buffer binding");
+			};
+			cases.push_back(std::move(c));
+		}
+		{
+			// perType alone: heap constant buffers stay uniform buffers, on the uniform buffer binding.
+			Case c{ .name = "per-type uniform buffers", .fixture = "cbv_heap", .stage = VK_SHADER_STAGE_COMPUTE_BIT };
+			cbvPlan(c);
+			perTypeTarget(c.target);
+			c.expect = [](Checks& a_checks, const std::string& a_text) {
+				a_checks.BoundAt(a_text, "type_ConstantBuffer_Lens", 0, 15);
+				a_checks.BoundAt(a_text, "type_ConstantBuffer_Frame", 0, 15);
+				a_checks.BoundAt(a_text, "type_Material", 0, 15);
+				a_checks.BoundAt(a_text, "type_ConstantBuffer_Indirect", 0, 15);
+				a_checks.BoundAt(a_text, "type_RWByteAddressBuffer", 0, 14);
+				a_checks.Count(a_text, "= OpVariable %\\S+ Uniform$", 4, "uniform variables");
+				a_checks.HasNo(a_text, "NonWritable$", "NonWritable without cbvAsStorageBuffer");
+			};
+			cases.push_back(std::move(c));
+		}
+		{
+			// The default target: heap constant buffers stay uniform buffers on the mutable binding.
+			Case c{ .name = "heap constant buffers (default target)", .fixture = "cbv_heap", .stage = VK_SHADER_STAGE_COMPUTE_BIT };
+			cbvPlan(c);
+			c.expect = [](Checks& a_checks, const std::string& a_text) {
+				a_checks.BoundAt(a_text, "type_ConstantBuffer_Lens", 0, 0);
+				a_checks.BoundAt(a_text, "type_Material", 0, 0);
+				a_checks.Count(a_text, "= OpVariable %\\S+ Uniform$", 4, "uniform variables");
+				a_checks.Count(a_text, "= OpVariable %\\S+ StorageBuffer$", 1, "storage buffer variables (the output)");
+			};
+			cases.push_back(std::move(c));
+		}
+
 		// Negative cases.
 		{
 			Case c{ .name = "several entry points without a name fail", .fixture = "two_entries", .stage = VK_SHADER_STAGE_COMPUTE_BIT };
@@ -444,12 +720,23 @@ namespace {
 	}
 }
 
-int main() {
+int main(int a_argc, char** a_argv) {
+	// --dump DIR writes each successful case's lowered disassembly to DIR, to compare two builds of the lowering.
+	if (a_argc == 3 && std::string(a_argv[1]) == "--dump") {
+		g_dumpDir = a_argv[2];
+	}
 	std::vector<Case> cases = Cases();
 	int failures = 0;
+	size_t identityCases = 0;
 	for (Case& c : cases) {
 		failures += RunCase(c) ? 0 : 1;
 	}
-	std::printf("%d of %zu lowering cases failed\n", failures, cases.size());
+	for (Case& c : cases) {
+		if (!c.errorContains && !c.target.perType && !c.target.cbvAsStorageBuffer) {
+			failures += RunMutableIdentity(c) ? 0 : 1;
+			++identityCases;
+		}
+	}
+	std::printf("%d of %zu lowering cases failed\n", failures, cases.size() + identityCases);
 	return failures == 0 ? 0 : 1;
 }

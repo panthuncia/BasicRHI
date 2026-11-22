@@ -1567,9 +1567,47 @@ namespace rhi {
 			return impl && impl->bindingModel == VulkanBindingModel::DescriptorBuffer;
 		}
 
-		// Either binding model: bindless heaps, pipeline layouts and pipelines work.
+		// Descriptor-sets model (VulkanBindingModel::DescriptorSets): update-after-bind descriptor sets stand in for the descriptor
+		// buffers. Everything else (the universal layout, lowering, push data, samplers) is the descriptor-buffer model's.
+		static bool VkDescriptorSetsModel(const VulkanDevice* impl) noexcept {
+			return impl && impl->bindingModel == VulkanBindingModel::DescriptorSets;
+		}
+
+		// Either lowered model: one universal pipeline layout, shaders lowered to it, push data through push constants and the spill.
+		static bool VkUniversalLayoutModel(const VulkanDevice* impl) noexcept {
+			return VkDescriptorBufferModel(impl) || VkDescriptorSetsModel(impl);
+		}
+
+		// Any binding model: bindless heaps, pipeline layouts and pipelines work.
 		static bool VkBindlessModel(const VulkanDevice* impl) noexcept {
-			return impl && (impl->descriptorHeapEnabled || VkDescriptorBufferModel(impl));
+			return impl && (impl->descriptorHeapEnabled || VkUniversalLayoutModel(impl));
+		}
+
+		// Descriptor-sets model: the descriptor type of each kind's binding (VulkanDescriptorSetsModel::Kind).
+		static constexpr VkDescriptorType kSetsKindType[VulkanDescriptorSetsModel::KindCount] = {
+			VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
+			VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR };
+
+		// Descriptor-sets model: the kind a descriptor type is written as. CBVs are storage buffers in this model.
+		static uint8_t VkSetsKindOf(VkDescriptorType type) noexcept {
+			switch (type) {
+			case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: return VulkanDescriptorSetsModel::SampledImage;
+			case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: return VulkanDescriptorSetsModel::StorageImage;
+			case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: return VulkanDescriptorSetsModel::UniformTexelBuffer;
+			case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: return VulkanDescriptorSetsModel::StorageTexelBuffer;
+			case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+			case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: return VulkanDescriptorSetsModel::StorageBuffer;
+			case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: return VulkanDescriptorSetsModel::AccelerationStructure;
+			default: return VulkanDescriptorSetsModel::kNoKind;
+			}
+		}
+
+		// The pipeline create flag of the binding model: descriptor buffers or descriptor heaps. Descriptor sets need none.
+		static VkPipelineCreateFlags2 VkPipelineBindingModelFlags(const VulkanDevice* impl) noexcept {
+			if (VkDescriptorSetsModel(impl)) {
+				return 0;
+			}
+			return VkDescriptorBufferModel(impl) ? VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT : VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
 		}
 
 		// The sampler cache's key: every VkSamplerCreateInfo field a sampler is made from (BasicRHI chains nothing to it).
@@ -1662,7 +1700,7 @@ namespace rhi {
 				}
 				if (slot.sampler != VK_NULL_HANDLE) {
 					// The descriptor-buffer model's slot samplers are the sampler cache's.
-					if (VkDescriptorBufferModel(impl)) {
+					if (VkUniversalLayoutModel(impl)) {
 						VkReleaseCachedSampler(impl, slot.sampler);
 					}
 					else {
@@ -2281,7 +2319,11 @@ namespace rhi {
 		}
 
 		static uint64_t VkDescriptorHeapStride(const VulkanDevice* impl, DescriptorHeapType type) noexcept {
-			if (VkDescriptorBufferModel(impl)) {
+			// Descriptor-sets model: a slot is a set element, not bytes.
+			if (VkDescriptorSetsModel(impl)) {
+				return 1;
+			}
+			if (VkUniversalLayoutModel(impl)) {
 				// The universal set layout's element strides (VkInitDescriptorBufferModel).
 				switch (type) {
 				case DescriptorHeapType::CbvSrvUav: return impl->descriptorBuffer.resourceStride;
@@ -2309,21 +2351,21 @@ namespace rhi {
 		// Capture-replay flags serve the descriptor-heap model's capture tools; the descriptor-buffer model never sets them (an
 		// adopted host may have enabled bufferDeviceAddressCaptureReplay for its own use).
 		static VkBufferCreateFlags VkBufferDeviceAddressCreateFlags(const VulkanDevice* impl) noexcept {
-			return impl && impl->bufferDeviceAddressCaptureReplayEnabled && !VkDescriptorBufferModel(impl)
+			return impl && impl->bufferDeviceAddressCaptureReplayEnabled && !VkUniversalLayoutModel(impl)
 				? VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT
 				: 0;
 		}
 
 		static VkMemoryAllocateFlags VkMemoryDeviceAddressAllocateFlags(const VulkanDevice* impl) noexcept {
 			VkMemoryAllocateFlags flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-			if (impl && impl->bufferDeviceAddressCaptureReplayEnabled && !VkDescriptorBufferModel(impl)) {
+			if (impl && impl->bufferDeviceAddressCaptureReplayEnabled && !VkUniversalLayoutModel(impl)) {
 				flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
 			}
 			return flags;
 		}
 
 		static VkImageCreateFlags VkDescriptorHeapCaptureReplayImageFlags(const VulkanDevice* impl) noexcept {
-			return impl && impl->descriptorHeapCaptureReplayEnabled && !VkDescriptorBufferModel(impl)
+			return impl && impl->descriptorHeapCaptureReplayEnabled && !VkUniversalLayoutModel(impl)
 				? VK_IMAGE_CREATE_DESCRIPTOR_HEAP_CAPTURE_REPLAY_BIT_EXT
 				: 0;
 		}
@@ -2357,10 +2399,149 @@ namespace rhi {
 			return base + static_cast<size_t>(byteOffset);
 		}
 
+		// Descriptor-sets model: one descriptor as vkUpdateDescriptorSets takes it. Null handles write the kind's null descriptor
+		// (robustness2 nullDescriptor).
+		struct VkSetsWrite {
+			VkDescriptorType type = VK_DESCRIPTOR_TYPE_MAX_ENUM;
+			VkDescriptorImageInfo image{};  // images and samplers
+			VkDescriptorBufferInfo buffer{ VK_NULL_HANDLE, 0, VK_WHOLE_SIZE };
+			VkBufferView texelView = VK_NULL_HANDLE;
+			VkAccelerationStructureKHR accelerationStructure = VK_NULL_HANDLE;
+		};
+
+		// Descriptor-sets model: what a descriptor names that VkDescriptorGetInfoEXT gives by address only. Descriptor sets take
+		// buffers, texel buffer views and acceleration structures as objects.
+		struct VkSetsDescriptorSource {
+			VkBuffer buffer = VK_NULL_HANDLE;  // a buffer descriptor's buffer, and its offset into it
+			VkDeviceSize offset = 0;
+			VkBufferView texelView = VK_NULL_HANDLE;
+			VkAccelerationStructureKHR accelerationStructure = VK_NULL_HANDLE;
+		};
+
+		static void VkUpdateSetsElement(VulkanDevice* impl, VkDescriptorSet set, uint32_t binding, uint32_t element, const VkSetsWrite& data) noexcept {
+			VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+			VkWriteDescriptorSetAccelerationStructureKHR accelerationStructureWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
+			write.dstSet = set;
+			write.dstBinding = binding;
+			write.dstArrayElement = element;
+			write.descriptorCount = 1;
+			write.descriptorType = data.type;
+			switch (data.type) {
+			case VK_DESCRIPTOR_TYPE_SAMPLER:
+			case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+			case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+				write.pImageInfo = &data.image;
+				break;
+			case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+			case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+				write.pTexelBufferView = &data.texelView;
+				break;
+			case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+				accelerationStructureWrite.accelerationStructureCount = 1;
+				accelerationStructureWrite.pAccelerationStructures = &data.accelerationStructure;
+				write.pNext = &accelerationStructureWrite;
+				break;
+			default:
+				write.pBufferInfo = &data.buffer;
+				break;
+			}
+			vkUpdateDescriptorSets(impl->device, 1, &write, 0, nullptr);
+		}
+
+		// Descriptor-sets model: writes one descriptor into element `element` of a heap's set, in its kind's binding. A resource
+		// heap element whose kind changes gets the null descriptor in its old kind's binding first, so a stale read there finds
+		// null rather than a destroyed view. Elements past the capacity are the view ref region (resource heaps) and the
+		// static-sampler tail (sampler heaps). A CPU-only heap has no set: its slot records serve the CPU alone, so nothing is
+		// written. The caller holds descriptorViewsMutex, which serializes every update of a set.
+		static Result VkWriteSetsDescriptor(VulkanDevice* impl, VulkanDescriptorHeap& heap, uint32_t element, const VkSetsWrite& data) noexcept {
+			if (!heap.shaderVisible) {
+				return Result::Ok;
+			}
+			if (heap.descriptorSet == VK_NULL_HANDLE || element >= heap.setElements) {
+				spdlog::error("Vulkan descriptor-sets write rejected: element={} of {} type={}", element, heap.setElements, static_cast<int>(data.type));
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (heap.type == DescriptorHeapType::Sampler) {
+				if (data.type != VK_DESCRIPTOR_TYPE_SAMPLER || data.image.sampler == VK_NULL_HANDLE) {
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				VkUpdateSetsElement(impl, heap.descriptorSet, 0, element, data);
+				return Result::Ok;
+			}
+			const uint8_t kind = VkSetsKindOf(data.type);
+			if (kind == VulkanDescriptorSetsModel::kNoKind || element >= heap.setKinds.size() ||
+				(kind == VulkanDescriptorSetsModel::AccelerationStructure && !impl->descriptorSets.accelerationStructures)) {
+				spdlog::error("Vulkan descriptor-sets write rejected: descriptor type {} has no binding in the resource set", static_cast<int>(data.type));
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			const uint8_t previous = heap.setKinds[element];
+			if (previous != VulkanDescriptorSetsModel::kNoKind && previous != kind) {
+				VkSetsWrite null{};
+				null.type = kSetsKindType[previous];
+				null.image.imageLayout = previous == VulkanDescriptorSetsModel::StorageImage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+				VkUpdateSetsElement(impl, heap.descriptorSet, VulkanDescriptorSetsModel::kBinding[previous], element, null);
+			}
+			VkSetsWrite written = data;
+			written.type = kSetsKindType[kind];
+			VkUpdateSetsElement(impl, heap.descriptorSet, VulkanDescriptorSetsModel::kBinding[kind], element, written);
+			heap.setKinds[element] = kind;
+			return Result::Ok;
+		}
+
 		// Descriptor-buffer model: writes one descriptor (vkGetDescriptorEXT) into element `element` of a heap's descriptor
 		// memory, the element zeroed first (a mutable element is as large as the largest listed type; the rest stays zero).
 		// Elements past the heap's capacity are the sampler heaps' static-sampler tail.
-		static Result VkWriteBufferModelDescriptor(VulkanDevice* impl, VulkanDescriptorHeap& heap, uint32_t element, const VkDescriptorGetInfoEXT& info) noexcept {
+		// Descriptor-sets model: the same descriptor goes to the heap's set (VkWriteSetsDescriptor). A buffer, texel buffer or
+		// acceleration structure descriptor then needs `source` for the objects the get info names by address.
+		static Result VkWriteBufferModelDescriptor(VulkanDevice* impl, VulkanDescriptorHeap& heap, uint32_t element, const VkDescriptorGetInfoEXT& info,
+			const VkSetsDescriptorSource* source = nullptr) noexcept {
+			if (VkDescriptorSetsModel(impl)) {
+				VkSetsWrite write{};
+				write.type = info.type;
+				bool missingSource = false;
+				switch (info.type) {
+				case VK_DESCRIPTOR_TYPE_SAMPLER:
+					if (info.data.pSampler) write.image.sampler = *info.data.pSampler;
+					break;
+				case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+					if (info.data.pSampledImage) write.image = *info.data.pSampledImage;
+					else write.image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+					break;
+				case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+					if (info.data.pStorageImage) write.image = *info.data.pStorageImage;
+					else write.image.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+					break;
+				case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+				case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
+					const VkDescriptorAddressInfoEXT* address = info.type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ? info.data.pUniformTexelBuffer : info.data.pStorageTexelBuffer;
+					if (address) {
+						missingSource = !source || source->texelView == VK_NULL_HANDLE;
+						write.texelView = source ? source->texelView : VK_NULL_HANDLE;
+					}
+				} break;
+				case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+				case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
+					const VkDescriptorAddressInfoEXT* address = info.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? info.data.pUniformBuffer : info.data.pStorageBuffer;
+					if (address) {
+						missingSource = !source || source->buffer == VK_NULL_HANDLE;
+						if (source) write.buffer = { source->buffer, source->offset, address->range };
+					}
+				} break;
+				case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+					if (info.data.accelerationStructure != 0) {
+						missingSource = !source || source->accelerationStructure == VK_NULL_HANDLE;
+						write.accelerationStructure = source ? source->accelerationStructure : VK_NULL_HANDLE;
+					}
+					break;
+				default:
+					break;
+				}
+				if (missingSource) {
+					spdlog::error("Vulkan descriptor-sets write rejected: a type {} descriptor without the object it names", static_cast<int>(info.type));
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				return VkWriteSetsDescriptor(impl, heap, element, write);
+			}
 			const auto& model = impl->descriptorBuffer;
 			size_t dataSize = 0;
 			switch (info.type) {
@@ -2390,13 +2571,19 @@ namespace rhi {
 		// ---- Buffer view refs (rhi_shader_abi.h, BUFFER_VIEW_REF_*) ----
 
 		// One storage buffer descriptor over [address, address + size) at dst (the heaps' stride, zeroed first). Address 0 writes
-		// the null descriptor where the device has one, else leaves zeros, which no ref names.
-		static void VkWriteViewRefDescriptor(VulkanDevice* impl, std::byte* dst, VkDeviceAddress address, VkDeviceSize size) noexcept {
+		// the null descriptor where the device has one, else leaves zeros, which no ref names. Descriptor-sets model: dst holds a
+		// VkDescriptorBufferInfo over `buffer` (the null one for address 0), which VkCopyViewRefSlots writes into each heap's set.
+		static void VkWriteViewRefDescriptor(VulkanDevice* impl, std::byte* dst, VkBuffer buffer, VkDeviceAddress address, VkDeviceSize size) noexcept {
 			auto& r = impl->viewRefs;
 			std::memset(dst, 0, static_cast<size_t>(r.stride));
+			if (VkDescriptorSetsModel(impl)) {
+				const VkDescriptorBufferInfo info = address != 0 ? VkDescriptorBufferInfo{ buffer, 0, size } : VkDescriptorBufferInfo{ VK_NULL_HANDLE, 0, VK_WHOLE_SIZE };
+				std::memcpy(dst, &info, sizeof(info));
+				return;
+			}
 			if (address == 0 && !impl->nullDescriptorEnabled)
 				return;
-			if (VkDescriptorBufferModel(impl)) {
+			if (VkUniversalLayoutModel(impl)) {
 				VkDescriptorAddressInfoEXT addressInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT };
 				addressInfo.address = address;
 				addressInfo.range = size;
@@ -2423,6 +2610,24 @@ namespace rhi {
 		// Copies staging slots [a_first, a_first + a_count) into a heap's region. Under descriptorViewsMutex.
 		static void VkCopyViewRefSlots(VulkanDevice* impl, VulkanDescriptorHeap& heap, uint32_t a_first, uint32_t a_count) noexcept {
 			auto& r = impl->viewRefs;
+			// Descriptor-sets model: staging holds VkDescriptorBufferInfos, written into the storage buffer binding. Nothing else
+			// writes these elements, so their kind stays storage buffer.
+			if (VkDescriptorSetsModel(impl)) {
+				const uint32_t element = heap.capacity + a_first;
+				if (heap.descriptorSet == VK_NULL_HANDLE || heap.viewRefSlots == 0 || a_count == 0 || element + a_count > heap.setElements ||
+					element + a_count > heap.setKinds.size())
+					return;
+				VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+				write.dstSet = heap.descriptorSet;
+				write.dstBinding = VulkanDescriptorSetsModel::kBinding[VulkanDescriptorSetsModel::StorageBuffer];
+				write.dstArrayElement = element;
+				write.descriptorCount = a_count;
+				write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+				write.pBufferInfo = reinterpret_cast<const VkDescriptorBufferInfo*>(r.staging.data() + static_cast<size_t>(a_first * r.stride));
+				vkUpdateDescriptorSets(impl->device, 1, &write, 0, nullptr);
+				std::fill_n(heap.setKinds.begin() + element, a_count, static_cast<uint8_t>(VulkanDescriptorSetsModel::StorageBuffer));
+				return;
+			}
 			if (!heap.mappedData || heap.viewRefSlots == 0)
 				return;
 			const uint64_t offset = heap.descriptorBaseOffset + (static_cast<uint64_t>(heap.capacity) + a_first) * r.stride;
@@ -2447,8 +2652,12 @@ namespace rhi {
 				return;
 			}
 			r.stride = VkDescriptorHeapStride(impl, DescriptorHeapType::CbvSrvUav);
-			r.descriptorSize = VkDescriptorBufferModel(impl) ? impl->descriptorBuffer.storageBufferSize
+			r.descriptorSize = VkUniversalLayoutModel(impl) ? impl->descriptorBuffer.storageBufferSize
 				: static_cast<uint64_t>(impl->descriptorHeapProperties.bufferDescriptorSize);
+			// Descriptor-sets model: a slot's staging is the VkDescriptorBufferInfo it is written from.
+			if (VkDescriptorSetsModel(impl)) {
+				r.stride = r.descriptorSize = sizeof(VkDescriptorBufferInfo);
+			}
 			if (r.stride == 0 || r.descriptorSize == 0 || r.descriptorSize > r.stride) {
 				spdlog::warn("{}: no buffer view refs (descriptor stride {}, storage buffer descriptor {} bytes)", caller, r.stride, r.descriptorSize);
 				return;
@@ -2457,6 +2666,12 @@ namespace rhi {
 				r.staging.assign(static_cast<size_t>(BUFFER_VIEW_REF_SLOTS * r.stride), std::byte{ 0 });
 			} catch (...) {
 				return;
+			}
+			// Descriptor-sets model: every slot starts as the null storage buffer, which a set can hold (zeros are no valid info).
+			if (VkDescriptorSetsModel(impl)) {
+				for (uint32_t i = 0; i < BUFFER_VIEW_REF_SLOTS; ++i) {
+					VkWriteViewRefDescriptor(impl, r.staging.data() + static_cast<size_t>(i * r.stride), VK_NULL_HANDLE, 0, 0);
+				}
 			}
 			try {
 				r.pairs.assign(BUFFER_VIEW_REF_PAIRS, {});
@@ -2510,7 +2725,7 @@ namespace rhi {
 			}
 			std::byte* srv = r.staging.data() + static_cast<size_t>(2 * pair * r.stride);
 			const VkDeviceSize range = (std::min)(resource->bufferSize, maxRange);
-			VkWriteViewRefDescriptor(impl, srv, resource->deviceAddress, range);
+			VkWriteViewRefDescriptor(impl, srv, resource->buffer, resource->deviceAddress, range);
 			std::memcpy(srv + r.stride, srv, static_cast<size_t>(r.stride));
 			VkPublishViewRefPair(impl, pair);
 			r.pairByResource.emplace(key, pair);
@@ -2532,7 +2747,7 @@ namespace rhi {
 			const uint32_t pair = found->second;
 			r.pairByResource.erase(found);
 			std::byte* srv = r.staging.data() + static_cast<size_t>(2 * pair * r.stride);
-			VkWriteViewRefDescriptor(impl, srv, 0, 0);
+			VkWriteViewRefDescriptor(impl, srv, VK_NULL_HANDLE, 0, 0);
 			std::memcpy(srv + r.stride, srv, static_cast<size_t>(r.stride));
 			VkPublishViewRefPair(impl, pair);
 			r.pairs[pair].live = false;  // the address stays: the fault report names the freed buffer
@@ -2570,7 +2785,7 @@ namespace rhi {
 			const VkDeviceSize maxRange = impl->physicalDeviceProperties.limits.maxStorageBufferRange;
 			const VkDeviceSize range = (std::min)(static_cast<VkDeviceSize>(resource->bufferSize), maxRange);
 			std::byte* srv = r.staging.data() + static_cast<size_t>(2 * pair * r.stride);
-			VkWriteViewRefDescriptor(impl, srv, resource->deviceAddress, range);
+			VkWriteViewRefDescriptor(impl, srv, resource->buffer, resource->deviceAddress, range);
 			std::memcpy(srv + r.stride, srv, static_cast<size_t>(r.stride));
 			VkPublishViewRefPair(impl, pair);
 			r.pairByResource.emplace(toKey, pair);
@@ -3348,7 +3563,15 @@ namespace rhi {
 			if (heap.memory != VK_NULL_HANDLE) {
 				VkFreeDeviceMemory(impl->device, heap.memory);
 			}
+			// Descriptor-sets model: the pool frees the heap's set with it.
+			if (heap.descriptorPool != VK_NULL_HANDLE) {
+				vkDestroyDescriptorPool(impl->device, heap.descriptorPool, nullptr);
+			}
 
+			heap.descriptorPool = VK_NULL_HANDLE;
+			heap.descriptorSet = VK_NULL_HANDLE;
+			heap.setElements = 0;
+			heap.setKinds = {};
 			heap.buffer = VK_NULL_HANDLE;
 			heap.memory = VK_NULL_HANDLE;
 			heap.mappedData = nullptr;
@@ -4292,7 +4515,7 @@ namespace rhi {
 
 			VkResetDescriptorSlot(impl, *descriptorSlot);
 
-			if (VkDescriptorBufferModel(impl)) {
+			if (VkUniversalLayoutModel(impl)) {
 				if (resource->deviceAddress == 0 || slot.index >= heap->capacity) {
 					RHI_FAIL(Result::InvalidArgument);
 				}
@@ -4313,7 +4536,23 @@ namespace rhi {
 				case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: getInfo.data.pUniformBuffer = &addressInfo; break;
 				default: getInfo.data.pStorageBuffer = &addressInfo; break;
 				}
-				if (const Result result = VkWriteBufferModelDescriptor(impl, *heap, slot.index, getInfo); result != Result::Ok) {
+				// Descriptor sets name the buffer itself, and a texel buffer through a view the slot owns (VkResetDescriptorSlot
+				// destroys it). A CPU-only heap writes nothing, so it needs no view.
+				VkSetsDescriptorSource source{ resource->buffer, offsetBytes };
+				if (VkDescriptorSetsModel(impl) && texel && heap->shaderVisible) {
+					VkBufferViewCreateInfo viewInfo{ VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO };
+					viewInfo.buffer = resource->buffer;
+					viewInfo.format = format;
+					viewInfo.offset = offsetBytes;
+					viewInfo.range = sizeBytes;
+					if (const VkResult viewResult = vkCreateBufferView(impl->device, &viewInfo, nullptr, &descriptorSlot->bufferView); viewResult != VK_SUCCESS) {
+						descriptorSlot->bufferView = VK_NULL_HANDLE;
+						return ToRHI(viewResult);
+					}
+					source.texelView = descriptorSlot->bufferView;
+				}
+				if (const Result result = VkWriteBufferModelDescriptor(impl, *heap, slot.index, getInfo, &source); result != Result::Ok) {
+					VkResetDescriptorSlot(impl, *descriptorSlot);
 					return result;
 				}
 			}
@@ -8038,7 +8277,7 @@ namespace rhi {
 				return;
 			}
 			const VulkanPipelineLayout* layoutState = VkPipelineLayoutState(impl, commandListState.boundLayout);
-			if (!VkDescriptorBufferModel(impl)) {
+			if (!VkUniversalLayoutModel(impl)) {
 				if (layoutState && layoutState->usesDescriptorHeap && commandListState.pushedDataDirty && layoutState->totalPushDataBytes != 0 &&
 					commandListState.pushDataShadow.size() >= layoutState->totalPushDataBytes &&
 					layoutState->totalPushDataBytes <= impl->descriptorHeapProperties.maxPushDataSize) {
@@ -8139,7 +8378,7 @@ namespace rhi {
 			commandListState->boundLayout = VkPipelineLayoutState(impl, layout) ? layout : PipelineLayoutHandle{};
 			// Descriptor-buffer model: push constants persist across layouts (every pipeline has the universal one), but the spill
 			// image is per layout, so another layout's spilled ranges are uploaded afresh before they are read.
-			if (VkDescriptorBufferModel(impl) && (previous.index != commandListState->boundLayout.index || previous.generation != commandListState->boundLayout.generation)) {
+			if (VkUniversalLayoutModel(impl) && (previous.index != commandListState->boundLayout.index || previous.generation != commandListState->boundLayout.generation)) {
 				if (const VulkanPipelineLayout* layoutState = VkPipelineLayoutState(impl, commandListState->boundLayout)) {
 					if (commandListState->pushDataShadow.size() < layoutState->totalPushDataBytes) {
 						commandListState->pushDataShadow.resize(layoutState->totalPushDataBytes, 0u);
@@ -9069,7 +9308,7 @@ namespace rhi {
 			// execution.
 			VulkanCommandList::PreprocessedIndirect record{ signature, argumentBuffer, argumentOffset, countBuffer, countOffset, maxCommandCount, pipeline,
 				preprocessAddress, preprocessSize };
-			if (VkDescriptorBufferModel(impl)) {
+			if (VkUniversalLayoutModel(impl)) {
 				record.pushConstantsRecorded = VkBufferModelPreprocessPushConstants(impl, *stateListState, *commandListState, record.pushConstants);
 				if (commandListState->pendingError != Result::Ok) {
 					return;
@@ -9120,7 +9359,7 @@ namespace rhi {
 				// BasicRHI tracks is recorded again: the push data before the next command that reads it (both models), the pipeline
 				// now (descriptor-buffer model).
 				const auto afterGeneratedCommands = [&] {
-					if (!VkDescriptorBufferModel(impl)) {
+					if (!VkUniversalLayoutModel(impl)) {
 						commandListState->pushedDataDirty = true;
 						if (generatedInfo.indirectExecutionSet != VK_NULL_HANDLE)
 							commandListState->boundPipelineRecorded = false;
@@ -9313,13 +9552,72 @@ namespace rhi {
 			commandListState.emittedSamplerHeap = commandListState.boundSamplerHeap;
 		}
 
+		// Descriptor-sets model SetDescriptorHeaps: binds the resource heap's set as set 0 and the sampler heap's as set 1 of the
+		// universal layout, for each bind point the list's queue has. Like descriptor buffer offsets, the bindings persist across
+		// pipeline binds, every pipeline having the universal layout. A bind replaces both heaps, as D3D12's SetDescriptorHeaps does.
+		static void VkSetDescriptorSets(VulkanDevice* impl, VulkanCommandList& commandListState, DescriptorHeapHandle cbvSrvUav, std::optional<DescriptorHeapHandle> sampler) noexcept {
+			VulkanDescriptorHeap* resourceHeap = VkDescriptorHeapState(impl, cbvSrvUav);
+			if (resourceHeap && (resourceHeap->type != DescriptorHeapType::CbvSrvUav || !resourceHeap->shaderVisible || resourceHeap->descriptorSet == VK_NULL_HANDLE)) {
+				resourceHeap = nullptr;
+			}
+			VulkanDescriptorHeap* samplerHeap = sampler.has_value() ? VkDescriptorHeapState(impl, sampler.value()) : nullptr;
+			if (samplerHeap && (samplerHeap->type != DescriptorHeapType::Sampler || !samplerHeap->shaderVisible || samplerHeap->descriptorSet == VK_NULL_HANDLE)) {
+				samplerHeap = nullptr;
+			}
+			commandListState.boundCbvSrvUavHeap = resourceHeap ? cbvSrvUav : DescriptorHeapHandle{};
+			commandListState.boundSamplerHeap = samplerHeap ? sampler.value() : DescriptorHeapHandle{};
+			if (!resourceHeap && !samplerHeap) {
+				return;
+			}
+			const bool emitted = (commandListState.emittedCbvSrvUavHeap.valid() || commandListState.emittedSamplerHeap.valid()) &&
+				VkSameHandle(commandListState.emittedCbvSrvUavHeap, commandListState.boundCbvSrvUavHeap) &&
+				VkSameHandle(commandListState.emittedSamplerHeap, commandListState.boundSamplerHeap);
+			if (emitted && rhi::DiagnosticDedupeHeapBinds().load(std::memory_order_relaxed)) {
+				return;
+			}
+			const VkQueueFlags queueFlags = VkCommandListQueueFlags(impl, commandListState);
+			if ((queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == 0) {
+				return;
+			}
+			std::array<VkDescriptorSet, 2> sets{};
+			uint32_t firstSet = 0;
+			uint32_t setCount = 0;
+			if (resourceHeap) {
+				sets[setCount++] = resourceHeap->descriptorSet;
+			}
+			else {
+				firstSet = 1;
+			}
+			if (samplerHeap) {
+				sets[setCount++] = samplerHeap->descriptorSet;
+			}
+			const auto bind = [&](VkPipelineBindPoint bindPoint) {
+				vkCmdBindDescriptorSets(commandListState.commandBuffer, bindPoint, impl->descriptorBuffer.pipelineLayout, firstSet, setCount, sets.data(), 0, nullptr);
+			};
+			if ((queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+				bind(VK_PIPELINE_BIND_POINT_GRAPHICS);
+			}
+			if ((queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
+				bind(VK_PIPELINE_BIND_POINT_COMPUTE);
+				if (impl->rayTracingPipelineEnabled) {
+					bind(VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
+				}
+			}
+			commandListState.emittedCbvSrvUavHeap = commandListState.boundCbvSrvUavHeap;
+			commandListState.emittedSamplerHeap = commandListState.boundSamplerHeap;
+		}
+
 		static void cl_setDescriptorHeaps(CommandList* commandList, DescriptorHeapHandle cbvSrvUav, std::optional<DescriptorHeapHandle> sampler) noexcept {
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
 			if (!impl || !commandListState) {
 				return;
 			}
-			if (VkDescriptorBufferModel(impl)) {
+			if (VkDescriptorSetsModel(impl)) {
+				VkSetDescriptorSets(impl, *commandListState, cbvSrvUav, sampler);
+				return;
+			}
+			if (VkUniversalLayoutModel(impl)) {
 				VkSetDescriptorBuffers(impl, *commandListState, cbvSrvUav, sampler);
 				return;
 			}
@@ -9693,7 +9991,7 @@ namespace rhi {
 			// Descriptor-buffer model: the bytes go to the list's push data image; those in the layout's pushed prefix are push
 			// constants of the universal layout now, the spilled ones reach memory before the next command that reads them
 			// (VkFlushPendingPushData).
-			if (VkDescriptorBufferModel(impl)) {
+			if (VkUniversalLayoutModel(impl)) {
 				if (!layoutState->usesDescriptorBuffer || pushByteOffset + pushByteSize > layoutState->totalPushDataBytes) {
 					return;
 				}
@@ -9915,7 +10213,7 @@ namespace rhi {
 			commandListState->emittedCbvSrvUavHeap = {};
 			commandListState->emittedSamplerHeap = {};
 			// Descriptor-buffer model: push constants are undefined too; the list's push data is recorded again before it is read.
-			commandListState->pushedDataDirty = commandListState->spilledDataDirty = VkDescriptorBufferModel(impl);
+			commandListState->pushedDataDirty = commandListState->spilledDataDirty = VkUniversalLayoutModel(impl);
 			// Placeholder vertex and index buffers, so the caller's next binds reach the driver (VkBindPlaceholderInputBuffers).
 			// Inside the pass only vkCmdExecuteCommands may follow, so EndPass binds them. Secondaries that continue an adopted
 			// buffer's rendering ran inside its owner's pass, which this wrapper does not end: the owner binds its own.
@@ -10357,6 +10655,24 @@ namespace rhi {
 				target.uniformBlockAlignment = static_cast<uint32_t>((std::max<VkDeviceSize>)(4, impl->physicalDeviceProperties.limits.minUniformBufferOffsetAlignment));
 				target.spillAlignment = static_cast<uint32_t>(VkEmulatedRootConstantAlignment(impl));
 				target.staticSamplerElements = std::span<const uint32_t>(layoutState.staticSamplerElements.data(), layoutState.staticSamplerElements.size());
+				// Heap CBVs are storage buffers wherever the resource heap holds no uniform buffers (VulkanDescriptorBufferModel::
+				// uniformBuffers): always in the descriptor-sets model, and on devices whose uniform buffer limits are below the capacity.
+				target.cbvAsStorageBuffer = !impl->descriptorBuffer.uniformBuffers;
+				// Descriptor-sets model: one binding per kind in set 0 (VulkanDescriptorSetsModel::kBinding). Uniform buffers have no
+				// binding there, so theirs (6) is past the last.
+				if (VkDescriptorSetsModel(impl)) {
+					using Kind = vulkan_binding::LoweringTarget::Kind;
+					const auto bindingOf = [](uint8_t kind) { return VulkanDescriptorSetsModel::kBinding[kind]; };
+					target.perType = true;
+					target.kindBindings[static_cast<uint32_t>(Kind::SampledImage)] = bindingOf(VulkanDescriptorSetsModel::SampledImage);
+					target.kindBindings[static_cast<uint32_t>(Kind::StorageImage)] = bindingOf(VulkanDescriptorSetsModel::StorageImage);
+					target.kindBindings[static_cast<uint32_t>(Kind::UniformTexelBuffer)] = bindingOf(VulkanDescriptorSetsModel::UniformTexelBuffer);
+					target.kindBindings[static_cast<uint32_t>(Kind::StorageTexelBuffer)] = bindingOf(VulkanDescriptorSetsModel::StorageTexelBuffer);
+					target.kindBindings[static_cast<uint32_t>(Kind::StorageBuffer)] = bindingOf(VulkanDescriptorSetsModel::StorageBuffer);
+					target.kindBindings[static_cast<uint32_t>(Kind::UniformBuffer)] = 6;
+					target.kindBindings[static_cast<uint32_t>(Kind::AccelerationStructure)] = bindingOf(VulkanDescriptorSetsModel::AccelerationStructure);
+					target.cbvAsStorageBuffer = true;
+				}
 
 				const std::span<const uint32_t> input(code, codeBytes / sizeof(uint32_t));
 				std::vector<uint32_t> lowered;
@@ -10427,6 +10743,9 @@ namespace rhi {
 			identity.driverVersion = impl->physicalDeviceProperties.driverVersion;
 			static_assert(sizeof(identity.uuid) == VK_UUID_SIZE);
 			std::memcpy(identity.uuid, impl->physicalDeviceProperties.pipelineCacheUUID, VK_UUID_SIZE);
+			// The descriptor-sets model lowers shaders to other bindings, so it keeps a cache of its own. The other models keep 0,
+			// which their existing caches were saved with.
+			identity.reserved = VkDescriptorSetsModel(impl) ? static_cast<uint32_t>(VulkanBindingModel::DescriptorSets) : 0u;
 			return identity;
 		}
 
@@ -10794,7 +11113,7 @@ namespace rhi {
 					layoutHandle = rayTracingPipeline->globalLayout;
 					layoutState = VkPipelineLayoutState(impl, layoutHandle);
 				}
-				const bool bufferModel = VkDescriptorBufferModel(impl);
+				const bool bufferModel = VkUniversalLayoutModel(impl);
 				if (!layoutState || (bufferModel ? !layoutState->usesDescriptorBuffer : (!layoutState->usesDescriptorHeap || !impl->descriptorHeapEnabled))) {
 					spdlog::error("Vulkan ray tracing pipeline: needs a descriptor-heap or descriptor-buffer pipeline layout");
 					RHI_FAIL(Result::Unsupported);
@@ -10929,7 +11248,7 @@ namespace rhi {
 				}
 
 				VkPipelineCreateFlags2CreateInfo createFlags{ VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
-				createFlags.flags = bufferModel ? VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT : VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
+				createFlags.flags = VkPipelineBindingModelFlags(impl);
 				if (rayTracingPipeline->library) {
 					createFlags.flags |= VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR;
 				}
@@ -11028,7 +11347,7 @@ namespace rhi {
 				if (!impl->dynamicRenderingEnabled) {
 					RHI_FAIL(Result::Unsupported);
 				}
-				const bool bufferModel = VkDescriptorBufferModel(impl);
+				const bool bufferModel = VkUniversalLayoutModel(impl);
 				if (bufferModel ? !layoutState->usesDescriptorBuffer : (!layoutState->usesDescriptorHeap || !impl->descriptorHeapEnabled)) {
 					RHI_FAIL(Result::Unsupported);
 				}
@@ -11269,7 +11588,7 @@ namespace rhi {
 					rendering.stencilAttachmentFormat = rendering.depthAttachmentFormat;
 				}
 				VkPipelineCreateFlags2CreateInfo createFlags{ VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
-				createFlags.flags = bufferModel ? VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT : VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
+				createFlags.flags = VkPipelineBindingModelFlags(impl);
 				// ExecuteIndirect supplies the already-bound pipeline through
 				// VkGeneratedCommandsPipelineInfoEXT.  INDIRECT_BINDABLE is required
 				// for pipelines stored in an indirect execution set, not for this
@@ -11354,7 +11673,7 @@ namespace rhi {
 				spdlog::error("Vulkan pipeline creation: a pipeline layout subobject is required");
 				RHI_FAIL(Result::InvalidArgument);
 			}
-			const bool bufferModel = VkDescriptorBufferModel(impl);
+			const bool bufferModel = VkUniversalLayoutModel(impl);
 			if (bufferModel ? !layoutState->usesDescriptorBuffer : (!layoutState->usesDescriptorHeap || !impl->descriptorHeapEnabled)) {
 				RHI_FAIL(Result::Unsupported);
 			}
@@ -11401,7 +11720,7 @@ namespace rhi {
 			stageInfo.pNext = shaderMappingInfo.mappingCount != 0 ? &shaderMappingInfo : nullptr;
 
 			VkPipelineCreateFlags2CreateInfo createFlags{ VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
-			createFlags.flags = bufferModel ? VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT : VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
+			createFlags.flags = VkPipelineBindingModelFlags(impl);
 			const bool computeIndirectBindable = (pipelineFlags & PipelineFlags_IndirectBindable) != 0;
 			if (computeIndirectBindable) {
 				if (!impl->deviceGeneratedCommandsEnabled) {
@@ -11835,7 +12154,9 @@ namespace rhi {
 					{
 						const std::shared_lock registryLock(impl->descriptorHeaps.mutex);
 						for (auto& heapSlot : impl->descriptorHeaps.slots) {
-							if (heapSlot.alive && heapSlot.obj.type == DescriptorHeapType::Sampler && heapSlot.obj.shaderVisible && heapSlot.obj.buffer != VK_NULL_HANDLE) {
+							// A shader-visible sampler heap is a descriptor buffer, or in the descriptor-sets model a set.
+							if (heapSlot.alive && heapSlot.obj.type == DescriptorHeapType::Sampler && heapSlot.obj.shaderVisible &&
+								(heapSlot.obj.buffer != VK_NULL_HANDLE || heapSlot.obj.descriptorSet != VK_NULL_HANDLE)) {
 								if (const Result result = VkWriteStaticSamplers(impl, heapSlot.obj, registered); result != Result::Ok) {
 									return result;
 								}
@@ -11860,8 +12181,8 @@ namespace rhi {
 
 			VulkanPipelineLayout layoutState{};
 			layoutState.flags = desc.flags;
-			layoutState.usesDescriptorHeap = !VkDescriptorBufferModel(impl);
-			layoutState.usesDescriptorBuffer = VkDescriptorBufferModel(impl);
+			layoutState.usesDescriptorHeap = !VkUniversalLayoutModel(impl);
+			layoutState.usesDescriptorBuffer = VkUniversalLayoutModel(impl);
 			layoutState.ranges.assign(desc.ranges.data, desc.ranges.data + desc.ranges.size);
 			layoutState.pushConstants.assign(desc.pushConstants.data, desc.pushConstants.data + desc.pushConstants.size);
 			layoutState.staticSamplers.assign(desc.staticSamplers.data, desc.staticSamplers.data + desc.staticSamplers.size);
@@ -11899,7 +12220,7 @@ namespace rhi {
 				}
 			}
 
-			if (VkDescriptorBufferModel(impl)) {
+			if (VkUniversalLayoutModel(impl)) {
 				// The push data image reaches shaders through the universal layout's pushConstantBytes of push constants. A layout
 				// that fits is pushed whole. A larger one pushes a strict prefix of its ranges in declaration order - those ending
 				// within pushedPrefixBytes, stopping at the first that does not (ranges are never split) - and spills the rest to
@@ -12023,7 +12344,8 @@ namespace rhi {
 					// (ResourceDescriptorHeap / SamplerDescriptorHeap) need VK_EXT_descriptor_heap.
 					// The descriptor-buffer model reaches them too, through its lowered shaders.
 					out->maxShaderModel = VkBindlessModel(impl) ? ShaderModel::SM_6_6 : ShaderModel::SM_6_0;
-					out->unifiedResourceHeaps = VkBindlessModel(impl);
+					// Vulkan memory can back buffers and any texture alike.
+					out->unifiedResourceHeaps = true;
 					out->unboundedDescriptorTables = VkBindlessModel(impl);
 					out->waveOps = false;
 					out->int64ShaderOps = impl->supportedFeatures.shaderInt64 == VK_TRUE;
@@ -12209,7 +12531,7 @@ namespace rhi {
 					if (header->structVersion >= 2) {
 						// The descriptor-buffer model pushes a layout's root constants within pushedPrefixBytes when they exceed
 						// pushConstantBytes (VulkanPipelineLayout::pushedBytes); the descriptor-heap model pushes all of them.
-						out->constantArgumentBytes = VkDescriptorBufferModel(impl) ? impl->descriptorBuffer.pushedPrefixBytes : 0u;
+						out->constantArgumentBytes = VkUniversalLayoutModel(impl) ? impl->descriptorBuffer.pushedPrefixBytes : 0u;
 					}
 					if (header->structVersion >= 3)
 						out->countedDraws = impl->drawIndirectCountEnabled && vkCmdDrawIndexedIndirectCount;
@@ -12383,7 +12705,7 @@ namespace rhi {
 			VkIndirectCommandsLayoutEXT indirectLayout = VK_NULL_HANDLE;
 			if (needsGeneratedCommands || desc.args.size != 1) {
 				VulkanPipelineLayout* layoutState = VkPipelineLayoutState(impl, layout);
-				const bool bufferModel = VkDescriptorBufferModel(impl);
+				const bool bufferModel = VkUniversalLayoutModel(impl);
 				if (!layoutState ||
 					(bufferModel && !layoutState->usesDescriptorBuffer) ||
 					!impl->deviceGeneratedCommandsEnabled ||
@@ -12687,11 +13009,78 @@ namespace rhi {
 			return Result::Ok;
 		}
 
+		// Descriptor-sets model: a shader-visible heap's update-after-bind set, from a pool of its own sized to the universal set
+		// layout. Every binding has the full count whatever the heap's capacity: resourceCapacity elements, or for a sampler heap
+		// samplerCapacity and the static-sampler tail. A CPU-only heap has no set: its slot records serve the CPU alone.
+		static Result VkCreateSetsModelHeapBacking(VulkanDevice* impl, VulkanDescriptorHeap& heap) noexcept {
+			const auto& model = impl->descriptorBuffer;
+			const bool samplerHeap = heap.type == DescriptorHeapType::Sampler;
+			if (!heap.shaderVisible) {
+				return Result::Ok;
+			}
+			heap.setElements = samplerHeap ? model.samplerCapacity + model.staticSamplerCapacity : model.resourceCapacity;
+			std::array<VkDescriptorPoolSize, VulkanDescriptorSetsModel::KindCount> sizes{};
+			uint32_t sizeCount = 0;
+			if (samplerHeap) {
+				sizes[sizeCount++] = { VK_DESCRIPTOR_TYPE_SAMPLER, heap.setElements };
+			}
+			else {
+				for (uint8_t kind = 0; kind < VulkanDescriptorSetsModel::KindCount; ++kind) {
+					if (kind == VulkanDescriptorSetsModel::AccelerationStructure && !impl->descriptorSets.accelerationStructures) {
+						continue;
+					}
+					sizes[sizeCount++] = { kSetsKindType[kind], heap.setElements };
+				}
+			}
+			VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+			poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+			poolInfo.maxSets = 1;
+			poolInfo.poolSizeCount = sizeCount;
+			poolInfo.pPoolSizes = sizes.data();
+			if (const VkResult result = vkCreateDescriptorPool(impl->device, &poolInfo, nullptr, &heap.descriptorPool); result != VK_SUCCESS) {
+				spdlog::error("Vulkan descriptor-sets model: vkCreateDescriptorPool for a {}-element {} heap failed ({})", heap.setElements,
+					samplerHeap ? "sampler" : "CBV/SRV/UAV", static_cast<int>(result));
+				heap.descriptorPool = VK_NULL_HANDLE;
+				return ToRHI(result);
+			}
+			VkDescriptorSetAllocateInfo allocateInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+			allocateInfo.descriptorPool = heap.descriptorPool;
+			allocateInfo.descriptorSetCount = 1;
+			allocateInfo.pSetLayouts = samplerHeap ? &model.samplerSetLayout : &model.resourceSetLayout;
+			if (const VkResult result = vkAllocateDescriptorSets(impl->device, &allocateInfo, &heap.descriptorSet); result != VK_SUCCESS) {
+				spdlog::error("Vulkan descriptor-sets model: vkAllocateDescriptorSets for a {}-element {} heap failed ({})", heap.setElements,
+					samplerHeap ? "sampler" : "CBV/SRV/UAV", static_cast<int>(result));
+				heap.descriptorSet = VK_NULL_HANDLE;
+				VkDestroyDescriptorHeapBacking(impl, heap);
+				return ToRHI(result);
+			}
+			if (samplerHeap) {
+				for (const auto& staticSampler : model.staticSamplers) {
+					if (const Result written = VkWriteStaticSamplers(impl, heap, staticSampler); written != Result::Ok) {
+						VkDestroyDescriptorHeapBacking(impl, heap);
+						return written;
+					}
+				}
+			}
+			else {
+				try {
+					heap.setKinds.assign(heap.setElements, VulkanDescriptorSetsModel::kNoKind);
+				} catch (...) {
+					VkDestroyDescriptorHeapBacking(impl, heap);
+					RHI_FAIL(Result::OutOfMemory);
+				}
+			}
+			return Result::Ok;
+		}
+
 		// Descriptor-buffer model: a heap's descriptor memory. A shader-visible heap is a descriptor buffer laid out as the universal
 		// set layout's binding (its binding offset, then one element per stride; a sampler heap has room for samplerCapacity
 		// samplers and the static-sampler tail whatever its capacity), with no reserved range. A CPU-only heap is plain host memory:
 		// it is never bound, and its slots serve only the CPU (UAV clears, slot records).
 		static Result VkCreateBufferModelHeapBacking(VulkanDevice* impl, VulkanDescriptorHeap& heap) noexcept {
+			if (VkDescriptorSetsModel(impl)) {
+				return VkCreateSetsModelHeapBacking(impl, heap);
+			}
 			const auto& model = impl->descriptorBuffer;
 			const bool samplerHeap = heap.type == DescriptorHeapType::Sampler;
 			heap.descriptorStride = samplerHeap ? model.samplerStride : model.resourceStride;
@@ -12814,7 +13203,7 @@ namespace rhi {
 				heap.viewRefSlots = BUFFER_VIEW_REF_SLOTS;
 			}
 
-			if (VkDescriptorBufferModel(impl) && (desc.type == DescriptorHeapType::CbvSrvUav || desc.type == DescriptorHeapType::Sampler)) {
+			if (VkUniversalLayoutModel(impl) && (desc.type == DescriptorHeapType::CbvSrvUav || desc.type == DescriptorHeapType::Sampler)) {
 				if (const Result result = VkCreateBufferModelHeapBacking(impl, heap); result != Result::Ok) {
 					out.Reset();
 					return result;
@@ -13005,7 +13394,7 @@ namespace rhi {
 
 			if (desc.dimension == SrvDim::AccelerationStruct) {
 				VulkanImageViewSlot* descriptorSlot = VkImageViewSlotState(impl, slot, DescriptorHeapType::CbvSrvUav);
-				if (!VkBindlessModel(impl) || !heap || (heap->buffer == VK_NULL_HANDLE && !VkDescriptorBufferModel(impl)) || !descriptorSlot) {
+				if (!VkBindlessModel(impl) || !heap || (heap->buffer == VK_NULL_HANDLE && !VkUniversalLayoutModel(impl)) || !descriptorSlot) {
 					RHI_FAIL(Result::InvalidArgument);
 				}
 				if (desc.accel.partitioned) {
@@ -13042,7 +13431,7 @@ namespace rhi {
 					RHI_FAIL(Result::InvalidArgument);
 				}
 
-				if (VkDescriptorBufferModel(impl)) {
+				if (VkUniversalLayoutModel(impl)) {
 					// The descriptor-buffer model writes acceleration structures by address, when the resource heap's mutable list
 					// holds them (VulkanDescriptorBufferModel::accelerationStructures); partitioned ones have no descriptor-buffer form.
 					if (desc.accel.partitioned || !impl->descriptorBuffer.accelerationStructures) {
@@ -13057,7 +13446,16 @@ namespace rhi {
 					VkDescriptorGetInfoEXT getInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT };
 					getInfo.type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 					getInfo.data.accelerationStructure = accelerationStructureAddress;
-					if (const Result result = VkWriteBufferModelDescriptor(impl, *heap, slot.index, getInfo); result != Result::Ok) {
+					// Descriptor sets name the acceleration structure object: one given only by address has no descriptor there.
+					VkSetsDescriptorSource source{};
+					if (const VulkanAccelerationStructure* accelerationStructure = VkAccelerationStructureState(impl, desc.accel.accelerationStructure)) {
+						source.accelerationStructure = accelerationStructure->accelerationStructure;
+					}
+					if (VkDescriptorSetsModel(impl) && source.accelerationStructure == VK_NULL_HANDLE) {
+						spdlog::error("Vulkan descriptor-sets model: an acceleration structure SRV needs the acceleration structure, not only its address");
+						RHI_FAIL(Result::Unsupported);
+					}
+					if (const Result result = VkWriteBufferModelDescriptor(impl, *heap, slot.index, getInfo, &source); result != Result::Ok) {
 						return result;
 					}
 					descriptorSlot->kind = VulkanImageViewSlot::Kind::AccelerationStructure;
@@ -13106,7 +13504,7 @@ namespace rhi {
 			if (!resource.valid()) {
 				// A null view (D3D12: CreateShaderResourceView without a resource): reads return zero.
 				VulkanImageViewSlot* descriptorSlot = VkImageViewSlotState(impl, slot, DescriptorHeapType::CbvSrvUav);
-				if (VkDescriptorBufferModel(impl)) {
+				if (VkUniversalLayoutModel(impl)) {
 					// robustness2 nullDescriptor: a get info naming no image or address writes the type's null descriptor.
 					if (!impl->nullDescriptorEnabled || !heap || !descriptorSlot || slot.index >= heap->capacity) {
 						RHI_FAIL(Result::Unsupported);
@@ -13201,7 +13599,7 @@ namespace rhi {
 			const VkComponentMapping components = stencilPlane ? VkComponentMapping{}
 				: VkSrvComponentMapping(impl, desc.componentMapping, desc.formatOverride != Format::Unknown ? desc.formatOverride : resourceState->rhiFormat);
 
-			if (VkDescriptorBufferModel(impl)) {
+			if (VkUniversalLayoutModel(impl)) {
 				VkImageViewCreateInfo viewCreateInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
 				viewCreateInfo.image = resourceState->image;
 				viewCreateInfo.viewType = viewType;
@@ -13348,7 +13746,7 @@ namespace rhi {
 			}
 
 			const VkImageSubresourceRange subresourceRange = VkUavSubresourceRange(*resourceState, desc, aspectMask);
-			if (VkDescriptorBufferModel(impl)) {
+			if (VkUniversalLayoutModel(impl)) {
 				VkImageViewCreateInfo viewCreateInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
 				viewCreateInfo.image = resourceState->image;
 				viewCreateInfo.viewType = viewType;
@@ -13471,7 +13869,7 @@ namespace rhi {
 
 			VkSamplerCreateInfo createInfo = VkBuildSamplerCreateInfo(desc);
 
-			if (VkDescriptorBufferModel(impl)) {
+			if (VkUniversalLayoutModel(impl)) {
 				// The descriptor names a VkSampler: the cache's for this description, released when the slot is reset.
 				if (!heap || slot.index >= heap->capacity) {
 					RHI_FAIL(Result::InvalidArgument);
@@ -15506,6 +15904,17 @@ namespace rhi {
 		impl->mutableDescriptorTypeEnabled = e.mutableDescriptorType.mutableDescriptorType == VK_TRUE;
 		impl->variableDescriptorCountEnabled = e.vulkan12.descriptorBindingVariableDescriptorCount == VK_TRUE;
 		impl->nullDescriptorEnabled = e.nullDescriptor;
+		impl->descriptorSetsFeaturesEnabled = e.nullDescriptor && e.vulkan12.bufferDeviceAddress == VK_TRUE &&
+			e.vulkan12.scalarBlockLayout == VK_TRUE && e.vulkan12.runtimeDescriptorArray == VK_TRUE &&
+			e.vulkan12.descriptorBindingPartiallyBound == VK_TRUE && e.vulkan12.descriptorBindingUpdateUnusedWhilePending == VK_TRUE &&
+			e.vulkan12.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE && e.vulkan12.descriptorBindingStorageImageUpdateAfterBind == VK_TRUE &&
+			e.vulkan12.descriptorBindingUniformTexelBufferUpdateAfterBind == VK_TRUE &&
+			e.vulkan12.descriptorBindingStorageTexelBufferUpdateAfterBind == VK_TRUE &&
+			e.vulkan12.descriptorBindingStorageBufferUpdateAfterBind == VK_TRUE &&
+			e.vulkan12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE && e.vulkan12.shaderStorageImageArrayNonUniformIndexing == VK_TRUE &&
+			e.vulkan12.shaderUniformTexelBufferArrayNonUniformIndexing == VK_TRUE &&
+			e.vulkan12.shaderStorageTexelBufferArrayNonUniformIndexing == VK_TRUE &&
+			e.vulkan12.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE;
 		impl->descriptorHeapCaptureReplayEnabled = e.descriptorHeap.descriptorHeapCaptureReplay == VK_TRUE;
 		impl->meshShaderEnabled = e.meshShader.meshShader == VK_TRUE;
 		impl->taskShaderEnabled = e.meshShader.taskShader == VK_TRUE;
@@ -15548,6 +15957,10 @@ namespace rhi {
 		// preferred capacities: the post-device check measures the real stride against them, the sampler tail fits in the rest.
 		uint32_t bufferResourceLimit = 0;
 		uint32_t bufferSamplerLimit = 0;
+		// The descriptor-sets model: an acceleration structure binding fits its capacity, and the device's sampler count before
+		// the preferred capacity (the static-sampler tail fits in the rest).
+		bool setsAccelerationStructures = false;
+		uint32_t setsSamplerLimit = 0;
 	};
 
 	// BASICRHI_VK_LIMITS=base: every limit an evaluation reads is clamped to the Vulkan base-spec minimum. Read at each call (a test
@@ -15587,6 +16000,7 @@ namespace rhi {
 			const bool hasMutable = hasExtension(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME) || hasExtension(VK_VALVE_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
 			const bool hasMaintenance5 = hasExtension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) || properties.apiVersion >= VK_API_VERSION_1_4;
 			const bool hasAccelerationStructure = hasExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+			const bool hasRobustness2 = hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) || hasExtension("VK_KHR_robustness2");
 
 			VkPhysicalDeviceVulkan12Features features12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
 			VkPhysicalDeviceDescriptorHeapFeaturesEXT heapFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT };
@@ -15596,9 +16010,12 @@ namespace rhi {
 			VkPhysicalDeviceFeatures2 features2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
 			VkPhysicalDeviceDescriptorBufferPropertiesEXT bufferProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT };
 			VkPhysicalDeviceAccelerationStructurePropertiesKHR accelerationStructureProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR };
+			VkPhysicalDeviceRobustness2FeaturesEXT robustness2Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT };
+			VkPhysicalDeviceVulkan12Properties properties12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES };
 			VkPhysicalDeviceProperties2 properties2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
 			const auto chain = [](auto& head, auto& node) { node.pNext = head.pNext; head.pNext = &node; };
-			if (vulkan12) chain(features2, features12);
+			if (vulkan12) { chain(features2, features12); chain(properties2, properties12); }
+			if (hasRobustness2) chain(features2, robustness2Features);
 			VkPhysicalDeviceDescriptorHeapPropertiesEXT heapProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT };
 			if (hasHeap) { chain(features2, heapFeatures); chain(properties2, heapProperties); }
 			if (hasBuffer) { chain(features2, bufferFeatures); chain(properties2, bufferProperties); }
@@ -15708,11 +16125,20 @@ namespace rhi {
 			resourceLimitOf("maxPerStageDescriptorStorageBuffers", limits.maxPerStageDescriptorStorageBuffers, 4);
 			resourceLimitOf("maxDescriptorSetStorageBuffers", limits.maxDescriptorSetStorageBuffers, 24);
 			resourceLimitOf("maxPerStageResources", limits.maxPerStageResources, 128);
-			// Uniform buffers are always in the mutable list: the lowering reads heap ConstantBuffers as uniform buffers (it has no
-			// CBV-as-storage-buffer rewrite yet), so their limits bound the heap like every other type's.
-			resourceLimitOf("maxPerStageDescriptorUniformBuffers", limits.maxPerStageDescriptorUniformBuffers, 12);
-			resourceLimitOf("maxDescriptorSetUniformBuffers", limits.maxDescriptorSetUniformBuffers, 72);
-			evaluation.uniformBuffers = true;
+			// Uniform buffers join the mutable list only when their limits hold the heap the other types allow. Otherwise CBVs are
+			// written as storage buffers and the lowering reads heap ConstantBuffers as storage buffers
+			// (LoweringTarget::cbvAsStorageBuffer), so those limits do not cap the heap.
+			{
+				const uint64_t uniformLimit = (std::min)(limit(limits.maxPerStageDescriptorUniformBuffers, 12), limit(limits.maxDescriptorSetUniformBuffers, 72));
+				const uint64_t wanted = (std::min<uint64_t>)(capacities.preferredResources, (std::min)(resourceLimit, maxDescriptors));
+				evaluation.uniformBuffers = uniformLimit >= wanted;
+				checks.push_back(std::format("{}: uniform buffers in the resource heap: maxPerStageDescriptorUniformBuffers {} and maxDescriptorSetUniformBuffers {} "
+					">= {}: {}", kBuffer, limit(limits.maxPerStageDescriptorUniformBuffers, 12), limit(limits.maxDescriptorSetUniformBuffers, 72), wanted,
+					evaluation.uniformBuffers ? "yes" : "no, CBVs are storage buffers"));
+				if (evaluation.uniformBuffers) {
+					resourceLimit = (std::min)(resourceLimit, uniformLimit);
+				}
+			}
 
 			// Descriptor buffer ranges and address spaces, estimating a mutable element as the largest listed type (the device's
 			// stride is measured, and the capacity checked again, once the device exists).
@@ -15720,8 +16146,11 @@ namespace rhi {
 			uint64_t resourceDescriptorSize = (std::max)({ bufferProperties.sampledImageDescriptorSize, bufferProperties.storageImageDescriptorSize,
 				robust ? bufferProperties.robustUniformTexelBufferDescriptorSize : bufferProperties.uniformTexelBufferDescriptorSize,
 				robust ? bufferProperties.robustStorageTexelBufferDescriptorSize : bufferProperties.storageTexelBufferDescriptorSize,
-				robust ? bufferProperties.robustStorageBufferDescriptorSize : bufferProperties.storageBufferDescriptorSize,
-				robust ? bufferProperties.robustUniformBufferDescriptorSize : bufferProperties.uniformBufferDescriptorSize });
+				robust ? bufferProperties.robustStorageBufferDescriptorSize : bufferProperties.storageBufferDescriptorSize });
+			if (evaluation.uniformBuffers) {
+				resourceDescriptorSize = (std::max)(resourceDescriptorSize,
+					static_cast<uint64_t>(robust ? bufferProperties.robustUniformBufferDescriptorSize : bufferProperties.uniformBufferDescriptorSize));
+			}
 
 			// Acceleration structures join the list when their limits do not lower the capacity the other types allow.
 			if (hasAccelerationStructure && accelerationStructureFeatures.accelerationStructure == VK_TRUE) {
@@ -15773,6 +16202,90 @@ namespace rhi {
 				evaluation.report.bufferModelResources = bufferResources;
 				evaluation.report.bufferModelSamplers = bufferSamplers;
 			}
+
+			// The descriptor-sets model: update-after-bind descriptor sets with one binding per descriptor kind, for devices without
+			// mutable descriptors. Every binding covers the whole slot range, so each kind's update-after-bind limits bound the
+			// capacity. Sampled images and uniform texel buffers share one per-stage limit, and storage images and storage texel
+			// buffers another, so each of those holds two bindings. Uniform buffers are not in the heap: CBVs are storage buffers.
+			constexpr const char* kSets = "descriptor sets";
+			bool setsSupported = true;
+			feature(setsSupported, kSets, "Vulkan 1.2", vulkan12);
+			feature(setsSupported, kSets, "VK_EXT_robustness2 (or VK_KHR_robustness2)", hasRobustness2);
+			feature(setsSupported, kSets, "nullDescriptor", robustness2Features.nullDescriptor == VK_TRUE);
+			feature(setsSupported, kSets, "bufferDeviceAddress", features12.bufferDeviceAddress == VK_TRUE);
+			feature(setsSupported, kSets, "scalarBlockLayout", features12.scalarBlockLayout == VK_TRUE);
+			feature(setsSupported, kSets, "runtimeDescriptorArray", features12.runtimeDescriptorArray == VK_TRUE);
+			feature(setsSupported, kSets, "descriptorBindingPartiallyBound", features12.descriptorBindingPartiallyBound == VK_TRUE);
+			feature(setsSupported, kSets, "descriptorBindingUpdateUnusedWhilePending", features12.descriptorBindingUpdateUnusedWhilePending == VK_TRUE);
+			feature(setsSupported, kSets, "descriptorBindingSampledImageUpdateAfterBind", features12.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE);
+			feature(setsSupported, kSets, "descriptorBindingStorageImageUpdateAfterBind", features12.descriptorBindingStorageImageUpdateAfterBind == VK_TRUE);
+			feature(setsSupported, kSets, "descriptorBindingUniformTexelBufferUpdateAfterBind", features12.descriptorBindingUniformTexelBufferUpdateAfterBind == VK_TRUE);
+			feature(setsSupported, kSets, "descriptorBindingStorageTexelBufferUpdateAfterBind", features12.descriptorBindingStorageTexelBufferUpdateAfterBind == VK_TRUE);
+			feature(setsSupported, kSets, "descriptorBindingStorageBufferUpdateAfterBind", features12.descriptorBindingStorageBufferUpdateAfterBind == VK_TRUE);
+			feature(setsSupported, kSets, "shaderSampledImageArrayNonUniformIndexing", features12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE);
+			feature(setsSupported, kSets, "shaderStorageImageArrayNonUniformIndexing", features12.shaderStorageImageArrayNonUniformIndexing == VK_TRUE);
+			feature(setsSupported, kSets, "shaderUniformTexelBufferArrayNonUniformIndexing", features12.shaderUniformTexelBufferArrayNonUniformIndexing == VK_TRUE);
+			feature(setsSupported, kSets, "shaderStorageTexelBufferArrayNonUniformIndexing", features12.shaderStorageTexelBufferArrayNonUniformIndexing == VK_TRUE);
+			feature(setsSupported, kSets, "shaderStorageBufferArrayNonUniformIndexing", features12.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE);
+			// BasicRHI enables every core feature the device has, robustBufferAccess included, and update-after-bind buffer
+			// bindings then need robustBufferAccessUpdateAfterBind.
+			if (features2.features.robustBufferAccess == VK_TRUE) {
+				feature(setsSupported, kSets, "robustBufferAccessUpdateAfterBind (robustBufferAccess is enabled)", properties12.robustBufferAccessUpdateAfterBind == VK_TRUE);
+			}
+			atLeast(setsSupported, kSets, "maxPushConstantsSize", VulkanDescriptorBufferModel::kMinPushConstantBytes, limit(limits.maxPushConstantsSize, 128));
+			// The Vulkan base-spec minimum of each update-after-bind limit is 500000.
+			const auto setsLimit = [&](const char* name, uint64_t device) {
+				const uint64_t value = (std::min)(limit(device, 500000), maxDescriptors);
+				checks.push_back(std::format("{}: {}: device {}", kSets, name, value));
+				return value;
+			};
+			const uint64_t sampledPool = (std::min)(setsLimit("maxPerStageDescriptorUpdateAfterBindSampledImages (sampled images, uniform texel buffers)",
+				properties12.maxPerStageDescriptorUpdateAfterBindSampledImages), setsLimit("maxDescriptorSetUpdateAfterBindSampledImages",
+				properties12.maxDescriptorSetUpdateAfterBindSampledImages));
+			const uint64_t storageImagePool = (std::min)(setsLimit("maxPerStageDescriptorUpdateAfterBindStorageImages (storage images, storage texel buffers)",
+				properties12.maxPerStageDescriptorUpdateAfterBindStorageImages), setsLimit("maxDescriptorSetUpdateAfterBindStorageImages",
+				properties12.maxDescriptorSetUpdateAfterBindStorageImages));
+			const uint64_t storageBufferPool = (std::min)(setsLimit("maxPerStageDescriptorUpdateAfterBindStorageBuffers",
+				properties12.maxPerStageDescriptorUpdateAfterBindStorageBuffers), setsLimit("maxDescriptorSetUpdateAfterBindStorageBuffers",
+				properties12.maxDescriptorSetUpdateAfterBindStorageBuffers));
+			const uint64_t resourcePool = setsLimit("maxPerStageUpdateAfterBindResources (five bindings)", properties12.maxPerStageUpdateAfterBindResources);
+			const uint64_t setsSlots = (std::min)({ sampledPool / 2, storageImagePool / 2, storageBufferPool, resourcePool / 5 });
+			// A device short of the preferred capacity gets the largest power of two it holds (524288 where a limit is 1048576
+			// shared by two bindings) rather than an odd count.
+			uint64_t setsPreferred = capacities.preferredResources;
+			if (setsSlots < setsPreferred) {
+				uint64_t step = 1;
+				while (step * 2 <= setsSlots) step *= 2;
+				if (step >= capacities.minResources) setsPreferred = step;
+			}
+			checks.push_back(std::format("{}: slots every binding holds: min(sampled {} / 2, storage image {} / 2, storage buffer {}, resources {} / 5) = {}; "
+				"preferred {}", kSets, sampledPool, storageImagePool, storageBufferPool, resourcePool, setsSlots, setsPreferred));
+			const uint32_t setsResources = chooseCapacity(setsSupported, kSets, "resource", setsPreferred, setsSlots, capacities.minResources);
+			if (hasAccelerationStructure && accelerationStructureFeatures.accelerationStructure == VK_TRUE) {
+				const uint64_t perStage = limit(accelerationStructureProperties.maxPerStageDescriptorUpdateAfterBindAccelerationStructures, 500000);
+				const uint64_t perSet = limit(accelerationStructureProperties.maxDescriptorSetUpdateAfterBindAccelerationStructures, 500000);
+				evaluation.setsAccelerationStructures = accelerationStructureFeatures.descriptorBindingAccelerationStructureUpdateAfterBind == VK_TRUE &&
+					(std::min)(perStage, perSet) >= setsResources;
+				checks.push_back(std::format("{}: acceleration structure binding: descriptorBindingAccelerationStructureUpdateAfterBind {}, "
+					"maxPerStageDescriptorUpdateAfterBindAccelerationStructures {} and maxDescriptorSetUpdateAfterBindAccelerationStructures {} >= {}: {}",
+					kSets, accelerationStructureFeatures.descriptorBindingAccelerationStructureUpdateAfterBind == VK_TRUE, perStage, perSet, setsResources,
+					evaluation.setsAccelerationStructures ? "yes" : "no, acceleration structure SRVs are unsupported"));
+			}
+			const uint64_t setsSamplerPool = (std::min)(setsLimit("maxPerStageDescriptorUpdateAfterBindSamplers", properties12.maxPerStageDescriptorUpdateAfterBindSamplers),
+				setsLimit("maxDescriptorSetUpdateAfterBindSamplers", properties12.maxDescriptorSetUpdateAfterBindSamplers));
+			const uint32_t setsSamplers = chooseCapacity(setsSupported, kSets, "sampler", capacities.preferredSamplers, setsSamplerPool, capacities.minSamplers);
+			const uint64_t setsDescriptors = static_cast<uint64_t>(setsResources) * (evaluation.setsAccelerationStructures ? 6u : 5u) + setsSamplers;
+			atLeast(setsSupported, kSets, "maxUpdateAfterBindDescriptorsInAllPools (one resource and one sampler heap)", setsDescriptors,
+				limit(properties12.maxUpdateAfterBindDescriptorsInAllPools, 500000));
+			atLeast(setsSupported, kSets, "maxBoundDescriptorSets", 2, limit(limits.maxBoundDescriptorSets, 4));
+			atLeast(setsSupported, kSets, "maxSamplerAllocationCount (the host's samplers and at least one of BasicRHI's)",
+				static_cast<uint64_t>(requirements.hostSamplerObjects) + 1u, limit(limits.maxSamplerAllocationCount, 4000));
+			evaluation.setsSamplerLimit = static_cast<uint32_t>((std::min<uint64_t>)(setsSamplerPool, (std::numeric_limits<uint32_t>::max)()));
+			if (setsSupported) {
+				evaluation.report.supportedModels |= vulkan::BindingModel_DescriptorSets;
+				evaluation.report.setsModelResources = setsResources;
+				evaluation.report.setsModelSamplers = setsSamplers;
+			}
 		} catch (...) {
 			evaluation = {};
 		}
@@ -15783,16 +16296,20 @@ namespace rhi {
 		switch (model) {
 		case VulkanBindingModel::DescriptorHeap: return "descriptor heap";
 		case VulkanBindingModel::DescriptorBuffer: return "descriptor buffer";
+		case VulkanBindingModel::DescriptorSets: return "descriptor sets";
 		default: return "none";
 		}
 	}
 
 	static void VkLogBindingModels(const char* caller, const char* deviceName, const VkBindingModelEvaluation& evaluation, VulkanBindingModel chosen) noexcept {
-		spdlog::info("{}: binding models for '{}': descriptor heap {} ({} / {} descriptors), descriptor buffer {} ({} / {}); using {}", caller, deviceName,
+		spdlog::info("{}: binding models for '{}': descriptor heap {} ({} / {} descriptors), descriptor buffer {} ({} / {}), descriptor sets {} ({} / {}); "
+			"using {}", caller, deviceName,
 			(evaluation.report.supportedModels & vulkan::BindingModel_DescriptorHeap) ? "supported" : "unsupported",
 			evaluation.report.heapModelResources, evaluation.report.heapModelSamplers,
 			(evaluation.report.supportedModels & vulkan::BindingModel_DescriptorBuffer) ? "supported" : "unsupported",
-			evaluation.report.bufferModelResources, evaluation.report.bufferModelSamplers, VkBindingModelName(chosen));
+			evaluation.report.bufferModelResources, evaluation.report.bufferModelSamplers,
+			(evaluation.report.supportedModels & vulkan::BindingModel_DescriptorSets) ? "supported" : "unsupported",
+			evaluation.report.setsModelResources, evaluation.report.setsModelSamplers, VkBindingModelName(chosen));
 		for (const std::string& check : evaluation.report.checks) {
 			spdlog::info("{}:   {}", caller, check);
 		}
@@ -15849,6 +16366,29 @@ namespace rhi {
 		model.pipelineLayout = VK_NULL_HANDLE;
 		model.resourceSetLayout = VK_NULL_HANDLE;
 		model.samplerSetLayout = VK_NULL_HANDLE;
+	}
+
+	// The universal pipeline layout of both lowered models: set 0 the resource set layout, set 1 the sampler set layout, and push
+	// constants for every stage over the device's whole push range (a multiple of 8, for the spill address in its last 8 bytes).
+	static bool VkCreateUniversalPipelineLayout(VulkanDevice* impl, const char* caller) noexcept {
+		auto& model = impl->descriptorBuffer;
+		const std::array<VkDescriptorSetLayout, 2> setLayouts{ model.resourceSetLayout, model.samplerSetLayout };
+		model.pushConstantBytes = (std::clamp)(impl->physicalDeviceProperties.limits.maxPushConstantsSize, VulkanDescriptorBufferModel::kMinPushConstantBytes,
+			VulkanDescriptorBufferModel::kMaxPushConstantBytes) & ~7u;
+		model.pushedPrefixBytes = model.pushConstantBytes - 8;
+		model.spillAddressOffset = model.pushConstantBytes - 8;
+		const VkPushConstantRange pushRange{ VK_SHADER_STAGE_ALL, 0, model.pushConstantBytes };
+		VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+		layoutInfo.setLayoutCount = static_cast<uint32_t>(setLayouts.size());
+		layoutInfo.pSetLayouts = setLayouts.data();
+		layoutInfo.pushConstantRangeCount = 1;
+		layoutInfo.pPushConstantRanges = &pushRange;
+		if (vkCreatePipelineLayout(impl->device, &layoutInfo, nullptr, &model.pipelineLayout) != VK_SUCCESS) {
+			spdlog::error("{}: vkCreatePipelineLayout failed for the {} model's universal pipeline layout", caller, VkBindingModelName(impl->bindingModel));
+			model.pipelineLayout = VK_NULL_HANDLE;
+			return false;
+		}
+		return true;
 	}
 
 	// The descriptor-buffer model's device state, once the VkDevice exists: the element strides (from vkGetDescriptorSetLayoutSizeEXT,
@@ -15999,20 +16539,7 @@ namespace rhi {
 		vkGetDescriptorSetLayoutBindingOffsetEXT(impl->device, model.resourceSetLayout, 0, &model.resourceBindingOffset);
 		vkGetDescriptorSetLayoutBindingOffsetEXT(impl->device, model.samplerSetLayout, 0, &model.samplerBindingOffset);
 
-		const std::array<VkDescriptorSetLayout, 2> setLayouts{ model.resourceSetLayout, model.samplerSetLayout };
-		// The device's whole push range (a multiple of 8, for the spill address in its last 8 bytes).
-		model.pushConstantBytes = (std::clamp)(impl->physicalDeviceProperties.limits.maxPushConstantsSize, VulkanDescriptorBufferModel::kMinPushConstantBytes,
-			VulkanDescriptorBufferModel::kMaxPushConstantBytes) & ~7u;
-		model.pushedPrefixBytes = model.pushConstantBytes - 8;
-		model.spillAddressOffset = model.pushConstantBytes - 8;
-		const VkPushConstantRange pushRange{ VK_SHADER_STAGE_ALL, 0, model.pushConstantBytes };
-		VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-		layoutInfo.setLayoutCount = static_cast<uint32_t>(setLayouts.size());
-		layoutInfo.pSetLayouts = setLayouts.data();
-		layoutInfo.pushConstantRangeCount = 1;
-		layoutInfo.pPushConstantRanges = &pushRange;
-		if (vkCreatePipelineLayout(impl->device, &layoutInfo, nullptr, &model.pipelineLayout) != VK_SUCCESS) {
-			spdlog::error("{}: vkCreatePipelineLayout failed for the descriptor-buffer model's universal pipeline layout", caller);
+		if (!VkCreateUniversalPipelineLayout(impl, caller)) {
 			VkDestroyDescriptorBufferModel(impl);
 			RHI_FAIL(Result::Unsupported);
 		}
@@ -16035,6 +16562,122 @@ namespace rhi {
 			model.resourceBindingOffset, model.uniformBuffers, model.accelerationStructures, model.samplerCapacity,
 			model.staticSamplerCapacity, model.samplerStride, model.samplerBindingOffset, model.pushConstantBytes,
 			model.pushedPrefixBytes, static_cast<uint64_t>(properties.descriptorBufferOffsetAlignment), robust, model.samplerBudget);
+		return Result::Ok;
+	}
+
+	// A universal set layout of the descriptor-sets model: set 0 one binding per kind (VulkanDescriptorSetsModel::kBinding), the
+	// acceleration structure binding only when `accelerationStructures`; or set 1, one sampler binding. Every binding has `count`
+	// elements and is update-after-bind, partially bound and updatable while pending. It points into itself: not copyable.
+	struct VkSetsLayoutInfo {
+		std::array<VkDescriptorSetLayoutBinding, VulkanDescriptorSetsModel::KindCount> bindings{};
+		std::array<VkDescriptorBindingFlags, VulkanDescriptorSetsModel::KindCount> bindingFlags{};
+		VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO };
+		VkDescriptorSetLayoutCreateInfo createInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+
+		VkSetsLayoutInfo(bool samplerSet, uint32_t count, bool accelerationStructures) noexcept {
+			uint32_t bindingCount = 0;
+			const auto add = [&](uint32_t binding, VkDescriptorType type) {
+				bindings[bindingCount] = { binding, type, count, VK_SHADER_STAGE_ALL, nullptr };
+				bindingFlags[bindingCount] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+					VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+				++bindingCount;
+			};
+			if (samplerSet) {
+				add(0, VK_DESCRIPTOR_TYPE_SAMPLER);
+			}
+			else {
+				for (uint8_t kind = 0; kind < VulkanDescriptorSetsModel::KindCount; ++kind) {
+					if (kind != VulkanDescriptorSetsModel::AccelerationStructure || accelerationStructures) {
+						add(VulkanDescriptorSetsModel::kBinding[kind], kSetsKindType[kind]);
+					}
+				}
+			}
+			flagsInfo.bindingCount = bindingCount;
+			flagsInfo.pBindingFlags = bindingFlags.data();
+			createInfo.pNext = &flagsInfo;
+			createInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+			createInfo.bindingCount = bindingCount;
+			createInfo.pBindings = bindings.data();
+		}
+		VkSetsLayoutInfo(const VkSetsLayoutInfo&) = delete;
+		VkSetsLayoutInfo& operator=(const VkSetsLayoutInfo&) = delete;
+	};
+
+	// The descriptor-sets model's device state, once the VkDevice exists: the universal set layouts, checked with
+	// vkGetDescriptorSetLayoutSupport at their real counts (a resource capacity the driver rejects steps down by halves to the
+	// minimum), the universal pipeline layout and the sampler budget. It fills the state it shares with the descriptor-buffer model
+	// (VulkanDescriptorBufferModel): no uniform buffers in the heap, and no descriptor strides or sizes. Fails, with the reason
+	// logged, when the device cannot hold what the evaluation promised.
+	static Result VkInitDescriptorSetsModel(VulkanDevice* impl, const VkBindingModelEvaluation& evaluation,
+		const vulkan::BindingRequirements& requirements, const char* caller) noexcept {
+		auto& model = impl->descriptorBuffer;
+		auto& sets = impl->descriptorSets;
+		const DescriptorHeapCapacities& capacities = requirements.heapCapacities;
+		model.uniformBuffers = false;
+		sets.accelerationStructures = evaluation.setsAccelerationStructures && impl->accelerationStructureEnabled &&
+			impl->accelerationStructureFeatures.descriptorBindingAccelerationStructureUpdateAfterBind == VK_TRUE;
+		model.accelerationStructures = sets.accelerationStructures;
+		model.resourceCapacity = evaluation.report.setsModelResources;
+		model.samplerCapacity = evaluation.report.setsModelSamplers;
+		if (model.resourceCapacity < capacities.minResources || model.samplerCapacity < capacities.minSamplers ||
+			evaluation.setsSamplerLimit < model.samplerCapacity) {
+			spdlog::error("{}: the descriptor-sets model has no capacities from the evaluation ({} resources, {} samplers)", caller,
+				model.resourceCapacity, model.samplerCapacity);
+			RHI_FAIL(Result::Unsupported);
+		}
+		model.staticSamplerCapacity = static_cast<uint32_t>((std::min<uint64_t>)(VulkanDescriptorBufferModel::kMaxStaticSamplers,
+			evaluation.setsSamplerLimit - model.samplerCapacity));
+		const uint32_t samplerCount = model.samplerCapacity + model.staticSamplerCapacity;
+
+		const auto supported = [&](const VkSetsLayoutInfo& info) {
+			VkDescriptorSetLayoutSupport support{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT };
+			vkGetDescriptorSetLayoutSupport(impl->device, &info.createInfo, &support);
+			return support.supported == VK_TRUE;
+		};
+		{
+			const uint32_t chosen = model.resourceCapacity;
+			uint32_t capacity = chosen;
+			bool ok = supported(VkSetsLayoutInfo(false, capacity, sets.accelerationStructures));
+			while (!ok && capacity > capacities.minResources) {
+				capacity = (std::max)(capacity / 2, capacities.minResources);
+				ok = supported(VkSetsLayoutInfo(false, capacity, sets.accelerationStructures));
+			}
+			if (!ok) {
+				spdlog::error("{}: the device supports no descriptor-sets resource set layout of {} to {} elements per binding", caller,
+					capacities.minResources, chosen);
+				RHI_FAIL(Result::Unsupported);
+			}
+			if (capacity != chosen) {
+				spdlog::warn("{}: the device's set layout holds {} resource descriptors per binding, not the {} its limits allow; using {}", caller,
+					capacity, chosen, capacity);
+				model.resourceCapacity = capacity;
+			}
+		}
+		const VkSetsLayoutInfo resourceInfo(false, model.resourceCapacity, sets.accelerationStructures);
+		const VkSetsLayoutInfo samplerInfo(true, samplerCount, false);
+		if (!supported(samplerInfo)) {
+			spdlog::error("{}: the device does not support the descriptor-sets model's sampler set layout ({} descriptors)", caller, samplerCount);
+			RHI_FAIL(Result::Unsupported);
+		}
+		impl->shaderVisibleResourceCapacity = model.resourceCapacity;
+		impl->shaderVisibleSamplerCapacity = model.samplerCapacity;
+		if (vkCreateDescriptorSetLayout(impl->device, &resourceInfo.createInfo, nullptr, &model.resourceSetLayout) != VK_SUCCESS ||
+			vkCreateDescriptorSetLayout(impl->device, &samplerInfo.createInfo, nullptr, &model.samplerSetLayout) != VK_SUCCESS) {
+			spdlog::error("{}: vkCreateDescriptorSetLayout failed for the descriptor-sets model's universal set layouts", caller);
+			VkDestroyDescriptorBufferModel(impl);
+			RHI_FAIL(Result::Unsupported);
+		}
+		if (!VkCreateUniversalPipelineLayout(impl, caller)) {
+			VkDestroyDescriptorBufferModel(impl);
+			RHI_FAIL(Result::Unsupported);
+		}
+		const uint32_t maxSamplers = impl->physicalDeviceProperties.limits.maxSamplerAllocationCount;
+		model.samplerBudget = maxSamplers > requirements.hostSamplerObjects ? maxSamplers - requirements.hostSamplerObjects : 0u;
+
+		spdlog::info("{}: descriptor-sets model: resource set {} descriptors per binding (sampled image, storage image, uniform texel, storage texel, "
+			"storage buffer{}; CBVs as storage buffers), sampler set {} + {} static, push constants {} bytes (pushed prefix {} when spilling), "
+			"sampler budget {}", caller, model.resourceCapacity, sets.accelerationStructures ? ", acceleration structure" : "", model.samplerCapacity,
+			model.staticSamplerCapacity, model.pushConstantBytes, model.pushedPrefixBytes, model.samplerBudget);
 		return Result::Ok;
 	}
 
@@ -16732,8 +17375,8 @@ namespace rhi {
 			enabledVulkan12Features.shaderSharedInt64Atomics = VK_TRUE;
 		}
 		// The binding model. The descriptor-heap model is preferred; the descriptor-buffer model is used where heaps are unavailable
-		// and the device passes its checks (VkEvaluateBindingModels). BASICRHI_VK_BINDING=buffer|heap forces one (buffer only if the
-		// checks pass).
+		// and the device passes its checks (VkEvaluateBindingModels), and the descriptor-sets model where neither is.
+		// BASICRHI_VK_BINDING=buffer|heap|sets forces one (buffer and sets only if their checks pass).
 		// The shader-visible heap capacities are the caller's preferred ones where the device holds them, else the device's limit
 		// (DeviceCreateInfo::descriptorHeapCapacities; a model whose limit is below the minimum is unsupported).
 		vulkan::BindingRequirements bindingRequirements{};
@@ -16743,6 +17386,7 @@ namespace rhi {
 		bindingRequirements.hostSamplerDescriptorBufferBytes = ci.vulkanGuestSamplerDescriptorBufferBytes;
 		const VkBindingModelEvaluation bindingEvaluation = VkEvaluateBindingModels(vkGetInstanceProcAddr, instance, physicalDevice, bindingRequirements);
 		const bool descriptorBufferModelSupported = (bindingEvaluation.report.supportedModels & vulkan::BindingModel_DescriptorBuffer) != 0;
+		const bool descriptorSetsModelSupported = (bindingEvaluation.report.supportedModels & vulkan::BindingModel_DescriptorSets) != 0;
 		const bool descriptorHeapModelAvailable = (bindingEvaluation.report.supportedModels & vulkan::BindingModel_DescriptorHeap) != 0 &&
 			hasDescriptorHeapExtension && hasMaintenance5Extension &&
 			supportedDescriptorHeapFeatures.descriptorHeap == VK_TRUE && enabledVulkan12Features.bufferDeviceAddress == VK_TRUE &&
@@ -16759,16 +17403,35 @@ namespace rhi {
 		else if (bindingOverride && std::strcmp(bindingOverride, "heap") == 0) {
 			useDescriptorBufferModel = false;
 		}
+		const bool forceDescriptorSetsModel = bindingOverride && std::strcmp(bindingOverride, "sets") == 0;
+		if (forceDescriptorSetsModel) {
+			useDescriptorBufferModel = false;
+			allowDescriptorHeapModel = false;
+			if (!descriptorSetsModelSupported) {
+				spdlog::warn("CreateVulkanDevice: BASICRHI_VK_BINDING=sets, but the device fails the descriptor-sets model's checks (logged below)");
+			}
+		}
 		// The caller's allowed models (DeviceCreateInfo::vulkanBindingModels): a guest that records into the same command buffers
 		// must bind descriptors the same way.
 		if (ci.vulkanBindingModels && !(ci.vulkanBindingModels & vulkan::BindingModel_DescriptorHeap)) {
-			useDescriptorBufferModel = descriptorBufferModelSupported && (ci.vulkanBindingModels & vulkan::BindingModel_DescriptorBuffer);
+			useDescriptorBufferModel = !forceDescriptorSetsModel && descriptorBufferModelSupported && (ci.vulkanBindingModels & vulkan::BindingModel_DescriptorBuffer);
 			allowDescriptorHeapModel = false;
 		}
 		else if (ci.vulkanBindingModels && !(ci.vulkanBindingModels & vulkan::BindingModel_DescriptorBuffer)) {
 			useDescriptorBufferModel = false;
 		}
 		if (useDescriptorBufferModel) {
+			allowDescriptorHeapModel = false;
+		}
+		// The descriptor-sets model: forced, or where the device can run neither of the others (unless one of them was forced), and
+		// only when the caller allows it.
+		const bool otherModelForced = bindingOverride && (std::strcmp(bindingOverride, "buffer") == 0 || std::strcmp(bindingOverride, "heap") == 0);
+		bool useDescriptorSetsModel = descriptorSetsModelSupported && !useDescriptorBufferModel &&
+			(forceDescriptorSetsModel || (!otherModelForced && !(allowDescriptorHeapModel && descriptorHeapModelAvailable)));
+		if (ci.vulkanBindingModels && !(ci.vulkanBindingModels & vulkan::BindingModel_DescriptorSets)) {
+			useDescriptorSetsModel = false;
+		}
+		if (useDescriptorSetsModel) {
 			allowDescriptorHeapModel = false;
 		}
 		VkPhysicalDeviceDescriptorBufferFeaturesEXT enabledDescriptorBufferFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT };
@@ -16786,6 +17449,26 @@ namespace rhi {
 			enabledVulkan12Features.pNext = &enabledDescriptorBufferFeatures;
 			// The lowered shaders index texel buffer arrays (non-uniformly) and size the heap sets by variable descriptor count.
 			enabledVulkan12Features.descriptorBindingVariableDescriptorCount = VK_TRUE;
+			enabledVulkan12Features.shaderUniformTexelBufferArrayNonUniformIndexing = VK_TRUE;
+			enabledVulkan12Features.shaderStorageTexelBufferArrayNonUniformIndexing = VK_TRUE;
+			enabledVulkan12Features.shaderUniformTexelBufferArrayDynamicIndexing = supportedVulkan12Features.shaderUniformTexelBufferArrayDynamicIndexing;
+			enabledVulkan12Features.shaderStorageTexelBufferArrayDynamicIndexing = supportedVulkan12Features.shaderStorageTexelBufferArrayDynamicIndexing;
+		}
+		// The descriptor-sets model: update-after-bind bindings of every kind, non-uniform indexing into each, and robustness2's null
+		// descriptors (a slot that changes kind nulls its old binding). Nothing else of robustness2 is turned on.
+		VkPhysicalDeviceRobustness2FeaturesEXT enabledRobustness2Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT };
+		if (useDescriptorSetsModel) {
+			appendUniqueName(enabledDeviceExtensions, VkHasDeviceExtension(physicalDevice, "VK_KHR_robustness2") ? "VK_KHR_robustness2" : VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+			enabledRobustness2Features.nullDescriptor = VK_TRUE;
+			enabledRobustness2Features.pNext = enabledVulkan12Features.pNext;
+			enabledVulkan12Features.pNext = &enabledRobustness2Features;
+			enabledVulkan12Features.descriptorBindingPartiallyBound = VK_TRUE;
+			enabledVulkan12Features.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+			enabledVulkan12Features.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+			enabledVulkan12Features.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
+			enabledVulkan12Features.descriptorBindingUniformTexelBufferUpdateAfterBind = VK_TRUE;
+			enabledVulkan12Features.descriptorBindingStorageTexelBufferUpdateAfterBind = VK_TRUE;
+			enabledVulkan12Features.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
 			enabledVulkan12Features.shaderUniformTexelBufferArrayNonUniformIndexing = VK_TRUE;
 			enabledVulkan12Features.shaderStorageTexelBufferArrayNonUniformIndexing = VK_TRUE;
 			enabledVulkan12Features.shaderUniformTexelBufferArrayDynamicIndexing = supportedVulkan12Features.shaderUniformTexelBufferArrayDynamicIndexing;
@@ -16853,6 +17536,11 @@ namespace rhi {
 			enabledAccelerationStructureFeatures.accelerationStructure = VK_TRUE;
 			enabledAccelerationStructureFeatures.accelerationStructureCaptureReplay = supportedAccelerationStructureFeatures.accelerationStructureCaptureReplay;
 			enabledAccelerationStructureFeatures.accelerationStructureIndirectBuild = supportedAccelerationStructureFeatures.accelerationStructureIndirectBuild;
+			// The descriptor-sets model's acceleration structure binding is update-after-bind like the others.
+			if (useDescriptorSetsModel) {
+				enabledAccelerationStructureFeatures.descriptorBindingAccelerationStructureUpdateAfterBind =
+					supportedAccelerationStructureFeatures.descriptorBindingAccelerationStructureUpdateAfterBind;
+			}
 		}
 		const bool enableRayTracingPipeline =
 			enableAccelerationStructure &&
@@ -17126,6 +17814,7 @@ namespace rhi {
 			enabled.descriptorHeap = enabledDescriptorHeapFeatures;
 			enabled.descriptorBuffer = enabledDescriptorBufferFeatures;
 			enabled.mutableDescriptorType = enabledMutableDescriptorTypeFeatures;
+			enabled.nullDescriptor = enabledRobustness2Features.nullDescriptor == VK_TRUE;
 			enabled.meshShader = enabledMeshShaderFeatures;
 			enabled.deviceGeneratedCommands = enabledDeviceGeneratedCommandsFeatures;
 			enabled.computeShaderDerivatives = enabledComputeShaderDerivativesFeatures;
@@ -17228,7 +17917,8 @@ namespace rhi {
 		}
 
 		impl->bindingModel = impl->descriptorHeapEnabled ? VulkanBindingModel::DescriptorHeap
-			: (useDescriptorBufferModel && impl->descriptorBufferEnabled && impl->mutableDescriptorTypeEnabled ? VulkanBindingModel::DescriptorBuffer : VulkanBindingModel::None);
+			: (useDescriptorBufferModel && impl->descriptorBufferEnabled && impl->mutableDescriptorTypeEnabled ? VulkanBindingModel::DescriptorBuffer
+			: (useDescriptorSetsModel && impl->descriptorSetsFeaturesEnabled ? VulkanBindingModel::DescriptorSets : VulkanBindingModel::None));
 		VkLogBindingModels("CreateVulkanDevice", impl->physicalDeviceProperties.deviceName, bindingEvaluation, impl->bindingModel);
 		if (impl->bindingModel == VulkanBindingModel::DescriptorHeap) {
 			impl->shaderVisibleResourceCapacity = bindingEvaluation.report.heapModelResources;
@@ -17239,6 +17929,13 @@ namespace rhi {
 		if (impl->bindingModel == VulkanBindingModel::DescriptorBuffer) {
 			if (const Result modelResult = VkInitDescriptorBufferModel(impl.get(), bindingEvaluation, bindingRequirements, "CreateVulkanDevice"); modelResult != Result::Ok) {
 				spdlog::error("CreateVulkanDevice: the descriptor-buffer model could not be set up on '{}'; failing device creation", impl->physicalDeviceProperties.deviceName);
+				impl->Shutdown();
+				RHI_FAIL(modelResult);
+			}
+		}
+		if (impl->bindingModel == VulkanBindingModel::DescriptorSets) {
+			if (const Result modelResult = VkInitDescriptorSetsModel(impl.get(), bindingEvaluation, bindingRequirements, "CreateVulkanDevice"); modelResult != Result::Ok) {
+				spdlog::error("CreateVulkanDevice: the descriptor-sets model could not be set up on '{}'; failing device creation", impl->physicalDeviceProperties.deviceName);
 				impl->Shutdown();
 				RHI_FAIL(modelResult);
 			}
@@ -17562,7 +18259,8 @@ namespace rhi {
 			impl->self = Device{ impl.get(), &g_vkdevvt };
 
 			// The binding model is the one whose features the host enabled: descriptor heaps, else descriptor buffers with mutable
-			// descriptors (which must pass their checks), else none.
+			// descriptors (which must pass their checks), else update-after-bind descriptor sets when the host enabled every feature
+			// they need and the device passes their checks, else none.
 			// The host's requirements (heap capacities, its sampler objects and descriptor buffer bytes) are the ones it evaluated the
 			// device with, so the capacities chosen here are those its evaluation reported.
 			const BindingRequirements& bindingRequirements = info.bindingRequirements;
@@ -17591,10 +18289,20 @@ namespace rhi {
 				}
 				impl->bindingModel = VulkanBindingModel::DescriptorBuffer;
 			}
+			else if (impl->descriptorSetsFeaturesEnabled && (bindingEvaluation.report.supportedModels & BindingModel_DescriptorSets) != 0) {
+				impl->bindingModel = VulkanBindingModel::DescriptorSets;
+			}
 			VkLogBindingModels("AdoptVulkanDevice", impl->physicalDeviceProperties.deviceName, bindingEvaluation, impl->bindingModel);
 			if (impl->bindingModel == VulkanBindingModel::DescriptorBuffer) {
 				if (const Result modelResult = VkInitDescriptorBufferModel(impl.get(), bindingEvaluation, bindingRequirements, "AdoptVulkanDevice"); modelResult != Result::Ok) {
 					spdlog::error("AdoptVulkanDevice: the descriptor-buffer model could not be set up on '{}'; adoption fails", impl->physicalDeviceProperties.deviceName);
+					impl->Shutdown();
+					RHI_FAIL(modelResult);
+				}
+			}
+			if (impl->bindingModel == VulkanBindingModel::DescriptorSets) {
+				if (const Result modelResult = VkInitDescriptorSetsModel(impl.get(), bindingEvaluation, bindingRequirements, "AdoptVulkanDevice"); modelResult != Result::Ok) {
+					spdlog::error("AdoptVulkanDevice: the descriptor-sets model could not be set up on '{}'; adoption fails", impl->physicalDeviceProperties.deviceName);
 					impl->Shutdown();
 					RHI_FAIL(modelResult);
 				}
@@ -17652,6 +18360,7 @@ namespace rhi {
 			switch (static_cast<const VulkanDevice*>(device.impl)->bindingModel) {
 			case VulkanBindingModel::DescriptorHeap: return BindingModel_DescriptorHeap;
 			case VulkanBindingModel::DescriptorBuffer: return BindingModel_DescriptorBuffer;
+			case VulkanBindingModel::DescriptorSets: return BindingModel_DescriptorSets;
 			default: return 0;
 			}
 		}

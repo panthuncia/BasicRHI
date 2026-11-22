@@ -419,11 +419,13 @@ if(BASICRHI_BUILD_TESTS)
         endif()
         add_test(NAME BasicRHIVulkanAdoptionSmoke COMMAND BasicRHIVulkanAdoptionSmoke)
         add_test(NAME BasicRHIVulkanAdoptionSmoke.HostSubmit COMMAND BasicRHIVulkanAdoptionSmoke submit)
-        # Both binding models on one GPU (BASICRHI_VK_BINDING forces the model of a device BasicRHI creates).
+        # Every binding model on one GPU (BASICRHI_VK_BINDING forces the model of a device BasicRHI creates).
         add_test(NAME BasicRHIVulkanSmoke.DescriptorHeap COMMAND BasicRHIVulkanSmoke)
         set_tests_properties(BasicRHIVulkanSmoke.DescriptorHeap PROPERTIES ENVIRONMENT "BASICRHI_VK_BINDING=heap")
         add_test(NAME BasicRHIVulkanSmoke.DescriptorBuffer COMMAND BasicRHIVulkanSmoke)
         set_tests_properties(BasicRHIVulkanSmoke.DescriptorBuffer PROPERTIES ENVIRONMENT "BASICRHI_VK_BINDING=buffer")
+        add_test(NAME BasicRHIVulkanSmoke.DescriptorSets COMMAND BasicRHIVulkanSmoke)
+        set_tests_properties(BasicRHIVulkanSmoke.DescriptorSets PROPERTIES ENVIRONMENT "BASICRHI_VK_BINDING=sets")
 
         # The descriptor-buffer lowering on HLSL fixtures (tests/lowering: compiled with the shader ABI's DXC flags, lowered,
         # validated). No GPU needed.
