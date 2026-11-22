@@ -9551,6 +9551,21 @@ namespace rhi {
 
 			if (!DxSafeOMSetRenderTargets(l->cl.Get(), (UINT)rtvs.size(), rtvs.data(), pDsv)) {
 				spdlog::critical("DX12 BeginPass: OMSetRenderTargets crashed");
+				// Name each attachment, so a stale view can be traced to its resource.
+				for (uint32_t i = 0; i < p.colors.size; ++i) {
+					const auto handle = p.colors.data[i].resource;
+					auto* resource = l->dev->resources.get(handle);
+					wchar_t wide[128]{};
+					UINT bytes = sizeof(wide) - sizeof(wchar_t);
+					if (resource && resource->res)
+						(void)resource->res->GetPrivateData(WKPDID_D3DDebugObjectNameW, &bytes, wide);
+					std::string name;
+					for (const wchar_t* c = wide; *c; ++c)
+						name.push_back(*c < 128 ? static_cast<char>(*c) : '?');
+					spdlog::critical("DX12 BeginPass: color[{}] resource ({}, {}) {} rtv heap=({}, {}) index={} name '{}'", i, handle.index, handle.generation,
+						resource ? (resource->res ? "live" : "without a resource") : "gone", p.colors.data[i].rtv.heap.index, p.colors.data[i].rtv.heap.generation,
+						p.colors.data[i].rtv.index, name);
+				}
 				LogDredData();
 				BreakIfDebugging();
 				std::abort();
