@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include "rhi.h"
 
@@ -178,3 +179,54 @@ namespace rhi {
 	bool QueryNativeWorkGraph(WorkGraph, uint32_t iid, void* outStruct, uint32_t outSize) noexcept;
 	bool QueryNativeDescriptorSlot(Device, DescriptorSlot, uint32_t iid, void* outStruct, uint32_t outSize) noexcept;
 } // namespace rhi
+
+namespace rhi::dx12 {
+	/**
+	 * Capture tables, a debug aid for tools that dump a frame. Off until EnableCaptureTables. Once on, every view and sampler
+	 * BasicRHI writes is recorded by its descriptor, and every graphics pipeline keeps its shader bytecode and state.
+	 */
+	enum class DescriptorSlotKind : uint32_t { None, Srv, Uav, Cbv, Sampler };
+	/** @brief What a descriptor slot holds. desc is the D3D12 view or sampler desc as written (D3D12_*_VIEW_DESC, D3D12_SAMPLER_DESC). */
+	struct DescriptorSlotInfo {
+		DescriptorSlotKind kind = DescriptorSlotKind::None;
+		void* resource = nullptr;  // ID3D12Resource*, with a reference added for the caller. Null for a null view or a sampler.
+		alignas(8) uint8_t desc[64]{};
+	};
+	/** @brief A graphics pipeline as BasicRHI handed it to CreatePipelineState. The state blobs are the D3D12 structs. */
+	struct PipelineCaptureInfo {
+		std::vector<uint8_t> vs, ps;  // empty when the stage is absent
+		alignas(8) uint8_t rasterizer[64]{};    // D3D12_RASTERIZER_DESC
+		alignas(8) uint8_t depthStencil[64]{};  // D3D12_DEPTH_STENCIL_DESC
+		alignas(8) uint8_t blend[336]{};        // D3D12_BLEND_DESC
+		uint32_t rtvCount = 0;
+		uint32_t rtvFormats[8]{};
+		uint32_t dsvFormat = 0;
+		uint32_t sampleCount = 1, sampleQuality = 0;
+		uint32_t sampleMask = 0xFFFFFFFFu;
+		uint32_t topologyType = 0;  // D3D12_PRIMITIVE_TOPOLOGY_TYPE
+	};
+	/** @brief Turns the capture tables on for a D3D12 device. Views and pipelines made before the call are not recorded. */
+	void EnableCaptureTables(Device device) noexcept;
+	/**
+	 * @brief For a stall report: logs every D3D12 timeline's completed value and its recent signals and waits, with the queue of each.
+	 * A queue stuck on a GPU wait shows as a wait whose value is past its timeline's completed one. Reads the histories racily.
+	 * @return The number of timelines logged; 0 on another backend.
+	 */
+	uint32_t DumpTimelineHistories(Device device) noexcept;
+	/** @brief Whether the capture tables are on. */
+	bool CaptureTablesEnabled(Device device) noexcept;
+	/**
+	 * @brief The view or sampler at a_slot of a_heap. A slot of the buffer view refs' region (past a full-size heap's capacity)
+	 * reads the region's staging copy. False when nothing was recorded there.
+	 */
+	bool DescribeDescriptorSlot(Device device, DescriptorHeapHandle heap, uint32_t slot, DescriptorSlotInfo& out) noexcept;
+	/** @brief A graphics pipeline's bytecode and state. False when it was not recorded. */
+	bool DescribePipeline(Device device, PipelineHandle pipeline, PipelineCaptureInfo& out) noexcept;
+	/** @brief A live buffer resource and its GPU address range. */
+	struct BufferResourceInfo {
+		void* resource = nullptr;  // ID3D12Resource*, with a reference added for the caller
+		uint64_t address = 0, bytes = 0;
+	};
+	/** @brief Every live buffer resource of the device, once each (a packed buffer's shared resource once). A debug aid; it walks the registry. */
+	void EnumerateBufferResources(Device device, std::vector<BufferResourceInfo>& out) noexcept;
+}

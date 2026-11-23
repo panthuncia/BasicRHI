@@ -722,6 +722,25 @@ namespace rhi {
 	// in push data, so one pushed address can supply every binding of a draw (and an indirect command
 	// stream can change it per command). Vulkan only (VK_EXT_descriptor_heap mappings); D3D12 rejects
 	// them. Supported where IndirectCommandsFeatureInfo::indirectBindings is set.
+	// PushIndex is supported on both backends, for constant buffer ranges only (samplers = true fails
+	// CreatePipelineLayout with InvalidArgument; on Vulkan the range maps uniform buffers only).
+	// D3D12: each PushIndex range is a root descriptor table of `count` CBVs (registers binding.., space
+	// set, the range's visibility), placed after every root constant parameter, so it costs one root
+	// DWORD. The command list sets the table whenever PushConstants writes the named dword, and again
+	// after SetDescriptorHeaps, BindLayout and an ExecuteIndirect that sets root constants. The slot is
+	// pass-wide: a command signature must not write the named dword (CreateCommandSignature fails with
+	// InvalidArgument when one of its Constant arguments covers it). The table's descriptors must stay
+	// unchanged while a command list that uses them executes (DATA_STATIC_WHILE_SET_AT_EXECUTE).
+	// Vulkan: the descriptor-heap model maps it to VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_PUSH_INDEX_EXT.
+	// The descriptor-sets model on a device with VK_KHR_push_descriptor binds each constant buffer as a
+	// real uniform buffer of a push descriptor set (set 2, one binding per constant buffer). The list
+	// pushes it from the slots before the next draw or dispatch after the triggers above (and after
+	// ExecuteCommands), and skips a push of unchanged slots. The descriptors are read at record time, so
+	// they must be written before then (as D3D12's static descriptors). A layout past the uniform buffer
+	// limits, a device without push descriptors, an adopted device and BASICRHI_VK_BOUND_UBO=0 fall back
+	// to the lowering below (rhi::vulkan::BoundUniformBuffers tells which). The descriptor-buffer model
+	// (and the fallback) lowers it like a heap-indexed constant buffer whose index is read from push data
+	// (or from the spill image when that dword is spilled).
 	enum class LayoutRangeSource : uint32_t {
 		HeapSlot,         // binding b reads descriptor heap slot b
 		IndirectIndex,    // binding (binding + i) reads the heap slot whose index (uint32) is at record + recordOffset + 4 * i;
@@ -729,6 +748,9 @@ namespace rhi {
 		IndirectAddress,  // constant buffer (binding + i) reads the buffer whose device address (uint64) is at record + recordOffset + 8 * i
 		PushAddress,      // constant buffer (binding + i) reads the buffer whose device address (uint64) is push data itself: dwords
 		                  // addressOffset32 + 2 * i of push constant range addressRootIndex (no record)
+		PushIndex,        // constant buffer (binding + i) reads heap slot (S + recordOffset + i), where S is the uint32 at dword
+		                  // addressOffset32 of push constant range addressRootIndex; recordOffset is a slot count here, so
+		                  // several ranges can share one pushed index
 	};
 
 	struct LayoutBindingRange {
@@ -738,9 +760,10 @@ namespace rhi {
 		LayoutRangeSource source = LayoutRangeSource::HeapSlot;
 		// Indirect sources: the record's device address is the uint64 at dword addressOffset32 of push
 		// constant range addressRootIndex (a RootConstants32 range of this layout). PushAddress: the first buffer's.
+		// PushIndex: the uint32 heap slot at that dword.
 		uint32_t addressRootIndex = 0;
 		uint32_t addressOffset32 = 0;
-		uint32_t recordOffset = 0;  // bytes
+		uint32_t recordOffset = 0;  // bytes; PushIndex: a slot count added to the pushed slot
 		bool samplers = false;      // IndirectIndex: the range holds samplers
 	};
 

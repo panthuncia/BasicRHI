@@ -196,6 +196,11 @@ namespace rhi::vulkan {
     // The binding model a Vulkan device runs on (one BindingModelBits value), 0 for a device of another backend.
     uint32_t GetBindingModel(rhi::Device device) noexcept;
 
+    // Whether the device binds LayoutRangeSource::PushIndex constant buffers as real uniform buffers: the descriptor-sets model
+    // with push descriptors on a device BasicRHI created (BASICRHI_VK_BOUND_UBO=0 turns it off). The descriptor-heap model maps
+    // PushIndex natively, and the other cases read those constant buffers from the heap. False for a device of another backend.
+    bool BoundUniformBuffers(rhi::Device device) noexcept;
+
     /// One memory heap's budget and usage (VK_EXT_memory_budget).
     struct MemoryHeapBudget {
         uint32_t heapIndex = 0;

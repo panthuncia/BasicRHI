@@ -16,12 +16,14 @@
 #include <optional>
 #include <deque>
 #include <array>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstddef>  // offsetof
 #include <type_traits>
 #include <cstdint>
 #include <memory>
+#include <atomic>
 
 #include "rhi_interop_dx12.h"
 #include "rhi_conversions_dx12.h"
@@ -184,6 +186,14 @@ namespace rhi {
 			PushConstantRangeType type = PushConstantRangeType::RootConstants32;
 		};
 		std::vector<RootConstParam> rcParams;
+		// A LayoutRangeSource::PushIndex range: a root descriptor table after the root constants, set from a pushed heap slot.
+		struct PushIndexTable {
+			uint32_t rootIndex = 0;      // the table's root parameter
+			uint32_t pushRootIndex = 0;  // the root constant parameter that holds the slot
+			uint32_t dword = 0;          // the slot's dword in that parameter
+			uint32_t slotOffset = 0;     // added to the pushed slot (LayoutBindingRange::recordOffset)
+		};
+		std::vector<PushIndexTable> pushIndexTables;
 		Dx12Device* dev = nullptr;
 	};
 
@@ -279,8 +289,12 @@ namespace rhi {
 			uint32_t rootIndex = 0;
 			bool graphics = false, compute = false;
 			std::vector<uint32_t> values;
+			uint64_t written = 0;  // bit d: dword d was pushed (a root constant parameter holds at most 64)
 		};
 		std::vector<RootConstantValues> rootConstantValues;
+		// The shader-visible CBV/SRV/UAV heap set with SetDescriptorHeaps (gpuStart 0 until then), for PushIndex tables.
+		D3D12_GPU_DESCRIPTOR_HANDLE csuHeapGpuStart{};
+		UINT csuHeapIncrement = 0;
 		Dx12Device* dev = nullptr;
 		Dx12Pipeline* boundPipeline = nullptr; // For debug validation
 		// The stencil reference set with SetStencilRef (0 until then). Applied: the list holds it. A list starts
@@ -428,6 +442,44 @@ namespace rhi {
 		std::deque<WaitRecord> recentWaits;
 	};
 
+	// A queue's last submissions, waits and signals, for a stall report (rhi::dx12::DumpTimelineHistories). Written under the
+	// queue's progressMutex by q_submit, and by q_wait and q_signal.
+	struct Dx12SubmitLog {
+		struct Entry {
+			uint64_t seq = 0;
+			uint32_t thread = 0;
+			uint32_t lists = 0;
+			const char* kind = "";
+			uint8_t waitCount = 0, signalCount = 0;
+			std::array<std::pair<uint32_t, uint64_t>, 6> waits{}, signals{};  // timeline index, value (the first six)
+		};
+		static constexpr uint32_t kEntries = 64;
+		std::array<Entry, kEntries> entries{};
+		uint64_t count = 0;
+		void Note(const char* a_kind, uint32_t a_lists, std::span<const TimelinePoint> a_waits, std::span<const TimelinePoint> a_signals) noexcept
+		{
+			static const bool enabled = [] {
+				char* value = nullptr;
+				size_t length = 0;
+				const bool on = _dupenv_s(&value, &length, "BASICRHI_DX12_SUBMIT_LOG") == 0 && value && value[0] == '1';
+				std::free(value);
+				return on;
+			}();
+			if (!enabled)
+				return;
+			auto& entry = entries[count % kEntries];
+			entry = {};
+			entry.seq = count++;
+			entry.thread = GetCurrentThreadId();
+			entry.lists = a_lists;
+			entry.kind = a_kind;
+			for (const auto& w : a_waits)
+				if (entry.waitCount < entry.waits.size()) entry.waits[entry.waitCount++] = { w.t.index, w.value };
+			for (const auto& s : a_signals)
+				if (entry.signalCount < entry.signals.size()) entry.signals[entry.signalCount++] = { s.t.index, s.value };
+		}
+	};
+
 	struct Dx12QueueState {
 		Dx12QueueState() {}
 		Microsoft::WRL::ComPtr<ID3D12CommandQueue> pNativeQueue;
@@ -445,6 +497,7 @@ namespace rhi {
 		bool hasProgress = false;
 		uint64_t progressSubmitted = 0;
 		std::shared_ptr<std::mutex> progressMutex = std::make_shared<std::mutex>();
+		std::shared_ptr<Dx12SubmitLog> submitLog = std::make_shared<Dx12SubmitLog>();
 	};
 
 	struct Dx12Swapchain {
@@ -665,6 +718,22 @@ namespace rhi {
 
 	};
 
+	/**
+	 * @brief The capture tables (rhi_interop.h, EnableCaptureTables). Off by default, so a write costs one relaxed load. Slots are keyed by
+	 * CPU descriptor handle, which covers every heap and the buffer view refs' staging heap.
+	 */
+	struct Dx12CaptureTables {
+		struct Slot {
+			rhi::dx12::DescriptorSlotKind kind = rhi::dx12::DescriptorSlotKind::None;
+			Microsoft::WRL::ComPtr<ID3D12Resource> resource;  // held, so a captured slot's resource stays readable
+			alignas(8) uint8_t desc[64]{};
+		};
+		std::atomic<bool> enabled{ false };
+		std::mutex mutex;
+		std::unordered_map<SIZE_T, Slot> slots;
+		std::unordered_map<uint64_t, std::shared_ptr<const rhi::dx12::PipelineCaptureInfo>> pipelines;  // by handle index and generation
+	};
+
 	struct Dx12Device {
 		~Dx12Device() = default;
 		void Shutdown() noexcept;
@@ -683,6 +752,7 @@ namespace rhi {
 
 		Registry<Dx12Resource> resources;
 		Dx12ViewRefRegion viewRefs;
+		Dx12CaptureTables capture;
 		Registry<Dx12Sampler> samplers;
 		Registry<Dx12PipelineLayout> pipelineLayouts;
 		Registry<Dx12Pipeline> pipelines;

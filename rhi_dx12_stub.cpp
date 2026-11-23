@@ -18,3 +18,15 @@ namespace rhi::dx12 {
     Result export_shared_heap(rhi::Device, rhi::Heap, ExternalHandle&) noexcept { return Result::Unsupported; }
     Result export_shared_timeline(rhi::Device, rhi::Timeline, ExternalHandle&) noexcept { return Result::Unsupported; }
 }
+
+namespace rhi::dx12 {
+    void EnableCaptureTables(rhi::Device) noexcept {}
+    uint32_t DumpTimelineHistories(rhi::Device) noexcept { return 0; }
+    bool CaptureTablesEnabled(rhi::Device) noexcept { return false; }
+    bool DescribeDescriptorSlot(rhi::Device, rhi::DescriptorHeapHandle, uint32_t, DescriptorSlotInfo& out) noexcept {
+        out = {};
+        return false;
+    }
+    bool DescribePipeline(rhi::Device, rhi::PipelineHandle, PipelineCaptureInfo&) noexcept { return false; }
+    void EnumerateBufferResources(rhi::Device, std::vector<BufferResourceInfo>& out) noexcept { out.clear(); }
+}

@@ -65,6 +65,17 @@ namespace {
 			.source = BindingSource::BufferPushAddress, .pushOffset = a_pushOffset };
 	}
 
+	BindingMapping PushIndex(uint32_t a_set, uint32_t a_binding, uint32_t a_count, uint32_t a_pushOffset, uint32_t a_slotOffset) {
+		return BindingMapping{ .set = a_set, .firstBinding = a_binding, .bindingCount = a_count, .resourceMask = VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT,
+			.source = BindingSource::HeapPush, .pushOffset = a_pushOffset, .recordOffset = a_slotOffset };
+	}
+
+	// A PushIndex range in the descriptor-sets model with bound uniform buffers: push descriptor set 2, bindings a_boundBinding onward.
+	BindingMapping BoundUniform(uint32_t a_set, uint32_t a_binding, uint32_t a_count, uint32_t a_boundBinding) {
+		return BindingMapping{ .set = a_set, .firstBinding = a_binding, .bindingCount = a_count, .resourceMask = VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT,
+			.source = BindingSource::BoundUniform, .heapElement = a_boundBinding, .boundSet = 2 };
+	}
+
 	BindingMapping PushData(uint32_t a_set, uint32_t a_binding, uint32_t a_pushOffset, uint32_t a_bytes) {
 		return BindingMapping{ .set = a_set, .firstBinding = a_binding, .resourceMask = VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT,
 			.source = BindingSource::PushData, .pushOffset = a_pushOffset, .pushDataBytes = a_bytes };
@@ -655,7 +666,151 @@ namespace {
 			cases.push_back(std::move(c));
 		}
 
+		// push_index's plan: Root pushed (16 bytes, frameSlot at byte 8), FrameA and FrameB at slots (frameSlot + 3 + i), FrameC at
+		// (frameSlot + 10). a_slotOffset moves the pushed index (byte 8 in Root, byte 20 past it).
+		const auto pushIndexPlan = [](Case& a_case, uint32_t a_slotOffset) {
+			AddAbiHeaps(a_case.plan);
+			a_case.plan.mappings.push_back(PushData(0, 0, 0, 16));
+			a_case.plan.mappings.push_back(PushIndex(9, 0, 2, a_slotOffset, 3));
+			a_case.plan.mappings.push_back(PushIndex(9, 2, 1, a_slotOffset, 10));
+			a_case.plan.pushDataBytes = 16;
+			a_case.target.pushedBytes = 16;
+		};
+		{
+			// The index is Root.frameSlot, read through Root's push block clone; the blocks are heap aliases at index + constant.
+			Case c{ .name = "push index constant buffers", .fixture = "push_index", .stage = VK_SHADER_STAGE_FRAGMENT_BIT };
+			pushIndexPlan(c, 8);
+			c.expect = [](Checks& a_checks, const std::string& a_text) {
+				a_checks.Count(a_text, "= OpVariable %\\S+ PushConstant$", 1, "push constant variables (Root)");
+				a_checks.Count(a_text, "OpMemberDecorate %BasicRHIPushData [0-9]+ Offset", 1, "push block members (the index must be read through Root)");
+				a_checks.HasNo(a_text, "PhysicalStorageBuffer", "unexpected PhysicalStorageBuffer use");
+				a_checks.BoundAt(a_text, "type_FrameA", 0, 0);
+				a_checks.BoundAt(a_text, "type_FrameB", 0, 0);
+				a_checks.BoundAt(a_text, "type_FrameC", 0, 0);
+				a_checks.Has(a_text, "OpConstant %uint 3$", "slot offset 3 (FrameA) missing");
+				a_checks.Has(a_text, "OpConstant %uint 4$", "slot offset 4 (FrameB) missing");
+				a_checks.Has(a_text, "OpConstant %uint 10$", "slot offset 10 (FrameC) missing");
+				// The pushed index plus each block's constant, at each use.
+				a_checks.Has(a_text, "= OpIAdd %uint %\\S+ %uint_3$", "no index + 3 (FrameA)");
+				a_checks.Has(a_text, "= OpIAdd %uint %\\S+ %uint_4$", "no index + 4 (FrameB)");
+				a_checks.Has(a_text, "= OpIAdd %uint %\\S+ %uint_10$", "no index + 10 (FrameC)");
+				a_checks.HasNo(a_text, "OpDecorate %(FrameA|FrameB|FrameC) ", "a block kept its own binding");
+			};
+			cases.push_back(std::move(c));
+		}
+		{
+			// The index past the pushed prefix: one load from the spill image (its address at push byte 120), shared by the blocks.
+			Case c{ .name = "push index spilled", .fixture = "push_index", .stage = VK_SHADER_STAGE_FRAGMENT_BIT };
+			pushIndexPlan(c, 20);
+			c.plan.pushDataBytes = 32;
+			c.target.spillAddressOffset = 120;
+			c.expect = [](Checks& a_checks, const std::string& a_text) {
+				a_checks.Has(a_text, "OpMemoryModel PhysicalStorageBuffer64", "no PhysicalStorageBuffer64 addressing");
+				a_checks.Has(a_text, "OpMemberDecorate %BasicRHIPushData [0-9]+ Offset 120$", "no push member for the spill address");
+				a_checks.Count(a_text, "OpLoad %uint %\\S+ Aligned 4$", 1, "spilled index loads (one per function, 4 bytes past a 16-aligned spill)");
+				a_checks.HasNo(a_text, "Offset 20$", "the spilled index read as a push constant");
+			};
+			cases.push_back(std::move(c));
+		}
+		{
+			// cbvAsStorageBuffer with perType: the blocks become read-only storage buffers on the storage buffer binding.
+			Case c{ .name = "per-type push index constant buffers as storage buffers", .fixture = "push_index", .stage = VK_SHADER_STAGE_FRAGMENT_BIT };
+			pushIndexPlan(c, 8);
+			perTypeTarget(c.target);
+			c.target.cbvAsStorageBuffer = true;
+			c.expect = [](Checks& a_checks, const std::string& a_text) {
+				a_checks.BoundAt(a_text, "type_FrameA", 0, 14);
+				a_checks.BoundAt(a_text, "type_FrameB", 0, 14);
+				a_checks.BoundAt(a_text, "type_FrameC", 0, 14);
+				a_checks.Count(a_text, "= OpVariable %\\S+ Uniform$", 0, "uniform variables");
+				a_checks.HasNo(a_text, "Binding 15$", "something on the uniform buffer binding");
+				a_checks.Has(a_text, "OpDecorate %BasicRHIResourceHeap(_[0-9]+)? NonWritable$", "the storage buffer alias is not NonWritable");
+			};
+			cases.push_back(std::move(c));
+		}
+		{
+			// perType alone: the blocks stay uniform buffers, on the uniform buffer binding.
+			Case c{ .name = "per-type push index uniform buffers", .fixture = "push_index", .stage = VK_SHADER_STAGE_FRAGMENT_BIT };
+			pushIndexPlan(c, 8);
+			perTypeTarget(c.target);
+			c.expect = [](Checks& a_checks, const std::string& a_text) {
+				a_checks.BoundAt(a_text, "type_FrameA", 0, 15);
+				a_checks.BoundAt(a_text, "type_FrameC", 0, 15);
+			};
+			cases.push_back(std::move(c));
+		}
+
+		// The descriptor-sets model with bound uniform buffers (VkPlanBoundUniforms): push_index's space 9 blocks are uniform buffers of
+		// the push descriptor set 2. FrameC is the layout's first range (binding 0), FrameA and FrameB the next (bindings 1 and 2).
+		const auto boundUniformPlan = [](Case& a_case) {
+			AddAbiHeaps(a_case.plan);
+			a_case.plan.mappings.push_back(PushData(0, 0, 0, 16));
+			a_case.plan.mappings.push_back(BoundUniform(9, 0, 2, 1));
+			a_case.plan.mappings.push_back(BoundUniform(9, 2, 1, 0));
+			a_case.plan.pushDataBytes = 16;
+			a_case.target.pushedBytes = 16;
+			perTypeTarget(a_case.target);
+			a_case.target.cbvAsStorageBuffer = true;
+		};
+		{
+			// The blocks keep their uniform type and are only re-decorated: no heap alias, no index, no storage buffer.
+			Case c{ .name = "bound uniform buffers", .fixture = "push_index", .stage = VK_SHADER_STAGE_FRAGMENT_BIT };
+			boundUniformPlan(c);
+			c.expect = [](Checks& a_checks, const std::string& a_text) {
+				a_checks.BoundAt(a_text, "type_FrameA", 2, 1);
+				a_checks.BoundAt(a_text, "type_FrameB", 2, 2);
+				a_checks.BoundAt(a_text, "type_FrameC", 2, 0);
+				a_checks.Count(a_text, "= OpVariable %\\S+ Uniform$", 3, "uniform variables (the three blocks)");
+				a_checks.Count(a_text, "= OpVariable %\\S+ StorageBuffer$", 0, "storage buffer variables");
+				a_checks.HasNo(a_text, "BasicRHIResourceHeap", "a heap alias for a bound block");
+				a_checks.HasNo(a_text, "PhysicalStorageBuffer", "unexpected PhysicalStorageBuffer use");
+				a_checks.HasNo(a_text, "= OpIAdd %uint %\\S+ %uint_(3|4|10)$", "a heap index computed for a bound block");
+				a_checks.Count(a_text, "= OpVariable %\\S+ PushConstant$", 1, "push constant variables (Root)");
+			};
+			cases.push_back(std::move(c));
+		}
+		{
+			// A layout past the bound limits keeps HeapPush for some blocks: those become storage buffers, the bound ones stay uniform.
+			Case c{ .name = "bound uniform buffers beside heap-pushed blocks", .fixture = "push_index", .stage = VK_SHADER_STAGE_FRAGMENT_BIT };
+			AddAbiHeaps(c.plan);
+			c.plan.mappings.push_back(PushData(0, 0, 0, 16));
+			c.plan.mappings.push_back(BoundUniform(9, 0, 2, 0));
+			c.plan.mappings.push_back(PushIndex(9, 2, 1, 8, 10));
+			c.plan.pushDataBytes = 16;
+			c.target.pushedBytes = 16;
+			perTypeTarget(c.target);
+			c.target.cbvAsStorageBuffer = true;
+			c.expect = [](Checks& a_checks, const std::string& a_text) {
+				a_checks.BoundAt(a_text, "type_FrameA", 2, 0);
+				a_checks.BoundAt(a_text, "type_FrameB", 2, 1);
+				a_checks.BoundAt(a_text, "type_FrameC", 0, 14);
+				a_checks.Count(a_text, "= OpVariable %\\S+ Uniform$", 2, "uniform variables (FrameA, FrameB)");
+				a_checks.Has(a_text, "= OpIAdd %uint %\\S+ %uint_10$", "no index + 10 (FrameC)");			};
+			cases.push_back(std::move(c));
+		}
+		{
+			// The mutable-binding target (no perType) must leave bound blocks alone too.
+			Case c{ .name = "bound uniform buffers on the mutable target", .fixture = "push_index", .stage = VK_SHADER_STAGE_FRAGMENT_BIT };
+			AddAbiHeaps(c.plan);
+			c.plan.mappings.push_back(PushData(0, 0, 0, 16));
+			c.plan.mappings.push_back(BoundUniform(9, 0, 3, 4));
+			c.plan.pushDataBytes = 16;
+			c.target.pushedBytes = 16;
+			c.expect = [](Checks& a_checks, const std::string& a_text) {
+				a_checks.BoundAt(a_text, "type_FrameA", 2, 4);
+				a_checks.BoundAt(a_text, "type_FrameB", 2, 5);
+				a_checks.BoundAt(a_text, "type_FrameC", 2, 6);
+			};
+			cases.push_back(std::move(c));
+		}
+
 		// Negative cases.
+		{
+			Case c{ .name = "push index past the push data fails", .fixture = "push_index", .stage = VK_SHADER_STAGE_FRAGMENT_BIT };
+			pushIndexPlan(c, 16);
+			c.errorContains = "reads a push data index at byte 16";
+			cases.push_back(std::move(c));
+		}
 		{
 			Case c{ .name = "several entry points without a name fail", .fixture = "two_entries", .stage = VK_SHADER_STAGE_COMPUTE_BIT };
 			AddAbiHeaps(c.plan);

@@ -9,6 +9,10 @@
 //   Heap, StaticSampler at element e != 0, HeapIndirect: every use becomes an access chain into a typed alias of the heap binding
 //     (one alias variable per descriptor type), at e plus the variable's own array index. HeapIndirect's e is a uint32 loaded once per
 //     function, in its entry block, through a PhysicalStorageBuffer pointer at the record address (push data) + recordOffset + 4i.
+//   HeapPush: as HeapIndirect, with e = (the uint32 push data dword at pushOffset) + recordOffset. The dword is read once per
+//     function, in its entry block: a push constant in the pushed prefix, else a load from the spill image.
+//   BoundUniform: the uniform block stays as it is, re-decorated to (boundSet, heapElement + its index): a real uniform buffer the
+//     command list binds (a push descriptor set). cbvAsStorageBuffer does not apply to it.
 //   PushData inside the pushed prefix: a member of the one push constant block (see BuildPushBlock); access chains get the member
 //     index prepended and are retyped Uniform -> PushConstant.
 //   PushData past the pushed prefix (spilled), BufferIndirectAddress, BufferPushAddress: the uniform block becomes a
@@ -20,7 +24,7 @@
 // Two target options change the heap bindings (LoweringTarget):
 //   perType: each heap resource goes to its kind's binding (kindBindings) instead of the one mutable binding. Typed buffers
 //     (image Dim Buffer) are texel buffers; the counter heap's buffers are storage buffers. Samplers keep their own binding.
-//   cbvAsStorageBuffer: a heap ConstantBuffer (Heap or HeapIndirect) becomes a NonWritable StorageBuffer variable before the
+//   cbvAsStorageBuffer: a heap ConstantBuffer (Heap, HeapIndirect or HeapPush) becomes a NonWritable StorageBuffer variable before the
 //     rewrite, its access chains and loads retyped. The block type and its layout decorations stay as they are.
 
 #include <algorithm>
@@ -118,6 +122,8 @@ namespace rhi::vulkan_binding {
 			case BindingSource::BufferPushAddress: return "BufferPushAddress";
 			case BindingSource::PushData: return "PushData";
 			case BindingSource::StaticSampler: return "StaticSampler";
+			case BindingSource::HeapPush: return "HeapPush";
+			case BindingSource::BoundUniform: return "BoundUniform";
 			default: return "?";
 			}
 		}
@@ -261,6 +267,8 @@ namespace rhi::vulkan_binding {
 			// RecordValue's: by function, type, push offset and record offset.
 			std::map<std::tuple<opt::Function*, uint32_t, uint32_t, uint32_t>, uint32_t> recordValues;
 			std::map<std::pair<opt::Function*, uint32_t>, uint32_t> recordAddresses;
+			// PushIndexValue's: by function and push offset.
+			std::map<std::pair<opt::Function*, uint32_t>, uint32_t> pushIndices;
 
 			static IRContext::Analysis Preserved() { return IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping; }
 
@@ -872,6 +880,7 @@ namespace rhi::vulkan_binding {
 					case BindingSource::BufferIndirectAddress:
 					case BindingSource::BufferPushAddress:
 					case BindingSource::PushData:
+					case BindingSource::BoundUniform:
 						if (resource.kind != VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT || resource.arrayed) {
 							Fail(resource.description, ": a ", SourceName(resource.mapping->source), " mapping needs a single (non-arrayed) uniform block");
 						}
@@ -887,6 +896,7 @@ namespace rhi::vulkan_binding {
 						break;
 					case BindingSource::Heap:
 					case BindingSource::HeapIndirect:
+					case BindingSource::HeapPush:
 						if (target.cbvAsStorageBuffer && resource.kind == VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT) {
 							ConvertToStorageBuffer(resource);
 						}
@@ -933,6 +943,20 @@ namespace rhi::vulkan_binding {
 				}
 			}
 
+			// The planning half of ReadPushUint: the push constant dwords it reads.
+			void NeedPushUint(const Resource& a_resource, uint32_t a_offset) {
+				if (a_offset % 4 != 0 || a_offset + 4 > plan.pushDataBytes) {
+					Fail(a_resource.description, " reads a push data index at byte ", a_offset, ", not a dword within the layout's ", plan.pushDataBytes,
+						" push data bytes");
+				}
+				if (a_offset + 4 <= target.pushedBytes) {
+					NeedDword(a_offset);
+				}
+				else {
+					NeedSpillAddress(a_resource, a_offset);
+				}
+			}
+
 			// Which push block members the stage needs: a clone per pushed root-constant cbuffer, the address dwords the lowering reads.
 			void PlanPushData() {
 				for (Resource& resource : resources) {
@@ -947,6 +971,9 @@ namespace rhi::vulkan_binding {
 						break;
 					case BindingSource::BufferPushAddress:
 						NeedPushAddress(resource, mapping.pushOffset + 8 * resource.index);
+						break;
+					case BindingSource::HeapPush:
+						NeedPushUint(resource, mapping.pushOffset);
 						break;
 					case BindingSource::PushData: {
 						const uint32_t extent = Extent(resource.pointee);
@@ -1206,6 +1233,29 @@ namespace rhi::vulkan_binding {
 				return LoadPhysical(a_where, Uvec2(), address, AlignmentAt(target.spillAlignment, spilled));
 			}
 
+			// The uint32 at push data image byte a_offset: a push constant in the pushed prefix, else read from the spill image
+			// (NeedPushUint planned the dwords).
+			uint32_t ReadPushUint(Instruction* a_where, uint32_t a_offset) {
+				if (a_offset + 4 <= target.pushedBytes) {
+					return ReadPushDword(a_where, a_offset);
+				}
+				const uint32_t spilled = a_offset - target.pushedBytes;
+				const uint32_t address = AddressPlus(a_where, ReadSpillAddress(a_where), spilled);
+				return LoadPhysical(a_where, Uint(), address, AlignmentAt(target.spillAlignment, spilled));
+			}
+
+			// A HeapPush index: the push data dword at a_pushOffset, read once per function in its entry block (like RecordValue).
+			uint32_t PushIndexValue(Instruction* a_where, uint32_t a_pushOffset) {
+				opt::Function* function = context()->get_instr_block(a_where)->GetParent();
+				const auto key = std::pair{ function, a_pushOffset };
+				if (const auto found = pushIndices.find(key); found != pushIndices.end()) {
+					return found->second;
+				}
+				const uint32_t value = ReadPushUint(EntryInsertionPoint(a_where), a_pushOffset);
+				pushIndices.emplace(key, value);
+				return value;
+			}
+
 			// ---- Descriptors ----------------------------------------------------------------------------------------------
 
 			void Redecorate(Resource& a_resource, uint32_t a_set, uint32_t a_binding) {
@@ -1272,6 +1322,12 @@ namespace rhi::vulkan_binding {
 				case BindingSource::HeapIndirect:
 					// The record base is recordAlignment-aligned; its index entries at least 4 (recordOffset + 4i).
 					return RecordValue(a_where, Uint(), mapping.pushOffset, mapping.recordOffset + 4 * a_resource.index);
+				case BindingSource::HeapPush: {
+					// recordOffset counts slots here.
+					const uint32_t pushed = PushIndexValue(a_where, mapping.pushOffset);
+					const uint32_t offset = mapping.recordOffset + a_resource.index;
+					return offset == 0 ? pushed : Builder(a_where).AddIAdd(Uint(), pushed, UintConstant(offset))->result_id();
+				}
 				default:
 					Fail(a_resource.description, ": not a descriptor mapping");
 				}
@@ -1572,6 +1628,7 @@ namespace rhi::vulkan_binding {
 					}
 				} break;
 				case BindingSource::HeapIndirect:
+				case BindingSource::HeapPush:
 					RewriteDescriptor(a_resource);
 					break;
 				case BindingSource::PushData:
@@ -1585,6 +1642,9 @@ namespace rhi::vulkan_binding {
 				case BindingSource::BufferIndirectAddress:
 				case BindingSource::BufferPushAddress:
 					RewritePhysical(a_resource);
+					break;
+				case BindingSource::BoundUniform:
+					Redecorate(a_resource, mapping.boundSet, mapping.heapElement + a_resource.index);
 					break;
 				}
 			}

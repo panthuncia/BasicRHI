@@ -36,6 +36,13 @@ namespace rhi::vulkan_binding {
 		PushData,
 		// A static sampler: element i of layout static sampler staticSampler (StaticSamplerDesc, consecutive elements).
 		StaticSampler,
+		// A heap descriptor whose element index is (the uint32 in push data at pushOffset) + recordOffset + i
+		// (LayoutRangeSource::PushIndex; recordOffset is a slot count here). Appended last: tools read sources by number.
+		HeapPush,
+		// A uniform buffer bound at descriptor set boundSet, binding (heapElement + i): a push descriptor set the command list fills
+		// from heap slots (LayoutRangeSource::PushIndex in the descriptor-sets model with bound uniform buffers). The variable keeps
+		// its type and is only re-decorated. Appended last, like HeapPush.
+		BoundUniform,
 	};
 
 	struct BindingMapping {
@@ -47,11 +54,13 @@ namespace rhi::vulkan_binding {
 		// VK_SPIRV_RESOURCE_TYPE_*_BIT_EXT: the declared resource types this mapping applies to.
 		VkFlags resourceMask = 0;
 		BindingSource source = BindingSource::Heap;
-		uint32_t heapElement = 0;   // Heap
-		uint32_t pushOffset = 0;    // bytes into push data: the record address (*Indirect*), the address (BufferPushAddress), the data (PushData)
-		uint32_t recordOffset = 0;  // bytes, *Indirect* sources
+		uint32_t heapElement = 0;   // Heap; BoundUniform: the binding of element 0 in boundSet
+		uint32_t pushOffset = 0;    // bytes into push data: the record address (*Indirect*), the address (BufferPushAddress), the data (PushData),
+		                            // the heap index (HeapPush)
+		uint32_t recordOffset = 0;  // bytes, *Indirect* sources; HeapPush: slots added to the pushed index
 		uint32_t pushDataBytes = 0; // PushData: the range's size in bytes
 		uint32_t staticSampler = 0; // StaticSampler: index into the layout's static samplers
+		uint32_t boundSet = 0;      // BoundUniform: the push descriptor set
 	};
 
 	struct BindingPlan {

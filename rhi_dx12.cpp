@@ -5,6 +5,8 @@
 #include <initguid.h>   // defines INITGUID
 #include <dxgidebug.h>  // DXGI live object reporting
 #include <debugapi.h>   // OutputDebugStringA
+#include <chrono>
+#include <thread>
 
 #if BASICRHI_ENABLE_STREAMLINE
 #include <sl.h>
@@ -746,6 +748,38 @@ namespace rhi {
 		return selected;
 	}
 
+	// Private data on each native command list: its Dx12CommandList, so a device-removal report can name the open debug labels.
+	static constexpr GUID kDx12ListOwnerGuid = { 0x6b1f3c2a, 0x52d4, 0x4c7e, { 0x9a, 0x11, 0x3e, 0x7d, 0x20, 0x45, 0x8c, 0x61 } };
+
+	/** @brief The debug labels open at breadcrumb a_op of a DRED node, outermost first, from the list's recorded labels. */
+	static std::string Dx12DredOpenLabels(const D3D12_AUTO_BREADCRUMB_NODE1& a_node, UINT32 a_op) noexcept {
+		if (!a_node.pCommandList || !a_node.pCommandHistory) return {};
+		Dx12CommandList* owner = nullptr;
+		UINT size = sizeof(owner);
+		if (FAILED(a_node.pCommandList->GetPrivateData(kDx12ListOwnerGuid, &size, &owner)) || !owner || size != sizeof(owner))
+			return {};
+		try {
+			std::vector<uint32_t> open;
+			uint32_t begun = 0;
+			const UINT32 end = (std::min)(a_op + 1, a_node.BreadcrumbCount);
+			for (UINT32 i = 0; i < end; ++i) {
+				if (a_node.pCommandHistory[i] == D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT)
+					open.push_back(begun++);
+				else if (a_node.pCommandHistory[i] == D3D12_AUTO_BREADCRUMB_OP_ENDEVENT && !open.empty())
+					open.pop_back();
+			}
+			std::string text;
+			for (const uint32_t index : open) {
+				if (!text.empty()) text += " > ";
+				text += index < owner->labels.size() ? owner->labels[index] : std::string("?");
+			}
+			if (!owner->instrumentationPassName.empty()) text += " (pass " + owner->instrumentationPassName + ")";
+			return text;
+		} catch (...) {
+			return {};
+		}
+	}
+
 	static void LogDredData() noexcept {
 		if (!g_dredDevice) return;
 
@@ -851,6 +885,23 @@ namespace rhi {
 						const char* marker = (i == last) ? " <<< LAST COMPLETED" :
 						                     (i == last + 1) ? " <<< LIKELY FAULTING OP" : "";
 						spdlog::error("    [{:5}] {} ({}){}", i, BreadcrumbOpToString(node->pCommandHistory[i]), static_cast<int>(node->pCommandHistory[i]), marker);
+					}
+					// The first op after the last completed one that does work (not a label's begin or end): the one the GPU is on.
+					UINT32 working = last + 1 < count ? last + 1 : last;
+					while (working + 1 < count && (node->pCommandHistory[working] == D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT ||
+							node->pCommandHistory[working] == D3D12_AUTO_BREADCRUMB_OP_ENDEVENT || node->pCommandHistory[working] == D3D12_AUTO_BREADCRUMB_OP_SETMARKER))
+						++working;
+					const std::string labels = Dx12DredOpenLabels(*node, working);
+					if (!labels.empty()) spdlog::error("      open labels at op {} ({}): {}", working, BreadcrumbOpToString(node->pCommandHistory[working]), labels);
+					// The last completed op's labels too: an indirect op completes once issued, so its work may be what the GPU is still running.
+					if (count > 0) {
+						UINT32 issued = last < count ? last : count - 1;
+						while (issued > 0 && (node->pCommandHistory[issued] == D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT ||
+								node->pCommandHistory[issued] == D3D12_AUTO_BREADCRUMB_OP_ENDEVENT || node->pCommandHistory[issued] == D3D12_AUTO_BREADCRUMB_OP_SETMARKER))
+							--issued;
+						const std::string issuedLabels = Dx12DredOpenLabels(*node, issued);
+						if (!issuedLabels.empty())
+							spdlog::error("      open labels at the last completed op {} ({}): {}", issued, BreadcrumbOpToString(node->pCommandHistory[issued]), issuedLabels);
 					}
 				}
 				if (node->pBreadcrumbContexts && node->BreadcrumbContextsCount > 0) {
@@ -1897,6 +1948,30 @@ namespace rhi {
 			pipeline.readsStencilRef = !isCompute && hasDepth && depth.StencilEnable;
 			pipeline.readsBlendFactor = !isCompute && readsBlendFactor;
 			auto handle = dimpl->pipelines.alloc(std::move(pipeline));
+			if (!isCompute && dimpl->capture.enabled.load(std::memory_order_relaxed)) {
+				auto info = std::make_shared<rhi::dx12::PipelineCaptureInfo>();
+				const auto bytes = [](const D3D12_SHADER_BYTECODE& a_code) {
+					const auto* data = static_cast<const uint8_t*>(a_code.pShaderBytecode);
+					return data ? std::vector<uint8_t>(data, data + a_code.BytecodeLength) : std::vector<uint8_t>{};
+				};
+				info->vs = bytes(vs);
+				info->ps = bytes(ps);
+				static_assert(sizeof(D3D12_RASTERIZER_DESC) <= sizeof(info->rasterizer) && sizeof(D3D12_DEPTH_STENCIL_DESC) <= sizeof(info->depthStencil) &&
+					sizeof(D3D12_BLEND_DESC) <= sizeof(info->blend));
+				std::memcpy(info->rasterizer, &rast, sizeof(rast));
+				std::memcpy(info->depthStencil, &depth, sizeof(depth));
+				std::memcpy(info->blend, &blend, sizeof(blend));
+				info->rtvCount = rtv.NumRenderTargets;
+				for (uint32_t k = 0; k < 8; ++k)
+					info->rtvFormats[k] = static_cast<uint32_t>(rtv.RTFormats[k]);
+				info->dsvFormat = static_cast<uint32_t>(dsv);
+				info->sampleCount = sample.Count;
+				info->sampleQuality = sample.Quality;
+				info->sampleMask = sampleMask;
+				info->topologyType = static_cast<uint32_t>(primitiveTopologyType);
+				std::lock_guard lock(dimpl->capture.mutex);
+				dimpl->capture.pipelines[(uint64_t(handle.generation) << 32) | handle.index] = std::move(info);
+			}
 			Pipeline ret(handle);
 			ret.vt = &g_psovt;
 			ret.impl = dimpl;
@@ -1921,6 +1996,10 @@ namespace rhi {
 		}
 		static void d_destroyPipeline(DeviceDeletionContext* d, PipelineHandle h) noexcept
 		{
+			if (auto* impl = dx12_detail::Dev(d); impl->capture.enabled.load(std::memory_order_relaxed)) {
+				std::lock_guard lock(impl->capture.mutex);
+				impl->capture.pipelines.erase((uint64_t(h.generation) << 32) | h.index);
+			}
 			dx12_detail::Dev(d)->pipelines.free(h);
 		}
 
@@ -2537,17 +2616,39 @@ namespace rhi {
 
 		static Result d_createPipelineLayout(Device* d, const PipelineLayoutDesc& ld, PipelineLayoutPtr& out) noexcept {
 			auto* impl = static_cast<Dx12Device*>(d->impl);
+			uint32_t pushIndexCount = 0;
 			for (uint32_t i = 0; i < ld.ranges.size; ++i) {
-				if (ld.ranges.data[i].source != LayoutRangeSource::HeapSlot) {
+				const LayoutBindingRange& range = ld.ranges.data[i];
+				if (range.source == LayoutRangeSource::HeapSlot) {
+					continue;
+				}
+				if (range.source != LayoutRangeSource::PushIndex) {
 					RHI_FAIL(Result::Unsupported);  // VK_EXT_descriptor_heap mappings have no D3D12 equivalent
 				}
+				// The slot must be a dword of a RootConstants32 range, and the range must hold constant buffers.
+				const bool validSlot = range.addressRootIndex < ld.pushConstants.size &&
+				                       !Dx12UsesEmulatedRootConstants(ld.pushConstants.data[range.addressRootIndex]) &&
+				                       range.addressOffset32 < ld.pushConstants.data[range.addressRootIndex].num32BitValues;
+				if (!validSlot || range.samplers || range.count == 0) {
+					spdlog::error("DX12 CreatePipelineLayout: push index range at space {} register b{} needs a slot inside a RootConstants32 range "
+						"and constant buffers only", range.set, range.binding);
+					RHI_FAIL(Result::InvalidArgument);
+				}
+				++pushIndexCount;
 			}
 
-			// Root parameters: push constants only (bindless tables omitted for brevity)
+			// Root parameters: the push constants in declaration order (root index = range index), then one descriptor table per
+			// PushIndex range. Tables go after the constants: other parameters before the root constants slow Pascal down.
 			std::vector<D3D12_ROOT_PARAMETER1> params;
-			params.reserve(ld.pushConstants.size);
+			params.reserve(ld.pushConstants.size + pushIndexCount);
 			std::vector<D3D12_ROOT_PARAMETER> paramsV10;
-			paramsV10.reserve(ld.pushConstants.size);
+			paramsV10.reserve(ld.pushConstants.size + pushIndexCount);
+			// The tables' ranges, reserved up front so the parameters' pointers stay valid.
+			std::vector<D3D12_DESCRIPTOR_RANGE1> tableRanges;
+			tableRanges.reserve(pushIndexCount);
+			std::vector<D3D12_DESCRIPTOR_RANGE> tableRangesV10;
+			tableRangesV10.reserve(pushIndexCount);
+			uint32_t rootDwords = 0;
 			for (uint32_t i = 0; i < ld.pushConstants.size; ++i) {
 				const auto& pc = ld.pushConstants.data[i];
 				const bool useRootCbv = Dx12UsesEmulatedRootConstants(pc);
@@ -2579,6 +2680,55 @@ namespace rhi {
 				}
 				pV10.ShaderVisibility = ToDx12Vis(pc.visibility);
 				paramsV10.push_back(pV10);
+				rootDwords += useRootCbv ? 2u : pc.num32BitValues;
+			}
+
+			std::vector<Dx12PipelineLayout::PushIndexTable> pushIndexTables;
+			pushIndexTables.reserve(pushIndexCount);
+			for (uint32_t i = 0; i < ld.ranges.size; ++i) {
+				const LayoutBindingRange& range = ld.ranges.data[i];
+				if (range.source != LayoutRangeSource::PushIndex) {
+					continue;
+				}
+				D3D12_DESCRIPTOR_RANGE1& r = tableRanges.emplace_back();
+				r.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+				r.NumDescriptors = range.count;
+				r.BaseShaderRegister = range.binding;
+				r.RegisterSpace = range.set;
+				// The pass's blocks do not change while the list executes, so the driver may read them early.
+				r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE;
+				r.OffsetInDescriptorsFromTableStart = 0;
+				D3D12_DESCRIPTOR_RANGE& rV10 = tableRangesV10.emplace_back();
+				rV10.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+				rV10.NumDescriptors = range.count;
+				rV10.BaseShaderRegister = range.binding;
+				rV10.RegisterSpace = range.set;
+				rV10.OffsetInDescriptorsFromTableStart = 0;
+
+				Dx12PipelineLayout::PushIndexTable table{};
+				table.rootIndex = static_cast<uint32_t>(params.size());
+				table.pushRootIndex = range.addressRootIndex;
+				table.dword = range.addressOffset32;
+				table.slotOffset = range.recordOffset;
+				pushIndexTables.push_back(table);
+
+				D3D12_ROOT_PARAMETER1 p{};
+				p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+				p.DescriptorTable.NumDescriptorRanges = 1;
+				p.DescriptorTable.pDescriptorRanges = &r;
+				p.ShaderVisibility = ToDx12Vis(range.visibility);
+				params.push_back(p);
+				D3D12_ROOT_PARAMETER pV10{};
+				pV10.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+				pV10.DescriptorTable.NumDescriptorRanges = 1;
+				pV10.DescriptorTable.pDescriptorRanges = &rV10;
+				pV10.ShaderVisibility = ToDx12Vis(range.visibility);
+				paramsV10.push_back(pV10);
+				rootDwords += 1;
+			}
+			if (rootDwords > 48) {
+				spdlog::info("DX12 CreatePipelineLayout: root signature uses {} of 64 DWORDs ({} root constant ranges, {} push index tables)",
+					rootDwords, static_cast<uint32_t>(ld.pushConstants.size), pushIndexCount);
 			}
 
 			// Static samplers
@@ -2830,6 +2980,7 @@ namespace rhi {
 			if (ld.staticSamplers.size && ld.staticSamplers.data) {
 				L.staticSamplers.assign(ld.staticSamplers.data, ld.staticSamplers.data + ld.staticSamplers.size);
 			}
+			L.pushIndexTables = std::move(pushIndexTables);
 			L.root = root;
 			{
 				// The pipeline cache keys pipelines by this hash (Dx12PipelineStreamKey).
@@ -3449,6 +3600,21 @@ namespace rhi {
 							L->rcParams[rootIndex].binding);
 						RHI_FAIL(Result::InvalidArgument);
 					}
+
+					// A push index slot is pass-wide: the command list sets its table when the slot is pushed, which an
+					// indirect command cannot do.
+					const auto& constants = cd.args.data[i].u.rootConstants;
+					for (const auto& table : L->pushIndexTables) {
+						if (table.pushRootIndex == rootIndex && table.dword >= constants.destOffset32 &&
+							table.dword - constants.destOffset32 < constants.num32) {
+							spdlog::error(
+								"DX12 CreateCommandSignature: root constant arg {} writes dword {} of root parameter {}, a push index slot (pass-wide)",
+								i,
+								table.dword,
+								rootIndex);
+							RHI_FAIL(Result::InvalidArgument);
+						}
+					}
 				}
 				rs = L->root.Get();
 			}
@@ -3574,6 +3740,33 @@ namespace rhi {
 			return true;
 		}
 
+		// ---- Capture tables (rhi_interop.h, EnableCaptureTables) ----
+
+		/** @brief Records what a descriptor write put at a_dst, when the capture tables are on. */
+		static void Dx12NoteSlot(Dx12Device* impl, D3D12_CPU_DESCRIPTOR_HANDLE a_dst, rhi::dx12::DescriptorSlotKind a_kind, ID3D12Resource* a_resource,
+			const void* a_desc, size_t a_bytes) noexcept {
+			auto& tables = impl->capture;
+			if (!tables.enabled.load(std::memory_order_relaxed))
+				return;
+			Dx12CaptureTables::Slot slot{};
+			slot.kind = a_kind;
+			slot.resource = a_resource;
+			std::memcpy(slot.desc, a_desc, (std::min)(a_bytes, sizeof(slot.desc)));
+			std::lock_guard lock(tables.mutex);
+			tables.slots[a_dst.ptr] = std::move(slot);
+		}
+		static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) <= 64 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) <= 64 &&
+			sizeof(D3D12_CONSTANT_BUFFER_VIEW_DESC) <= 64 && sizeof(D3D12_SAMPLER_DESC) <= 64);
+		static void Dx12CreateSrv(Dx12Device* impl, ID3D12Resource* a_resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* a_desc, D3D12_CPU_DESCRIPTOR_HANDLE a_dst) noexcept {
+			impl->pNativeDevice->CreateShaderResourceView(a_resource, a_desc, a_dst);
+			Dx12NoteSlot(impl, a_dst, rhi::dx12::DescriptorSlotKind::Srv, a_resource, a_desc, sizeof(*a_desc));
+		}
+		static void Dx12CreateUav(Dx12Device* impl, ID3D12Resource* a_resource, ID3D12Resource* a_counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* a_desc,
+			D3D12_CPU_DESCRIPTOR_HANDLE a_dst) noexcept {
+			impl->pNativeDevice->CreateUnorderedAccessView(a_resource, a_counter, a_desc, a_dst);
+			Dx12NoteSlot(impl, a_dst, rhi::dx12::DescriptorSlotKind::Uav, a_resource, a_desc, sizeof(*a_desc));
+		}
+
 		// ---- Buffer view refs (rhi_shader_abi.h, BUFFER_VIEW_REF_*) ----
 
 		static void Dx12RawBufferViews(Dx12Device* impl, ID3D12Resource* resource, uint64_t bytes, bool unordered,
@@ -3585,7 +3778,7 @@ namespace rhi {
 			s.Buffer.FirstElement = start / 4;
 			s.Buffer.NumElements = static_cast<UINT>((std::min<uint64_t>)(bytes / 4, UINT32_MAX));
 			s.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-			impl->pNativeDevice->CreateShaderResourceView(resource, &s, srv);
+			Dx12CreateSrv(impl, resource, &s, srv);
 			D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
 			u.Format = DXGI_FORMAT_R32_TYPELESS;
 			u.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -3593,7 +3786,7 @@ namespace rhi {
 			u.Buffer.NumElements = s.Buffer.NumElements;
 			u.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
 			// Without UAV access the slot holds a null view, so every slot of the region is a valid descriptor to copy.
-			impl->pNativeDevice->CreateUnorderedAccessView(unordered ? resource : nullptr, nullptr, &u, uav);
+			Dx12CreateUav(impl, unordered ? resource : nullptr, nullptr, &u, uav);
 		}
 
 		static D3D12_CPU_DESCRIPTOR_HANDLE Dx12ViewRefStaging(const Dx12ViewRefRegion& r, uint32_t a_slot) noexcept {
@@ -3916,7 +4109,7 @@ namespace rhi {
 					desc.Format = ToDxgi(dv.formatOverride);
 					if (desc.Format == DXGI_FORMAT_UNKNOWN) return Result::InvalidArgument;
 				}
-				impl->pNativeDevice->CreateShaderResourceView(nullptr, &desc, dst);
+				Dx12CreateSrv(impl, nullptr, &desc, dst);
 				return Result::Ok;
 			}
 
@@ -3956,7 +4149,7 @@ namespace rhi {
 					break;
 				}
 				desc.Buffer.FirstElement += first;
-				impl->pNativeDevice->CreateShaderResourceView(B->res.Get(), &desc, dst);
+				Dx12CreateSrv(impl, B->res.Get(), &desc, dst);
 				return Result::Ok;
 			}
 
@@ -3967,7 +4160,7 @@ namespace rhi {
 				desc.Texture1D.MostDetailedMip = dv.tex1D.mostDetailedMip;
 				desc.Texture1D.MipLevels = dv.tex1D.mipLevels;
 				desc.Texture1D.ResourceMinLODClamp = dv.tex1D.minLodClamp;
-				impl->pNativeDevice->CreateShaderResourceView(T->res.Get(), &desc, dst);
+				Dx12CreateSrv(impl, T->res.Get(), &desc, dst);
 				return Result::Ok;
 			}
 
@@ -3981,7 +4174,7 @@ namespace rhi {
 				desc.Texture1DArray.ArraySize = dv.tex1DArray.arraySize;
 				desc.Texture1DArray.ResourceMinLODClamp = dv.tex1DArray.minLodClamp;
 				auto* R = T->res.Get();
-				impl->pNativeDevice->CreateShaderResourceView(R, &desc, dst);
+				Dx12CreateSrv(impl, R, &desc, dst);
 				return Result::Ok;
 			}
 
@@ -3995,7 +4188,7 @@ namespace rhi {
 				desc.Texture2D.MipLevels = dv.tex2D.mipLevels;
 				desc.Texture2D.PlaneSlice = dv.tex2D.planeSlice;
 				desc.Texture2D.ResourceMinLODClamp = dv.tex2D.minLodClamp;
-				impl->pNativeDevice->CreateShaderResourceView(T->res.Get(), &desc, dst);
+				Dx12CreateSrv(impl, T->res.Get(), &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4009,7 +4202,7 @@ namespace rhi {
 				desc.Texture2DArray.ArraySize = dv.tex2DArray.arraySize;
 				desc.Texture2DArray.PlaneSlice = dv.tex2DArray.planeSlice;
 				desc.Texture2DArray.ResourceMinLODClamp = dv.tex2DArray.minLodClamp;
-				impl->pNativeDevice->CreateShaderResourceView(T->res.Get(), &desc, dst);
+				Dx12CreateSrv(impl, T->res.Get(), &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4017,7 +4210,7 @@ namespace rhi {
 				auto* T = impl->resources.get(resource); if (!T || !T->res) return Result::InvalidArgument;
 				desc.Format = DxSrvFormat((dv.formatOverride == Format::Unknown) ? T->fmt : ToDxgi(dv.formatOverride));
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
-				impl->pNativeDevice->CreateShaderResourceView(T->res.Get(), &desc, dst);
+				Dx12CreateSrv(impl, T->res.Get(), &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4027,7 +4220,7 @@ namespace rhi {
 				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
 				desc.Texture2DMSArray.FirstArraySlice = dv.tex2DMSArray.firstArraySlice;
 				desc.Texture2DMSArray.ArraySize = dv.tex2DMSArray.arraySize;
-				impl->pNativeDevice->CreateShaderResourceView(T->res.Get(), &desc, dst);
+				Dx12CreateSrv(impl, T->res.Get(), &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4038,7 +4231,7 @@ namespace rhi {
 				desc.Texture3D.MostDetailedMip = dv.tex3D.mostDetailedMip;
 				desc.Texture3D.MipLevels = dv.tex3D.mipLevels;
 				desc.Texture3D.ResourceMinLODClamp = dv.tex3D.minLodClamp;
-				impl->pNativeDevice->CreateShaderResourceView(T->res.Get(), &desc, dst);
+				Dx12CreateSrv(impl, T->res.Get(), &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4049,7 +4242,7 @@ namespace rhi {
 				desc.TextureCube.MostDetailedMip = dv.cube.mostDetailedMip;
 				desc.TextureCube.MipLevels = dv.cube.mipLevels;
 				desc.TextureCube.ResourceMinLODClamp = dv.cube.minLodClamp;
-				impl->pNativeDevice->CreateShaderResourceView(T->res.Get(), &desc, dst);
+				Dx12CreateSrv(impl, T->res.Get(), &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4062,7 +4255,7 @@ namespace rhi {
 				desc.TextureCubeArray.First2DArrayFace = dv.cubeArray.first2DArrayFace;
 				desc.TextureCubeArray.NumCubes = dv.cubeArray.numCubes;
 				desc.TextureCubeArray.ResourceMinLODClamp = dv.cubeArray.minLodClamp;
-				impl->pNativeDevice->CreateShaderResourceView(T->res.Get(), &desc, dst);
+				Dx12CreateSrv(impl, T->res.Get(), &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4079,7 +4272,7 @@ namespace rhi {
 				desc.Format = DXGI_FORMAT_UNKNOWN;
 				desc.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
 				desc.RaytracingAccelerationStructure.Location = address;
-				impl->pNativeDevice->CreateShaderResourceView(nullptr, &desc, dst);
+				Dx12CreateSrv(impl, nullptr, &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4170,7 +4363,7 @@ namespace rhi {
 					break;
 				}
 
-				impl->pNativeDevice->CreateUnorderedAccessView(pResource, pCounterResource, &desc, dst);
+				Dx12CreateUav(impl, pResource, pCounterResource, &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4192,7 +4385,7 @@ namespace rhi {
 				desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
 				desc.Texture1D.MipSlice = dv.texture1D.mipSlice;
 
-				impl->pNativeDevice->CreateUnorderedAccessView(pResource, nullptr, &desc, dst);
+				Dx12CreateUav(impl, pResource, nullptr, &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4216,7 +4409,7 @@ namespace rhi {
 				desc.Texture1DArray.FirstArraySlice = dv.texture1DArray.firstArraySlice;
 				desc.Texture1DArray.ArraySize = dv.texture1DArray.arraySize;
 
-				impl->pNativeDevice->CreateUnorderedAccessView(pResource, nullptr, &desc, dst);
+				Dx12CreateUav(impl, pResource, nullptr, &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4238,7 +4431,7 @@ namespace rhi {
 				desc.Texture2D.MipSlice = dv.texture2D.mipSlice;
 				desc.Texture2D.PlaneSlice = dv.texture2D.planeSlice;
 
-				impl->pNativeDevice->CreateUnorderedAccessView(pResource, nullptr, &desc, dst);
+				Dx12CreateUav(impl, pResource, nullptr, &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4262,7 +4455,7 @@ namespace rhi {
 				desc.Texture2DArray.ArraySize = dv.texture2DArray.arraySize;
 				desc.Texture2DArray.PlaneSlice = dv.texture2DArray.planeSlice;
 
-				impl->pNativeDevice->CreateUnorderedAccessView(pResource, nullptr, &desc, dst);
+				Dx12CreateUav(impl, pResource, nullptr, &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4285,7 +4478,7 @@ namespace rhi {
 				desc.Texture3D.FirstWSlice = dv.texture3D.firstWSlice;
 				desc.Texture3D.WSize = (dv.texture3D.wSize == 0) ? UINT(-1) : dv.texture3D.wSize;
 
-				impl->pNativeDevice->CreateUnorderedAccessView(pResource, nullptr, &desc, dst);
+				Dx12CreateUav(impl, pResource, nullptr, &desc, dst);
 				return Result::Ok;
 			}
 
@@ -4312,6 +4505,7 @@ namespace rhi {
 			desc.BufferLocation = B->BufferAddress() + dv.byteOffset;
 			desc.SizeInBytes = (UINT)((dv.byteSize + 255) & ~255u);
 			impl->pNativeDevice->CreateConstantBufferView(&desc, dst);
+			Dx12NoteSlot(impl, dst, rhi::dx12::DescriptorSlotKind::Cbv, B->res.Get(), &desc, sizeof(desc));
 			return Result::Ok;
 		}
 
@@ -4344,6 +4538,7 @@ namespace rhi {
 			FillDxBorderColor(sd, desc.BorderColor);
 
 			impl->pNativeDevice->CreateSampler(&desc, dst);
+			Dx12NoteSlot(impl, dst, rhi::dx12::DescriptorSlotKind::Sampler, nullptr, &desc, sizeof(desc));
 			return Result::Ok;
 		}
 
@@ -4641,6 +4836,9 @@ namespace rhi {
 			recWithScratch.open = true;  // CreateCommandList opens it
 			const auto h = impl->commandLists.alloc(recWithScratch);
 			const_cast<Dx12Allocator*>(A)->lists.push_back(h);
+			if (Dx12CommandList* owner = impl->commandLists.get(h)) {
+				(void)cl->SetPrivateData(kDx12ListOwnerGuid, sizeof(owner), &owner);
+			}
 
 			CommandList ret{ h };
 			ret.impl = impl;
@@ -6189,12 +6387,41 @@ namespace rhi {
 			return progress;
 		}
 
+		/**
+		 * @brief Waits on the CPU until some queue has been given each signal a_waits names. A GPU wait for a value nobody has submitted
+		 * yet blocks the queue, and when that signal comes later on the same queue (another thread's submission), nothing runs again.
+		 * Only timelines BasicRHI's queues signal: a shared fence another API signals is skipped. Gives up after 2 s, logged.
+		 */
+		static void Dx12WaitForSubmittedSignals(Dx12Device* a_dev, const SubmitDesc& a_submit) noexcept {
+			for (const auto& w : a_submit.waits) {
+				const auto* TL = a_dev->timelines.get(w.t);
+				if (!TL || TL->recentSignals.empty())
+					continue;
+				const auto submitted = [&] { return *static_cast<const volatile uint64_t*>(&TL->lastSubmittedSignalValue); };
+				if (submitted() >= w.value)
+					continue;
+				const auto start = std::chrono::steady_clock::now();
+				while (submitted() < w.value && std::chrono::steady_clock::now() - start < std::chrono::seconds(2))
+					std::this_thread::sleep_for(std::chrono::microseconds(50));
+				const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+				static std::atomic<uint32_t> reports{ 0 };
+				if (submitted() < w.value)
+					spdlog::error("q_submit: timeline '{}' value {} was still not submitted after {:.0f} ms (last submitted {}); waiting on the GPU anyway",
+						TL->debugName, w.value, ms, submitted());
+				else if (ms >= 1.0 && reports.fetch_add(1, std::memory_order_relaxed) < 32)
+					spdlog::warn("q_submit: waited {:.2f} ms for timeline '{}' value {} to be submitted before waiting on it (logged 32 times)",
+						ms, TL->debugName, w.value);
+			}
+		}
+
 		static Result q_submit(Queue* q, Span<CommandList> lists, const SubmitDesc& s) noexcept {
 			auto* qs = dx12_detail::QState(q);
 			auto* dev = qs->dev;
 			if (!dev) {
 				RHI_FAIL(Result::InvalidArgument);
 			}
+			// Before the queue's lock: the signal may come from another thread's submission to this queue.
+			Dx12WaitForSubmittedSignals(dev, s);
 			std::lock_guard progressLock(*qs->progressMutex);
 			if (!qs->hasProgress) {
 				Microsoft::WRL::ComPtr<ID3D12Fence> fence;
@@ -6319,6 +6546,9 @@ namespace rhi {
 				}
 				Dx12RecordTimelineSignal(*TL, *q, sgn.value, completedBefore, lists.size, "q_submit");
 			}
+			if (qs->submitLog)
+				qs->submitLog->Note("submit", static_cast<uint32_t>(lists.size), std::span<const TimelinePoint>(s.waits.data, s.waits.size),
+					std::span<const TimelinePoint>(s.signals.data, s.signals.size));
 			if (qs->hasProgress) {
 				if (auto* progress = dev->timelines.get(qs->progress)) {
 					const uint64_t value = qs->progressSubmitted + 1;
@@ -8910,6 +9140,9 @@ namespace rhi {
 				return Result::Failed;
 			}
 			Dx12RecordTimelineSignal(*TL, *q, p.value, completedBefore, 0, "q_signal");
+			// Unlocked (a diagnostic): taking the queue's lock here would reorder this thread against the queue's submitters.
+			if (qs->submitLog)
+				qs->submitLog->Note("signal", 0, {}, std::span<const TimelinePoint>(&p, 1));
 			return Result::Ok;
 		}
 
@@ -8937,6 +9170,9 @@ namespace rhi {
 				LogDredData();
 				return Result::InvalidArgument;
 			}
+			// Unlocked (a diagnostic): taking the queue's lock here would reorder this thread against the queue's submitters.
+			if (qs->submitLog)
+				qs->submitLog->Note("wait", 0, std::span<const TimelinePoint>(&p, 1), {});
 			return SUCCEEDED(qs->pNativeQueue->Wait(TL->fence.Get(), p.value)) ? Result::Ok : Result::Failed;
 		}
 
@@ -9317,6 +9553,8 @@ namespace rhi {
 			l->boundLayout = {};
 			l->boundLayoutPtr = nullptr;
 			l->rootConstantValues.clear();
+			l->csuHeapGpuStart = {};
+			l->csuHeapIncrement = 0;
 			l->activeRootCbvShadowStateCount = 0;
 			l->stencilRef = 0;
 			l->stencilRefApplied = false;
@@ -9577,6 +9815,36 @@ namespace rhi {
 		}
 
 		static void cl_endPass(CommandList* /*cl*/) noexcept {} // nothing to do in DX12
+
+		// Sets the bound layout's PushIndex tables from the pushed slots: every table, or only those whose slot is in dwords
+		// [a_first, a_first + a_count) of root parameter a_pushRootIndex. A table is set once its slot was pushed and a
+		// shader-visible CBV/SRV/UAV heap is set, on the bind points the slot was pushed for.
+		static void Dx12SetPushIndexTables(Dx12CommandList* l, uint32_t a_pushRootIndex = UINT32_MAX, uint32_t a_first = 0, uint32_t a_count = UINT32_MAX) noexcept {
+			const Dx12PipelineLayout* L = l->boundLayoutPtr;
+			if (!L || L->pushIndexTables.empty() || l->csuHeapGpuStart.ptr == 0) {
+				return;
+			}
+			for (const auto& table : L->pushIndexTables) {
+				if (a_pushRootIndex != UINT32_MAX &&
+					(table.pushRootIndex != a_pushRootIndex || table.dword < a_first || table.dword - a_first >= a_count)) {
+					continue;
+				}
+				const auto entry = std::find_if(l->rootConstantValues.begin(), l->rootConstantValues.end(),
+					[&](const auto& values) { return values.rootIndex == table.pushRootIndex; });
+				if (entry == l->rootConstantValues.end() || table.dword >= entry->values.size() || (entry->written & (1ull << table.dword)) == 0) {
+					continue;
+				}
+				const uint64_t slot = static_cast<uint64_t>(entry->values[table.dword]) + table.slotOffset;
+				const D3D12_GPU_DESCRIPTOR_HANDLE handle{ l->csuHeapGpuStart.ptr + slot * l->csuHeapIncrement };
+				if (entry->graphics) {
+					l->cl->SetGraphicsRootDescriptorTable(table.rootIndex, handle);
+				}
+				if (entry->compute) {
+					l->cl->SetComputeRootDescriptorTable(table.rootIndex, handle);
+				}
+			}
+		}
+
 		static void cl_bindLayout(CommandList* cl, PipelineLayoutHandle layoutH) noexcept {
 			auto* impl = dx12_detail::CL(cl);
 			auto* dev = impl->dev;
@@ -9607,6 +9875,8 @@ namespace rhi {
 			}
 			impl->boundLayout = layoutH;
 			impl->boundLayoutPtr = L;
+			// Rebinding the same layout keeps the pushed values: set its tables again.
+			Dx12SetPushIndexTables(impl);
 		}
 		static void cl_bindPipeline(CommandList* cl, PipelineHandle psoH) noexcept {
 			auto* l = dx12_detail::CL(cl);
@@ -10113,6 +10383,7 @@ namespace rhi {
 						l->cl->SetComputeRoot32BitConstants(entry.rootIndex, static_cast<UINT>(entry.values.size()), entry.values.data(), 0);
 					}
 				}
+				Dx12SetPushIndexTables(l);
 			}
 		}
 		static void cl_setDescriptorHeaps(CommandList* cl, DescriptorHeapHandle csu, std::optional<DescriptorHeapHandle> samp) noexcept {
@@ -10123,6 +10394,10 @@ namespace rhi {
 			UINT n = 0;
 			if (auto* H = dev->descHeaps.get(csu)) {
 				heaps[n++] = H->heap.Get();
+				if (H->shaderVisible && H->type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+					l->csuHeapGpuStart = H->gpuStart;
+					l->csuHeapIncrement = H->inc;
+				}
 			}
 			if (samp.has_value()) {
 				if (auto* H = dev->descHeaps.get(samp.value())) {
@@ -10131,6 +10406,7 @@ namespace rhi {
 			}
 			if (n) {
 				l->cl->SetDescriptorHeaps(n, heaps);
+				Dx12SetPushIndexTables(l);
 			}
 		}
 
@@ -10970,8 +11246,10 @@ namespace rhi {
 					found->values.resize(maxAvail, 0u);
 				}
 				std::memcpy(found->values.data() + dstOffset32, p32, static_cast<size_t>(num32) * sizeof(uint32_t));
+				found->written |= (num32 >= 64 ? ~0ull : ((1ull << num32) - 1ull)) << dstOffset32;
 				found->graphics = found->graphics || graphics;
 				found->compute = found->compute || compute;
+				Dx12SetPushIndexTables(impl, rc->rootIndex, dstOffset32, num32);
 				return;
 			}
 
@@ -13080,6 +13358,135 @@ namespace rhi {
 			out = ExternalHandle(handle, ExternalHandleType::D3D12Fence,
 				ExternalHandleImportOwnership::RetainedByCaller, &CloseExternalWin32Handle);
 			return Result::Ok;
+		}
+	}
+
+	namespace dx12 {
+		uint32_t DumpTimelineHistories(Device device) noexcept
+		{
+			if (!device || device.vt != &g_devvt || !device.impl)
+				return 0;
+			auto* impl = static_cast<Dx12Device*>(device.impl);
+			uint32_t logged = 0;
+			try {
+				std::shared_lock lock(impl->timelines.mutex);
+				for (uint32_t i = 0; i < impl->timelines.slots.size(); ++i) {
+					const auto& slot = impl->timelines.slots[i];
+					if (!slot.alive || (slot.obj.recentSignals.empty() && slot.obj.recentWaits.empty()))
+						continue;
+					const uint64_t completed = slot.obj.fence ? slot.obj.fence->GetCompletedValue() : 0;
+					Dx12LogTimelineHistory("stall report", TimelineHandle{ i, slot.generation }, slot.obj, completed);
+					++logged;
+				}
+				// Each queue's last submissions in order. A wait marked "not reached" blocks the queue and everything after it.
+				const auto describe = [&](uint32_t a_index, uint64_t a_value, bool a_wait) {
+					std::string name = "?";
+					uint64_t completed = 0;
+					if (a_index < impl->timelines.slots.size() && impl->timelines.slots[a_index].alive) {
+						name = impl->timelines.slots[a_index].obj.debugName;
+						const auto& fence = impl->timelines.slots[a_index].obj.fence;
+						completed = fence ? fence->GetCompletedValue() : 0;
+					}
+					return fmt::format(" {}{}{}{}", name, a_wait ? ">=" : "=", a_value, a_wait && completed < a_value ? " (not reached)" : "");
+				};
+				std::shared_lock queueLock(impl->queues.mutex);
+				for (uint32_t q = 0; q < impl->queues.slots.size(); ++q) {
+					const auto& queue = impl->queues.slots[q];
+					if (!queue.alive || !queue.obj.submitLog || queue.obj.submitLog->count == 0)
+						continue;
+					const auto& log = *queue.obj.submitLog;
+					const uint64_t first = log.count > Dx12SubmitLog::kEntries ? log.count - Dx12SubmitLog::kEntries : 0;
+					spdlog::critical("DX12 queue {}: the last {} of {} submissions, oldest first", q, log.count - first, log.count);
+					for (uint64_t seq = first; seq < log.count; ++seq) {
+						const auto& e = log.entries[seq % Dx12SubmitLog::kEntries];
+						std::string text = fmt::format("  #{} {} thread {} lists {}:", e.seq, e.kind, e.thread, e.lists);
+						for (uint8_t w = 0; w < e.waitCount; ++w) text += describe(e.waits[w].first, e.waits[w].second, true);
+						text += " ->";
+						for (uint8_t s = 0; s < e.signalCount; ++s) text += describe(e.signals[s].first, e.signals[s].second, false);
+						spdlog::critical("{}", text);
+					}
+				}
+			} catch (...) {
+			}
+			return logged;
+		}
+
+		void EnableCaptureTables(Device device) noexcept
+		{
+			if (!device || device.vt != &g_devvt || !device.impl)
+				return;
+			static_cast<Dx12Device*>(device.impl)->capture.enabled.store(true);
+			spdlog::info("DX12 capture tables: on; views, samplers and graphics pipelines made from now on are recorded");
+		}
+
+		bool CaptureTablesEnabled(Device device) noexcept
+		{
+			return device && device.vt == &g_devvt && device.impl && static_cast<Dx12Device*>(device.impl)->capture.enabled.load(std::memory_order_relaxed);
+		}
+
+		bool DescribeDescriptorSlot(Device device, DescriptorHeapHandle heap, uint32_t slot, DescriptorSlotInfo& out) noexcept
+		{
+			out = {};
+			if (!CaptureTablesEnabled(device))
+				return false;
+			auto* impl = static_cast<Dx12Device*>(device.impl);
+			auto* H = impl->descHeaps.get(heap);
+			if (!H)
+				return false;
+			D3D12_CPU_DESCRIPTOR_HANDLE handle = H->cpuStart;
+			handle.ptr += SIZE_T(slot) * H->inc;
+			// The buffer view refs' region is written in staging and copied into each full-size heap.
+			const auto& refs = impl->viewRefs;
+			if (H->type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && refs.ready && slot >= refs.firstSlot && slot < refs.firstSlot + BUFFER_VIEW_REF_SLOTS)
+				handle = Dx12ViewRefStaging(refs, slot - refs.firstSlot);
+			std::lock_guard lock(impl->capture.mutex);
+			const auto found = impl->capture.slots.find(handle.ptr);
+			if (found == impl->capture.slots.end())
+				return false;
+			out.kind = found->second.kind;
+			if (auto* resource = found->second.resource.Get()) {
+				resource->AddRef();
+				out.resource = resource;
+			}
+			std::memcpy(out.desc, found->second.desc, sizeof(out.desc));
+			return true;
+		}
+
+		void EnumerateBufferResources(Device device, std::vector<BufferResourceInfo>& out) noexcept
+		{
+			out.clear();
+			if (!device || device.vt != &g_devvt || !device.impl)
+				return;
+			auto* impl = static_cast<Dx12Device*>(device.impl);
+			std::unordered_set<ID3D12Resource*> seen;
+			std::shared_lock lock(impl->resources.mutex);
+			for (auto& slot : impl->resources.slots) {
+				if (!slot.alive || slot.obj.kind != Dx12ResourceKind::Buffer || !slot.obj.res)
+					continue;
+				ID3D12Resource* resource = slot.obj.res.Get();
+				if (!seen.insert(resource).second)
+					continue;
+				const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+				resource->AddRef();
+				out.push_back({ resource, resource->GetGPUVirtualAddress(), desc.Width });
+			}
+		}
+
+		bool DescribePipeline(Device device, PipelineHandle pipeline, PipelineCaptureInfo& out) noexcept
+		{
+			if (!CaptureTablesEnabled(device))
+				return false;
+			auto* impl = static_cast<Dx12Device*>(device.impl);
+			std::shared_ptr<const PipelineCaptureInfo> info;
+			{
+				std::lock_guard lock(impl->capture.mutex);
+				const auto found = impl->capture.pipelines.find((uint64_t(pipeline.generation) << 32) | pipeline.index);
+				if (found == impl->capture.pipelines.end())
+					return false;
+				info = found->second;
+			}
+			out = *info;
+			return true;
 		}
 	}
 

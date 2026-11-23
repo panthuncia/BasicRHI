@@ -368,6 +368,14 @@ namespace rhi {
 		uint32_t pushedBytes = 0;
 		uint32_t spillAddressOffset = 0xFFFFFFFFu;
 		std::vector<uint32_t> staticSamplerElements;
+		// Descriptor-sets model with bound uniform buffers (VulkanDescriptorSetsModel::boundUniforms): the PushIndex ranges'
+		// push descriptor set and the pipeline layout pipelines of this layout are made with (both the device's), and per range
+		// the first binding of its uniform buffers in that set (ranges that are not PushIndex hold 0). Null when the layout has
+		// no PushIndex range or does not fit the limits: its PushIndex ranges are lowered like heap CBVs.
+		VkDescriptorSetLayout boundUniformSetLayout = VK_NULL_HANDLE;
+		VkPipelineLayout boundUniformPipelineLayout = VK_NULL_HANDLE;
+		std::vector<uint32_t> boundUniformBindings;
+		uint32_t boundUniformCount = 0;
 	};
 
 	struct VulkanPipeline {
@@ -606,6 +614,15 @@ namespace rhi {
 		std::vector<uint8_t> pushDataShadow;
 		bool pushedDataDirty = false;
 		bool spilledDataDirty = false;
+		// Descriptor-sets model, bound uniform buffers: the bound layout's push descriptor set layout (null: it has none), and
+		// whether its descriptors must be checked before the next command that reads them (BindLayout, PushConstants over a
+		// pushed index). boundUniformPushed* is what the buffer holds: the set layout and heap slots last pushed; a null set
+		// layout means nothing valid (SetDescriptorHeaps, ExecuteCommands and generated commands disturb the push).
+		VkDescriptorSetLayout boundUniformSetLayout = VK_NULL_HANDLE;
+		bool boundUniformsDirty = false;
+		VkDescriptorSetLayout boundUniformPushedSetLayout = VK_NULL_HANDLE;
+		DescriptorHeapHandle boundUniformPushedHeap{};
+		std::vector<uint32_t> boundUniformPushedSlots;
 		std::vector<VkQueryPool> transientQueryPools;
 		std::vector<TracyGpuOpenZone> tracyGpuZoneStack;
 		std::vector<TracyGpuZoneEvent> tracyGpuZoneEvents;
@@ -632,6 +649,25 @@ namespace rhi {
 		static constexpr uint32_t kBinding[KindCount] = { 0, 1, 2, 3, 4, 5 };
 		// Binding 5 exists only when acceleration structures are enabled.
 		bool accelerationStructures = false;
+
+		// Bound uniform buffers: a layout's PushIndex ranges become real uniform buffers in a push descriptor set at
+		// kBoundUniformSet (VK_KHR_push_descriptor), instead of heap CBVs read as storage buffers. The command list pushes
+		// them from the heap slots the pushed index names. Off without push descriptors, or with BASICRHI_VK_BOUND_UBO=0.
+		static constexpr uint32_t kBoundUniformSet = 2;
+		static constexpr uint32_t kMaxBoundUniforms = 32;  // per layout, whatever the device allows
+		bool boundUniforms = false;
+		// What one layout may bind: uniform buffers visible to one stage, and in all (push descriptors, set limits).
+		uint32_t boundUniformsPerStage = 0;
+		uint32_t boundUniformsPerLayout = 0;
+		// The push descriptor set layouts and their pipeline layouts (the universal sets 0 and 1, the universal push range,
+		// and the push set), by each binding's stage flags. Layouts with the same bindings share one, so they stay compatible.
+		// Made on first use and kept until the device goes.
+		struct BoundUniformLayout {
+			VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+			VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+		};
+		std::mutex boundUniformLayoutsMutex;
+		std::vector<std::pair<std::vector<VkShaderStageFlags>, BoundUniformLayout>> boundUniformLayouts;
 	};
 
 	// The descriptor-buffer model's device state (VulkanBindingModel::DescriptorBuffer), set up once the VkDevice exists.
@@ -841,6 +877,7 @@ namespace rhi {
 			uint64_t next = 0;
 		} retiredBuffers;
 		bool nullDescriptorEnabled = false;  // VK_EXT_robustness2 nullDescriptor: views with no resource
+		bool pushDescriptorEnabled = false;  // VK_KHR_push_descriptor (bound uniform buffers in the descriptor-sets model)
 		// Every feature the descriptor-sets model needs: update-after-bind and non-uniform indexing for each kind, partially bound,
 		// update unused while pending, null descriptors, buffer device address, runtime arrays and scalar block layout.
 		bool descriptorSetsFeaturesEnabled = false;

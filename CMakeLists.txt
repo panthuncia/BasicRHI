@@ -460,6 +460,10 @@ if(BASICRHI_BUILD_TESTS)
         add_executable(BasicRHID3D12FixedFunctionSmoke tests/D3D12FixedFunctionSmoke.cpp)
         target_link_libraries(BasicRHID3D12FixedFunctionSmoke PRIVATE BasicRHI::BasicRHI d3dcompiler)
         add_test(NAME BasicRHID3D12FixedFunctionSmoke COMMAND BasicRHID3D12FixedFunctionSmoke)
+        # Constant buffers bound through root descriptor tables based at a pushed heap slot (LayoutRangeSource::PushIndex).
+        add_executable(BasicRHID3D12PushIndexSmoke tests/D3D12PushIndexSmoke.cpp)
+        target_link_libraries(BasicRHID3D12PushIndexSmoke PRIVATE BasicRHI::BasicRHI d3dcompiler)
+        add_test(NAME BasicRHID3D12PushIndexSmoke COMMAND BasicRHID3D12PushIndexSmoke)
 
         # Clustered raytracing needs the preview runtime and SM 6.10 compiler the renderer ships beside BasicRHI.
         set(_basicrhi_rt_tools "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer")
