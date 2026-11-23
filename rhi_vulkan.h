@@ -1040,6 +1040,15 @@ namespace rhi {
 			std::mutex saveMutex;
 			detail::PipelineCacheCounters counters;
 		} pipelineCache;
+		// Lowered shader modules by a hash of everything their lowering reads (VkCreateBufferModelShaderModule). Pipelines share
+		// stages, so a load's thousands of pipelines lowered the same modules again and again, which was most of their build time.
+		struct LoweredModules {
+			std::mutex mutex;
+			std::unordered_map<uint64_t, std::shared_ptr<const std::vector<uint32_t>>> byKey;
+			size_t words = 0;  // held in all; cleared past kMaxWords
+			uint64_t hits = 0, misses = 0;
+			static constexpr size_t kMaxWords = size_t(32) << 20;  // 128 MiB
+		} loweredModules;
 		std::weak_ptr<VulkanDevice> selfWeak;
 	};
 

@@ -10859,6 +10859,47 @@ namespace rhi {
 				}
 
 				const std::span<const uint32_t> input(code, codeBytes / sizeof(uint32_t));
+				// The key covers the module, the plan, the target, the stage and the entry point: all the lowering reads.
+				const uint64_t key = [&] {
+					detail::Fnv1a64 hash;
+					hash.Add(code, codeBytes);
+					hash.AddValue(static_cast<uint32_t>(stage));
+					hash.AddValue(static_cast<uint64_t>(entryPoint.size()));
+					hash.Add(entryPoint.data(), entryPoint.size());
+					hash.AddValue(plan.pushDataBytes);
+					for (const auto& m : plan.mappings) {
+						hash.AddValue(m.set); hash.AddValue(m.firstBinding); hash.AddValue(m.bindingCount); hash.AddValue(m.resourceMask);
+						hash.AddValue(static_cast<uint32_t>(m.source)); hash.AddValue(m.heapElement); hash.AddValue(m.pushOffset); hash.AddValue(m.recordOffset);
+						hash.AddValue(m.pushDataBytes); hash.AddValue(m.staticSampler); hash.AddValue(m.boundSet);
+					}
+					hash.AddValue(target.resourceSet); hash.AddValue(target.resourceBinding); hash.AddValue(target.samplerSet); hash.AddValue(target.samplerBinding);
+					hash.AddValue(target.pushedBytes); hash.AddValue(target.spillAddressOffset); hash.AddValue(target.pushConstantBytes);
+					hash.AddValue(target.recordAlignment); hash.AddValue(target.uniformBlockAlignment); hash.AddValue(target.spillAlignment);
+					hash.AddValue(static_cast<uint64_t>(target.staticSamplerElements.size()));
+					hash.Add(target.staticSamplerElements.data(), target.staticSamplerElements.size_bytes());
+					hash.AddValue(target.perType); hash.AddValue(target.kindBindings); hash.AddValue(target.cbvAsStorageBuffer);
+					return hash.Value();
+				}();
+				// A dump writes each lowering's files, so it skips the cache.
+				auto& cache = impl->loweredModules;
+				std::shared_ptr<const std::vector<uint32_t>> found;
+				if (dumpDirectory.empty()) {
+					const std::scoped_lock lock(cache.mutex);
+					if (const auto it = cache.byKey.find(key); it != cache.byKey.end()) {
+						found = it->second;
+						++cache.hits;
+					}
+				}
+				if (found) {
+					VkShaderModuleCreateInfo moduleInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+					moduleInfo.codeSize = found->size() * sizeof(uint32_t);
+					moduleInfo.pCode = found->data();
+					if (const VkResult result = vkCreateShaderModule(impl->device, &moduleInfo, nullptr, &outModule); result != VK_SUCCESS) {
+						outModule = VK_NULL_HANDLE;
+						return ToRHI(result);
+					}
+					return Result::Ok;
+				}
 				std::vector<uint32_t> lowered;
 				std::string error;
 				const bool loweredOk = vulkan_binding::LowerForDescriptorBuffer(input, plan, stage, target, lowered, error, entryPoint);
@@ -10905,9 +10946,22 @@ namespace rhi {
 						spdlog::error("Vulkan descriptor-buffer model: lowered stage 0x{:x} of pipeline '{}' fails validation: {}", static_cast<uint32_t>(stage), name, validationError);
 					}
 				}
+				auto kept = std::make_shared<const std::vector<uint32_t>>(std::move(lowered));
+				if (dumpDirectory.empty()) {
+					const std::scoped_lock lock(cache.mutex);
+					++cache.misses;
+					if (cache.words + kept->size() > cache.kMaxWords) {
+						spdlog::info("Vulkan descriptor-buffer model: lowered module cache full ({} modules, {} MiB; {} reused, {} lowered); emptied",
+							cache.byKey.size(), (cache.words * sizeof(uint32_t)) >> 20, cache.hits, cache.misses);
+						cache.byKey.clear();
+						cache.words = 0;
+					}
+					if (cache.byKey.try_emplace(key, kept).second)
+						cache.words += kept->size();
+				}
 				VkShaderModuleCreateInfo moduleInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-				moduleInfo.codeSize = lowered.size() * sizeof(uint32_t);
-				moduleInfo.pCode = lowered.data();
+				moduleInfo.codeSize = kept->size() * sizeof(uint32_t);
+				moduleInfo.pCode = kept->data();
 				if (const VkResult result = vkCreateShaderModule(impl->device, &moduleInfo, nullptr, &outModule); result != VK_SUCCESS) {
 					spdlog::error("Vulkan descriptor-buffer model: vkCreateShaderModule for stage 0x{:x} of pipeline '{}' failed ({})", static_cast<uint32_t>(stage), name, static_cast<int>(result));
 					outModule = VK_NULL_HANDLE;
@@ -11152,6 +11206,7 @@ namespace rhi {
 		}
 
 		static Result d_createPipelineFromStream(Device* device, const PipelineStreamItem* items, uint32_t count, PipelinePtr& out) noexcept {
+			ZoneScopedN("RHI.Vulkan.CreatePipeline");
 			out.Reset();
 			auto* impl = device ? static_cast<VulkanDevice*>(device->impl) : nullptr;
 			if (!impl || !items || count == 0 || impl->device == VK_NULL_HANDLE) {
@@ -11600,6 +11655,7 @@ namespace rhi {
 					}
 					VkShaderModule module = VK_NULL_HANDLE;
 					if (bufferModel) {
+						ZoneScopedN("RHI.Vulkan.LowerShaderModule");
 						// Descriptor-buffer model: lowered after the capture names are applied, so they survive into the module.
 						if (const Result lowered = VkCreateBufferModelShaderModule(impl, *layoutState, VkShaderStageForRHI(shader->stage), VkShaderStageForRHI(shader->stage),
 								moduleInfo.pCode, moduleInfo.codeSize, shader->entryPoint.c_str(),
@@ -11821,6 +11877,7 @@ namespace rhi {
 				if (t_pipelineStatisticsLabel)
 					for (VkShaderModule module : modules) VkSetObjectName(impl, reinterpret_cast<uint64_t>(module), VK_OBJECT_TYPE_SHADER_MODULE, t_pipelineStatisticsLabel);
 				VkResult vkResult = VkCreatePipelineThroughCache(impl, pipelineInfo, [&](VkPipelineCache cache) {
+					ZoneScopedN("RHI.Vulkan.CreateGraphicsPipelines");
 					return vkCreateGraphicsPipelines(impl->device, cache, 1, &pipelineInfo, nullptr, &nativePipeline);
 				});
 				if (vkResult == VK_SUCCESS && t_pipelineStatisticsLabel)
