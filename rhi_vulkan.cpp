@@ -18732,11 +18732,9 @@ namespace rhi {
 			spdlog::info("{}: descriptor-sets model: bound uniform buffers off (BASICRHI_VK_BOUND_UBO=0); PushIndex constant buffers are heap storage buffers", caller);
 			return;
 		}
-		// An adopted device belongs to a guest API that records into the same command buffers; it keeps the heap path.
-		if (!impl->ownsDevice) {
-			spdlog::info("{}: descriptor-sets model: no bound uniform buffers on an adopted device; PushIndex constant buffers are heap storage buffers", caller);
-			return;
-		}
+		// An adopted device's host records into the same command buffers. The push descriptor set is one more set BasicRHI binds
+		// there, as it binds its universal sets: the host must bind its own descriptors again after BasicRHI's commands, which DXVK
+		// does (DxvkContext::invalidateExternalCommandState).
 		if (!impl->pushDescriptorEnabled || !vkCmdPushDescriptorSetKHR) {
 			spdlog::info("{}: descriptor-sets model: no bound uniform buffers ({} is not enabled); PushIndex constant buffers are heap storage buffers", caller,
 				VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
