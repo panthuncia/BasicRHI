@@ -10914,6 +10914,69 @@ namespace rhi {
 			VkHashLoweringTarget(hash, target);
 		}
 
+		// The key of a lowered module (VkHashLoweringInputs over what the lowering reads): the lowered module cache's and the
+		// module identifier store's.
+		static uint64_t VkLoweringKey(const VulkanDevice* impl, const VulkanPipelineLayout& layoutState, VkShaderStageFlagBits stage, VkShaderStageFlags planStages,
+			const uint32_t* code, size_t codeBytes, std::string_view entryPoint) {
+			const vulkan_binding::BindingPlan plan = VkBuildBindingPlan(layoutState, planStages);
+			const vulkan_binding::LoweringTarget target = VkBufferModelLoweringTarget(impl, layoutState);
+			detail::Fnv1a64 hash;
+			VkHashLoweringInputs(hash, code, codeBytes, stage, entryPoint, plan, target);
+			return hash.Value();
+		}
+
+		// The stored identifier of the module lowered under `key`, marked used. False when the store has none.
+		static bool VkFindModuleIdentifier(VulkanDevice* impl, uint64_t key, VulkanDevice::LoweredModules::ModuleIdentifier& out) noexcept {
+			auto& cache = impl->loweredModules;
+			const std::scoped_lock lock(cache.mutex);
+			const auto it = cache.identifiers.find(key);
+			if (cache.path.empty() || it == cache.identifiers.end()) {
+				return false;
+			}
+			if (!it->second.used) {
+				it->second.used = true;
+				++cache.changes;
+			}
+			out = it->second;
+			return true;
+		}
+
+		// Stores the identifier of `module`, lowered under `key`, while the store is open.
+		static void VkRecordModuleIdentifier(VulkanDevice* impl, uint64_t key, VkShaderModule module) noexcept {
+			if (!impl->shaderModuleIdentifierEnabled || !vkGetShaderModuleIdentifierEXT || module == VK_NULL_HANDLE) {
+				return;
+			}
+			auto& cache = impl->loweredModules;
+			{
+				const std::scoped_lock lock(cache.mutex);
+				if (cache.path.empty()) {
+					return;
+				}
+				if (const auto it = cache.identifiers.find(key); it != cache.identifiers.end()) {
+					if (!it->second.used) {
+						it->second.used = true;
+						++cache.changes;
+					}
+					return;
+				}
+			}
+			VkShaderModuleIdentifierEXT identifier{ VK_STRUCTURE_TYPE_SHADER_MODULE_IDENTIFIER_EXT };
+			vkGetShaderModuleIdentifierEXT(impl->device, module, &identifier);
+			if (identifier.identifierSize == 0 || identifier.identifierSize > VK_MAX_SHADER_MODULE_IDENTIFIER_SIZE_EXT) {
+				return;
+			}
+			try {
+				VulkanDevice::LoweredModules::ModuleIdentifier stored;
+				stored.size = identifier.identifierSize;
+				std::memcpy(stored.bytes, identifier.identifier, identifier.identifierSize);
+				const std::scoped_lock lock(cache.mutex);
+				if (!cache.path.empty() && cache.identifiers.try_emplace(key, stored).second) {
+					++cache.changes;
+				}
+			} catch (...) {
+			}
+		}
+
 		// Descriptor-buffer model: one stage's module, its SPIR-V lowered (rhi_vulkan_spirv_lowering.h) to the stage's binding plan
 		// against the universal pipeline layout. a_planStages are the stages whose layout ranges the plan maps (one stage; every ray
 		// tracing stage for a ray tracing pipeline, as the descriptor-heap model maps them). Diagnostics: BASICRHI_VK_VALIDATE_LOWERING=1
@@ -10956,6 +11019,7 @@ namespace rhi {
 						outModule = VK_NULL_HANDLE;
 						return ToRHI(result);
 					}
+					VkRecordModuleIdentifier(impl, key, outModule);
 					return Result::Ok;
 				}
 				std::vector<uint32_t> lowered;
@@ -11032,6 +11096,7 @@ namespace rhi {
 					outModule = VK_NULL_HANDLE;
 					return ToRHI(result);
 				}
+				VkRecordModuleIdentifier(impl, key, outModule);
 				return Result::Ok;
 			} catch (...) {
 				RHI_FAIL(Result::OutOfMemory);
@@ -11628,6 +11693,40 @@ namespace rhi {
 			}
 		}
 
+		// The static sampler placements a save writes: this session's, then those of `readPlacements` (read from the file) that
+		// clash with none of them, so a sampler not seen this session keeps its place. The caller holds neither descriptorViewsMutex
+		// nor the binary store's lock.
+		static std::vector<VkBinaryStore::StaticSamplerPlacement> VkStaticSamplerPlacementsToSave(VulkanDevice* impl,
+			std::vector<VkBinaryStore::StaticSamplerPlacement> readPlacements) {
+			using Placement = VkBinaryStore::StaticSamplerPlacement;
+			std::vector<Placement> placements;
+			{
+				const std::scoped_lock viewLock(impl->descriptorViewsMutex);
+				const auto& model = impl->descriptorBuffer;
+				for (const auto& registered : model.staticSamplers) {
+					if (registered.element >= model.samplerCapacity && registered.key.size() <= kVkMaxStaticSamplerKeyBytes) {
+						placements.push_back(Placement{ registered.key, registered.count, registered.element - model.samplerCapacity });
+					}
+				}
+			}
+			const size_t current = placements.size();
+			for (Placement& placement : readPlacements) {
+				bool clashes = false;
+				for (size_t i = 0; i < current && !clashes; ++i) {
+					const Placement& other = placements[i];
+					clashes = (other.key == placement.key && other.count == placement.count) ||
+						(placement.offset < other.offset + other.count && other.offset < placement.offset + placement.count);
+				}
+				if (!clashes) {
+					placements.push_back(std::move(placement));
+				}
+			}
+			if (placements.size() > VulkanDescriptorBufferModel::kMaxStaticSamplers) {
+				placements.resize(VulkanDescriptorBufferModel::kMaxStaticSamplers);
+			}
+			return placements;
+		}
+
 		// Writes the store's file when it changed since the last write. Entries used this session are written with 0 unused
 		// sessions. The others are written one session older, left out at kMaxIdleSessions, and kept, the least idle first, only
 		// while the file stays under kMaxFileBytes; a binary counts once however many entries use it. Safe while other threads
@@ -11668,34 +11767,8 @@ namespace rhi {
 					}
 					readPlacements = store.staticSamplerPlacements;
 				}
-				// The static sampler placements: this session's, then those read from the file that clash with none of them, so a
-				// sampler not seen this session keeps its place. Taken outside the store's lock: registration takes that lock inside
-				// descriptorViewsMutex.
-				std::vector<Placement> placements;
-				{
-					const std::scoped_lock viewLock(impl->descriptorViewsMutex);
-					const auto& model = impl->descriptorBuffer;
-					for (const auto& registered : model.staticSamplers) {
-						if (registered.element >= model.samplerCapacity && registered.key.size() <= kVkMaxStaticSamplerKeyBytes) {
-							placements.push_back(Placement{ registered.key, registered.count, registered.element - model.samplerCapacity });
-						}
-					}
-				}
-				const size_t current = placements.size();
-				for (Placement& placement : readPlacements) {
-					bool clashes = false;
-					for (size_t i = 0; i < current && !clashes; ++i) {
-						const Placement& other = placements[i];
-						clashes = (other.key == placement.key && other.count == placement.count) ||
-							(placement.offset < other.offset + other.count && other.offset < placement.offset + placement.count);
-					}
-					if (!clashes) {
-						placements.push_back(std::move(placement));
-					}
-				}
-				if (placements.size() > VulkanDescriptorBufferModel::kMaxStaticSamplers) {
-					placements.resize(VulkanDescriptorBufferModel::kMaxStaticSamplers);
-				}
+				// Taken outside the store's lock: registration takes that lock inside descriptorViewsMutex.
+				std::vector<Placement> placements = VkStaticSamplerPlacementsToSave(impl, std::move(readPlacements));
 
 				// Used entries first, then the least idle; ties by key, so the file is the same for the same contents.
 				std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
@@ -11817,6 +11890,299 @@ namespace rhi {
 			}
 		}
 
+		// Whether lowered pipelines try the module identifier store first: it is open, and no diagnostic needs every module lowered
+		// or the compile's statistics or ISA.
+		static bool VkModuleIdentifierStoreUsable(VulkanDevice* impl) noexcept {
+			if (!impl->shaderModuleIdentifierEnabled || !vkGetShaderModuleIdentifierEXT || VkLoweringDiagnosticsRequested() || PipelineStatisticsRequested(impl) ||
+				IsaDumpRequested(impl)) {
+				return false;
+			}
+			auto& cache = impl->loweredModules;
+			const std::scoped_lock lock(cache.mutex);
+			return !cache.path.empty();
+		}
+
+		// ---------------------------------------------------------------------------------------------------------------
+		// The module identifier store (VulkanDevice::LoweredModules::identifiers, VK_EXT_shader_module_identifier), where the
+		// pipeline binary store is off: NVIDIA by default, where pipelines made from binaries keep 2 MiB of process memory each.
+		// Each lowered module's identifier is kept by its lowering key (VkLoweringKey). A lowered pipeline whose stages all have
+		// identifiers is first made from them with VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT, through the pipeline
+		// cache: no lowering, no modules. A cache miss lowers and builds it as before, which records the identifiers. The store
+		// also keeps the static sampler placements, which lowered modules bake in (VkPlaceStaticSampler), so their keys stay the
+		// same from run to run. BASICRHI_VK_MODULE_IDENTIFIERS=0 turns it off.
+		//
+		// File (<pipeline cache path>.identifiers), version 1: VkModuleIdentifierFileHeader, then two tables.
+		// - Static sampler placements (placementCount), as in the binary store's file.
+		// - Identifiers (entryCount): key (uint64), the sessions it went unused (uint32), its size (uint32) and its bytes.
+		// The header's identity and lowering hash must match this device, driver and build, or the file is stale and rewritten.
+
+		struct VkModuleIdentifierFileHeader {
+			static constexpr uint32_t kMagic = 0x44494D42u;  // "BMID"
+			static constexpr uint32_t kVersion = 1u;
+			uint32_t magic = kMagic;
+			uint32_t version = kVersion;
+			detail::PipelineCacheIdentity identity{};
+			uint64_t loweringHash = 0;
+			uint8_t algorithm[VK_UUID_SIZE]{};  // shaderModuleIdentifierAlgorithmUUID
+			uint32_t placementCount = 0;
+			uint64_t entryCount = 0;
+			uint64_t payloadBytes = 0;
+			uint64_t payloadHash = 0;  // Hash128's low half over the payload
+		};
+
+		// Identifiers unused for this many sessions are left out of the file.
+		static constexpr uint32_t kVkModuleIdentifierMaxIdleSessions = 8;
+
+		struct VkModuleIdentifierFileEntry {
+			uint64_t key = 0;
+			VulkanDevice::LoweredModules::ModuleIdentifier identifier;
+		};
+
+		static void VkModuleIdentifierAlgorithm(const VulkanDevice* impl, uint8_t (&out)[VK_UUID_SIZE]) noexcept {
+			std::memset(out, 0, VK_UUID_SIZE);
+			VkPhysicalDeviceShaderModuleIdentifierPropertiesEXT identifierProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_PROPERTIES_EXT };
+			VkPhysicalDeviceProperties2 properties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+			properties.pNext = &identifierProperties;
+			vkGetPhysicalDeviceProperties2(impl->physicalDevice, &properties);
+			std::memcpy(out, identifierProperties.shaderModuleIdentifierAlgorithmUUID, VK_UUID_SIZE);
+		}
+
+		// Reads the store's file. Returns Empty without a file, Stale for another device, driver, lowering build, identifier
+		// algorithm or file version, Corrupt for a damaged file, and Loaded otherwise. The outputs are empty unless Loaded.
+		static PipelineCacheLoadResult VkReadModuleIdentifierFile(const std::filesystem::path& filePath, const VkModuleIdentifierFileHeader& expected,
+			std::vector<VkBinaryStore::StaticSamplerPlacement>& placements, std::vector<VkModuleIdentifierFileEntry>& entries, uint64_t& payloadBytes) noexcept {
+			placements.clear();
+			entries.clear();
+			payloadBytes = 0;
+			const auto corrupt = [&] {
+				placements.clear();
+				entries.clear();
+				return PipelineCacheLoadResult::Corrupt;
+			};
+			try {
+				std::error_code error;
+				if (!std::filesystem::exists(filePath, error)) {
+					return PipelineCacheLoadResult::Empty;
+				}
+				std::ifstream file(filePath, std::ios::binary);
+				uint32_t start[2]{};
+				if (!file || !file.read(reinterpret_cast<char*>(start), sizeof(start)) || start[0] != VkModuleIdentifierFileHeader::kMagic) {
+					return PipelineCacheLoadResult::Corrupt;
+				}
+				if (start[1] != VkModuleIdentifierFileHeader::kVersion) {
+					return PipelineCacheLoadResult::Stale;
+				}
+				VkModuleIdentifierFileHeader header{};
+				file.seekg(0);
+				if (!file.read(reinterpret_cast<char*>(&header), sizeof(header))) {
+					return PipelineCacheLoadResult::Corrupt;
+				}
+				if (!detail::SamePipelineCacheIdentity(header.identity, expected.identity) || header.loweringHash != expected.loweringHash ||
+					std::memcmp(header.algorithm, expected.algorithm, VK_UUID_SIZE) != 0) {
+					return PipelineCacheLoadResult::Stale;
+				}
+				const uint64_t fileBytes = static_cast<uint64_t>(std::filesystem::file_size(filePath, error));
+				if (error || fileBytes != sizeof(header) + header.payloadBytes || header.placementCount > VulkanDescriptorBufferModel::kMaxStaticSamplers ||
+					header.entryCount > header.payloadBytes) {
+					return PipelineCacheLoadResult::Corrupt;
+				}
+				uint64_t left = header.payloadBytes;
+				detail::Hash128 hash;
+				const auto read = [&](void* data, size_t size) {
+					if (size > left || !file.read(static_cast<char*>(data), static_cast<std::streamsize>(size))) return false;
+					left -= size;
+					hash.Add(data, size);
+					return true;
+				};
+				placements.reserve(header.placementCount);
+				for (uint32_t p = 0; p < header.placementCount; ++p) {
+					VkBinaryStore::StaticSamplerPlacement placement;
+					uint32_t keyBytes = 0;
+					if (!read(&placement.count, sizeof(placement.count)) || !read(&placement.offset, sizeof(placement.offset)) || !read(&keyBytes, sizeof(keyBytes)) ||
+						placement.count == 0 || placement.count > VulkanDescriptorBufferModel::kMaxStaticSamplers ||
+						placement.offset > VulkanDescriptorBufferModel::kMaxStaticSamplers - placement.count || keyBytes > kVkMaxStaticSamplerKeyBytes) {
+						return corrupt();
+					}
+					placement.key.resize(keyBytes);
+					if (!read(placement.key.data(), keyBytes)) {
+						return corrupt();
+					}
+					placements.push_back(std::move(placement));
+				}
+				entries.reserve(static_cast<size_t>(header.entryCount));
+				for (uint64_t e = 0; e < header.entryCount; ++e) {
+					VkModuleIdentifierFileEntry entry;
+					auto& identifier = entry.identifier;
+					if (!read(&entry.key, sizeof(entry.key)) || !read(&identifier.idleSessions, sizeof(identifier.idleSessions)) ||
+						!read(&identifier.size, sizeof(identifier.size)) || identifier.size == 0 || identifier.size > VK_MAX_SHADER_MODULE_IDENTIFIER_SIZE_EXT ||
+						!read(identifier.bytes, identifier.size)) {
+						return corrupt();
+					}
+					identifier.used = false;
+					entries.push_back(entry);
+				}
+				if (left != 0 || hash.Value().lo != header.payloadHash) {
+					return corrupt();
+				}
+				payloadBytes = header.payloadBytes;
+				return PipelineCacheLoadResult::Loaded;
+			} catch (...) {
+				return corrupt();
+			}
+		}
+
+		// Opens the store beside the pipeline cache file at `cachePath`, for a lowered binding model whose binary store did not
+		// open. Loads the file's identifiers, and its placements into the binary store's (which a closed binary store leaves
+		// empty, and static sampler registration reads).
+		static void VkOpenModuleIdentifierStore(VulkanDevice* impl, const char* cachePath) noexcept {
+			auto& cache = impl->loweredModules;
+			{
+				const std::scoped_lock lock(cache.mutex);
+				cache.path.clear();
+				cache.identifiers.clear();
+			}
+			if (!cachePath || !*cachePath || !VkUniversalLayoutModel(impl)) {
+				return;
+			}
+			if (const char* value = std::getenv("BASICRHI_VK_MODULE_IDENTIFIERS"); value && std::strcmp(value, "0") == 0) {
+				spdlog::info("Vulkan module identifiers: off (BASICRHI_VK_MODULE_IDENTIFIERS=0)");
+				return;
+			}
+			if (!impl->shaderModuleIdentifierEnabled || !vkGetShaderModuleIdentifierEXT) {
+				spdlog::info("Vulkan module identifiers: off (the device has no VK_EXT_shader_module_identifier); every run lowers its pipelines' modules");
+				return;
+			}
+			try {
+				const std::string path = std::string(cachePath) + ".identifiers";
+				VkModuleIdentifierFileHeader expected{};
+				expected.identity = VkPipelineCacheIdentity(impl);
+				expected.loweringHash = VkLoweringIdentityHash();
+				VkModuleIdentifierAlgorithm(impl, expected.algorithm);
+				std::vector<VkBinaryStore::StaticSamplerPlacement> placements;
+				std::vector<VkModuleIdentifierFileEntry> entries;
+				uint64_t payloadBytes = 0;
+				const PipelineCacheLoadResult load = VkReadModuleIdentifierFile(detail::PipelineCachePath(path.c_str()), expected, placements, entries, payloadBytes);
+				const size_t placementCount = placements.size();
+				{
+					const std::unique_lock lock(impl->pipelineBinaries.mutex);
+					impl->pipelineBinaries.staticSamplerPlacements = std::move(placements);
+				}
+				{
+					const std::scoped_lock lock(cache.mutex);
+					cache.path = path;
+					cache.loweringHash = expected.loweringHash;
+					cache.identifiers.reserve(entries.size());
+					for (const auto& entry : entries) cache.identifiers.try_emplace(entry.key, entry.identifier);
+				}
+				// A file that was not loaded is replaced on the first save.
+				if (load != PipelineCacheLoadResult::Loaded && load != PipelineCacheLoadResult::Empty) ++cache.changes;
+				spdlog::info("Vulkan module identifiers '{}': {} ({} identifiers, {} static sampler placements; file {} bytes)", path,
+					detail::PipelineCacheLoadName(load), entries.size(), placementCount, payloadBytes);
+			} catch (...) {
+				const std::scoped_lock lock(cache.mutex);
+				cache.path.clear();
+				cache.identifiers.clear();
+			}
+		}
+
+		// Writes the store's file when it changed since the last write. Identifiers used this session are written with 0 unused
+		// sessions, the others one session older, and left out at kVkModuleIdentifierMaxIdleSessions. Safe while other threads
+		// create pipelines.
+		static Result VkSaveModuleIdentifierStore(VulkanDevice* impl) noexcept {
+			auto& cache = impl->loweredModules;
+			const std::lock_guard saveLock(cache.saveMutex);
+			using Placement = VkBinaryStore::StaticSamplerPlacement;
+			std::vector<VkModuleIdentifierFileEntry> items;
+			std::string path;
+			VkModuleIdentifierFileHeader header{};
+			uint64_t changes = 0;
+			try {
+				{
+					const std::scoped_lock lock(cache.mutex);
+					changes = cache.changes.load();
+					if (cache.path.empty() || changes == cache.savedChanges) {
+						return Result::Ok;
+					}
+					path = cache.path;
+					header.loweringHash = cache.loweringHash;
+					items.reserve(cache.identifiers.size());
+					for (const auto& [key, identifier] : cache.identifiers) {
+						VkModuleIdentifierFileEntry item{ key, identifier };
+						item.identifier.idleSessions = identifier.used ? 0u : identifier.idleSessions + 1u;
+						if (item.identifier.idleSessions < kVkModuleIdentifierMaxIdleSessions) items.push_back(item);
+					}
+				}
+				header.identity = VkPipelineCacheIdentity(impl);
+				VkModuleIdentifierAlgorithm(impl, header.algorithm);
+				std::vector<Placement> readPlacements;
+				{
+					const std::shared_lock lock(impl->pipelineBinaries.mutex);
+					readPlacements = impl->pipelineBinaries.staticSamplerPlacements;
+				}
+				const std::vector<Placement> placements = VkStaticSamplerPlacementsToSave(impl, std::move(readPlacements));
+				std::sort(items.begin(), items.end(), [](const VkModuleIdentifierFileEntry& a, const VkModuleIdentifierFileEntry& b) { return a.key < b.key; });
+
+				const std::filesystem::path filePath = detail::PipelineCachePath(path.c_str());
+				std::error_code error;
+				if (filePath.has_parent_path()) std::filesystem::create_directories(filePath.parent_path(), error);
+				std::filesystem::path temporary = filePath;
+				temporary += ".tmp";
+				uint64_t payloadBytes = 0;
+				{
+					std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+					if (!file) {
+						spdlog::warn("Vulkan module identifiers '{}': save failed (cannot write {})", path, temporary.string());
+						return Result::Failed;
+					}
+					header.placementCount = static_cast<uint32_t>(placements.size());
+					header.entryCount = items.size();
+					file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+					detail::Hash128 hash;
+					const auto write = [&](const void* data, size_t size) {
+						file.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+						hash.Add(data, size);
+						payloadBytes += size;
+					};
+					for (const Placement& placement : placements) {
+						const uint32_t keyBytes = static_cast<uint32_t>(placement.key.size());
+						write(&placement.count, sizeof(placement.count));
+						write(&placement.offset, sizeof(placement.offset));
+						write(&keyBytes, sizeof(keyBytes));
+						write(placement.key.data(), placement.key.size());
+					}
+					for (const auto& item : items) {
+						write(&item.key, sizeof(item.key));
+						write(&item.identifier.idleSessions, sizeof(item.identifier.idleSessions));
+						write(&item.identifier.size, sizeof(item.identifier.size));
+						write(item.identifier.bytes, item.identifier.size);
+					}
+					header.payloadBytes = payloadBytes;
+					header.payloadHash = hash.Value().lo;
+					file.seekp(0);
+					file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+					if (!file) {
+						file.close();
+						std::filesystem::remove(temporary, error);
+						spdlog::warn("Vulkan module identifiers '{}': save failed (write error)", path);
+						return Result::Failed;
+					}
+				}
+				std::filesystem::rename(temporary, filePath, error);
+				if (error) {
+					std::filesystem::remove(temporary, error);
+					spdlog::warn("Vulkan module identifiers '{}': save failed (rename)", path);
+					return Result::Failed;
+				}
+				cache.savedChanges = changes;
+				spdlog::info("Vulkan module identifiers '{}': saved {} identifiers, {} static sampler placements ({} bytes); {} pipelines made from them so far, "
+					"{} missed the cache and were lowered",
+					path, items.size(), placements.size(), payloadBytes, cache.identifierHits.load(), cache.identifierMisses.load());
+				return Result::Ok;
+			} catch (...) {
+				RHI_FAIL(Result::OutOfMemory);
+			}
+		}
+
 		// Destroys the open cache without saving it. The caller holds the cache's lock exclusively.
 		static void VkClosePipelineCacheLocked(VulkanDevice* impl) noexcept {
 			auto& state = impl->pipelineCache;
@@ -11828,6 +12194,8 @@ namespace rhi {
 			state.rewritePending = false;
 			state.counters.Reset(PipelineCacheLoadResult::Off, 0);
 			VkClosePipelineBinaryStore(impl);
+			const std::scoped_lock modulesLock(impl->loweredModules.mutex);
+			impl->loweredModules.path.clear();
 		}
 
 		static Result d_openPipelineCache(Device* device, const char* path) noexcept {
@@ -11850,6 +12218,7 @@ namespace rhi {
 				// (ray tracing, pipelines made while a diagnostic is on); a file under it is read as usual.
 				constexpr uint64_t kStoreEraCacheBytes = uint64_t(64) << 20;
 				const bool binaryStoreOpen = VkOpenPipelineBinaryStore(impl, path);
+				if (!binaryStoreOpen) VkOpenModuleIdentifierStore(impl, path);
 				PipelineCacheLoadResult load = PipelineCacheLoadResult::Empty;
 				uint64_t fileBytes = 0;
 				if (binaryStoreOpen) {
@@ -11914,7 +12283,8 @@ namespace rhi {
 				return Result::Ok;
 			}
 			const std::lock_guard saveLock(state.saveMutex);
-			const Result binariesSaved = VkSavePipelineBinaryStore(impl);
+			Result binariesSaved = VkSavePipelineBinaryStore(impl);
+			if (const Result identifiersSaved = VkSaveModuleIdentifierStore(impl); binariesSaved == Result::Ok) binariesSaved = identifiersSaved;
 			// Pipelines created while this runs stay counted for the next save.
 			const uint64_t added = state.counters.added.exchange(0);
 			if (added == 0 && !state.rewritePending) {
@@ -11967,7 +12337,8 @@ namespace rhi {
 			out.binaryPruned = store.pruned.load();
 			out.binaryLoadedBytes = store.loadedBytes.load();
 			out.binarySavedBytes = store.savedBytes.load();
-			out.binaryChanges = store.changes.load();
+			// The module identifier store's changes count too: they are written by the same save.
+			out.binaryChanges = store.changes.load() + impl->loweredModules.changes.load();
 			{
 				const std::shared_lock lock(store.mutex);
 				out.binaryEntries = store.entries.size();
@@ -12061,6 +12432,61 @@ namespace rhi {
 				}
 			}
 			return result;
+		}
+
+		// Makes a lowered pipeline from its stages' module identifiers (the module identifier store), through the pipeline cache,
+		// with VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT. `stages` are `info`'s stages, without modules, and `keys`
+		// their lowering keys. True with the pipeline made. False, with `info` and `stages` as they were, when a stage has no
+		// identifier or the driver needs the modules (a cache miss): the caller then lowers and builds it in full.
+		template<class CreateInfo, class CreateFn>
+		static bool VkCreatePipelineFromIdentifiers(VulkanDevice* impl, CreateInfo& info, VkPipelineCreateFlags2CreateInfo& createFlags,
+			std::span<VkPipelineShaderStageCreateInfo> stages, std::span<const uint64_t> keys, CreateFn&& create) noexcept {
+			constexpr size_t kMaxStages = 3;
+			if (stages.empty() || stages.size() > kMaxStages || keys.size() != stages.size()) {
+				return false;
+			}
+			std::array<VulkanDevice::LoweredModules::ModuleIdentifier, kMaxStages> identifiers{};
+			for (size_t i = 0; i < stages.size(); ++i) {
+				if (!VkFindModuleIdentifier(impl, keys[i], identifiers[i])) {
+					return false;
+				}
+			}
+			std::array<VkPipelineShaderStageModuleIdentifierCreateInfoEXT, kMaxStages> identifierInfos{};
+			std::array<const void*, kMaxStages> nexts{};
+			for (size_t i = 0; i < stages.size(); ++i) {
+				identifierInfos[i] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT };
+				identifierInfos[i].identifierSize = identifiers[i].size;
+				identifierInfos[i].pIdentifier = identifiers[i].bytes;
+				identifierInfos[i].pNext = stages[i].pNext;
+				nexts[i] = stages[i].pNext;
+				stages[i].pNext = &identifierInfos[i];
+				stages[i].module = VK_NULL_HANDLE;
+			}
+			// VkChainPipelineCreateFlags put the flags in one place or the other; the bit has the same value in both.
+			const VkPipelineCreateFlags2 flags2 = createFlags.flags;
+			const VkPipelineCreateFlags flags = info.flags;
+			if (impl->maintenance5Enabled) createFlags.flags |= VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+			else info.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+			VkResult result = VK_ERROR_INITIALIZATION_FAILED;
+			{
+				ZoneScopedN("RHI.Vulkan.CreatePipelineFromIdentifiers");
+				result = VkCreatePipelineThroughCache(impl, info, create);
+			}
+			createFlags.flags = flags2;
+			info.flags = flags;
+			for (size_t i = 0; i < stages.size(); ++i) stages[i].pNext = nexts[i];
+			auto& cache = impl->loweredModules;
+			if (result == VK_SUCCESS) {
+				++cache.identifierHits;
+				return true;
+			}
+			++cache.identifierMisses;
+			if (result != VK_PIPELINE_COMPILE_REQUIRED) {
+				static std::atomic<bool> reported{ false };
+				if (!reported.exchange(true))
+					spdlog::warn("Vulkan module identifiers: a pipeline made from identifiers failed ({}); such pipelines are built in full", static_cast<int>(result));
+			}
+			return false;
 		}
 
 		// The fixed-function part of a graphics pipeline's store key: every state the create info carries, read from the structs
@@ -12645,6 +13071,9 @@ namespace rhi {
 				// With the pipeline binary store, lowering waits until the store has been asked: a stored pipeline needs no modules.
 				// Each stage keeps the SPIR-V it would be lowered from (with capture names, if any) and its lowering entry point.
 				const bool useBinaryStore = bufferModel && VkPipelineBinaryStoreUsable(impl);
+				// With the module identifier store, too: a pipeline made from identifiers needs no modules.
+				const bool useIdentifiers = bufferModel && !useBinaryStore && VkModuleIdentifierStoreUsable(impl);
+				const bool deferLowering = useBinaryStore || useIdentifiers;
 				struct DeferredStage {
 					const SubobjShader* shader = nullptr;
 					const uint32_t* code = nullptr;
@@ -12680,7 +13109,7 @@ namespace rhi {
 						}
 					}
 					VkShaderModule module = VK_NULL_HANDLE;
-					if (useBinaryStore) {
+					if (deferLowering) {
 						DeferredStage& deferred = deferredStages[shaderStages.size()];
 						deferred.shader = shader;
 						deferred.namedCode = std::move(namedCode);
@@ -12979,13 +13408,28 @@ namespace rhi {
 						return lowered;
 					}
 				} else {
-					if (useBinaryStore) {
-						if (const Result lowered = lowerDeferredStages(); lowered != Result::Ok) {
-							for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
-							return lowered;
+					bool fromIdentifiers = false;
+					if (useIdentifiers) {
+						try {
+							std::array<uint64_t, 3> keys{};
+							for (size_t i = 0; i < shaderStages.size() && i < keys.size(); ++i) {
+								keys[i] = VkLoweringKey(impl, *layoutState, shaderStages[i].stage, shaderStages[i].stage, deferredStages[i].code, deferredStages[i].codeBytes,
+									deferredStages[i].loweringEntry);
+							}
+							fromIdentifiers = VkCreatePipelineFromIdentifiers(impl, pipelineInfo, createFlags, std::span<VkPipelineShaderStageCreateInfo>(shaderStages),
+								std::span<const uint64_t>(keys.data(), (std::min)(shaderStages.size(), keys.size())), createGraphicsPipeline);
+						} catch (...) {
 						}
 					}
-					vkResult = VkCreatePipelineThroughCache(impl, pipelineInfo, createGraphicsPipeline);
+					if (!fromIdentifiers) {
+						if (deferLowering) {
+							if (const Result lowered = lowerDeferredStages(); lowered != Result::Ok) {
+								for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
+								return lowered;
+							}
+						}
+						vkResult = VkCreatePipelineThroughCache(impl, pipelineInfo, createGraphicsPipeline);
+					}
 				}
 				if (vkResult == VK_SUCCESS && t_pipelineStatisticsLabel)
 					VkSetObjectName(impl, reinterpret_cast<uint64_t>(nativePipeline), VK_OBJECT_TYPE_PIPELINE, t_pipelineStatisticsLabel);
@@ -13043,8 +13487,11 @@ namespace rhi {
 			};
 			// With the pipeline binary store, lowering waits until the store has been asked: a stored pipeline needs no module.
 			const bool useBinaryStore = bufferModel && VkPipelineBinaryStoreUsable(impl);
+			// With the module identifier store, too: a pipeline made from its identifier needs no module.
+			const bool useIdentifiers = bufferModel && !useBinaryStore && VkModuleIdentifierStoreUsable(impl);
+			const bool deferLowering = useBinaryStore || useIdentifiers;
 			VkResult vkResult = VK_SUCCESS;
-			if (!useBinaryStore) {
+			if (!deferLowering) {
 				if (bufferModel) {
 					if (const Result lowered = lowerComputeShader(); lowered != Result::Ok) {
 						return lowered;
@@ -13142,13 +13589,25 @@ namespace rhi {
 					return lowered;
 				}
 			} else {
-				if (useBinaryStore) {
-					if (const Result lowered = lowerComputeShader(); lowered != Result::Ok) {
-						return lowered;
+				bool fromIdentifiers = false;
+				if (useIdentifiers) {
+					try {
+						const uint64_t key = VkLoweringKey(impl, *layoutState, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_STAGE_COMPUTE_BIT, shaderModuleInfo.pCode,
+							shaderModuleInfo.codeSize, computeShader->entryPoint);
+						fromIdentifiers = VkCreatePipelineFromIdentifiers(impl, pipelineInfo, createFlags, std::span<VkPipelineShaderStageCreateInfo>(&pipelineInfo.stage, 1),
+							std::span<const uint64_t>(&key, 1), createComputePipeline);
+					} catch (...) {
 					}
-					pipelineInfo.stage.module = shaderModule;
 				}
-				vkResult = VkCreatePipelineThroughCache(impl, pipelineInfo, createComputePipeline);
+				if (!fromIdentifiers) {
+					if (deferLowering) {
+						if (const Result lowered = lowerComputeShader(); lowered != Result::Ok) {
+							return lowered;
+						}
+						pipelineInfo.stage.module = shaderModule;
+					}
+					vkResult = VkCreatePipelineThroughCache(impl, pipelineInfo, createComputePipeline);
+				}
 			}
 			vkDestroyShaderModule(impl->device, shaderModule, nullptr);
 			if (vkResult != VK_SUCCESS) {
@@ -17460,6 +17919,7 @@ namespace rhi {
 		VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipelineExecutableProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
 		VkPhysicalDevicePipelineBinaryFeaturesKHR pipelineBinary{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
 		VkPhysicalDevicePipelineRobustnessFeaturesEXT pipelineRobustness{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT };
+		VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT shaderModuleIdentifier{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT };
 	};
 
 	// Picks the robustness BasicRHI chains into its own pipelines, and logs it once per device.
@@ -17520,6 +17980,7 @@ namespace rhi {
 		// The store creates pipelines with VkPipelineCreateFlags2CreateInfo, which needs maintenance5 (a dependency of the extension).
 		impl->pipelineBinaryEnabled = e.maintenance5 && e.pipelineBinary.pipelineBinaries == VK_TRUE;
 		impl->pipelineRobustnessEnabled = e.pipelineRobustness.pipelineRobustness == VK_TRUE;
+		impl->shaderModuleIdentifierEnabled = e.shaderModuleIdentifier.shaderModuleIdentifier == VK_TRUE;
 		VkConfigurePipelineRobustness(impl);
 		impl->accelerationStructureFeatures = e.accelerationStructure;
 		impl->rayTracingPipelineFeatures = e.rayTracingPipeline;
@@ -19392,6 +19853,18 @@ namespace rhi {
 				enabledPipelineRobustnessFeatures.pipelineRobustness = VK_TRUE;
 			}
 		}
+		// VK_EXT_shader_module_identifier: the module identifier store (VkOpenModuleIdentifierStore).
+		VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT enabledShaderModuleIdentifierFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT };
+		if (VkHasDeviceExtension(physicalDevice, VK_EXT_SHADER_MODULE_IDENTIFIER_EXTENSION_NAME)) {
+			VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT supportedShaderModuleIdentifierFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT };
+			VkPhysicalDeviceFeatures2 shaderModuleIdentifierQuery{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+			shaderModuleIdentifierQuery.pNext = &supportedShaderModuleIdentifierFeatures;
+			vkGetPhysicalDeviceFeatures2(physicalDevice, &shaderModuleIdentifierQuery);
+			if (supportedShaderModuleIdentifierFeatures.shaderModuleIdentifier == VK_TRUE) {
+				appendUniqueName(enabledDeviceExtensions, VK_EXT_SHADER_MODULE_IDENTIFIER_EXTENSION_NAME);
+				enabledShaderModuleIdentifierFeatures.shaderModuleIdentifier = VK_TRUE;
+			}
+		}
 
 		VkDeviceCreateInfo deviceCreateInfo{};
 		deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -19407,6 +19880,10 @@ namespace rhi {
 		if (enabledPipelineRobustnessFeatures.pipelineRobustness == VK_TRUE) {
 			enabledPipelineRobustnessFeatures.pNext = const_cast<void*>(deviceCreateInfo.pNext);
 			deviceCreateInfo.pNext = &enabledPipelineRobustnessFeatures;
+		}
+		if (enabledShaderModuleIdentifierFeatures.shaderModuleIdentifier == VK_TRUE) {
+			enabledShaderModuleIdentifierFeatures.pNext = const_cast<void*>(deviceCreateInfo.pNext);
+			deviceCreateInfo.pNext = &enabledShaderModuleIdentifierFeatures;
 		}
 		if (enabledFaultFeatures.deviceFault == VK_TRUE) {
 			enabledFaultFeatures.pNext = const_cast<void*>(deviceCreateInfo.pNext);
@@ -19779,6 +20256,7 @@ namespace rhi {
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR: VkCopyFeatureStruct(e.pipelineExecutableProperties, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR: VkCopyFeatureStruct(e.pipelineBinary, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT: VkCopyFeatureStruct(e.pipelineRobustness, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT: VkCopyFeatureStruct(e.shaderModuleIdentifier, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT: VkCopyFeatureStruct(e.shaderSubgroupPartitioned, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR: VkCopyFeatureStruct(e.accelerationStructure, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR: VkCopyFeatureStruct(e.rayTracingPipeline, node); break;
@@ -19892,6 +20370,8 @@ namespace rhi {
 				enabled.pipelineBinary = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
 			if (!hasExtension(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME))
 				enabled.pipelineRobustness = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT };
+			if (!hasExtension(VK_EXT_SHADER_MODULE_IDENTIFIER_EXTENSION_NAME))
+				enabled.shaderModuleIdentifier = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT };
 			if (!hasExtension(VK_EXT_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME)) enabled.shaderSubgroupPartitioned = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT };
 			if (!hasExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) || !hasExtension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME))
 				enabled.accelerationStructure = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };

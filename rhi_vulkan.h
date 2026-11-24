@@ -895,6 +895,8 @@ namespace rhi {
 		bool maintenance5Enabled = false;
 		// VK_KHR_pipeline_binary's pipelineBinaries: the pipeline binary store (pipelineBinaries below).
 		bool pipelineBinaryEnabled = false;
+		// VK_EXT_shader_module_identifier's shaderModuleIdentifier: the module identifier store (loweredModules.identifiers).
+		bool shaderModuleIdentifierEnabled = false;
 		// VK_EXT_pipeline_robustness's pipelineRobustness. When chainPipelineRobustness is set, every graphics and compute
 		// pipeline gets pipelineRobustness chained in (VkConfigurePipelineRobustness, BASICRHI_VK_PIPELINE_ROBUSTNESS).
 		bool pipelineRobustnessEnabled = false;
@@ -1054,11 +1056,24 @@ namespace rhi {
 		// Lowered shader modules by a hash of everything their lowering reads (VkCreateBufferModelShaderModule). Pipelines share
 		// stages, so a load's thousands of pipelines lowered the same modules again and again, which was most of their build time.
 		// Least recently used first in `order`; past kMaxWords the oldest go.
+		//
+		// The module identifier store (VK_EXT_shader_module_identifier) sits beside it, where the pipeline binary store is off
+		// (NVIDIA by default): `identifiers` holds the driver's identifier of each lowered module by the same key, kept in a file
+		// beside the pipeline cache (VkOpenModuleIdentifierStore). A pipeline whose stages all have identifiers is first made from
+		// them alone, through the pipeline cache, with no lowering and no modules; only a cache miss lowers.
 		struct LoweredModules {
 			using Order = std::list<uint64_t>;
 			struct Entry {
 				std::shared_ptr<const std::vector<uint32_t>> words;
 				Order::iterator use;
+			};
+			struct ModuleIdentifier {
+				uint32_t size = 0;
+				uint8_t bytes[VK_MAX_SHADER_MODULE_IDENTIFIER_SIZE_EXT]{};
+				// Sessions in a row the identifier went unused, as loaded from the file.
+				uint32_t idleSessions = 0;
+				// Used (recorded or made a pipeline) this session.
+				bool used = true;
 			};
 			std::mutex mutex;
 			std::unordered_map<uint64_t, Entry> byKey;
@@ -1066,6 +1081,16 @@ namespace rhi {
 			size_t words = 0;  // held in all
 			uint64_t hits = 0, misses = 0, evicted = 0;
 			static constexpr size_t kMaxWords = size_t(64) << 20;  // 256 MiB
+			// The identifier store. `path` is empty while it is closed; `loweringHash` is the lowering build its keys were made by.
+			std::unordered_map<uint64_t, ModuleIdentifier> identifiers;
+			std::string path;
+			uint64_t loweringHash = 0;
+			// Identifiers recorded or first used; the pipeline cache's save writes the file when it changed.
+			std::atomic<uint64_t> changes{ 0 };
+			uint64_t savedChanges = 0;
+			// Pipelines made from identifiers, and those whose identifiers missed the cache and were lowered.
+			std::atomic<uint64_t> identifierHits{ 0 }, identifierMisses{ 0 };
+			std::mutex saveMutex;
 		} loweredModules;
 		// The pipeline binary store (VK_KHR_pipeline_binary), opened and saved with the pipeline cache, in a file beside it. A
 		// lowered model's pipeline is keyed by everything its creation reads, its modules taken before lowering; a stored pipeline
