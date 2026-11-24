@@ -1873,4 +1873,10 @@ namespace rhi::vulkan_binding {
 		return false;
 	}
 
+	const std::string& LoweringIdentity() {
+		// Bump the version when the lowering's output changes without an edit to this file (a header, a pass option).
+		static const std::string identity = Cat("lowering 1; ", __TIMESTAMP__, "; ", spvSoftwareVersionDetailsString());
+		return identity;
+	}
+
 }

@@ -893,6 +893,8 @@ namespace rhi {
 		// VK_KHR_maintenance5: pipeline create flags go in VkPipelineCreateFlags2CreateInfo; without it (AMD's legacy Polaris driver)
 		// in the legacy flags (VkChainPipelineCreateFlags).
 		bool maintenance5Enabled = false;
+		// VK_KHR_pipeline_binary's pipelineBinaries: the pipeline binary store (pipelineBinaries below).
+		bool pipelineBinaryEnabled = false;
 		// VK_KHR_pipeline_executable_properties' pipelineExecutableInfo: the debugging switches' (DXVK_PIPELINE_STATS, BASICRHI_VK_DUMP_ISA).
 		bool pipelineExecutableInfoEnabled = false;
 		bool shaderDemoteToHelperInvocationEnabled = false;
@@ -1038,6 +1040,9 @@ namespace rhi {
 			detail::PipelineCacheIdentity identity{};
 			// VK_EXT_pipeline_creation_feedback (core in 1.3) tells hits from misses.
 			bool creationFeedback = false;
+			// The file was not loaded because the pipeline binary store holds the lowered pipelines: the next save writes the
+			// cache even with nothing added, so the file shrinks to what still goes through it.
+			bool rewritePending = false;
 			std::mutex saveMutex;
 			detail::PipelineCacheCounters counters;
 		} pipelineCache;
@@ -1057,6 +1062,44 @@ namespace rhi {
 			uint64_t hits = 0, misses = 0, evicted = 0;
 			static constexpr size_t kMaxWords = size_t(64) << 20;  // 256 MiB
 		} loweredModules;
+		// The pipeline binary store (VK_KHR_pipeline_binary), opened and saved with the pipeline cache, in a file beside it. A
+		// lowered model's pipeline is keyed by everything its creation reads, its modules taken before lowering; a stored pipeline
+		// is made from the driver's binaries, with no lowering and no compile. Lookups take `mutex` shared; open, close and
+		// inserts take it exclusively. Binaries never change once stored, so saves copy their pointers and write outside the lock.
+		struct PipelineBinaryStore {
+			struct KeyHash {
+				size_t operator()(const detail::Hash128Value& key) const noexcept { return static_cast<size_t>(key.lo ^ (key.hi * 0x9E3779B97F4A7C15ull)); }
+			};
+			struct Binary {
+				uint32_t keySize = 0;
+				uint8_t key[VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR]{};
+				std::vector<uint8_t> data;
+			};
+			using Binaries = std::vector<Binary>;
+			struct Entry {
+				std::shared_ptr<const Binaries> binaries;
+				// Sessions in a row the entry went unused, as loaded; a save writes 0 for entries used this session.
+				uint32_t idleSessions = 0;
+				// Used (made from, or stored) this session.
+				mutable std::atomic<bool> used{ false };
+			};
+			// Entries unused for this many sessions are left out of the file.
+			static constexpr uint32_t kMaxIdleSessions = 4;
+			// Entries unused this session are kept in the file only while it stays under this size.
+			static constexpr uint64_t kMaxFileBytes = uint64_t(256) << 20;
+			mutable std::shared_mutex mutex;
+			std::unordered_map<detail::Hash128Value, Entry, KeyHash> entries;
+			bool open = false;  // a file path is set and the device has pipelineBinaries
+			std::string path;
+			uint64_t loweringHash = 0;  // the lowering build the entries were keyed for (vulkan_binding::LoweringIdentity)
+			uint32_t globalKeySize = 0;  // vkGetPipelineKeyKHR's global key: the driver's binaries change with it
+			uint8_t globalKey[VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR]{};
+			std::mutex saveMutex;
+			std::atomic<PipelineCacheLoadResult> load{ PipelineCacheLoadResult::Off };
+			std::atomic<uint64_t> hits{ 0 }, misses{ 0 }, stored{ 0 }, pruned{ 0 }, loadedBytes{ 0 }, savedBytes{ 0 };
+			std::atomic<uint64_t> changes{ 0 };     // entries added or first used since open
+			std::atomic<uint64_t> savedChanges{ 0 };  // `changes` at the last write; a save with no change since skips the write
+		} pipelineBinaries;
 		std::weak_ptr<VulkanDevice> selfWeak;
 	};
 

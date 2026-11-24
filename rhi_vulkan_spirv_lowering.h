@@ -63,4 +63,8 @@ namespace rhi::vulkan_binding {
 	// (BASICRHI_VK_VALIDATE_LOWERING=1). False and the validator's messages in a_error when invalid.
 	bool ValidateLoweredModule(std::span<const uint32_t> a_spirv, std::string& a_error);
 
+	// Names this build of the lowering: a version number, the lowering source's modification time and SPIRV-Tools' version.
+	// Data keyed on modules before lowering (the pipeline binary store) is only valid for the build that lowered them.
+	const std::string& LoweringIdentity();
+
 }

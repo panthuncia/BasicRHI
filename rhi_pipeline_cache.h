@@ -49,6 +49,90 @@ namespace rhi::detail {
 		uint64_t hash_ = 14695981039346656037ull;
 	};
 
+	/** @brief A 128-bit value of Hash128. */
+	struct Hash128Value {
+		uint64_t lo = 0;
+		uint64_t hi = 0;
+		friend bool operator==(const Hash128Value&, const Hash128Value&) = default;
+	};
+
+	/**
+	 * @brief A 128-bit hash over bytes fed in pieces, with the interface of Fnv1a64. Two lanes with their own constants mix each
+	 * 8-byte word, so a collision needs both to collide. Stable across runs and builds, so it can key on-disk data. Not for
+	 * hostile input.
+	 */
+	class Hash128 {
+	public:
+		void Add(const void* data, size_t size) noexcept {
+			const auto* bytes = static_cast<const uint8_t*>(data);
+			total_ += size;
+			// Finish a word an earlier piece started.
+			while (size != 0 && pending_ != 0) {
+				word_ |= static_cast<uint64_t>(*bytes++) << (8 * pending_);
+				--size;
+				if (++pending_ == 8) {
+					Mix(word_);
+					word_ = 0;
+					pending_ = 0;
+				}
+			}
+			while (size >= 8) {
+				uint64_t word;
+				std::memcpy(&word, bytes, sizeof(word));
+				Mix(word);
+				bytes += 8;
+				size -= 8;
+			}
+			while (size != 0) {
+				word_ |= static_cast<uint64_t>(*bytes++) << (8 * pending_++);
+				--size;
+			}
+		}
+		template<class T>
+		void AddValue(const T& value) noexcept {
+			static_assert(std::is_trivially_copyable_v<T>, "AddValue takes plain values; hash structs field by field");
+			Add(&value, sizeof(T));
+		}
+		/** @brief A string and its length, so "ab"+"c" and "a"+"bc" differ. Null hashes as empty. */
+		void AddString(const char* text) noexcept {
+			const size_t length = text ? std::strlen(text) : 0;
+			AddValue(static_cast<uint64_t>(length));
+			Add(text, length);
+		}
+		Hash128Value Value() const noexcept {
+			uint64_t a = a_, b = b_;
+			if (pending_ != 0) {
+				MixInto(a, b, word_);
+			}
+			return { Finish(a ^ total_), Finish(b ^ (total_ * kB1)) };
+		}
+
+	private:
+		static constexpr uint64_t kA0 = 0x243F6A8885A308D3ull, kA1 = 0x9E3779B97F4A7C15ull, kA2 = 0xC2B2AE3D27D4EB4Full;
+		static constexpr uint64_t kB0 = 0x13198A2E03707344ull, kB1 = 0xD6E8FEB86659FD93ull, kB2 = 0x94D049BB133111EBull;
+		static constexpr uint64_t Rotl(uint64_t value, int bits) noexcept { return (value << bits) | (value >> (64 - bits)); }
+		// MurmurHash3's 64-bit finalizer.
+		static constexpr uint64_t Finish(uint64_t value) noexcept {
+			value ^= value >> 33;
+			value *= 0xFF51AFD7ED558CCDull;
+			value ^= value >> 33;
+			value *= 0xC4CEB9FE1A85EC53ull;
+			value ^= value >> 33;
+			return value;
+		}
+		static void MixInto(uint64_t& a, uint64_t& b, uint64_t word) noexcept {
+			a = Rotl(a ^ (word * kA1), 31) * kA2;
+			b = Rotl(b + (word * kB1), 27) * kB2;
+		}
+		void Mix(uint64_t word) noexcept { MixInto(a_, b_, word); }
+
+		uint64_t a_ = kA0;
+		uint64_t b_ = kB0;
+		uint64_t word_ = 0;   // bytes of an unfinished word, little-endian
+		uint64_t total_ = 0;  // bytes fed in all
+		uint32_t pending_ = 0;
+	};
+
 	/** @brief The device and driver a cache payload belongs to. */
 	struct PipelineCacheIdentity {
 		uint32_t backend = 0; // rhi::Backend

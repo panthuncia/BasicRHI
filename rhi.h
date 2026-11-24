@@ -3058,6 +3058,19 @@ namespace rhi {
 		uint64_t loadedBytes = 0; // payload read from the file
 		uint64_t savedBytes = 0;  // payload of the last save
 		uint32_t saves = 0;
+		// Vulkan's pipeline binary store (VK_KHR_pipeline_binary, beside the cache file): pipelines of the lowered binding models
+		// made from stored driver binaries, with no shader lowering and no compile. Off on other backends and devices.
+		PipelineCacheLoadResult binaryLoad = PipelineCacheLoadResult::Off;
+		uint64_t binaryHits = 0;      // pipelines made from stored binaries
+		uint64_t binaryMisses = 0;    // pipelines built in full, their binaries then stored
+		uint64_t binaryStored = 0;    // entries added this session
+		uint64_t binaryPruned = 0;    // entries the last save left out (unused for several sessions)
+		uint64_t binaryEntries = 0;   // entries held now
+		uint64_t binaryLoadedBytes = 0;
+		uint64_t binarySavedBytes = 0;
+		// Changes since the store was opened (entries added, loaded entries used for the first time): a save writes the store
+		// when this moved. Callers that save when `misses` moves should watch this too.
+		uint64_t binaryChanges = 0;
 	};
 
 	/** @brief What an optimally tiled texture of a format can be used as (FormatSupport::usage). */

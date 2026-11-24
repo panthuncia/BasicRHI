@@ -10811,6 +10811,67 @@ namespace rhi {
 			return result == VK_SUBOPTIMAL_KHR ? Result::Ok : ToRHI(result);
 		}
 
+		// The lowering target of a lowered model's modules against `layoutState` (VkCreateBufferModelShaderModule). Its static sampler
+		// elements point into layoutState.
+		static vulkan_binding::LoweringTarget VkBufferModelLoweringTarget(const VulkanDevice* impl, const VulkanPipelineLayout& layoutState) noexcept {
+			vulkan_binding::LoweringTarget target{};
+			target.resourceSet = 0;
+			target.resourceBinding = 0;
+			target.samplerSet = 1;
+			target.samplerBinding = 0;
+			target.pushedBytes = layoutState.pushedBytes;
+			target.spillAddressOffset = layoutState.spillAddressOffset;
+			target.pushConstantBytes = impl->descriptorBuffer.pushConstantBytes;
+			// What the heap model's contract guarantees of the addresses shaders read (rhi_vulkan_spirv_lowering.h), and the
+			// alignment of the scratch the spill image is uploaded to (VkAllocateEmulatedRootConstantScratch).
+			target.recordAlignment = 8;
+			target.uniformBlockAlignment = static_cast<uint32_t>((std::max<VkDeviceSize>)(4, impl->physicalDeviceProperties.limits.minUniformBufferOffsetAlignment));
+			target.spillAlignment = static_cast<uint32_t>(VkEmulatedRootConstantAlignment(impl));
+			target.staticSamplerElements = std::span<const uint32_t>(layoutState.staticSamplerElements.data(), layoutState.staticSamplerElements.size());
+			// Heap CBVs are storage buffers wherever the resource heap holds no uniform buffers (VulkanDescriptorBufferModel::
+			// uniformBuffers): always in the descriptor-sets model, and on devices whose uniform buffer limits are below the capacity.
+			target.cbvAsStorageBuffer = !impl->descriptorBuffer.uniformBuffers;
+			// Descriptor-sets model: one binding per kind in set 0 (VulkanDescriptorSetsModel::kBinding). Uniform buffers have no
+			// binding there, so theirs (6) is past the last.
+			if (VkDescriptorSetsModel(impl)) {
+				using Kind = vulkan_binding::LoweringTarget::Kind;
+				const auto bindingOf = [](uint8_t kind) { return VulkanDescriptorSetsModel::kBinding[kind]; };
+				target.perType = true;
+				target.kindBindings[static_cast<uint32_t>(Kind::SampledImage)] = bindingOf(VulkanDescriptorSetsModel::SampledImage);
+				target.kindBindings[static_cast<uint32_t>(Kind::StorageImage)] = bindingOf(VulkanDescriptorSetsModel::StorageImage);
+				target.kindBindings[static_cast<uint32_t>(Kind::UniformTexelBuffer)] = bindingOf(VulkanDescriptorSetsModel::UniformTexelBuffer);
+				target.kindBindings[static_cast<uint32_t>(Kind::StorageTexelBuffer)] = bindingOf(VulkanDescriptorSetsModel::StorageTexelBuffer);
+				target.kindBindings[static_cast<uint32_t>(Kind::StorageBuffer)] = bindingOf(VulkanDescriptorSetsModel::StorageBuffer);
+				target.kindBindings[static_cast<uint32_t>(Kind::UniformBuffer)] = 6;
+				target.kindBindings[static_cast<uint32_t>(Kind::AccelerationStructure)] = bindingOf(VulkanDescriptorSetsModel::AccelerationStructure);
+				target.cbvAsStorageBuffer = true;
+			}
+			return target;
+		}
+
+		// Feeds everything a module's lowering reads into `hash`: the module, the stage, the entry point, the plan and the target.
+		// It keys the lowered module cache (Fnv1a64) and is part of a pipeline's key in the pipeline binary store (Hash128).
+		template<class Hasher>
+		static void VkHashLoweringInputs(Hasher& hash, const uint32_t* code, size_t codeBytes, VkShaderStageFlagBits stage, std::string_view entryPoint,
+			const vulkan_binding::BindingPlan& plan, const vulkan_binding::LoweringTarget& target) noexcept {
+			hash.Add(code, codeBytes);
+			hash.AddValue(static_cast<uint32_t>(stage));
+			hash.AddValue(static_cast<uint64_t>(entryPoint.size()));
+			hash.Add(entryPoint.data(), entryPoint.size());
+			hash.AddValue(plan.pushDataBytes);
+			for (const auto& m : plan.mappings) {
+				hash.AddValue(m.set); hash.AddValue(m.firstBinding); hash.AddValue(m.bindingCount); hash.AddValue(m.resourceMask);
+				hash.AddValue(static_cast<uint32_t>(m.source)); hash.AddValue(m.heapElement); hash.AddValue(m.pushOffset); hash.AddValue(m.recordOffset);
+				hash.AddValue(m.pushDataBytes); hash.AddValue(m.staticSampler); hash.AddValue(m.boundSet);
+			}
+			hash.AddValue(target.resourceSet); hash.AddValue(target.resourceBinding); hash.AddValue(target.samplerSet); hash.AddValue(target.samplerBinding);
+			hash.AddValue(target.pushedBytes); hash.AddValue(target.spillAddressOffset); hash.AddValue(target.pushConstantBytes);
+			hash.AddValue(target.recordAlignment); hash.AddValue(target.uniformBlockAlignment); hash.AddValue(target.spillAlignment);
+			hash.AddValue(static_cast<uint64_t>(target.staticSamplerElements.size()));
+			hash.Add(target.staticSamplerElements.data(), target.staticSamplerElements.size_bytes());
+			hash.AddValue(target.perType); hash.AddValue(target.kindBindings); hash.AddValue(target.cbvAsStorageBuffer);
+		}
+
 		// Descriptor-buffer model: one stage's module, its SPIR-V lowered (rhi_vulkan_spirv_lowering.h) to the stage's binding plan
 		// against the universal pipeline layout. a_planStages are the stages whose layout ranges the plan maps (one stage; every ray
 		// tracing stage for a ray tracing pipeline, as the descriptor-heap model maps them). Diagnostics: BASICRHI_VK_VALIDATE_LOWERING=1
@@ -10825,59 +10886,13 @@ namespace rhi {
 			static const std::string dumpDirectory = [] { const char* value = std::getenv("BASICRHI_VK_DUMP_LOWERED"); return std::string(value ? value : ""); }();
 			try {
 				const vulkan_binding::BindingPlan plan = VkBuildBindingPlan(layoutState, planStages);
-				vulkan_binding::LoweringTarget target{};
-				target.resourceSet = 0;
-				target.resourceBinding = 0;
-				target.samplerSet = 1;
-				target.samplerBinding = 0;
-				target.pushedBytes = layoutState.pushedBytes;
-				target.spillAddressOffset = layoutState.spillAddressOffset;
-				target.pushConstantBytes = impl->descriptorBuffer.pushConstantBytes;
-				// What the heap model's contract guarantees of the addresses shaders read (rhi_vulkan_spirv_lowering.h), and the
-				// alignment of the scratch the spill image is uploaded to (VkAllocateEmulatedRootConstantScratch).
-				target.recordAlignment = 8;
-				target.uniformBlockAlignment = static_cast<uint32_t>((std::max<VkDeviceSize>)(4, impl->physicalDeviceProperties.limits.minUniformBufferOffsetAlignment));
-				target.spillAlignment = static_cast<uint32_t>(VkEmulatedRootConstantAlignment(impl));
-				target.staticSamplerElements = std::span<const uint32_t>(layoutState.staticSamplerElements.data(), layoutState.staticSamplerElements.size());
-				// Heap CBVs are storage buffers wherever the resource heap holds no uniform buffers (VulkanDescriptorBufferModel::
-				// uniformBuffers): always in the descriptor-sets model, and on devices whose uniform buffer limits are below the capacity.
-				target.cbvAsStorageBuffer = !impl->descriptorBuffer.uniformBuffers;
-				// Descriptor-sets model: one binding per kind in set 0 (VulkanDescriptorSetsModel::kBinding). Uniform buffers have no
-				// binding there, so theirs (6) is past the last.
-				if (VkDescriptorSetsModel(impl)) {
-					using Kind = vulkan_binding::LoweringTarget::Kind;
-					const auto bindingOf = [](uint8_t kind) { return VulkanDescriptorSetsModel::kBinding[kind]; };
-					target.perType = true;
-					target.kindBindings[static_cast<uint32_t>(Kind::SampledImage)] = bindingOf(VulkanDescriptorSetsModel::SampledImage);
-					target.kindBindings[static_cast<uint32_t>(Kind::StorageImage)] = bindingOf(VulkanDescriptorSetsModel::StorageImage);
-					target.kindBindings[static_cast<uint32_t>(Kind::UniformTexelBuffer)] = bindingOf(VulkanDescriptorSetsModel::UniformTexelBuffer);
-					target.kindBindings[static_cast<uint32_t>(Kind::StorageTexelBuffer)] = bindingOf(VulkanDescriptorSetsModel::StorageTexelBuffer);
-					target.kindBindings[static_cast<uint32_t>(Kind::StorageBuffer)] = bindingOf(VulkanDescriptorSetsModel::StorageBuffer);
-					target.kindBindings[static_cast<uint32_t>(Kind::UniformBuffer)] = 6;
-					target.kindBindings[static_cast<uint32_t>(Kind::AccelerationStructure)] = bindingOf(VulkanDescriptorSetsModel::AccelerationStructure);
-					target.cbvAsStorageBuffer = true;
-				}
+				const vulkan_binding::LoweringTarget target = VkBufferModelLoweringTarget(impl, layoutState);
 
 				const std::span<const uint32_t> input(code, codeBytes / sizeof(uint32_t));
 				// The key covers the module, the plan, the target, the stage and the entry point: all the lowering reads.
 				const uint64_t key = [&] {
 					detail::Fnv1a64 hash;
-					hash.Add(code, codeBytes);
-					hash.AddValue(static_cast<uint32_t>(stage));
-					hash.AddValue(static_cast<uint64_t>(entryPoint.size()));
-					hash.Add(entryPoint.data(), entryPoint.size());
-					hash.AddValue(plan.pushDataBytes);
-					for (const auto& m : plan.mappings) {
-						hash.AddValue(m.set); hash.AddValue(m.firstBinding); hash.AddValue(m.bindingCount); hash.AddValue(m.resourceMask);
-						hash.AddValue(static_cast<uint32_t>(m.source)); hash.AddValue(m.heapElement); hash.AddValue(m.pushOffset); hash.AddValue(m.recordOffset);
-						hash.AddValue(m.pushDataBytes); hash.AddValue(m.staticSampler); hash.AddValue(m.boundSet);
-					}
-					hash.AddValue(target.resourceSet); hash.AddValue(target.resourceBinding); hash.AddValue(target.samplerSet); hash.AddValue(target.samplerBinding);
-					hash.AddValue(target.pushedBytes); hash.AddValue(target.spillAddressOffset); hash.AddValue(target.pushConstantBytes);
-					hash.AddValue(target.recordAlignment); hash.AddValue(target.uniformBlockAlignment); hash.AddValue(target.spillAlignment);
-					hash.AddValue(static_cast<uint64_t>(target.staticSamplerElements.size()));
-					hash.Add(target.staticSamplerElements.data(), target.staticSamplerElements.size_bytes());
-					hash.AddValue(target.perType); hash.AddValue(target.kindBindings); hash.AddValue(target.cbvAsStorageBuffer);
+					VkHashLoweringInputs(hash, code, codeBytes, stage, entryPoint, plan, target);
 					return hash.Value();
 				}();
 				// A dump writes each lowering's files, so it skips the cache.
@@ -11008,6 +11023,526 @@ namespace rhi {
 				std::memcmp(header.pipelineCacheUUID, impl->physicalDeviceProperties.pipelineCacheUUID, VK_UUID_SIZE) == 0;
 		}
 
+		// ---------------------------------------------------------------------------------------------------------------
+		// The pipeline binary store (VulkanDevice::PipelineBinaryStore, VK_KHR_pipeline_binary).
+		//
+		// A lowered model's pipeline is keyed by a 128-bit hash of everything its creation reads: each stage's SPIR-V before
+		// lowering with its stage, entry point, binding plan and lowering target; the model's layout; the fixed-function state and
+		// the create flags. A key found in the store makes the pipeline from the driver's binaries, with no lowering, no shader
+		// module and no compile. A miss lowers and compiles as before, with VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR, and stores
+		// the pipeline's binaries. Pipeline creation reads nothing the lowering makes but the modules, so the key stands for the
+		// lowered modules too. The file names the lowering build (vulkan_binding::LoweringIdentity), so a changed lowering starts
+		// the store over.
+		//
+		// File (<pipeline cache path>.binaries): VkPipelineBinaryFileHeader, then per entry its key (lo, hi: uint64), the sessions
+		// it went unused (uint32) and its binary count (uint32), then per binary its key size (uint32), key bytes
+		// (VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR), data size (uint64) and data. The header's identity, lowering hash and the driver's
+		// global key (vkGetPipelineKeyKHR) must match this device, driver and build, or the file is stale and rewritten on save.
+
+		struct VkPipelineBinaryFileHeader {
+			static constexpr uint32_t kMagic = 0x42505242u;  // "BRPB"
+			static constexpr uint32_t kVersion = 1u;
+			uint32_t magic = kMagic;
+			uint32_t version = kVersion;
+			detail::PipelineCacheIdentity identity{};
+			uint64_t loweringHash = 0;
+			uint32_t globalKeySize = 0;
+			uint8_t globalKey[VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR]{};
+			uint32_t reserved = 0;
+			uint64_t entryCount = 0;
+			uint64_t payloadBytes = 0;
+			uint64_t payloadHash = 0;  // Hash128's low half over the payload
+		};
+
+		// Limits a read entry must keep, so a damaged file cannot ask for absurd allocations.
+		static constexpr uint32_t kVkMaxBinariesPerPipeline = 64;
+
+		// BASICRHI_VK_PIPELINE_BINARY=0 turns the store off: lowered pipelines are lowered and compiled every run, through the
+		// pipeline cache.
+		static bool VkPipelineBinarySwitchedOff() noexcept {
+			static const bool off = [] { const char* value = std::getenv("BASICRHI_VK_PIPELINE_BINARY"); return value && std::strcmp(value, "0") == 0; }();
+			return off;
+		}
+
+		// The lowering diagnostics (BASICRHI_VK_VALIDATE_LOWERING, BASICRHI_VK_DUMP_LOWERED) need every module lowered, so pipelines
+		// skip the store while they are on.
+		static bool VkLoweringDiagnosticsRequested() noexcept {
+			static const bool requested = [] {
+				const char* validate = std::getenv("BASICRHI_VK_VALIDATE_LOWERING");
+				const char* dump = std::getenv("BASICRHI_VK_DUMP_LOWERED");
+				return (validate && std::strcmp(validate, "1") == 0) || (dump && *dump);
+			}();
+			return requested;
+		}
+
+		static uint64_t VkLoweringIdentityHash() noexcept {
+			try {
+				const std::string& identity = vulkan_binding::LoweringIdentity();
+				detail::Fnv1a64 hash;
+				hash.Add(identity.data(), identity.size());
+				return hash.Value();
+			} catch (...) {
+				return 0;
+			}
+		}
+
+		// The layout part of a pipeline's store key: the lowered model's universal layout and, with bound uniform buffers, the
+		// layout's push descriptor set. Handles change from run to run, so what they were made from is hashed.
+		static void VkHashModelLayout(detail::Hash128& hash, const VulkanDevice* impl, const VulkanPipelineLayout& layout) noexcept {
+			hash.AddValue(static_cast<uint32_t>(impl->bindingModel));
+			const auto& model = impl->descriptorBuffer;
+			hash.AddValue(model.pushConstantBytes);
+			hash.AddValue(model.uniformBuffers);
+			hash.AddValue(model.accelerationStructures);
+			hash.AddValue(model.resourceCapacity);
+			hash.AddValue(model.samplerCapacity);
+			hash.AddValue(model.staticSamplerCapacity);
+			hash.AddValue(impl->descriptorSets.accelerationStructures);
+			const bool bound = layout.boundUniformPipelineLayout != VK_NULL_HANDLE;
+			hash.AddValue(bound);
+			if (bound) {
+				// VkPlanBoundUniforms makes the set from these: one binding per constant buffer, in range order, with its range's stages.
+				for (const LayoutBindingRange& range : layout.ranges) {
+					if (range.source == LayoutRangeSource::PushIndex) {
+						hash.AddValue(range.count);
+						hash.AddValue(static_cast<uint32_t>(VkShaderStageFlagsForRHI(range.visibility)));
+					}
+				}
+			}
+		}
+
+		// One stage's part of a pipeline's store key: what its lowering reads (VkHashLoweringInputs) and the name the stage uses.
+		static void VkHashStoreStage(detail::Hash128& hash, const VulkanDevice* impl, const VulkanPipelineLayout& layout, VkShaderStageFlagBits stage,
+			VkShaderStageFlags planStages, const uint32_t* code, size_t codeBytes, std::string_view loweringEntry, const char* stageName) {
+			const vulkan_binding::BindingPlan plan = VkBuildBindingPlan(layout, planStages);
+			const vulkan_binding::LoweringTarget target = VkBufferModelLoweringTarget(impl, layout);
+			VkHashLoweringInputs(hash, code, codeBytes, stage, loweringEntry, plan, target);
+			hash.AddString(stageName);
+		}
+
+		// Whether pipelines of this device go through the store now. Diagnostics that read the compile (pipeline statistics, ISA
+		// dumps, lowering dumps) skip it.
+		static bool VkPipelineBinaryStoreUsable(VulkanDevice* impl) noexcept {
+			if (!impl->pipelineBinaryEnabled || VkLoweringDiagnosticsRequested() || PipelineStatisticsRequested(impl) || IsaDumpRequested(impl)) {
+				return false;
+			}
+			const std::shared_lock lock(impl->pipelineBinaries.mutex);
+			return impl->pipelineBinaries.open;
+		}
+
+		// The stored binaries of `key`, or null. Marks the entry used this session.
+		static std::shared_ptr<const VulkanDevice::PipelineBinaryStore::Binaries> VkFindPipelineBinaries(VulkanDevice* impl, const detail::Hash128Value& key) noexcept {
+			auto& store = impl->pipelineBinaries;
+			const std::shared_lock lock(store.mutex);
+			if (!store.open) {
+				return {};
+			}
+			const auto it = store.entries.find(key);
+			if (it == store.entries.end()) {
+				return {};
+			}
+			if (!it->second.used.exchange(true)) {
+				++store.changes;
+			}
+			return it->second.binaries;
+		}
+
+		static void VkAddPipelineBinaries(VulkanDevice* impl, const detail::Hash128Value& key, VulkanDevice::PipelineBinaryStore::Binaries&& binaries) noexcept {
+			auto& store = impl->pipelineBinaries;
+			try {
+				auto kept = std::make_shared<const VulkanDevice::PipelineBinaryStore::Binaries>(std::move(binaries));
+				const std::unique_lock lock(store.mutex);
+				if (!store.open) {
+					return;
+				}
+				auto& entry = store.entries.try_emplace(key).first->second;
+				entry.binaries = std::move(kept);
+				entry.idleSessions = 0;
+				entry.used = true;
+				++store.stored;
+				++store.changes;
+			} catch (...) {
+			}
+		}
+
+		// Drops an entry the driver refused, so the pipeline's full build stores it again.
+		static void VkForgetPipelineBinaries(VulkanDevice* impl, const detail::Hash128Value& key) noexcept {
+			auto& store = impl->pipelineBinaries;
+			const std::unique_lock lock(store.mutex);
+			if (store.entries.erase(key) != 0) {
+				++store.changes;
+			}
+		}
+
+		// Makes the VkPipelineBinaryKHR objects of stored binaries. False, with nothing made, when the driver refuses them.
+		static bool VkCreatePipelineBinariesFromData(VulkanDevice* impl, const VulkanDevice::PipelineBinaryStore::Binaries& binaries,
+			std::vector<VkPipelineBinaryKHR>& out) noexcept {
+			out.clear();
+			try {
+				const uint32_t count = static_cast<uint32_t>(binaries.size());
+				std::vector<VkPipelineBinaryKeyKHR> keys(count, VkPipelineBinaryKeyKHR{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR });
+				std::vector<VkPipelineBinaryDataKHR> data(count);
+				for (uint32_t i = 0; i < count; ++i) {
+					keys[i].keySize = binaries[i].keySize;
+					std::memcpy(keys[i].key, binaries[i].key, sizeof(keys[i].key));
+					data[i].dataSize = binaries[i].data.size();
+					data[i].pData = const_cast<uint8_t*>(binaries[i].data.data());
+				}
+				VkPipelineBinaryKeysAndDataKHR keysAndData{};
+				keysAndData.binaryCount = count;
+				keysAndData.pPipelineBinaryKeys = keys.data();
+				keysAndData.pPipelineBinaryData = data.data();
+				VkPipelineBinaryCreateInfoKHR createInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR };
+				createInfo.pKeysAndDataInfo = &keysAndData;
+				out.assign(count, VK_NULL_HANDLE);
+				VkPipelineBinaryHandlesInfoKHR handles{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR };
+				handles.pipelineBinaryCount = count;
+				handles.pPipelineBinaries = out.data();
+				if (vkCreatePipelineBinariesKHR(impl->device, &createInfo, nullptr, &handles) == VK_SUCCESS) {
+					return true;
+				}
+			} catch (...) {
+			}
+			for (VkPipelineBinaryKHR binary : out) {
+				if (binary != VK_NULL_HANDLE) vkDestroyPipelineBinaryKHR(impl->device, binary, nullptr);
+			}
+			out.clear();
+			return false;
+		}
+
+		static void VkDestroyPipelineBinaries(VulkanDevice* impl, std::vector<VkPipelineBinaryKHR>& binaries) noexcept {
+			for (VkPipelineBinaryKHR binary : binaries) {
+				if (binary != VK_NULL_HANDLE) vkDestroyPipelineBinaryKHR(impl->device, binary, nullptr);
+			}
+			binaries.clear();
+		}
+
+		// Reads the binaries of a pipeline created with VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR, then releases the pipeline's
+		// captured data (always, as the flag asks). False when the driver gave none.
+		static bool VkCapturePipelineBinaries(VulkanDevice* impl, VkPipeline pipeline, VulkanDevice::PipelineBinaryStore::Binaries& out) noexcept {
+			out.clear();
+			std::vector<VkPipelineBinaryKHR> handles;
+			bool ok = false;
+			try {
+				VkPipelineBinaryCreateInfoKHR createInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR };
+				createInfo.pipeline = pipeline;
+				VkPipelineBinaryHandlesInfoKHR handlesInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR };
+				VkResult result = vkCreatePipelineBinariesKHR(impl->device, &createInfo, nullptr, &handlesInfo);
+				if (result == VK_SUCCESS && handlesInfo.pipelineBinaryCount != 0 && handlesInfo.pipelineBinaryCount <= kVkMaxBinariesPerPipeline) {
+					handles.assign(handlesInfo.pipelineBinaryCount, VK_NULL_HANDLE);
+					handlesInfo.pPipelineBinaries = handles.data();
+					result = vkCreatePipelineBinariesKHR(impl->device, &createInfo, nullptr, &handlesInfo);
+					ok = result == VK_SUCCESS;
+					if (!ok) {
+						handles.clear();  // a failed call leaves no binaries behind
+					}
+				}
+				for (size_t i = 0; ok && i < handles.size(); ++i) {
+					VkPipelineBinaryDataInfoKHR dataInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR };
+					dataInfo.pipelineBinary = handles[i];
+					VkPipelineBinaryKeyKHR key{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR };
+					size_t size = 0;
+					ok = vkGetPipelineBinaryDataKHR(impl->device, &dataInfo, &key, &size, nullptr) == VK_SUCCESS && size != 0 &&
+						key.keySize <= VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR;
+					if (!ok) break;
+					VulkanDevice::PipelineBinaryStore::Binary binary;
+					binary.data.resize(size);
+					ok = vkGetPipelineBinaryDataKHR(impl->device, &dataInfo, &key, &size, binary.data.data()) == VK_SUCCESS;
+					binary.data.resize(size);
+					binary.keySize = key.keySize;
+					std::memcpy(binary.key, key.key, sizeof(binary.key));
+					out.push_back(std::move(binary));
+				}
+			} catch (...) {
+				ok = false;
+			}
+			VkDestroyPipelineBinaries(impl, handles);
+			VkReleaseCapturedPipelineDataInfoKHR releaseInfo{ VK_STRUCTURE_TYPE_RELEASE_CAPTURED_PIPELINE_DATA_INFO_KHR };
+			releaseInfo.pipeline = pipeline;
+			vkReleaseCapturedPipelineDataKHR(impl->device, &releaseInfo, nullptr);
+			if (!ok) out.clear();
+			return ok && !out.empty();
+		}
+
+		// Reads the store's file into `entries`. Returns Empty without a file, Stale for another device, driver or lowering build,
+		// Corrupt for a damaged file, and Loaded otherwise.
+		static PipelineCacheLoadResult VkReadPipelineBinaryFile(const std::string& path, const VkPipelineBinaryFileHeader& expected,
+			std::unordered_map<detail::Hash128Value, VulkanDevice::PipelineBinaryStore::Entry, VulkanDevice::PipelineBinaryStore::KeyHash>& entries,
+			uint64_t& payloadBytes) noexcept {
+			entries.clear();
+			payloadBytes = 0;
+			try {
+				const std::filesystem::path filePath = detail::PipelineCachePath(path.c_str());
+				std::error_code error;
+				if (!std::filesystem::exists(filePath, error)) {
+					return PipelineCacheLoadResult::Empty;
+				}
+				std::ifstream file(filePath, std::ios::binary);
+				VkPipelineBinaryFileHeader header{};
+				if (!file || !file.read(reinterpret_cast<char*>(&header), sizeof(header)) || header.magic != VkPipelineBinaryFileHeader::kMagic ||
+					header.version != VkPipelineBinaryFileHeader::kVersion) {
+					return PipelineCacheLoadResult::Corrupt;
+				}
+				if (!detail::SamePipelineCacheIdentity(header.identity, expected.identity) || header.loweringHash != expected.loweringHash ||
+					header.globalKeySize != expected.globalKeySize || std::memcmp(header.globalKey, expected.globalKey, sizeof(header.globalKey)) != 0) {
+					return PipelineCacheLoadResult::Stale;
+				}
+				const uint64_t fileBytes = static_cast<uint64_t>(std::filesystem::file_size(filePath, error));
+				if (error || fileBytes != sizeof(header) + header.payloadBytes) {
+					return PipelineCacheLoadResult::Corrupt;
+				}
+				uint64_t left = header.payloadBytes;
+				detail::Hash128 hash;
+				const auto read = [&](void* data, size_t size) {
+					if (size > left || !file.read(static_cast<char*>(data), static_cast<std::streamsize>(size))) return false;
+					left -= size;
+					hash.Add(data, size);
+					return true;
+				};
+				entries.reserve(static_cast<size_t>((std::min)(header.entryCount, uint64_t(1) << 20)));
+				for (uint64_t e = 0; e < header.entryCount; ++e) {
+					detail::Hash128Value key{};
+					uint32_t idleSessions = 0, binaryCount = 0;
+					if (!read(&key.lo, sizeof(key.lo)) || !read(&key.hi, sizeof(key.hi)) || !read(&idleSessions, sizeof(idleSessions)) ||
+						!read(&binaryCount, sizeof(binaryCount)) || binaryCount == 0 || binaryCount > kVkMaxBinariesPerPipeline) {
+						entries.clear();
+						return PipelineCacheLoadResult::Corrupt;
+					}
+					VulkanDevice::PipelineBinaryStore::Binaries binaries(binaryCount);
+					for (auto& binary : binaries) {
+						uint64_t dataBytes = 0;
+						if (!read(&binary.keySize, sizeof(binary.keySize)) || binary.keySize > VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR ||
+							!read(binary.key, sizeof(binary.key)) || !read(&dataBytes, sizeof(dataBytes)) || dataBytes == 0 || dataBytes > left) {
+							entries.clear();
+							return PipelineCacheLoadResult::Corrupt;
+						}
+						binary.data.resize(static_cast<size_t>(dataBytes));
+						if (!read(binary.data.data(), binary.data.size())) {
+							entries.clear();
+							return PipelineCacheLoadResult::Corrupt;
+						}
+					}
+					auto& entry = entries.try_emplace(key).first->second;
+					entry.binaries = std::make_shared<const VulkanDevice::PipelineBinaryStore::Binaries>(std::move(binaries));
+					entry.idleSessions = idleSessions;
+				}
+				if (left != 0 || hash.Value().lo != header.payloadHash) {
+					entries.clear();
+					return PipelineCacheLoadResult::Corrupt;
+				}
+				payloadBytes = header.payloadBytes;
+				return PipelineCacheLoadResult::Loaded;
+			} catch (...) {
+				entries.clear();
+				return PipelineCacheLoadResult::Corrupt;
+			}
+		}
+
+		// Empties the store and stops it. Stats stay until the next open.
+		static void VkClosePipelineBinaryStore(VulkanDevice* impl) noexcept {
+			auto& store = impl->pipelineBinaries;
+			const std::unique_lock lock(store.mutex);
+			store.entries.clear();
+			store.open = false;
+			store.path.clear();
+		}
+
+		// Opens the store beside the pipeline cache file at `cachePath` (null or empty: off). True when pipelines go through it.
+		static bool VkOpenPipelineBinaryStore(VulkanDevice* impl, const char* cachePath) noexcept {
+			auto& store = impl->pipelineBinaries;
+			const std::unique_lock lock(store.mutex);
+			store.entries.clear();
+			store.open = false;
+			store.path.clear();
+			store.hits = 0;
+			store.misses = 0;
+			store.stored = 0;
+			store.pruned = 0;
+			store.loadedBytes = 0;
+			store.savedBytes = 0;
+			store.changes = 0;
+			store.savedChanges = 0;
+			store.load = PipelineCacheLoadResult::Off;
+			if (!cachePath || !*cachePath) {
+				return false;
+			}
+			// Off: switched off, or nothing to store. Unsupported: the device or driver cannot do it.
+			const char* why = nullptr;
+			PipelineCacheLoadResult notOpened = PipelineCacheLoadResult::Off;
+			if (VkPipelineBinarySwitchedOff()) why = "off (BASICRHI_VK_PIPELINE_BINARY=0)";
+			else if (!VkUniversalLayoutModel(impl)) why = "off (the binding model lowers no shaders)";
+			else {
+				notOpened = PipelineCacheLoadResult::Unsupported;
+				if (!impl->pipelineBinaryEnabled) why = "off (the device has no VK_KHR_pipeline_binary with maintenance5)";
+				else if (!vkCreatePipelineBinariesKHR || !vkGetPipelineBinaryDataKHR || !vkReleaseCapturedPipelineDataKHR || !vkDestroyPipelineBinaryKHR ||
+					!vkGetPipelineKeyKHR) why = "off (VK_KHR_pipeline_binary's commands are missing)";
+			}
+			if (why) {
+				store.load = notOpened;
+				spdlog::info("Vulkan pipeline binaries: {}", why);
+				return false;
+			}
+			try {
+				VkPipelineBinaryKeyKHR globalKey{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR };
+				if (const VkResult result = vkGetPipelineKeyKHR(impl->device, nullptr, &globalKey); result != VK_SUCCESS ||
+					globalKey.keySize > VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR) {
+					store.load = PipelineCacheLoadResult::Unsupported;
+					spdlog::warn("Vulkan pipeline binaries: off (vkGetPipelineKeyKHR failed: {})", static_cast<int>(result));
+					return false;
+				}
+				store.globalKeySize = globalKey.keySize;
+				std::memset(store.globalKey, 0, sizeof(store.globalKey));
+				std::memcpy(store.globalKey, globalKey.key, globalKey.keySize);
+				store.path = std::string(cachePath) + ".binaries";
+				VkPipelineBinaryFileHeader expected{};
+				expected.identity = VkPipelineCacheIdentity(impl);
+				expected.loweringHash = VkLoweringIdentityHash();
+				expected.globalKeySize = store.globalKeySize;
+				std::memcpy(expected.globalKey, store.globalKey, sizeof(expected.globalKey));
+				store.loweringHash = expected.loweringHash;
+				uint64_t payloadBytes = 0;
+				const PipelineCacheLoadResult load = VkReadPipelineBinaryFile(store.path, expected, store.entries, payloadBytes);
+				store.load = load;
+				store.loadedBytes = payloadBytes;
+				store.open = true;
+				// A file that was not loaded is replaced on the first save.
+				if (load != PipelineCacheLoadResult::Loaded && load != PipelineCacheLoadResult::Empty) {
+					++store.changes;
+				}
+				spdlog::info("Vulkan pipeline binaries '{}': {} ({} entries, {} bytes)", store.path, detail::PipelineCacheLoadName(load), store.entries.size(),
+					payloadBytes);
+				return true;
+			} catch (...) {
+				store.entries.clear();
+				store.open = false;
+				store.load = PipelineCacheLoadResult::Corrupt;
+				return false;
+			}
+		}
+
+		// Writes the store's file when it changed since the last write. Entries used this session are written with 0 unused
+		// sessions. The others are written one session older, left out at kMaxIdleSessions, and kept, the least idle first, only
+		// while the file stays under kMaxFileBytes. Safe while other threads create pipelines.
+		static Result VkSavePipelineBinaryStore(VulkanDevice* impl) noexcept {
+			auto& store = impl->pipelineBinaries;
+			const std::lock_guard saveLock(store.saveMutex);
+			struct Item {
+				detail::Hash128Value key;
+				std::shared_ptr<const VulkanDevice::PipelineBinaryStore::Binaries> binaries;
+				uint32_t idleSessions = 0;
+				uint64_t bytes = 0;
+			};
+			std::vector<Item> items;
+			std::string path;
+			VkPipelineBinaryFileHeader header{};
+			uint64_t changes = 0;
+			try {
+				{
+					const std::shared_lock lock(store.mutex);
+					if (!store.open) {
+						return Result::Ok;
+					}
+					changes = store.changes.load();
+					if (changes == store.savedChanges.load()) {
+						return Result::Ok;
+					}
+					path = store.path;
+					header.identity = VkPipelineCacheIdentity(impl);
+					header.loweringHash = store.loweringHash;
+					header.globalKeySize = store.globalKeySize;
+					std::memcpy(header.globalKey, store.globalKey, sizeof(header.globalKey));
+					items.reserve(store.entries.size());
+					for (const auto& [key, entry] : store.entries) {
+						const bool used = entry.used.load();
+						items.push_back(Item{ key, entry.binaries, used ? 0u : entry.idleSessions + 1u, 0 });
+					}
+				}
+				uint64_t pruned = 0;
+				for (Item& item : items) {
+					item.bytes = 24;
+					for (const auto& binary : *item.binaries) {
+						item.bytes += 4 + sizeof(binary.key) + 8 + binary.data.size();
+					}
+				}
+				// Used entries first, then the least idle; ties by key, so the file is the same for the same contents.
+				std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+					if (a.idleSessions != b.idleSessions) return a.idleSessions < b.idleSessions;
+					return a.key.lo != b.key.lo ? a.key.lo < b.key.lo : a.key.hi < b.key.hi;
+				});
+				uint64_t payloadBytes = 0;
+				size_t kept = 0;
+				for (const Item& item : items) {
+					const bool used = item.idleSessions == 0;
+					if (!used && (item.idleSessions >= VulkanDevice::PipelineBinaryStore::kMaxIdleSessions ||
+						payloadBytes + item.bytes > VulkanDevice::PipelineBinaryStore::kMaxFileBytes)) {
+						++pruned;
+						continue;
+					}
+					payloadBytes += item.bytes;
+					items[kept++] = item;
+				}
+				items.resize(kept);
+
+				const std::filesystem::path filePath = detail::PipelineCachePath(path.c_str());
+				std::error_code error;
+				if (filePath.has_parent_path()) {
+					std::filesystem::create_directories(filePath.parent_path(), error);
+				}
+				std::filesystem::path temporary = filePath;
+				temporary += ".tmp";
+				{
+					std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+					if (!file) {
+						spdlog::warn("Vulkan pipeline binaries '{}': save failed (cannot write {})", path, temporary.string());
+						return Result::Failed;
+					}
+					header.entryCount = items.size();
+					header.payloadBytes = payloadBytes;
+					file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+					detail::Hash128 hash;
+					const auto write = [&](const void* data, size_t size) {
+						file.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+						hash.Add(data, size);
+					};
+					for (const Item& item : items) {
+						const uint32_t binaryCount = static_cast<uint32_t>(item.binaries->size());
+						write(&item.key.lo, sizeof(item.key.lo));
+						write(&item.key.hi, sizeof(item.key.hi));
+						write(&item.idleSessions, sizeof(item.idleSessions));
+						write(&binaryCount, sizeof(binaryCount));
+						for (const auto& binary : *item.binaries) {
+							const uint64_t dataBytes = binary.data.size();
+							write(&binary.keySize, sizeof(binary.keySize));
+							write(binary.key, sizeof(binary.key));
+							write(&dataBytes, sizeof(dataBytes));
+							write(binary.data.data(), binary.data.size());
+						}
+					}
+					header.payloadHash = hash.Value().lo;
+					file.seekp(0);
+					file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+					if (!file) {
+						file.close();
+						std::filesystem::remove(temporary, error);
+						spdlog::warn("Vulkan pipeline binaries '{}': save failed (write error)", path);
+						return Result::Failed;
+					}
+				}
+				std::filesystem::rename(temporary, filePath, error);
+				if (error) {
+					std::filesystem::remove(temporary, error);
+					spdlog::warn("Vulkan pipeline binaries '{}': save failed (rename)", path);
+					return Result::Failed;
+				}
+				store.savedChanges = changes;
+				store.savedBytes = payloadBytes;
+				store.pruned = pruned;
+				return Result::Ok;
+			} catch (...) {
+				RHI_FAIL(Result::OutOfMemory);
+			}
+		}
+
 		// Destroys the open cache without saving it. The caller holds the cache's lock exclusively.
 		static void VkClosePipelineCacheLocked(VulkanDevice* impl) noexcept {
 			auto& state = impl->pipelineCache;
@@ -11016,7 +11551,9 @@ namespace rhi {
 			}
 			state.cache = VK_NULL_HANDLE;
 			state.path.clear();
+			state.rewritePending = false;
 			state.counters.Reset(PipelineCacheLoadResult::Off, 0);
+			VkClosePipelineBinaryStore(impl);
 		}
 
 		static Result d_openPipelineCache(Device* device, const char* path) noexcept {
@@ -11033,7 +11570,26 @@ namespace rhi {
 			try {
 				state.identity = VkPipelineCacheIdentity(impl);
 				std::vector<uint8_t> payload;
-				PipelineCacheLoadResult load = detail::ReadPipelineCacheFile(path, state.identity, payload);
+				// With the binary store open, the lowered pipelines no longer go through the cache. A VkPipelineCache cannot drop
+				// entries, so a file that grew from them before the store would be read every run for nothing. Past
+				// kStoreEraCacheBytes the cache starts empty and the next save rewrites the file with what still goes through it
+				// (ray tracing, pipelines made while a diagnostic is on); a file under it is read as usual.
+				constexpr uint64_t kStoreEraCacheBytes = uint64_t(64) << 20;
+				const bool binaryStoreOpen = VkOpenPipelineBinaryStore(impl, path);
+				PipelineCacheLoadResult load = PipelineCacheLoadResult::Empty;
+				uint64_t fileBytes = 0;
+				if (binaryStoreOpen) {
+					std::error_code error;
+					const auto filePath = detail::PipelineCachePath(path);
+					if (std::filesystem::exists(filePath, error)) {
+						fileBytes = static_cast<uint64_t>(std::filesystem::file_size(filePath, error));
+						if (error) fileBytes = 0;
+					}
+					state.rewritePending = fileBytes > kStoreEraCacheBytes;
+				}
+				if (!state.rewritePending) {
+					load = detail::ReadPipelineCacheFile(path, state.identity, payload);
+				}
 				if (load == PipelineCacheLoadResult::Loaded && !VkPipelineCacheDataMatchesDevice(impl, payload)) {
 					load = PipelineCacheLoadResult::Stale;
 					payload.clear();
@@ -11060,7 +11616,12 @@ namespace rhi {
 				const uint32_t apiVersion = (std::min)(impl->instanceApiVersion, impl->physicalDeviceProperties.apiVersion);
 				state.creationFeedback = apiVersion >= VK_API_VERSION_1_3;
 				state.counters.Reset(load, payload.size());
-				spdlog::info("Vulkan pipeline cache '{}': {} ({} bytes)", path, detail::PipelineCacheLoadName(load), payload.size());
+				if (state.rewritePending) {
+					spdlog::info("Vulkan pipeline cache '{}': not read ({} bytes): the pipeline binary store holds the lowered pipelines, so the next save "
+						"rewrites it with the rest", path, fileBytes);
+				} else {
+					spdlog::info("Vulkan pipeline cache '{}': {} ({} bytes)", path, detail::PipelineCacheLoadName(load), payload.size());
+				}
 				return Result::Ok;
 			} catch (...) {
 				VkClosePipelineCacheLocked(impl);
@@ -11079,10 +11640,11 @@ namespace rhi {
 				return Result::Ok;
 			}
 			const std::lock_guard saveLock(state.saveMutex);
+			const Result binariesSaved = VkSavePipelineBinaryStore(impl);
 			// Pipelines created while this runs stay counted for the next save.
 			const uint64_t added = state.counters.added.exchange(0);
-			if (added == 0) {
-				return Result::Ok;
+			if (added == 0 && !state.rewritePending) {
+				return binariesSaved;
 			}
 			try {
 				std::vector<uint8_t> data;
@@ -11108,7 +11670,8 @@ namespace rhi {
 				}
 				state.counters.savedBytes = data.size();
 				++state.counters.saves;
-				return Result::Ok;
+				state.rewritePending = false;
+				return binariesSaved;
 			} catch (...) {
 				state.counters.added += added;
 				RHI_FAIL(Result::OutOfMemory);
@@ -11122,6 +11685,19 @@ namespace rhi {
 				RHI_FAIL(Result::InvalidArgument);
 			}
 			impl->pipelineCache.counters.Fill(out);
+			const auto& store = impl->pipelineBinaries;
+			out.binaryLoad = store.load.load();
+			out.binaryHits = store.hits.load();
+			out.binaryMisses = store.misses.load();
+			out.binaryStored = store.stored.load();
+			out.binaryPruned = store.pruned.load();
+			out.binaryLoadedBytes = store.loadedBytes.load();
+			out.binarySavedBytes = store.savedBytes.load();
+			out.binaryChanges = store.changes.load();
+			{
+				const std::shared_lock lock(store.mutex);
+				out.binaryEntries = store.entries.size();
+			}
 			return Result::Ok;
 		}
 
@@ -11211,6 +11787,153 @@ namespace rhi {
 				}
 			}
 			return result;
+		}
+
+		// The fixed-function part of a graphics pipeline's store key: every state the create info carries, read from the structs
+		// as they go to the driver (formats after their remaps). `info.pStages` is hashed per stage by the caller.
+		static void VkHashGraphicsState(detail::Hash128& hash, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfo& rendering) noexcept {
+			hash.AddValue(info.flags);
+			hash.AddValue(info.stageCount);
+			if (const VkPipelineVertexInputStateCreateInfo* vertexInput = info.pVertexInputState) {
+				hash.AddValue(vertexInput->vertexBindingDescriptionCount);
+				for (uint32_t i = 0; i < vertexInput->vertexBindingDescriptionCount; ++i) {
+					const VkVertexInputBindingDescription& binding = vertexInput->pVertexBindingDescriptions[i];
+					hash.AddValue(binding.binding); hash.AddValue(binding.stride); hash.AddValue(binding.inputRate);
+				}
+				hash.AddValue(vertexInput->vertexAttributeDescriptionCount);
+				for (uint32_t i = 0; i < vertexInput->vertexAttributeDescriptionCount; ++i) {
+					const VkVertexInputAttributeDescription& attribute = vertexInput->pVertexAttributeDescriptions[i];
+					hash.AddValue(attribute.location); hash.AddValue(attribute.binding); hash.AddValue(attribute.format); hash.AddValue(attribute.offset);
+				}
+			} else {
+				hash.AddValue(~0u);
+			}
+			if (const VkPipelineInputAssemblyStateCreateInfo* inputAssembly = info.pInputAssemblyState) {
+				hash.AddValue(inputAssembly->topology); hash.AddValue(inputAssembly->primitiveRestartEnable);
+			} else {
+				hash.AddValue(~0u);
+			}
+			if (const VkPipelineViewportStateCreateInfo* viewport = info.pViewportState) {
+				hash.AddValue(viewport->viewportCount); hash.AddValue(viewport->scissorCount);
+			} else {
+				hash.AddValue(~0u);
+			}
+			if (const VkPipelineRasterizationStateCreateInfo* raster = info.pRasterizationState) {
+				hash.AddValue(raster->depthClampEnable); hash.AddValue(raster->rasterizerDiscardEnable); hash.AddValue(raster->polygonMode);
+				hash.AddValue(raster->cullMode); hash.AddValue(raster->frontFace); hash.AddValue(raster->depthBiasEnable);
+				hash.AddValue(raster->depthBiasConstantFactor); hash.AddValue(raster->depthBiasClamp); hash.AddValue(raster->depthBiasSlopeFactor);
+				hash.AddValue(raster->lineWidth);
+			} else {
+				hash.AddValue(~0u);
+			}
+			if (const VkPipelineMultisampleStateCreateInfo* multisample = info.pMultisampleState) {
+				hash.AddValue(multisample->rasterizationSamples); hash.AddValue(multisample->sampleShadingEnable); hash.AddValue(multisample->minSampleShading);
+				hash.AddValue(multisample->alphaToCoverageEnable); hash.AddValue(multisample->alphaToOneEnable);
+				const uint32_t maskWords = multisample->pSampleMask ? (static_cast<uint32_t>(multisample->rasterizationSamples) + 31u) / 32u : 0u;
+				hash.AddValue(maskWords);
+				for (uint32_t i = 0; i < maskWords; ++i) hash.AddValue(multisample->pSampleMask[i]);
+			} else {
+				hash.AddValue(~0u);
+			}
+			if (const VkPipelineDepthStencilStateCreateInfo* depthStencil = info.pDepthStencilState) {
+				hash.AddValue(depthStencil->depthTestEnable); hash.AddValue(depthStencil->depthWriteEnable); hash.AddValue(depthStencil->depthCompareOp);
+				hash.AddValue(depthStencil->depthBoundsTestEnable); hash.AddValue(depthStencil->stencilTestEnable);
+				for (const VkStencilOpState* face : { &depthStencil->front, &depthStencil->back }) {
+					hash.AddValue(face->failOp); hash.AddValue(face->passOp); hash.AddValue(face->depthFailOp); hash.AddValue(face->compareOp);
+					hash.AddValue(face->compareMask); hash.AddValue(face->writeMask); hash.AddValue(face->reference);
+				}
+				hash.AddValue(depthStencil->minDepthBounds); hash.AddValue(depthStencil->maxDepthBounds);
+			} else {
+				hash.AddValue(~0u);
+			}
+			if (const VkPipelineColorBlendStateCreateInfo* colorBlend = info.pColorBlendState) {
+				hash.AddValue(colorBlend->logicOpEnable); hash.AddValue(colorBlend->logicOp); hash.AddValue(colorBlend->attachmentCount);
+				for (uint32_t i = 0; i < colorBlend->attachmentCount; ++i) {
+					const VkPipelineColorBlendAttachmentState& attachment = colorBlend->pAttachments[i];
+					hash.AddValue(attachment.blendEnable); hash.AddValue(attachment.srcColorBlendFactor); hash.AddValue(attachment.dstColorBlendFactor);
+					hash.AddValue(attachment.colorBlendOp); hash.AddValue(attachment.srcAlphaBlendFactor); hash.AddValue(attachment.dstAlphaBlendFactor);
+					hash.AddValue(attachment.alphaBlendOp); hash.AddValue(attachment.colorWriteMask);
+				}
+				hash.AddValue(colorBlend->blendConstants);
+			} else {
+				hash.AddValue(~0u);
+			}
+			if (const VkPipelineDynamicStateCreateInfo* dynamic = info.pDynamicState) {
+				hash.AddValue(dynamic->dynamicStateCount);
+				for (uint32_t i = 0; i < dynamic->dynamicStateCount; ++i) hash.AddValue(dynamic->pDynamicStates[i]);
+			} else {
+				hash.AddValue(~0u);
+			}
+			hash.AddValue(rendering.viewMask);
+			hash.AddValue(rendering.colorAttachmentCount);
+			for (uint32_t i = 0; i < rendering.colorAttachmentCount; ++i) hash.AddValue(rendering.pColorAttachmentFormats[i]);
+			hash.AddValue(rendering.depthAttachmentFormat);
+			hash.AddValue(rendering.stencilAttachmentFormat);
+		}
+
+		// Creates one pipeline of a lowered model through the pipeline binary store. `info` has `createFlags` chained (maintenance5),
+		// `lower` creates the stages' modules and puts them in `info`, and `create` makes the vkCreate*Pipelines call into `pipeline`
+		// with the cache it is given. A stored pipeline is made from its binaries, its stages without modules (binaries replace
+		// them). A miss, or binaries the driver refuses, lowers and compiles it with VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR and
+		// stores its binaries. Neither path may name a pipeline cache (vkCreate*Pipelines' valid usage for binaries and captured
+		// data); the driver's own cache still serves a miss. A failed lowering leaves its result in `lowerResult`.
+		template<class CreateInfo, class LowerFn, class CreateFn>
+		static VkResult VkCreatePipelineThroughBinaryStore(VulkanDevice* impl, const detail::Hash128Value& key, CreateInfo& info,
+			VkPipelineCreateFlags2CreateInfo& createFlags, VkPipeline& pipeline, Result& lowerResult, LowerFn&& lower, CreateFn&& create) noexcept {
+			auto& store = impl->pipelineBinaries;
+			lowerResult = Result::Ok;
+			if (const auto binaries = VkFindPipelineBinaries(impl, key)) {
+				VkResult result = VK_ERROR_INITIALIZATION_FAILED;
+				std::vector<VkPipelineBinaryKHR> handles;
+				bool made = false;
+				{
+					ZoneScopedN("RHI.Vulkan.CreatePipelineBinaries");
+					made = VkCreatePipelineBinariesFromData(impl, *binaries, handles);
+				}
+				if (made) {
+					VkPipelineBinaryInfoKHR binaryInfo{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR };
+					binaryInfo.binaryCount = static_cast<uint32_t>(handles.size());
+					binaryInfo.pPipelineBinaries = handles.data();
+					binaryInfo.pNext = info.pNext;
+					info.pNext = &binaryInfo;
+					result = create(VkPipelineCache{ VK_NULL_HANDLE });
+					info.pNext = binaryInfo.pNext;
+					VkDestroyPipelineBinaries(impl, handles);
+				}
+				if (result == VK_SUCCESS) {
+					++store.hits;
+					return VK_SUCCESS;
+				}
+				pipeline = VK_NULL_HANDLE;
+				VkForgetPipelineBinaries(impl, key);
+				static std::atomic<bool> reported{ false };
+				if (!reported.exchange(true)) {
+					spdlog::warn("Vulkan pipeline binaries: the driver refused stored binaries ({}); such pipelines are built in full and stored again",
+						made ? static_cast<int>(result) : -1);
+				}
+			}
+			lowerResult = lower();
+			if (lowerResult != Result::Ok) {
+				return VK_ERROR_INITIALIZATION_FAILED;
+			}
+			const VkPipelineCreateFlags2 flags = createFlags.flags;
+			createFlags.flags |= VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR;
+			const VkResult result = create(VkPipelineCache{ VK_NULL_HANDLE });
+			createFlags.flags = flags;
+			if (result != VK_SUCCESS) {
+				return result;
+			}
+			++store.misses;
+			VulkanDevice::PipelineBinaryStore::Binaries captured;
+			if (VkCapturePipelineBinaries(impl, pipeline, captured)) {
+				VkAddPipelineBinaries(impl, key, std::move(captured));
+			} else {
+				static std::atomic<bool> reported{ false };
+				if (!reported.exchange(true)) {
+					spdlog::warn("Vulkan pipeline binaries: the driver gave no binaries for a pipeline; such pipelines are built every run");
+				}
+			}
+			return VK_SUCCESS;
 		}
 
 		static Result d_createPipelineFromStream(Device* device, const PipelineStreamItem* items, uint32_t count, PipelinePtr& out) noexcept {
@@ -11635,6 +12358,17 @@ namespace rhi {
 				};
 				std::array<StageMappings, 3> stageMappings{};  // task, vertex or mesh, pixel
 				std::array<std::string, 3> entryNames{};
+				// With the pipeline binary store, lowering waits until the store has been asked: a stored pipeline needs no modules.
+				// Each stage keeps the SPIR-V it would be lowered from (with capture names, if any) and its lowering entry point.
+				const bool useBinaryStore = bufferModel && VkPipelineBinaryStoreUsable(impl);
+				struct DeferredStage {
+					const SubobjShader* shader = nullptr;
+					const uint32_t* code = nullptr;
+					size_t codeBytes = 0;
+					std::vector<uint32_t> namedCode;
+					std::string_view loweringEntry;
+				};
+				std::array<DeferredStage, 3> deferredStages{};
 				auto addShader = [&](const SubobjShader* shader) -> Result {
 					StageMappings& stageMapping = stageMappings[shaderStages.size()];
 					std::string& entryName = entryNames[shaderStages.size()];
@@ -11662,7 +12396,15 @@ namespace rhi {
 						}
 					}
 					VkShaderModule module = VK_NULL_HANDLE;
-					if (bufferModel) {
+					if (useBinaryStore) {
+						DeferredStage& deferred = deferredStages[shaderStages.size()];
+						deferred.shader = shader;
+						deferred.namedCode = std::move(namedCode);
+						deferred.code = deferred.namedCode.empty() ? moduleInfo.pCode : deferred.namedCode.data();
+						deferred.codeBytes = moduleInfo.codeSize;
+						deferred.loweringEntry = !entryName.empty() ? std::string_view(entryName) : std::string_view(shader->entryPoint);
+					}
+					else if (bufferModel) {
 						ZoneScopedN("RHI.Vulkan.LowerShaderModule");
 						// Descriptor-buffer model: lowered after the capture names are applied, so they survive into the module.
 						if (const Result lowered = VkCreateBufferModelShaderModule(impl, *layoutState, VkShaderStageForRHI(shader->stage), VkShaderStageForRHI(shader->stage),
@@ -11674,7 +12416,9 @@ namespace rhi {
 					else if (const VkResult result = vkCreateShaderModule(impl->device, &moduleInfo, nullptr, &module); result != VK_SUCCESS) {
 						return ToRHI(result);
 					}
-					modules.push_back(module);
+					if (module != VK_NULL_HANDLE) {
+						modules.push_back(module);
+					}
 					VkPipelineShaderStageCreateInfo stage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
 					stage.stage = VkShaderStageForRHI(shader->stage);
 					stage.module = module;
@@ -11884,10 +12628,61 @@ namespace rhi {
 				}
 				if (t_pipelineStatisticsLabel)
 					for (VkShaderModule module : modules) VkSetObjectName(impl, reinterpret_cast<uint64_t>(module), VK_OBJECT_TYPE_SHADER_MODULE, t_pipelineStatisticsLabel);
-				VkResult vkResult = VkCreatePipelineThroughCache(impl, pipelineInfo, [&](VkPipelineCache cache) {
+				// The pipeline binary store's deferred lowering: each stage's module, put into its stage info.
+				const auto lowerDeferredStages = [&]() -> Result {
+					for (size_t i = 0; i < shaderStages.size(); ++i) {
+						ZoneScopedN("RHI.Vulkan.LowerShaderModule");
+						const DeferredStage& deferred = deferredStages[i];
+						VkShaderModule module = VK_NULL_HANDLE;
+						if (const Result lowered = VkCreateBufferModelShaderModule(impl, *layoutState, shaderStages[i].stage, shaderStages[i].stage, deferred.code,
+								deferred.codeBytes, deferred.shader->entryPoint.c_str(), deferred.loweringEntry, module); lowered != Result::Ok) {
+							return lowered;
+						}
+						modules.push_back(module);
+						shaderStages[i].module = module;
+						if (t_pipelineStatisticsLabel) VkSetObjectName(impl, reinterpret_cast<uint64_t>(module), VK_OBJECT_TYPE_SHADER_MODULE, t_pipelineStatisticsLabel);
+					}
+					return Result::Ok;
+				};
+				const auto createGraphicsPipeline = [&](VkPipelineCache cache) {
 					ZoneScopedN("RHI.Vulkan.CreateGraphicsPipelines");
 					return vkCreateGraphicsPipelines(impl->device, cache, 1, &pipelineInfo, nullptr, &nativePipeline);
-				});
+				};
+				// The store key: what each stage's lowering reads, the layout, the create flags and the fixed-function state.
+				std::optional<detail::Hash128Value> storeKey;
+				if (useBinaryStore) {
+					try {
+						detail::Hash128 hash;
+						hash.AddValue(uint32_t{ 1 });  // a graphics pipeline
+						VkHashModelLayout(hash, impl, *layoutState);
+						hash.AddValue(static_cast<uint64_t>(createFlags.flags));
+						for (size_t i = 0; i < shaderStages.size(); ++i) {
+							VkHashStoreStage(hash, impl, *layoutState, shaderStages[i].stage, shaderStages[i].stage, deferredStages[i].code, deferredStages[i].codeBytes,
+								deferredStages[i].loweringEntry, shaderStages[i].pName);
+						}
+						VkHashGraphicsState(hash, pipelineInfo, rendering);
+						storeKey = hash.Value();
+					} catch (...) {
+					}
+				}
+				VkResult vkResult = VK_SUCCESS;
+				if (storeKey) {
+					Result lowered = Result::Ok;
+					vkResult = VkCreatePipelineThroughBinaryStore(impl, *storeKey, pipelineInfo, createFlags, nativePipeline, lowered, lowerDeferredStages,
+						createGraphicsPipeline);
+					if (lowered != Result::Ok) {
+						for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
+						return lowered;
+					}
+				} else {
+					if (useBinaryStore) {
+						if (const Result lowered = lowerDeferredStages(); lowered != Result::Ok) {
+							for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
+							return lowered;
+						}
+					}
+					vkResult = VkCreatePipelineThroughCache(impl, pipelineInfo, createGraphicsPipeline);
+				}
 				if (vkResult == VK_SUCCESS && t_pipelineStatisticsLabel)
 					VkSetObjectName(impl, reinterpret_cast<uint64_t>(nativePipeline), VK_OBJECT_TYPE_PIPELINE, t_pipelineStatisticsLabel);
 				for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
@@ -11936,18 +12731,26 @@ namespace rhi {
 			shaderModuleInfo.pCode = static_cast<const uint32_t*>(computeShader->bytecode.data);
 
 			VkShaderModule shaderModule = VK_NULL_HANDLE;
-			if (bufferModel) {
-				// Descriptor-buffer model: the module is lowered to the universal layout.
-				if (const Result lowered = VkCreateBufferModelShaderModule(impl, *layoutState, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_STAGE_COMPUTE_BIT,
-						shaderModuleInfo.pCode, shaderModuleInfo.codeSize, computeShader->entryPoint.c_str(), computeShader->entryPoint, shaderModule);
-						lowered != Result::Ok) {
-					return lowered;
+			// The descriptor-buffer model's lowering: the module lowered to the universal layout.
+			const auto lowerComputeShader = [&]() -> Result {
+				ZoneScopedN("RHI.Vulkan.LowerShaderModule");
+				return VkCreateBufferModelShaderModule(impl, *layoutState, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_STAGE_COMPUTE_BIT,
+					shaderModuleInfo.pCode, shaderModuleInfo.codeSize, computeShader->entryPoint.c_str(), computeShader->entryPoint, shaderModule);
+			};
+			// With the pipeline binary store, lowering waits until the store has been asked: a stored pipeline needs no module.
+			const bool useBinaryStore = bufferModel && VkPipelineBinaryStoreUsable(impl);
+			VkResult vkResult = VK_SUCCESS;
+			if (!useBinaryStore) {
+				if (bufferModel) {
+					if (const Result lowered = lowerComputeShader(); lowered != Result::Ok) {
+						return lowered;
+					}
 				}
-			}
-			VkResult vkResult = shaderModule != VK_NULL_HANDLE ? VK_SUCCESS : vkCreateShaderModule(impl->device, &shaderModuleInfo, nullptr, &shaderModule);
-			if (vkResult != VK_SUCCESS) {
-				spdlog::error("Vulkan compute pipeline creation: vkCreateShaderModule failed with VkResult {}", static_cast<int>(vkResult));
-				return ToRHI(vkResult);
+				vkResult = shaderModule != VK_NULL_HANDLE ? VK_SUCCESS : vkCreateShaderModule(impl->device, &shaderModuleInfo, nullptr, &shaderModule);
+				if (vkResult != VK_SUCCESS) {
+					spdlog::error("Vulkan compute pipeline creation: vkCreateShaderModule failed with VkResult {}", static_cast<int>(vkResult));
+					return ToRHI(vkResult);
+				}
 			}
 
 			VkPipelineLayout nativeLayout = VK_NULL_HANDLE;
@@ -11989,9 +12792,44 @@ namespace rhi {
 			pipelineInfo.layout = bufferModel ? VkModelPipelineLayout(impl, *layoutState) : nativeLayout;
 
 			VkPipeline nativePipeline = VK_NULL_HANDLE;
-			vkResult = VkCreatePipelineThroughCache(impl, pipelineInfo, [&](VkPipelineCache cache) {
+			const auto createComputePipeline = [&](VkPipelineCache cache) {
 				return vkCreateComputePipelines(impl->device, cache, 1, &pipelineInfo, nullptr, &nativePipeline);
-			});
+			};
+			// The store key: what the lowering reads, the layout and the create flags.
+			std::optional<detail::Hash128Value> storeKey;
+			if (useBinaryStore) {
+				try {
+					detail::Hash128 hash;
+					hash.AddValue(uint32_t{ 2 });  // a compute pipeline
+					VkHashModelLayout(hash, impl, *layoutState);
+					hash.AddValue(static_cast<uint64_t>(createFlags.flags));
+					hash.AddValue(pipelineInfo.flags);
+					VkHashStoreStage(hash, impl, *layoutState, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_STAGE_COMPUTE_BIT, shaderModuleInfo.pCode, shaderModuleInfo.codeSize,
+						computeShader->entryPoint, entryPoint);
+					storeKey = hash.Value();
+				} catch (...) {
+				}
+			}
+			if (storeKey) {
+				Result lowered = Result::Ok;
+				vkResult = VkCreatePipelineThroughBinaryStore(impl, *storeKey, pipelineInfo, createFlags, nativePipeline, lowered, [&]() -> Result {
+					const Result result = lowerComputeShader();
+					pipelineInfo.stage.module = shaderModule;
+					return result;
+				}, createComputePipeline);
+				if (lowered != Result::Ok) {
+					vkDestroyShaderModule(impl->device, shaderModule, nullptr);
+					return lowered;
+				}
+			} else {
+				if (useBinaryStore) {
+					if (const Result lowered = lowerComputeShader(); lowered != Result::Ok) {
+						return lowered;
+					}
+					pipelineInfo.stage.module = shaderModule;
+				}
+				vkResult = VkCreatePipelineThroughCache(impl, pipelineInfo, createComputePipeline);
+			}
 			vkDestroyShaderModule(impl->device, shaderModule, nullptr);
 			if (vkResult != VK_SUCCESS) {
 				spdlog::error("Vulkan compute pipeline creation: vkCreateComputePipelines failed with VkResult {}", static_cast<int>(vkResult));
@@ -16247,6 +17085,7 @@ namespace rhi {
 		bool memoryBudget = false;  // VK_EXT_memory_budget enabled
 		bool pushDescriptor = false;  // VK_KHR_push_descriptor enabled
 		VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipelineExecutableProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+		VkPhysicalDevicePipelineBinaryFeaturesKHR pipelineBinary{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
 	};
 
 	static void VkApplyEnabledDeviceState(VulkanDevice* impl, const VkEnabledDeviceState& e) noexcept {
@@ -16255,6 +17094,8 @@ namespace rhi {
 		impl->memoryBudgetEnabled = e.memoryBudget;
 		impl->pushDescriptorEnabled = e.pushDescriptor;
 		impl->pipelineExecutableInfoEnabled = e.pipelineExecutableProperties.pipelineExecutableInfo == VK_TRUE;
+		// The store creates pipelines with VkPipelineCreateFlags2CreateInfo, which needs maintenance5 (a dependency of the extension).
+		impl->pipelineBinaryEnabled = e.maintenance5 && e.pipelineBinary.pipelineBinaries == VK_TRUE;
 		impl->accelerationStructureFeatures = e.accelerationStructure;
 		impl->rayTracingPipelineFeatures = e.rayTracingPipeline;
 		impl->rayQueryFeatures = e.rayQuery;
@@ -18096,12 +18937,36 @@ namespace rhi {
 		}
 #endif
 
+		// VK_KHR_pipeline_binary: the pipeline binary store (VulkanDevice::pipelineBinaries). It needs maintenance5, whose feature is
+		// turned on with it.
+		VkPhysicalDevicePipelineBinaryFeaturesKHR enabledPipelineBinaryFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
+		VkPhysicalDeviceMaintenance5FeaturesKHR enabledMaintenance5Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR };
+		if (hasMaintenance5Extension && VkHasDeviceExtension(physicalDevice, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME)) {
+			VkPhysicalDevicePipelineBinaryFeaturesKHR supportedPipelineBinaryFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
+			VkPhysicalDeviceMaintenance5FeaturesKHR supportedMaintenance5Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR };
+			supportedPipelineBinaryFeatures.pNext = &supportedMaintenance5Features;
+			VkPhysicalDeviceFeatures2 pipelineBinaryQuery{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+			pipelineBinaryQuery.pNext = &supportedPipelineBinaryFeatures;
+			vkGetPhysicalDeviceFeatures2(physicalDevice, &pipelineBinaryQuery);
+			if (supportedPipelineBinaryFeatures.pipelineBinaries == VK_TRUE && supportedMaintenance5Features.maintenance5 == VK_TRUE) {
+				appendUniqueName(enabledDeviceExtensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+				appendUniqueName(enabledDeviceExtensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+				enabledPipelineBinaryFeatures.pipelineBinaries = VK_TRUE;
+				enabledMaintenance5Features.maintenance5 = VK_TRUE;
+			}
+		}
+
 		VkDeviceCreateInfo deviceCreateInfo{};
 		deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		deviceCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
 		deviceCreateInfo.pQueueCreateInfos = queueCreateInfos.data();
 		deviceCreateInfo.pEnabledFeatures = &supportedFeatures;
 		deviceCreateInfo.pNext = &enabledVulkan12Features;
+		if (enabledPipelineBinaryFeatures.pipelineBinaries == VK_TRUE) {
+			enabledMaintenance5Features.pNext = const_cast<void*>(deviceCreateInfo.pNext);
+			enabledPipelineBinaryFeatures.pNext = &enabledMaintenance5Features;
+			deviceCreateInfo.pNext = &enabledPipelineBinaryFeatures;
+		}
 		if (enabledFaultFeatures.deviceFault == VK_TRUE) {
 			enabledFaultFeatures.pNext = const_cast<void*>(deviceCreateInfo.pNext);
 			deviceCreateInfo.pNext = &enabledFaultFeatures;
@@ -18260,6 +19125,7 @@ namespace rhi {
 			enabled.computeShaderDerivatives = enabledComputeShaderDerivativesFeatures;
 			enabled.shaderImageAtomicInt64 = enabledShaderImageAtomicInt64Features;
 			enabled.pipelineExecutableProperties = enabledPipelineExecutableFeatures;
+			enabled.pipelineBinary = enabledPipelineBinaryFeatures;
 			enabled.shaderSubgroupPartitioned = enabledShaderSubgroupPartitionedFeatures;
 			enabled.accelerationStructure = enabledAccelerationStructureFeatures;
 			enabled.rayTracingPipeline = enabledRayTracingPipelineFeatures;
@@ -18469,6 +19335,7 @@ namespace rhi {
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR: VkCopyFeatureStruct(e.computeShaderDerivatives, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT: VkCopyFeatureStruct(e.shaderImageAtomicInt64, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR: VkCopyFeatureStruct(e.pipelineExecutableProperties, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR: VkCopyFeatureStruct(e.pipelineBinary, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT: VkCopyFeatureStruct(e.shaderSubgroupPartitioned, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR: VkCopyFeatureStruct(e.accelerationStructure, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR: VkCopyFeatureStruct(e.rayTracingPipeline, node); break;
@@ -18578,6 +19445,8 @@ namespace rhi {
 			if (!hasExtension(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME)) enabled.shaderImageAtomicInt64 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT };
 			if (!hasExtension(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME))
 				enabled.pipelineExecutableProperties = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+			if (!hasExtension(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME))
+				enabled.pipelineBinary = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
 			if (!hasExtension(VK_EXT_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME)) enabled.shaderSubgroupPartitioned = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT };
 			if (!hasExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) || !hasExtension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME))
 				enabled.accelerationStructure = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
