@@ -917,9 +917,11 @@ namespace rhi {
 						spdlog::error("      enclosing context breadcrumb={} '{}'", enclosing->BreadcrumbIndex,
 							enclosing->pContextString ? Dx12WideToUtf8(enclosing->pContextString) : "<null>");
 					}
+					// A list the GPU was part-way through: every context, which names the passes it ran before the fault.
+					const bool inProgress = last > 0 && last + 1 < count;
 					for (UINT32 contextIndex = 0; contextIndex < node->BreadcrumbContextsCount; ++contextIndex) {
 						const auto& context = node->pBreadcrumbContexts[contextIndex];
-						if (context.BreadcrumbIndex < contextStart || context.BreadcrumbIndex > contextEnd) {
+						if (!inProgress && (context.BreadcrumbIndex < contextStart || context.BreadcrumbIndex > contextEnd)) {
 							continue;
 						}
 						spdlog::error(
