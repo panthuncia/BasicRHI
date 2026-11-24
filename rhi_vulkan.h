@@ -895,6 +895,11 @@ namespace rhi {
 		bool maintenance5Enabled = false;
 		// VK_KHR_pipeline_binary's pipelineBinaries: the pipeline binary store (pipelineBinaries below).
 		bool pipelineBinaryEnabled = false;
+		// VK_EXT_pipeline_robustness's pipelineRobustness. When chainPipelineRobustness is set, every graphics and compute
+		// pipeline gets pipelineRobustness chained in (VkConfigurePipelineRobustness, BASICRHI_VK_PIPELINE_ROBUSTNESS).
+		bool pipelineRobustnessEnabled = false;
+		bool chainPipelineRobustness = false;
+		VkPipelineRobustnessCreateInfoEXT pipelineRobustness{ VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT };
 		// VK_KHR_pipeline_executable_properties' pipelineExecutableInfo: the debugging switches' (DXVK_PIPELINE_STATS, BASICRHI_VK_DUMP_ISA).
 		bool pipelineExecutableInfoEnabled = false;
 		bool shaderDemoteToHelperInvocationEnabled = false;

@@ -1519,6 +1519,26 @@ namespace rhi {
 			return true;
 		}
 
+		// Puts the device's pipeline robustness in front of `a_next` when it is chained. Returns the chain's new head.
+		static const void* VkChainPipelineRobustness(const VulkanDevice* impl, VkPipelineRobustnessCreateInfoEXT& a_robustness, const void* a_next) noexcept {
+			if (!impl->chainPipelineRobustness) return a_next;
+			a_robustness = impl->pipelineRobustness;
+			a_robustness.pNext = a_next;
+			return &a_robustness;
+		}
+
+		// The robustness part of a pipeline store key. The chained struct changes the compiled code. Nothing is hashed when
+		// nothing is chained, so keys from before per-pipeline robustness stay valid in device mode.
+		template<class Hasher>
+		static void VkHashPipelineRobustness(Hasher& hash, const VulkanDevice* impl) noexcept {
+			if (!impl->chainPipelineRobustness) return;
+			hash.AddValue(uint32_t{ 0x524F4255u });  // A marker ("ROBU").
+			hash.AddValue(static_cast<uint32_t>(impl->pipelineRobustness.storageBuffers));
+			hash.AddValue(static_cast<uint32_t>(impl->pipelineRobustness.uniformBuffers));
+			hash.AddValue(static_cast<uint32_t>(impl->pipelineRobustness.vertexInputs));
+			hash.AddValue(static_cast<uint32_t>(impl->pipelineRobustness.images));
+		}
+
 		static VulkanTimeline* VkTimelineState(VulkanDevice* impl, TimelineHandle handle) noexcept {
 			return impl ? impl->timelines.get(handle) : nullptr;
 		}
@@ -12852,7 +12872,8 @@ namespace rhi {
 				if (captureStatistics) createFlags.flags |= VK_PIPELINE_CREATE_2_CAPTURE_STATISTICS_BIT_KHR;
 				const bool dumpIsa = IsaDumpRequested(impl);
 				if (dumpIsa) createFlags.flags |= VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
-				createFlags.pNext = &rendering;
+				VkPipelineRobustnessCreateInfoEXT robustness{ VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT };
+				createFlags.pNext = VkChainPipelineRobustness(impl, robustness, &rendering);
 				VkGraphicsPipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
 				if (!VkChainPipelineCreateFlags(impl, createFlags, pipelineInfo)) {
 					for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
@@ -12914,6 +12935,7 @@ namespace rhi {
 								deferredStages[i].loweringEntry, shaderStages[i].pName);
 						}
 						VkHashGraphicsState(hash, pipelineInfo, rendering);
+						VkHashPipelineRobustness(hash, impl);
 						storeKey = hash.Value();
 					} catch (...) {
 					}
@@ -13054,6 +13076,8 @@ namespace rhi {
 			}
 			const bool dumpIsa = IsaDumpRequested(impl);
 			if (dumpIsa) createFlags.flags |= VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+			VkPipelineRobustnessCreateInfoEXT robustness{ VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT };
+			createFlags.pNext = VkChainPipelineRobustness(impl, robustness, createFlags.pNext);
 			VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
 			if (!VkChainPipelineCreateFlags(impl, createFlags, pipelineInfo)) {
 				vkDestroyShaderModule(impl->device, shaderModule, nullptr);
@@ -13077,6 +13101,7 @@ namespace rhi {
 					hash.AddValue(pipelineInfo.flags);
 					VkHashStoreStage(hash, impl, *layoutState, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_STAGE_COMPUTE_BIT, shaderModuleInfo.pCode, shaderModuleInfo.codeSize,
 						computeShader->entryPoint, entryPoint);
+					VkHashPipelineRobustness(hash, impl);
 					storeKey = hash.Value();
 				} catch (...) {
 				}
@@ -17423,7 +17448,57 @@ namespace rhi {
 		bool pushDescriptor = false;  // VK_KHR_push_descriptor enabled
 		VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipelineExecutableProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
 		VkPhysicalDevicePipelineBinaryFeaturesKHR pipelineBinary{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
+		VkPhysicalDevicePipelineRobustnessFeaturesEXT pipelineRobustness{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT };
 	};
+
+	// Picks the robustness BasicRHI chains into its own pipelines, and logs it once per device.
+	// BASICRHI_VK_PIPELINE_ROBUSTNESS selects it:
+	//   core (default): buffers get core robustBufferAccess, images none. That is what BasicRHI's own device has
+	//     (every core feature, robustBufferAccess included, and no robustImageAccess). So the guest runs the graph's
+	//     shaders as native Vulkan does. It drops robustness2's robustBufferAccess2 and robustImageAccess2. DXVK
+	//     enables those device-wide for D3D11, and they cost a lot in shaders with many storage buffer loads.
+	//   off: no robustness at all. Out-of-bounds reads and writes are undefined.
+	//   device (or 1): nothing chained, so pipelines keep the device's robustness. For A/B runs.
+	// Null descriptors stay defined in every mode. nullDescriptor is a robustness2 feature of its own: a null
+	// descriptor is valid to access and acts as if bound to nothing. Pipeline robustness only picks the
+	// out-of-bounds behaviours (robustBufferAccess, robustBufferAccess2, robustImageAccess, robustImageAccess2).
+	// Ray tracing pipelines are left alone: their libraries would all need the same struct.
+	static void VkConfigurePipelineRobustness(VulkanDevice* impl) noexcept {
+		enum class Mode { Core, Off, Device };
+		Mode mode = Mode::Core;
+		const char* value = std::getenv("BASICRHI_VK_PIPELINE_ROBUSTNESS");
+		if (value && *value) {
+			if (std::strcmp(value, "device") == 0 || std::strcmp(value, "1") == 0) {
+				mode = Mode::Device;
+			} else if (std::strcmp(value, "off") == 0 || std::strcmp(value, "0") == 0) {
+				mode = Mode::Off;
+			} else if (std::strcmp(value, "core") != 0) {
+				spdlog::warn("BasicRHI Vulkan: BASICRHI_VK_PIPELINE_ROBUSTNESS={} is not device, core or off; using core", value);
+			}
+		}
+		impl->chainPipelineRobustness = false;
+		impl->pipelineRobustness = { VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT };
+		if (!impl->pipelineRobustnessEnabled) {
+			spdlog::info("BasicRHI Vulkan: per-pipeline robustness unavailable (no VK_EXT_pipeline_robustness); pipelines keep the device's robustness");
+			return;
+		}
+		if (mode == Mode::Device) {
+			spdlog::info("BasicRHI Vulkan: per-pipeline robustness not chained (BASICRHI_VK_PIPELINE_ROBUSTNESS=device); pipelines keep the device's robustness");
+			return;
+		}
+		// Core robustBufferAccess per pipeline only where the device has it.
+		const bool coreBuffers = mode == Mode::Core && impl->supportedFeatures.robustBufferAccess == VK_TRUE;
+		const VkPipelineRobustnessBufferBehaviorEXT buffers =
+			coreBuffers ? VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT : VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+		impl->pipelineRobustness.storageBuffers = buffers;
+		impl->pipelineRobustness.uniformBuffers = buffers;
+		// Fixed-function vertex input follows the buffers. Pipelines with input layouts still use it.
+		impl->pipelineRobustness.vertexInputs = buffers;
+		impl->pipelineRobustness.images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
+		impl->chainPipelineRobustness = true;
+		spdlog::info("BasicRHI Vulkan: per-pipeline robustness {}: buffers and vertex inputs {}, images none (device robustness2 bounds checks dropped)",
+			mode == Mode::Core ? "core" : "off", coreBuffers ? "robustBufferAccess" : "none");
+	}
 
 	static void VkApplyEnabledDeviceState(VulkanDevice* impl, const VkEnabledDeviceState& e) noexcept {
 		impl->maintenance5Enabled = e.maintenance5;
@@ -17433,6 +17508,8 @@ namespace rhi {
 		impl->pipelineExecutableInfoEnabled = e.pipelineExecutableProperties.pipelineExecutableInfo == VK_TRUE;
 		// The store creates pipelines with VkPipelineCreateFlags2CreateInfo, which needs maintenance5 (a dependency of the extension).
 		impl->pipelineBinaryEnabled = e.maintenance5 && e.pipelineBinary.pipelineBinaries == VK_TRUE;
+		impl->pipelineRobustnessEnabled = e.pipelineRobustness.pipelineRobustness == VK_TRUE;
+		VkConfigurePipelineRobustness(impl);
 		impl->accelerationStructureFeatures = e.accelerationStructure;
 		impl->rayTracingPipelineFeatures = e.rayTracingPipeline;
 		impl->rayQueryFeatures = e.rayQuery;
@@ -19292,6 +19369,18 @@ namespace rhi {
 				enabledMaintenance5Features.maintenance5 = VK_TRUE;
 			}
 		}
+		// VK_EXT_pipeline_robustness: per-pipeline robustness (VkConfigurePipelineRobustness).
+		VkPhysicalDevicePipelineRobustnessFeaturesEXT enabledPipelineRobustnessFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT };
+		if (VkHasDeviceExtension(physicalDevice, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME)) {
+			VkPhysicalDevicePipelineRobustnessFeaturesEXT supportedPipelineRobustnessFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT };
+			VkPhysicalDeviceFeatures2 pipelineRobustnessQuery{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+			pipelineRobustnessQuery.pNext = &supportedPipelineRobustnessFeatures;
+			vkGetPhysicalDeviceFeatures2(physicalDevice, &pipelineRobustnessQuery);
+			if (supportedPipelineRobustnessFeatures.pipelineRobustness == VK_TRUE) {
+				appendUniqueName(enabledDeviceExtensions, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+				enabledPipelineRobustnessFeatures.pipelineRobustness = VK_TRUE;
+			}
+		}
 
 		VkDeviceCreateInfo deviceCreateInfo{};
 		deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -19303,6 +19392,10 @@ namespace rhi {
 			enabledMaintenance5Features.pNext = const_cast<void*>(deviceCreateInfo.pNext);
 			enabledPipelineBinaryFeatures.pNext = &enabledMaintenance5Features;
 			deviceCreateInfo.pNext = &enabledPipelineBinaryFeatures;
+		}
+		if (enabledPipelineRobustnessFeatures.pipelineRobustness == VK_TRUE) {
+			enabledPipelineRobustnessFeatures.pNext = const_cast<void*>(deviceCreateInfo.pNext);
+			deviceCreateInfo.pNext = &enabledPipelineRobustnessFeatures;
 		}
 		if (enabledFaultFeatures.deviceFault == VK_TRUE) {
 			enabledFaultFeatures.pNext = const_cast<void*>(deviceCreateInfo.pNext);
@@ -19463,6 +19556,7 @@ namespace rhi {
 			enabled.shaderImageAtomicInt64 = enabledShaderImageAtomicInt64Features;
 			enabled.pipelineExecutableProperties = enabledPipelineExecutableFeatures;
 			enabled.pipelineBinary = enabledPipelineBinaryFeatures;
+			enabled.pipelineRobustness = enabledPipelineRobustnessFeatures;
 			enabled.shaderSubgroupPartitioned = enabledShaderSubgroupPartitionedFeatures;
 			enabled.accelerationStructure = enabledAccelerationStructureFeatures;
 			enabled.rayTracingPipeline = enabledRayTracingPipelineFeatures;
@@ -19673,6 +19767,7 @@ namespace rhi {
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT: VkCopyFeatureStruct(e.shaderImageAtomicInt64, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR: VkCopyFeatureStruct(e.pipelineExecutableProperties, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR: VkCopyFeatureStruct(e.pipelineBinary, node); break;
+					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT: VkCopyFeatureStruct(e.pipelineRobustness, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT: VkCopyFeatureStruct(e.shaderSubgroupPartitioned, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR: VkCopyFeatureStruct(e.accelerationStructure, node); break;
 					case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR: VkCopyFeatureStruct(e.rayTracingPipeline, node); break;
@@ -19784,6 +19879,8 @@ namespace rhi {
 				enabled.pipelineExecutableProperties = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
 			if (!hasExtension(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME))
 				enabled.pipelineBinary = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR };
+			if (!hasExtension(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME))
+				enabled.pipelineRobustness = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT };
 			if (!hasExtension(VK_EXT_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME)) enabled.shaderSubgroupPartitioned = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT };
 			if (!hasExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) || !hasExtension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME))
 				enabled.accelerationStructure = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
