@@ -5772,7 +5772,8 @@ namespace rhi {
 			acquireSubmit.pCommandBuffers = initialLayout != VK_NULL_HANDLE ? &initialLayout : nullptr;
 			VkResult submitResult = VK_SUCCESS;
 			{
-				// timelinesMutex serializes BasicRHI's submissions to a queue (q_submit holds it too).
+				// submitMutex serializes BasicRHI's queue operations (q_submit takes it too).
+				const std::lock_guard submitLock(impl->submitMutex);
 				const std::lock_guard timelineLock(impl->timelinesMutex);
 				// The timeline arrays cover the binary acquire semaphore too (its value is ignored).
 				VulkanTimeline* acquireTimeline = VkSwapchainAcquireTimeline(impl, swapchain);
@@ -6801,7 +6802,10 @@ namespace rhi {
 				if (submits.fetch_add(1, std::memory_order_relaxed) % 6000 == 5999)
 					VkLogLiveMemory(impl);
 			}
-			const std::lock_guard timelineLock(impl->timelinesMutex);
+			// submitMutex keeps the queue and its progress values ordered; timelinesMutex is released around the queue call
+			// (VulkanDevice::submitMutex). The semaphores below are the caller's, alive until the submission completes.
+			const std::lock_guard submitLock(impl->submitMutex);
+			std::unique_lock timelineLock(impl->timelinesMutex);
 
 			if ((submit.waits.size != 0 || submit.signals.size != 0) && !impl->timelineSemaphoreEnabled) {
 				RHI_FAIL(Result::Unsupported);
@@ -6966,7 +6970,9 @@ namespace rhi {
 				submitInfo2.pCommandBufferInfos = commandBufferInfos.empty() ? nullptr : commandBufferInfos.data();
 				submitInfo2.signalSemaphoreInfoCount = static_cast<uint32_t>(signalInfos.size());
 				submitInfo2.pSignalSemaphoreInfos = signalInfos.empty() ? nullptr : signalInfos.data();
+				timelineLock.unlock();
 				submitResult = ToRHI(hooks->submit(hooks->user, queueState->queue, submitInfo2));
+				timelineLock.lock();
 			}
 			else {
 				ZoneScopedN("RHI.Vulkan.QueueSubmit");
@@ -6984,6 +6990,7 @@ namespace rhi {
 					submitInfo.commandBufferCount = static_cast<uint32_t>(commandBuffers.size());
 					submitInfo.pCommandBuffers = commandBuffers.data();
 				}
+				timelineLock.unlock();
 				if (diagnostics.splitSubmits && commandBuffers.size() > 1) {
 					// The first part waits, the last part signals, and queue order keeps the rest in order between them.
 					VkResult result = VK_SUCCESS;
@@ -7007,6 +7014,7 @@ namespace rhi {
 				} else {
 					submitResult = ToRHI(VkCheckDeviceLost(impl, vkQueueSubmit(queueState->queue, 1, &submitInfo, VK_NULL_HANDLE), "Queue::Submit"));
 				}
+				timelineLock.lock();
 			}
 			if (traced && submitResult == Result::Ok) {
 				submittrace::Record record;
@@ -10544,7 +10552,9 @@ namespace rhi {
 				VkHasPresentMode(swapchainState->switchablePresentModes, presentMode);
 			VkResult presentResult = VK_SUCCESS;
 			{
-				const std::lock_guard timelineLock(impl->timelinesMutex);
+				// As q_submit: submitMutex orders the queue, and timelinesMutex is released around the queue calls.
+				const std::lock_guard submitLock(impl->submitMutex);
+				std::unique_lock timelineLock(impl->timelinesMutex);
 				if (swapchainState->currentImageIndex >= swapchainState->presentWaitSemaphores.size()) {
 					RHI_FAIL(Result::InvalidArgument);
 				}
@@ -10581,6 +10591,9 @@ namespace rhi {
 				const VkSemaphore signalSemaphores[2] = { presentWaitSemaphore, progressTimeline ? progressTimeline->semaphore : VK_NULL_HANDLE };
 				const uint64_t signalValues[2] = { 0, progressValue };
 				const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+				// Copied out: the timeline pool can move while timelinesMutex is released below.
+				const VkSemaphore waitSemaphore = waitTimeline ? waitTimeline->semaphore : VK_NULL_HANDLE;
+				const bool hasProgress = progressTimeline != nullptr;
 				VkTimelineSemaphoreSubmitInfo timelineInfo{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
 				timelineInfo.waitSemaphoreValueCount = waitTimeline ? 1u : 0u;
 				timelineInfo.pWaitSemaphoreValues = waitTimeline ? &waitValue : nullptr;
@@ -10589,7 +10602,7 @@ namespace rhi {
 				VkSubmitInfo relayInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
 				relayInfo.pNext = (waitTimeline || progressTimeline) ? &timelineInfo : nullptr;
 				relayInfo.waitSemaphoreCount = waitTimeline ? 1u : 0u;
-				relayInfo.pWaitSemaphores = waitTimeline ? &waitTimeline->semaphore : nullptr;
+				relayInfo.pWaitSemaphores = waitTimeline ? &waitSemaphore : nullptr;
 				relayInfo.pWaitDstStageMask = waitTimeline ? &waitStage : nullptr;
 				relayInfo.signalSemaphoreCount = progressTimeline ? 2u : 1u;
 				relayInfo.pSignalSemaphores = signalSemaphores;
@@ -10599,7 +10612,9 @@ namespace rhi {
 				{
 					ZoneScopedN("RHI.Vulkan.PresentRelaySubmit");
 					const int64_t tracedBegin = submittrace::Enabled() ? VkTraceNow() : 0;
+					timelineLock.unlock();
 					relayResult = vkQueueSubmit(signalQueueState->queue, 1, &relayInfo, VK_NULL_HANDLE);
+					timelineLock.lock();
 					if (tracedBegin && relayResult == VK_SUCCESS) {
 						submittrace::Record record;
 						record.cpuBegin = tracedBegin;
@@ -10615,9 +10630,10 @@ namespace rhi {
 				if (relayResult != VK_SUCCESS) {
 					return ToRHI(relayResult);
 				}
-				if (progressTimeline) {
+				if (hasProgress) {
 					signalQueueState->progressSubmitted = progressValue;
-					progressTimeline->lastSubmittedSignalValue = progressValue;
+					if (VulkanTimeline* progress = VkTimelineState(impl, signalQueueState->progress))
+						progress->lastSubmittedSignalValue = progressValue;
 				}
 
 				VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
@@ -10646,7 +10662,9 @@ namespace rhi {
 				// a different logical wrapper for the same family hides the chain from synchronization validation, and is unsafe
 				// when the implementation returned distinct native queues for those wrappers.
 				const int64_t tracedPresent = submittrace::Enabled() ? VkTraceNow() : 0;
+				timelineLock.unlock();
 				presentResult = VkQueuePresentKHRHooked(signalQueueState->queue, &presentInfo);
+				timelineLock.lock();
 				if (tracedPresent) {
 					submittrace::Record record;
 					record.cpuBegin = tracedPresent;
@@ -10661,7 +10679,7 @@ namespace rhi {
 					swapchainState->presentCount = presentId;
 					swapchainState->presentQueue = waitOnGraph ? sync->queue.GetQueueHandle() : VkPrimaryQueueHandleForKind(impl, QueueKind::Graphics);
 					if (switchInPresent) swapchainState->presentMode = presentMode;
-					if (progressTimeline) {
+					if (hasProgress) {
 						swapchainState->pendingFrames.push_back({ signalQueueState->progress, progressValue, presentId });
 					}
 				}
@@ -13842,6 +13860,7 @@ namespace rhi {
 			}
 			if (auto* mutableQueueState = impl->queues.get(handle)) {
 				if (mutableQueueState->queue != VK_NULL_HANDLE) {
+					const std::lock_guard submitLock(impl->submitMutex);
 					vkQueueWaitIdle(mutableQueueState->queue);
 				}
 				VkDestroyQueueProgress(impl, *mutableQueueState);

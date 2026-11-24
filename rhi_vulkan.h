@@ -1022,6 +1022,11 @@ namespace rhi {
 		// one critical section so a slot cannot be destroyed or reused underneath it.
 		mutable std::mutex timelinesMutex;
 		std::condition_variable timelinesCondition;
+		// Serializes BasicRHI's queue operations (submits, presents, idling a queue), which Vulkan requires to be externally
+		// synchronized per queue, and keeps each queue's progress values in submission order. Taken before timelinesMutex. The
+		// queue calls themselves run without timelinesMutex: a capture layer (RenderDoc) can block inside vkQueueSubmit until the
+		// GPU finishes, and that work may wait on a value another thread signals after it polls a timeline.
+		std::mutex submitMutex;
 		VulkanRegistry<VulkanHeap> heaps;
 		VulkanRegistry<VulkanQueryPool> queryPools;
 		// Host query-pool reset is externally synchronized by Vulkan, and graph
