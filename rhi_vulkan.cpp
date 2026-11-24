@@ -10886,7 +10886,8 @@ namespace rhi {
 				if (dumpDirectory.empty()) {
 					const std::scoped_lock lock(cache.mutex);
 					if (const auto it = cache.byKey.find(key); it != cache.byKey.end()) {
-						found = it->second;
+						found = it->second.words;
+						cache.order.splice(cache.order.end(), cache.order, it->second.use);
 						++cache.hits;
 					}
 				}
@@ -10950,14 +10951,21 @@ namespace rhi {
 				if (dumpDirectory.empty()) {
 					const std::scoped_lock lock(cache.mutex);
 					++cache.misses;
-					if (cache.words + kept->size() > cache.kMaxWords) {
-						spdlog::info("Vulkan descriptor-buffer model: lowered module cache full ({} modules, {} MiB; {} reused, {} lowered); emptied",
-							cache.byKey.size(), (cache.words * sizeof(uint32_t)) >> 20, cache.hits, cache.misses);
-						cache.byKey.clear();
-						cache.words = 0;
-					}
-					if (cache.byKey.try_emplace(key, kept).second)
+					if (!cache.byKey.contains(key)) {
+						while (!cache.order.empty() && cache.words + kept->size() > cache.kMaxWords) {
+							const auto oldest = cache.byKey.find(cache.order.front());
+							cache.words -= oldest->second.words->size();
+							cache.byKey.erase(oldest);
+							cache.order.pop_front();
+							// The first eviction says the cache is full; later ones are counted.
+							if (cache.evicted++ == 0)
+								spdlog::info("Vulkan descriptor-buffer model: lowered module cache full ({} modules, {} MiB; {} reused, {} lowered); the least recently used go",
+									cache.byKey.size() + 1, (cache.words * sizeof(uint32_t)) >> 20, cache.hits, cache.misses);
+						}
+						cache.order.push_back(key);
+						cache.byKey.emplace(key, std::remove_reference_t<decltype(cache)>::Entry{ kept, std::prev(cache.order.end()) });
 						cache.words += kept->size();
+					}
 				}
 				VkShaderModuleCreateInfo moduleInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
 				moduleInfo.codeSize = kept->size() * sizeof(uint32_t);

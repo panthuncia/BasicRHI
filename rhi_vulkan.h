@@ -18,6 +18,7 @@ using namespace volk;
 #include <cstddef>
 #include <deque>
 #include <memory>
+#include <list>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -1042,12 +1043,19 @@ namespace rhi {
 		} pipelineCache;
 		// Lowered shader modules by a hash of everything their lowering reads (VkCreateBufferModelShaderModule). Pipelines share
 		// stages, so a load's thousands of pipelines lowered the same modules again and again, which was most of their build time.
+		// Least recently used first in `order`; past kMaxWords the oldest go.
 		struct LoweredModules {
+			using Order = std::list<uint64_t>;
+			struct Entry {
+				std::shared_ptr<const std::vector<uint32_t>> words;
+				Order::iterator use;
+			};
 			std::mutex mutex;
-			std::unordered_map<uint64_t, std::shared_ptr<const std::vector<uint32_t>>> byKey;
-			size_t words = 0;  // held in all; cleared past kMaxWords
-			uint64_t hits = 0, misses = 0;
-			static constexpr size_t kMaxWords = size_t(32) << 20;  // 128 MiB
+			std::unordered_map<uint64_t, Entry> byKey;
+			Order order;
+			size_t words = 0;  // held in all
+			uint64_t hits = 0, misses = 0, evicted = 0;
+			static constexpr size_t kMaxWords = size_t(64) << 20;  // 256 MiB
 		} loweredModules;
 		std::weak_ptr<VulkanDevice> selfWeak;
 	};
