@@ -5157,6 +5157,11 @@ namespace rhi {
 		}
 
 		static VkImageLayout VkToImageLayout(ResourceLayout layout, VkImageAspectFlags aspectMask) noexcept {
+			// Experiment: BASICRHI_VK_FORCE_GENERAL=1 keeps every image in GENERAL (but presents), as images shared with DXVK are.
+			static const bool forceGeneral = [] { const char* value = std::getenv("BASICRHI_VK_FORCE_GENERAL"); return value && std::strcmp(value, "1") == 0; }();
+			if (forceGeneral && layout != ResourceLayout::Present) {
+				return VK_IMAGE_LAYOUT_GENERAL;
+			}
 			switch (layout) {
 			case ResourceLayout::Common:
 			case ResourceLayout::DirectCommon:
@@ -6789,6 +6794,12 @@ namespace rhi {
 			auto* impl = queue ? static_cast<VulkanDevice*>(queue->impl) : nullptr;
 			if (!impl || impl->device == VK_NULL_HANDLE) {
 				RHI_FAIL(Result::InvalidArgument);
+			}
+			// An adopted device presents through its host, so the live memory report (and BASICRHI_MEMORY_DUMP) runs from submits.
+			if (!impl->ownsDevice) {
+				static std::atomic<uint64_t> submits{ 0 };
+				if (submits.fetch_add(1, std::memory_order_relaxed) % 6000 == 5999)
+					VkLogLiveMemory(impl);
 			}
 			const std::lock_guard timelineLock(impl->timelinesMutex);
 
