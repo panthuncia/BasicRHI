@@ -1070,12 +1070,31 @@ namespace rhi {
 			struct KeyHash {
 				size_t operator()(const detail::Hash128Value& key) const noexcept { return static_cast<size_t>(key.lo ^ (key.hi * 0x9E3779B97F4A7C15ull)); }
 			};
+			// A driver binary's key (VkPipelineBinaryKeyKHR). Under one global key it names the binary's data, so pipelines that
+			// share a binary share one copy of it.
+			struct BinaryKey {
+				uint32_t size = 0;
+				uint8_t bytes[VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR]{};
+				friend bool operator==(const BinaryKey& a, const BinaryKey& b) noexcept {
+					return a.size == b.size && std::memcmp(a.bytes, b.bytes, a.size) == 0;
+				}
+			};
+			struct BinaryKeyHash {
+				size_t operator()(const BinaryKey& key) const noexcept {
+					uint64_t hash = 14695981039346656037ull;
+					for (uint32_t i = 0; i < key.size; ++i) {
+						hash ^= key.bytes[i];
+						hash *= 1099511628211ull;
+					}
+					return static_cast<size_t>(hash);
+				}
+			};
 			struct Binary {
-				uint32_t keySize = 0;
-				uint8_t key[VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR]{};
+				BinaryKey key;
 				std::vector<uint8_t> data;
 			};
-			using Binaries = std::vector<Binary>;
+			// An entry's binaries, each shared with every other entry that has the same binary key.
+			using Binaries = std::vector<std::shared_ptr<const Binary>>;
 			struct Entry {
 				std::shared_ptr<const Binaries> binaries;
 				// Sessions in a row the entry went unused, as loaded; a save writes 0 for entries used this session.
@@ -1085,10 +1104,22 @@ namespace rhi {
 			};
 			// Entries unused for this many sessions are left out of the file.
 			static constexpr uint32_t kMaxIdleSessions = 4;
-			// Entries unused this session are kept in the file only while it stays under this size.
+			// Entries unused this session are kept in the file only while it stays under this size. Each binary counts once.
 			static constexpr uint64_t kMaxFileBytes = uint64_t(256) << 20;
+			// Where a static sampler sat in the static-sampler tail last time: its sampler key (VkSamplerCacheKey), its element
+			// count and its offset past samplerCapacity. Lowered shaders bake the element in, so the same placement every run
+			// keeps their store keys the same.
+			struct StaticSamplerPlacement {
+				std::string key;
+				uint32_t count = 0;
+				uint32_t offset = 0;
+			};
 			mutable std::shared_mutex mutex;
 			std::unordered_map<detail::Hash128Value, Entry, KeyHash> entries;
+			// Every live binary by its key, so a capture reuses a binary already held. Entries own the binaries.
+			std::unordered_map<BinaryKey, std::weak_ptr<const Binary>, BinaryKeyHash> binaries;
+			// The placements read from the file. Static sampler registration prefers them (VkRegisterStaticSamplers).
+			std::vector<StaticSamplerPlacement> staticSamplerPlacements;
 			bool open = false;  // a file path is set and the device has pipelineBinaries
 			std::string path;
 			uint64_t loweringHash = 0;  // the lowering build the entries were keyed for (vulkan_binding::LoweringIdentity)

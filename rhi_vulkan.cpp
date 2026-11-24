@@ -10851,6 +10851,27 @@ namespace rhi {
 
 		// Feeds everything a module's lowering reads into `hash`: the module, the stage, the entry point, the plan and the target.
 		// It keys the lowered module cache (Fnv1a64) and is part of a pipeline's key in the pipeline binary store (Hash128).
+		// VkHashBindingPlan and VkHashLoweringTarget are its parts; the key dump (BASICRHI_VK_BINARY_KEY_DUMP) hashes them apart.
+		template<class Hasher>
+		static void VkHashBindingPlan(Hasher& hash, const vulkan_binding::BindingPlan& plan) noexcept {
+			hash.AddValue(plan.pushDataBytes);
+			for (const auto& m : plan.mappings) {
+				hash.AddValue(m.set); hash.AddValue(m.firstBinding); hash.AddValue(m.bindingCount); hash.AddValue(m.resourceMask);
+				hash.AddValue(static_cast<uint32_t>(m.source)); hash.AddValue(m.heapElement); hash.AddValue(m.pushOffset); hash.AddValue(m.recordOffset);
+				hash.AddValue(m.pushDataBytes); hash.AddValue(m.staticSampler); hash.AddValue(m.boundSet);
+			}
+		}
+
+		template<class Hasher>
+		static void VkHashLoweringTarget(Hasher& hash, const vulkan_binding::LoweringTarget& target) noexcept {
+			hash.AddValue(target.resourceSet); hash.AddValue(target.resourceBinding); hash.AddValue(target.samplerSet); hash.AddValue(target.samplerBinding);
+			hash.AddValue(target.pushedBytes); hash.AddValue(target.spillAddressOffset); hash.AddValue(target.pushConstantBytes);
+			hash.AddValue(target.recordAlignment); hash.AddValue(target.uniformBlockAlignment); hash.AddValue(target.spillAlignment);
+			hash.AddValue(static_cast<uint64_t>(target.staticSamplerElements.size()));
+			hash.Add(target.staticSamplerElements.data(), target.staticSamplerElements.size_bytes());
+			hash.AddValue(target.perType); hash.AddValue(target.kindBindings); hash.AddValue(target.cbvAsStorageBuffer);
+		}
+
 		template<class Hasher>
 		static void VkHashLoweringInputs(Hasher& hash, const uint32_t* code, size_t codeBytes, VkShaderStageFlagBits stage, std::string_view entryPoint,
 			const vulkan_binding::BindingPlan& plan, const vulkan_binding::LoweringTarget& target) noexcept {
@@ -10858,18 +10879,8 @@ namespace rhi {
 			hash.AddValue(static_cast<uint32_t>(stage));
 			hash.AddValue(static_cast<uint64_t>(entryPoint.size()));
 			hash.Add(entryPoint.data(), entryPoint.size());
-			hash.AddValue(plan.pushDataBytes);
-			for (const auto& m : plan.mappings) {
-				hash.AddValue(m.set); hash.AddValue(m.firstBinding); hash.AddValue(m.bindingCount); hash.AddValue(m.resourceMask);
-				hash.AddValue(static_cast<uint32_t>(m.source)); hash.AddValue(m.heapElement); hash.AddValue(m.pushOffset); hash.AddValue(m.recordOffset);
-				hash.AddValue(m.pushDataBytes); hash.AddValue(m.staticSampler); hash.AddValue(m.boundSet);
-			}
-			hash.AddValue(target.resourceSet); hash.AddValue(target.resourceBinding); hash.AddValue(target.samplerSet); hash.AddValue(target.samplerBinding);
-			hash.AddValue(target.pushedBytes); hash.AddValue(target.spillAddressOffset); hash.AddValue(target.pushConstantBytes);
-			hash.AddValue(target.recordAlignment); hash.AddValue(target.uniformBlockAlignment); hash.AddValue(target.spillAlignment);
-			hash.AddValue(static_cast<uint64_t>(target.staticSamplerElements.size()));
-			hash.Add(target.staticSamplerElements.data(), target.staticSamplerElements.size_bytes());
-			hash.AddValue(target.perType); hash.AddValue(target.kindBindings); hash.AddValue(target.cbvAsStorageBuffer);
+			VkHashBindingPlan(hash, plan);
+			VkHashLoweringTarget(hash, target);
 		}
 
 		// Descriptor-buffer model: one stage's module, its SPIR-V lowered (rhi_vulkan_spirv_lowering.h) to the stage's binding plan
@@ -11034,28 +11045,40 @@ namespace rhi {
 		// lowered modules too. The file names the lowering build (vulkan_binding::LoweringIdentity), so a changed lowering starts
 		// the store over.
 		//
-		// File (<pipeline cache path>.binaries): VkPipelineBinaryFileHeader, then per entry its key (lo, hi: uint64), the sessions
-		// it went unused (uint32) and its binary count (uint32), then per binary its key size (uint32), key bytes
-		// (VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR), data size (uint64) and data. The header's identity, lowering hash and the driver's
-		// global key (vkGetPipelineKeyKHR) must match this device, driver and build, or the file is stale and rewritten on save.
+		// Pipelines share binaries: on NVIDIA every pipeline has one 2 MiB binary that is the same for all of them. So the store
+		// holds each binary once, by its driver key (VkPipelineBinaryKeyKHR), and an entry lists the binaries it uses.
+		//
+		// File (<pipeline cache path>.binaries), version 2: VkPipelineBinaryFileHeader, then three tables.
+		// - Static sampler placements (placementCount): element count (uint32), offset past samplerCapacity (uint32), key size
+		//   (uint32) and key bytes (VkSamplerCacheKey).
+		// - Binaries (binaryCount): key size (uint32), key bytes (VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR), data size (uint64) and data.
+		//   Each key once.
+		// - Entries (entryCount): key (lo, hi: uint64), the sessions it went unused (uint32), its binary count (uint32), then the
+		//   index of each of its binaries in the binary table (uint32).
+		// The header's identity, lowering hash and the driver's global key (vkGetPipelineKeyKHR) must match this device, driver
+		// and build, or the file is stale and rewritten on save. A file of another version is stale too.
+
+		using VkBinaryStore = VulkanDevice::PipelineBinaryStore;
 
 		struct VkPipelineBinaryFileHeader {
 			static constexpr uint32_t kMagic = 0x42505242u;  // "BRPB"
-			static constexpr uint32_t kVersion = 1u;
+			static constexpr uint32_t kVersion = 2u;
 			uint32_t magic = kMagic;
 			uint32_t version = kVersion;
 			detail::PipelineCacheIdentity identity{};
 			uint64_t loweringHash = 0;
 			uint32_t globalKeySize = 0;
 			uint8_t globalKey[VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR]{};
-			uint32_t reserved = 0;
+			uint32_t placementCount = 0;
+			uint64_t binaryCount = 0;
 			uint64_t entryCount = 0;
 			uint64_t payloadBytes = 0;
 			uint64_t payloadHash = 0;  // Hash128's low half over the payload
 		};
 
-		// Limits a read entry must keep, so a damaged file cannot ask for absurd allocations.
+		// Limits a read file must keep, so a damaged file cannot ask for absurd allocations.
 		static constexpr uint32_t kVkMaxBinariesPerPipeline = 64;
+		static constexpr uint32_t kVkMaxStaticSamplerKeyBytes = 256;
 
 		// BASICRHI_VK_PIPELINE_BINARY=0 turns the store off: lowered pipelines are lowered and compiled every run, through the
 		// pipeline cache.
@@ -11086,9 +11109,42 @@ namespace rhi {
 			}
 		}
 
+		// BASICRHI_VK_BINARY_KEY_DUMP=<path>: every store lookup appends one line to the file. It has the pipeline's name, its key,
+		// whether the store had it, and a hash of each part of the key: the layout, the flags, each stage's code, entry point,
+		// plan and target (with its static sampler elements), and the fixed-function state. Diff two runs' files to find the
+		// part that changed.
+		static std::FILE* VkBinaryKeyDumpFile() noexcept {
+			static std::FILE* const file = []() -> std::FILE* {
+				const char* path = std::getenv("BASICRHI_VK_BINARY_KEY_DUMP");
+				return path && *path ? std::fopen(path, "ab") : nullptr;
+			}();
+			return file;
+		}
+
+		static bool VkBinaryKeyDumpRequested() noexcept {
+			return VkBinaryKeyDumpFile() != nullptr;
+		}
+
+		static void VkWriteBinaryKeyDump(const std::string& line) noexcept {
+			std::FILE* file = VkBinaryKeyDumpFile();
+			if (!file || line.empty()) {
+				return;
+			}
+			static std::mutex mutex;
+			const std::scoped_lock lock(mutex);
+			std::fwrite(line.data(), 1, line.size(), file);
+			std::fputc('\n', file);
+			std::fflush(file);
+		}
+
+		static std::string VkHex128(const detail::Hash128Value& value) {
+			return std::format("{:016x}{:016x}", value.hi, value.lo);
+		}
+
 		// The layout part of a pipeline's store key: the lowered model's universal layout and, with bound uniform buffers, the
 		// layout's push descriptor set. Handles change from run to run, so what they were made from is hashed.
-		static void VkHashModelLayout(detail::Hash128& hash, const VulkanDevice* impl, const VulkanPipelineLayout& layout) noexcept {
+		template<class Hasher>
+		static void VkHashModelLayout(Hasher& hash, const VulkanDevice* impl, const VulkanPipelineLayout& layout) noexcept {
 			hash.AddValue(static_cast<uint32_t>(impl->bindingModel));
 			const auto& model = impl->descriptorBuffer;
 			hash.AddValue(model.pushConstantBytes);
@@ -11120,6 +11176,28 @@ namespace rhi {
 			hash.AddString(stageName);
 		}
 
+		// One stage's part of a key dump line (BASICRHI_VK_BINARY_KEY_DUMP): a hash of each input VkHashStoreStage feeds. `source`
+		// is the stage's bytecode as the caller gave it: `code` differs from it when capture names were added.
+		static std::string VkDescribeStoreStage(const VulkanDevice* impl, const VulkanPipelineLayout& layout, VkShaderStageFlagBits stage,
+			VkShaderStageFlags planStages, const uint32_t* code, size_t codeBytes, const void* source, size_t sourceBytes, std::string_view loweringEntry,
+			const char* stageName) {
+			const vulkan_binding::BindingPlan plan = VkBuildBindingPlan(layout, planStages);
+			const vulkan_binding::LoweringTarget target = VkBufferModelLoweringTarget(impl, layout);
+			detail::Fnv1a64 codeHash, sourceHash, planHash, targetHash;
+			codeHash.Add(code, codeBytes);
+			sourceHash.Add(source, sourceBytes);
+			VkHashBindingPlan(planHash, plan);
+			VkHashLoweringTarget(targetHash, target);
+			std::string text = std::format(" | stage={:x} code={:016x} source={:016x} entry={} name={} plan={:016x} target={:016x} samplers=",
+				static_cast<uint32_t>(stage), codeHash.Value(), sourceHash.Value(), loweringEntry, stageName ? stageName : "", planHash.Value(),
+				targetHash.Value());
+			for (size_t i = 0; i < target.staticSamplerElements.size(); ++i) {
+				if (i != 0) text += ',';
+				text += std::to_string(target.staticSamplerElements[i]);
+			}
+			return text;
+		}
+
 		// Whether pipelines of this device go through the store now. Diagnostics that read the compile (pipeline statistics, ISA
 		// dumps, lowering dumps) skip it.
 		static bool VkPipelineBinaryStoreUsable(VulkanDevice* impl) noexcept {
@@ -11131,7 +11209,7 @@ namespace rhi {
 		}
 
 		// The stored binaries of `key`, or null. Marks the entry used this session.
-		static std::shared_ptr<const VulkanDevice::PipelineBinaryStore::Binaries> VkFindPipelineBinaries(VulkanDevice* impl, const detail::Hash128Value& key) noexcept {
+		static std::shared_ptr<const VkBinaryStore::Binaries> VkFindPipelineBinaries(VulkanDevice* impl, const detail::Hash128Value& key) noexcept {
 			auto& store = impl->pipelineBinaries;
 			const std::shared_lock lock(store.mutex);
 			if (!store.open) {
@@ -11147,16 +11225,24 @@ namespace rhi {
 			return it->second.binaries;
 		}
 
-		static void VkAddPipelineBinaries(VulkanDevice* impl, const detail::Hash128Value& key, VulkanDevice::PipelineBinaryStore::Binaries&& binaries) noexcept {
+		// Stores a pipeline's binaries. A binary whose key the store already holds is replaced by the held one, so each is kept once.
+		static void VkAddPipelineBinaries(VulkanDevice* impl, const detail::Hash128Value& key, VkBinaryStore::Binaries&& binaries) noexcept {
 			auto& store = impl->pipelineBinaries;
 			try {
-				auto kept = std::make_shared<const VulkanDevice::PipelineBinaryStore::Binaries>(std::move(binaries));
 				const std::unique_lock lock(store.mutex);
 				if (!store.open) {
 					return;
 				}
+				for (auto& binary : binaries) {
+					auto& held = store.binaries[binary->key];
+					if (auto existing = held.lock()) {
+						binary = std::move(existing);
+					} else {
+						held = binary;
+					}
+				}
 				auto& entry = store.entries.try_emplace(key).first->second;
-				entry.binaries = std::move(kept);
+				entry.binaries = std::make_shared<const VkBinaryStore::Binaries>(std::move(binaries));
 				entry.idleSessions = 0;
 				entry.used = true;
 				++store.stored;
@@ -11175,18 +11261,17 @@ namespace rhi {
 		}
 
 		// Makes the VkPipelineBinaryKHR objects of stored binaries. False, with nothing made, when the driver refuses them.
-		static bool VkCreatePipelineBinariesFromData(VulkanDevice* impl, const VulkanDevice::PipelineBinaryStore::Binaries& binaries,
-			std::vector<VkPipelineBinaryKHR>& out) noexcept {
+		static bool VkCreatePipelineBinariesFromData(VulkanDevice* impl, const VkBinaryStore::Binaries& binaries, std::vector<VkPipelineBinaryKHR>& out) noexcept {
 			out.clear();
 			try {
 				const uint32_t count = static_cast<uint32_t>(binaries.size());
 				std::vector<VkPipelineBinaryKeyKHR> keys(count, VkPipelineBinaryKeyKHR{ VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR });
 				std::vector<VkPipelineBinaryDataKHR> data(count);
 				for (uint32_t i = 0; i < count; ++i) {
-					keys[i].keySize = binaries[i].keySize;
-					std::memcpy(keys[i].key, binaries[i].key, sizeof(keys[i].key));
-					data[i].dataSize = binaries[i].data.size();
-					data[i].pData = const_cast<uint8_t*>(binaries[i].data.data());
+					keys[i].keySize = binaries[i]->key.size;
+					std::memcpy(keys[i].key, binaries[i]->key.bytes, sizeof(keys[i].key));
+					data[i].dataSize = binaries[i]->data.size();
+					data[i].pData = const_cast<uint8_t*>(binaries[i]->data.data());
 				}
 				VkPipelineBinaryKeysAndDataKHR keysAndData{};
 				keysAndData.binaryCount = count;
@@ -11218,8 +11303,9 @@ namespace rhi {
 		}
 
 		// Reads the binaries of a pipeline created with VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR, then releases the pipeline's
-		// captured data (always, as the flag asks). False when the driver gave none.
-		static bool VkCapturePipelineBinaries(VulkanDevice* impl, VkPipeline pipeline, VulkanDevice::PipelineBinaryStore::Binaries& out) noexcept {
+		// captured data (always, as the flag asks). A binary whose key the store holds is not read again: the held one is used.
+		// False when the driver gave none.
+		static bool VkCapturePipelineBinaries(VulkanDevice* impl, VkPipeline pipeline, VkBinaryStore::Binaries& out) noexcept {
 			out.clear();
 			std::vector<VkPipelineBinaryKHR> handles;
 			bool ok = false;
@@ -11245,12 +11331,25 @@ namespace rhi {
 					ok = vkGetPipelineBinaryDataKHR(impl->device, &dataInfo, &key, &size, nullptr) == VK_SUCCESS && size != 0 &&
 						key.keySize <= VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR;
 					if (!ok) break;
-					VulkanDevice::PipelineBinaryStore::Binary binary;
-					binary.data.resize(size);
-					ok = vkGetPipelineBinaryDataKHR(impl->device, &dataInfo, &key, &size, binary.data.data()) == VK_SUCCESS;
-					binary.data.resize(size);
-					binary.keySize = key.keySize;
-					std::memcpy(binary.key, key.key, sizeof(binary.key));
+					VkBinaryStore::BinaryKey binaryKey;
+					binaryKey.size = key.keySize;
+					std::memcpy(binaryKey.bytes, key.key, key.keySize);
+					std::shared_ptr<const VkBinaryStore::Binary> held;
+					{
+						const std::shared_lock lock(impl->pipelineBinaries.mutex);
+						if (const auto it = impl->pipelineBinaries.binaries.find(binaryKey); it != impl->pipelineBinaries.binaries.end()) {
+							held = it->second.lock();
+						}
+					}
+					if (held) {
+						out.push_back(std::move(held));
+						continue;
+					}
+					auto binary = std::make_shared<VkBinaryStore::Binary>();
+					binary->key = binaryKey;
+					binary->data.resize(size);
+					ok = vkGetPipelineBinaryDataKHR(impl->device, &dataInfo, &key, &size, binary->data.data()) == VK_SUCCESS;
+					binary->data.resize(size);
 					out.push_back(std::move(binary));
 				}
 			} catch (...) {
@@ -11264,13 +11363,27 @@ namespace rhi {
 			return ok && !out.empty();
 		}
 
-		// Reads the store's file into `entries`. Returns Empty without a file, Stale for another device, driver or lowering build,
-		// Corrupt for a damaged file, and Loaded otherwise.
+		// What a read of the store's file gives.
+		struct VkPipelineBinaryFileContents {
+			std::unordered_map<detail::Hash128Value, VkBinaryStore::Entry, VkBinaryStore::KeyHash> entries;
+			std::unordered_map<VkBinaryStore::BinaryKey, std::weak_ptr<const VkBinaryStore::Binary>, VkBinaryStore::BinaryKeyHash> binaries;
+			std::vector<VkBinaryStore::StaticSamplerPlacement> placements;
+			uint64_t binaryBytes = 0;  // the data of the binaries the entries use
+			uint64_t payloadBytes = 0;
+			void Clear() noexcept {
+				entries.clear();
+				binaries.clear();
+				placements.clear();
+				binaryBytes = 0;
+				payloadBytes = 0;
+			}
+		};
+
+		// Reads the store's file into `out`. Returns Empty without a file, Stale for another device, driver, lowering build or file
+		// version, Corrupt for a damaged file, and Loaded otherwise. `out` is empty unless Loaded.
 		static PipelineCacheLoadResult VkReadPipelineBinaryFile(const std::string& path, const VkPipelineBinaryFileHeader& expected,
-			std::unordered_map<detail::Hash128Value, VulkanDevice::PipelineBinaryStore::Entry, VulkanDevice::PipelineBinaryStore::KeyHash>& entries,
-			uint64_t& payloadBytes) noexcept {
-			entries.clear();
-			payloadBytes = 0;
+			VkPipelineBinaryFileContents& out) noexcept {
+			out.Clear();
 			try {
 				const std::filesystem::path filePath = detail::PipelineCachePath(path.c_str());
 				std::error_code error;
@@ -11278,9 +11391,17 @@ namespace rhi {
 					return PipelineCacheLoadResult::Empty;
 				}
 				std::ifstream file(filePath, std::ios::binary);
+				// The magic and version first: an older file has another header.
+				uint32_t start[2]{};
+				if (!file || !file.read(reinterpret_cast<char*>(start), sizeof(start)) || start[0] != VkPipelineBinaryFileHeader::kMagic) {
+					return PipelineCacheLoadResult::Corrupt;
+				}
+				if (start[1] != VkPipelineBinaryFileHeader::kVersion) {
+					return PipelineCacheLoadResult::Stale;
+				}
 				VkPipelineBinaryFileHeader header{};
-				if (!file || !file.read(reinterpret_cast<char*>(&header), sizeof(header)) || header.magic != VkPipelineBinaryFileHeader::kMagic ||
-					header.version != VkPipelineBinaryFileHeader::kVersion) {
+				file.seekg(0);
+				if (!file.read(reinterpret_cast<char*>(&header), sizeof(header))) {
 					return PipelineCacheLoadResult::Corrupt;
 				}
 				if (!detail::SamePipelineCacheIdentity(header.identity, expected.identity) || header.loweringHash != expected.loweringHash ||
@@ -11288,7 +11409,8 @@ namespace rhi {
 					return PipelineCacheLoadResult::Stale;
 				}
 				const uint64_t fileBytes = static_cast<uint64_t>(std::filesystem::file_size(filePath, error));
-				if (error || fileBytes != sizeof(header) + header.payloadBytes) {
+				if (error || fileBytes != sizeof(header) + header.payloadBytes || header.placementCount > VulkanDescriptorBufferModel::kMaxStaticSamplers ||
+					header.binaryCount > header.payloadBytes || header.entryCount > header.payloadBytes) {
 					return PipelineCacheLoadResult::Corrupt;
 				}
 				uint64_t left = header.payloadBytes;
@@ -11299,41 +11421,73 @@ namespace rhi {
 					hash.Add(data, size);
 					return true;
 				};
-				entries.reserve(static_cast<size_t>((std::min)(header.entryCount, uint64_t(1) << 20)));
+				const auto corrupt = [&] {
+					out.Clear();
+					return PipelineCacheLoadResult::Corrupt;
+				};
+				out.placements.reserve(header.placementCount);
+				for (uint32_t p = 0; p < header.placementCount; ++p) {
+					VkBinaryStore::StaticSamplerPlacement placement;
+					uint32_t keyBytes = 0;
+					if (!read(&placement.count, sizeof(placement.count)) || !read(&placement.offset, sizeof(placement.offset)) || !read(&keyBytes, sizeof(keyBytes)) ||
+						placement.count == 0 || placement.count > VulkanDescriptorBufferModel::kMaxStaticSamplers ||
+						placement.offset > VulkanDescriptorBufferModel::kMaxStaticSamplers - placement.count || keyBytes > kVkMaxStaticSamplerKeyBytes) {
+						return corrupt();
+					}
+					placement.key.resize(keyBytes);
+					if (!read(placement.key.data(), keyBytes)) {
+						return corrupt();
+					}
+					out.placements.push_back(std::move(placement));
+				}
+				std::vector<std::shared_ptr<const VkBinaryStore::Binary>> table;
+				table.reserve(static_cast<size_t>(header.binaryCount));
+				out.binaries.reserve(static_cast<size_t>(header.binaryCount));
+				for (uint64_t b = 0; b < header.binaryCount; ++b) {
+					auto binary = std::make_shared<VkBinaryStore::Binary>();
+					uint64_t dataBytes = 0;
+					if (!read(&binary->key.size, sizeof(binary->key.size)) || binary->key.size > VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR ||
+						!read(binary->key.bytes, sizeof(binary->key.bytes)) || !read(&dataBytes, sizeof(dataBytes)) || dataBytes == 0 || dataBytes > left) {
+						return corrupt();
+					}
+					binary->data.resize(static_cast<size_t>(dataBytes));
+					if (!read(binary->data.data(), binary->data.size()) || !out.binaries.try_emplace(binary->key, binary).second) {
+						return corrupt();  // short, or a key twice
+					}
+					table.push_back(std::move(binary));
+				}
+				out.entries.reserve(static_cast<size_t>(header.entryCount));
+				std::vector<bool> referenced(table.size(), false);
 				for (uint64_t e = 0; e < header.entryCount; ++e) {
 					detail::Hash128Value key{};
 					uint32_t idleSessions = 0, binaryCount = 0;
 					if (!read(&key.lo, sizeof(key.lo)) || !read(&key.hi, sizeof(key.hi)) || !read(&idleSessions, sizeof(idleSessions)) ||
 						!read(&binaryCount, sizeof(binaryCount)) || binaryCount == 0 || binaryCount > kVkMaxBinariesPerPipeline) {
-						entries.clear();
-						return PipelineCacheLoadResult::Corrupt;
+						return corrupt();
 					}
-					VulkanDevice::PipelineBinaryStore::Binaries binaries(binaryCount);
+					VkBinaryStore::Binaries binaries(binaryCount);
 					for (auto& binary : binaries) {
-						uint64_t dataBytes = 0;
-						if (!read(&binary.keySize, sizeof(binary.keySize)) || binary.keySize > VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR ||
-							!read(binary.key, sizeof(binary.key)) || !read(&dataBytes, sizeof(dataBytes)) || dataBytes == 0 || dataBytes > left) {
-							entries.clear();
-							return PipelineCacheLoadResult::Corrupt;
+						uint32_t index = 0;
+						if (!read(&index, sizeof(index)) || index >= table.size()) {
+							return corrupt();
 						}
-						binary.data.resize(static_cast<size_t>(dataBytes));
-						if (!read(binary.data.data(), binary.data.size())) {
-							entries.clear();
-							return PipelineCacheLoadResult::Corrupt;
+						binary = table[index];
+						if (!referenced[index]) {
+							referenced[index] = true;
+							out.binaryBytes += binary->data.size();
 						}
 					}
-					auto& entry = entries.try_emplace(key).first->second;
-					entry.binaries = std::make_shared<const VulkanDevice::PipelineBinaryStore::Binaries>(std::move(binaries));
+					auto& entry = out.entries.try_emplace(key).first->second;
+					entry.binaries = std::make_shared<const VkBinaryStore::Binaries>(std::move(binaries));
 					entry.idleSessions = idleSessions;
 				}
 				if (left != 0 || hash.Value().lo != header.payloadHash) {
-					entries.clear();
-					return PipelineCacheLoadResult::Corrupt;
+					return corrupt();
 				}
-				payloadBytes = header.payloadBytes;
+				out.payloadBytes = header.payloadBytes;
 				return PipelineCacheLoadResult::Loaded;
 			} catch (...) {
-				entries.clear();
+				out.Clear();
 				return PipelineCacheLoadResult::Corrupt;
 			}
 		}
@@ -11343,6 +11497,8 @@ namespace rhi {
 			auto& store = impl->pipelineBinaries;
 			const std::unique_lock lock(store.mutex);
 			store.entries.clear();
+			store.binaries.clear();
+			store.staticSamplerPlacements.clear();
 			store.open = false;
 			store.path.clear();
 		}
@@ -11352,6 +11508,8 @@ namespace rhi {
 			auto& store = impl->pipelineBinaries;
 			const std::unique_lock lock(store.mutex);
 			store.entries.clear();
+			store.binaries.clear();
+			store.staticSamplerPlacements.clear();
 			store.open = false;
 			store.path.clear();
 			store.hits = 0;
@@ -11400,20 +11558,26 @@ namespace rhi {
 				expected.globalKeySize = store.globalKeySize;
 				std::memcpy(expected.globalKey, store.globalKey, sizeof(expected.globalKey));
 				store.loweringHash = expected.loweringHash;
-				uint64_t payloadBytes = 0;
-				const PipelineCacheLoadResult load = VkReadPipelineBinaryFile(store.path, expected, store.entries, payloadBytes);
+				VkPipelineBinaryFileContents contents;
+				const PipelineCacheLoadResult load = VkReadPipelineBinaryFile(store.path, expected, contents);
+				store.entries.swap(contents.entries);
+				store.binaries.swap(contents.binaries);
+				store.staticSamplerPlacements.swap(contents.placements);
 				store.load = load;
-				store.loadedBytes = payloadBytes;
+				store.loadedBytes = contents.payloadBytes;
 				store.open = true;
 				// A file that was not loaded is replaced on the first save.
 				if (load != PipelineCacheLoadResult::Loaded && load != PipelineCacheLoadResult::Empty) {
 					++store.changes;
 				}
-				spdlog::info("Vulkan pipeline binaries '{}': {} ({} entries, {} bytes)", store.path, detail::PipelineCacheLoadName(load), store.entries.size(),
-					payloadBytes);
+				spdlog::info("Vulkan pipeline binaries '{}': {} ({} entries, {} binaries of {} bytes, {} static sampler placements; file {} bytes)", store.path,
+					detail::PipelineCacheLoadName(load), store.entries.size(), store.binaries.size(), contents.binaryBytes, store.staticSamplerPlacements.size(),
+					contents.payloadBytes);
 				return true;
 			} catch (...) {
 				store.entries.clear();
+				store.binaries.clear();
+				store.staticSamplerPlacements.clear();
 				store.open = false;
 				store.load = PipelineCacheLoadResult::Corrupt;
 				return false;
@@ -11422,17 +11586,19 @@ namespace rhi {
 
 		// Writes the store's file when it changed since the last write. Entries used this session are written with 0 unused
 		// sessions. The others are written one session older, left out at kMaxIdleSessions, and kept, the least idle first, only
-		// while the file stays under kMaxFileBytes. Safe while other threads create pipelines.
+		// while the file stays under kMaxFileBytes; a binary counts once however many entries use it. Safe while other threads
+		// create pipelines.
 		static Result VkSavePipelineBinaryStore(VulkanDevice* impl) noexcept {
 			auto& store = impl->pipelineBinaries;
 			const std::lock_guard saveLock(store.saveMutex);
+			using Placement = VkBinaryStore::StaticSamplerPlacement;
 			struct Item {
 				detail::Hash128Value key;
-				std::shared_ptr<const VulkanDevice::PipelineBinaryStore::Binaries> binaries;
+				std::shared_ptr<const VkBinaryStore::Binaries> binaries;
 				uint32_t idleSessions = 0;
-				uint64_t bytes = 0;
 			};
 			std::vector<Item> items;
+			std::vector<Placement> readPlacements;
 			std::string path;
 			VkPipelineBinaryFileHeader header{};
 			uint64_t changes = 0;
@@ -11454,31 +11620,71 @@ namespace rhi {
 					items.reserve(store.entries.size());
 					for (const auto& [key, entry] : store.entries) {
 						const bool used = entry.used.load();
-						items.push_back(Item{ key, entry.binaries, used ? 0u : entry.idleSessions + 1u, 0 });
+						items.push_back(Item{ key, entry.binaries, used ? 0u : entry.idleSessions + 1u });
+					}
+					readPlacements = store.staticSamplerPlacements;
+				}
+				// The static sampler placements: this session's, then those read from the file that clash with none of them, so a
+				// sampler not seen this session keeps its place. Taken outside the store's lock: registration takes that lock inside
+				// descriptorViewsMutex.
+				std::vector<Placement> placements;
+				{
+					const std::scoped_lock viewLock(impl->descriptorViewsMutex);
+					const auto& model = impl->descriptorBuffer;
+					for (const auto& registered : model.staticSamplers) {
+						if (registered.element >= model.samplerCapacity && registered.key.size() <= kVkMaxStaticSamplerKeyBytes) {
+							placements.push_back(Placement{ registered.key, registered.count, registered.element - model.samplerCapacity });
+						}
 					}
 				}
-				uint64_t pruned = 0;
-				for (Item& item : items) {
-					item.bytes = 24;
-					for (const auto& binary : *item.binaries) {
-						item.bytes += 4 + sizeof(binary.key) + 8 + binary.data.size();
+				const size_t current = placements.size();
+				for (Placement& placement : readPlacements) {
+					bool clashes = false;
+					for (size_t i = 0; i < current && !clashes; ++i) {
+						const Placement& other = placements[i];
+						clashes = (other.key == placement.key && other.count == placement.count) ||
+							(placement.offset < other.offset + other.count && other.offset < placement.offset + placement.count);
+					}
+					if (!clashes) {
+						placements.push_back(std::move(placement));
 					}
 				}
+				if (placements.size() > VulkanDescriptorBufferModel::kMaxStaticSamplers) {
+					placements.resize(VulkanDescriptorBufferModel::kMaxStaticSamplers);
+				}
+
 				// Used entries first, then the least idle; ties by key, so the file is the same for the same contents.
 				std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
 					if (a.idleSessions != b.idleSessions) return a.idleSessions < b.idleSessions;
 					return a.key.lo != b.key.lo ? a.key.lo < b.key.lo : a.key.hi < b.key.hi;
 				});
-				uint64_t payloadBytes = 0;
+				// The binary table in the order entries first use each binary, by key.
+				std::unordered_map<VkBinaryStore::BinaryKey, uint32_t, VkBinaryStore::BinaryKeyHash> binaryIndex;
+				std::vector<const VkBinaryStore::Binary*> binaryTable;
+				uint64_t estimate = 0;  // the payload so far, for the size cap
+				for (const Placement& placement : placements) {
+					estimate += 12 + placement.key.size();
+				}
+				uint64_t pruned = 0;
 				size_t kept = 0;
 				for (const Item& item : items) {
+					uint64_t added = 24 + 4 * uint64_t(item.binaries->size());
+					for (const auto& binary : *item.binaries) {
+						if (!binaryIndex.contains(binary->key)) {
+							added += 4 + sizeof(binary->key.bytes) + 8 + binary->data.size();
+						}
+					}
 					const bool used = item.idleSessions == 0;
-					if (!used && (item.idleSessions >= VulkanDevice::PipelineBinaryStore::kMaxIdleSessions ||
-						payloadBytes + item.bytes > VulkanDevice::PipelineBinaryStore::kMaxFileBytes)) {
+					if (!used && (item.idleSessions >= VkBinaryStore::kMaxIdleSessions || estimate + added > VkBinaryStore::kMaxFileBytes)) {
 						++pruned;
 						continue;
 					}
-					payloadBytes += item.bytes;
+					for (const auto& binary : *item.binaries) {
+						if (binaryIndex.try_emplace(binary->key, static_cast<uint32_t>(binaryTable.size())).second) {
+							binaryTable.push_back(binary.get());
+						}
+					}
+					estimate += added;
 					items[kept++] = item;
 				}
 				items.resize(kept);
@@ -11490,20 +11696,39 @@ namespace rhi {
 				}
 				std::filesystem::path temporary = filePath;
 				temporary += ".tmp";
+				uint64_t payloadBytes = 0;
+				uint64_t binaryBytes = 0;
 				{
 					std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
 					if (!file) {
 						spdlog::warn("Vulkan pipeline binaries '{}': save failed (cannot write {})", path, temporary.string());
 						return Result::Failed;
 					}
+					header.placementCount = static_cast<uint32_t>(placements.size());
+					header.binaryCount = binaryTable.size();
 					header.entryCount = items.size();
-					header.payloadBytes = payloadBytes;
 					file.write(reinterpret_cast<const char*>(&header), sizeof(header));
 					detail::Hash128 hash;
 					const auto write = [&](const void* data, size_t size) {
 						file.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
 						hash.Add(data, size);
+						payloadBytes += size;
 					};
+					for (const Placement& placement : placements) {
+						const uint32_t keyBytes = static_cast<uint32_t>(placement.key.size());
+						write(&placement.count, sizeof(placement.count));
+						write(&placement.offset, sizeof(placement.offset));
+						write(&keyBytes, sizeof(keyBytes));
+						write(placement.key.data(), placement.key.size());
+					}
+					for (const VkBinaryStore::Binary* binary : binaryTable) {
+						const uint64_t dataBytes = binary->data.size();
+						write(&binary->key.size, sizeof(binary->key.size));
+						write(binary->key.bytes, sizeof(binary->key.bytes));
+						write(&dataBytes, sizeof(dataBytes));
+						write(binary->data.data(), binary->data.size());
+						binaryBytes += dataBytes;
+					}
 					for (const Item& item : items) {
 						const uint32_t binaryCount = static_cast<uint32_t>(item.binaries->size());
 						write(&item.key.lo, sizeof(item.key.lo));
@@ -11511,13 +11736,11 @@ namespace rhi {
 						write(&item.idleSessions, sizeof(item.idleSessions));
 						write(&binaryCount, sizeof(binaryCount));
 						for (const auto& binary : *item.binaries) {
-							const uint64_t dataBytes = binary.data.size();
-							write(&binary.keySize, sizeof(binary.keySize));
-							write(binary.key, sizeof(binary.key));
-							write(&dataBytes, sizeof(dataBytes));
-							write(binary.data.data(), binary.data.size());
+							const uint32_t index = binaryIndex.at(binary->key);
+							write(&index, sizeof(index));
 						}
 					}
+					header.payloadBytes = payloadBytes;
 					header.payloadHash = hash.Value().lo;
 					file.seekp(0);
 					file.write(reinterpret_cast<const char*>(&header), sizeof(header));
@@ -11534,9 +11757,16 @@ namespace rhi {
 					spdlog::warn("Vulkan pipeline binaries '{}': save failed (rename)", path);
 					return Result::Failed;
 				}
+				// The binaries no entry holds any more leave the index.
+				{
+					const std::unique_lock lock(store.mutex);
+					std::erase_if(store.binaries, [](const auto& held) { return held.second.expired(); });
+				}
 				store.savedChanges = changes;
 				store.savedBytes = payloadBytes;
 				store.pruned = pruned;
+				spdlog::info("Vulkan pipeline binaries '{}': saved {} entries, {} binaries of {} bytes, {} static sampler placements ({} entries left out)", path,
+					items.size(), binaryTable.size(), binaryBytes, placements.size(), pruned);
 				return Result::Ok;
 			} catch (...) {
 				RHI_FAIL(Result::OutOfMemory);
@@ -11791,7 +12021,8 @@ namespace rhi {
 
 		// The fixed-function part of a graphics pipeline's store key: every state the create info carries, read from the structs
 		// as they go to the driver (formats after their remaps). `info.pStages` is hashed per stage by the caller.
-		static void VkHashGraphicsState(detail::Hash128& hash, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfo& rendering) noexcept {
+		template<class Hasher>
+		static void VkHashGraphicsState(Hasher& hash, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfo& rendering) noexcept {
 			hash.AddValue(info.flags);
 			hash.AddValue(info.stageCount);
 			if (const VkPipelineVertexInputStateCreateInfo* vertexInput = info.pVertexInputState) {
@@ -11876,13 +12107,22 @@ namespace rhi {
 		// with the cache it is given. A stored pipeline is made from its binaries, its stages without modules (binaries replace
 		// them). A miss, or binaries the driver refuses, lowers and compiles it with VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR and
 		// stores its binaries. Neither path may name a pipeline cache (vkCreate*Pipelines' valid usage for binaries and captured
-		// data); the driver's own cache still serves a miss. A failed lowering leaves its result in `lowerResult`.
+		// data); the driver's own cache still serves a miss. A failed lowering leaves its result in `lowerResult`. `keyDump`, when
+		// not empty, is the key's dump line (BASICRHI_VK_BINARY_KEY_DUMP); it is written with whether the store had the key.
 		template<class CreateInfo, class LowerFn, class CreateFn>
 		static VkResult VkCreatePipelineThroughBinaryStore(VulkanDevice* impl, const detail::Hash128Value& key, CreateInfo& info,
-			VkPipelineCreateFlags2CreateInfo& createFlags, VkPipeline& pipeline, Result& lowerResult, LowerFn&& lower, CreateFn&& create) noexcept {
+			VkPipelineCreateFlags2CreateInfo& createFlags, VkPipeline& pipeline, Result& lowerResult, const std::string& keyDump, LowerFn&& lower,
+			CreateFn&& create) noexcept {
 			auto& store = impl->pipelineBinaries;
 			lowerResult = Result::Ok;
-			if (const auto binaries = VkFindPipelineBinaries(impl, key)) {
+			const auto binaries = VkFindPipelineBinaries(impl, key);
+			if (!keyDump.empty()) {
+				try {
+					VkWriteBinaryKeyDump(std::format("{} | stored={}", keyDump, binaries ? 1 : 0));
+				} catch (...) {
+				}
+			}
+			if (binaries) {
 				VkResult result = VK_ERROR_INITIALIZATION_FAILED;
 				std::vector<VkPipelineBinaryKHR> handles;
 				bool made = false;
@@ -12665,10 +12905,28 @@ namespace rhi {
 					} catch (...) {
 					}
 				}
+				std::string keyDump;
+				if (storeKey && VkBinaryKeyDumpRequested()) {
+					try {
+						detail::Fnv1a64 layoutHash, stateHash;
+						VkHashModelLayout(layoutHash, impl, *layoutState);
+						VkHashGraphicsState(stateHash, pipelineInfo, rendering);
+						keyDump = std::format("{} | graphics key={} layout={:016x} flags={:x}", t_pipelineStatisticsLabel ? t_pipelineStatisticsLabel : "(unnamed)",
+							VkHex128(*storeKey), layoutHash.Value(), static_cast<uint64_t>(createFlags.flags));
+						for (size_t i = 0; i < shaderStages.size(); ++i) {
+							keyDump += VkDescribeStoreStage(impl, *layoutState, shaderStages[i].stage, shaderStages[i].stage, deferredStages[i].code,
+								deferredStages[i].codeBytes, deferredStages[i].shader->bytecode.data, deferredStages[i].shader->bytecode.size,
+								deferredStages[i].loweringEntry, shaderStages[i].pName);
+						}
+						keyDump += std::format(" | state={:016x}", stateHash.Value());
+					} catch (...) {
+						keyDump.clear();
+					}
+				}
 				VkResult vkResult = VK_SUCCESS;
 				if (storeKey) {
 					Result lowered = Result::Ok;
-					vkResult = VkCreatePipelineThroughBinaryStore(impl, *storeKey, pipelineInfo, createFlags, nativePipeline, lowered, lowerDeferredStages,
+					vkResult = VkCreatePipelineThroughBinaryStore(impl, *storeKey, pipelineInfo, createFlags, nativePipeline, lowered, keyDump, lowerDeferredStages,
 						createGraphicsPipeline);
 					if (lowered != Result::Ok) {
 						for (VkShaderModule module : modules) vkDestroyShaderModule(impl->device, module, nullptr);
@@ -12810,9 +13068,22 @@ namespace rhi {
 				} catch (...) {
 				}
 			}
+			std::string keyDump;
+			if (storeKey && VkBinaryKeyDumpRequested()) {
+				try {
+					detail::Fnv1a64 layoutHash;
+					VkHashModelLayout(layoutHash, impl, *layoutState);
+					keyDump = std::format("{} | compute key={} layout={:016x} flags={:x}/{:x}", t_pipelineStatisticsLabel ? t_pipelineStatisticsLabel : "(unnamed)",
+						VkHex128(*storeKey), layoutHash.Value(), static_cast<uint64_t>(createFlags.flags), static_cast<uint32_t>(pipelineInfo.flags));
+					keyDump += VkDescribeStoreStage(impl, *layoutState, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_STAGE_COMPUTE_BIT, shaderModuleInfo.pCode,
+						shaderModuleInfo.codeSize, shaderModuleInfo.pCode, shaderModuleInfo.codeSize, computeShader->entryPoint, entryPoint);
+				} catch (...) {
+					keyDump.clear();
+				}
+			}
 			if (storeKey) {
 				Result lowered = Result::Ok;
-				vkResult = VkCreatePipelineThroughBinaryStore(impl, *storeKey, pipelineInfo, createFlags, nativePipeline, lowered, [&]() -> Result {
+				vkResult = VkCreatePipelineThroughBinaryStore(impl, *storeKey, pipelineInfo, createFlags, nativePipeline, lowered, keyDump, [&]() -> Result {
 					const Result result = lowerComputeShader();
 					pipelineInfo.stage.module = shaderModule;
 					return result;
@@ -13205,6 +13476,58 @@ namespace rhi {
 		// one into every live shader-visible sampler heap. A layout whose static samplers do not fit fails.
 		static Result VkWriteStaticSamplers(VulkanDevice* impl, VulkanDescriptorHeap& heap, const VulkanDescriptorBufferModel::StaticSampler& staticSampler) noexcept;
 
+		// Where a new static sampler goes in the static-sampler tail: its offset past samplerCapacity, or none when it does not fit.
+		// Lowered shaders bake a static sampler's element in, so its place is part of their pipeline binary store keys, and placing
+		// samplers in registration order gave other keys every run. So a sampler goes where it sat last run (the store's
+		// placements, read from its file). A sampler new to the store takes the first free elements that no sampler of last run
+		// sat in, and only when there are none, any free elements. The caller holds descriptorViewsMutex.
+		static std::optional<uint32_t> VkPlaceStaticSampler(VulkanDevice* impl, const std::string& key, uint32_t count) {
+			const auto& model = impl->descriptorBuffer;
+			const uint32_t capacity = model.staticSamplerCapacity;
+			if (count == 0 || count > capacity) {
+				return std::nullopt;
+			}
+			// Per element: 0 free, 1 registered this session, 2 where another sampler sat last run.
+			std::vector<uint8_t> taken(capacity, 0);
+			for (const auto& registered : model.staticSamplers) {
+				for (uint32_t e = 0; e < registered.count; ++e) {
+					const uint32_t offset = registered.element - model.samplerCapacity + e;
+					if (offset < capacity) taken[offset] = 1;
+				}
+			}
+			std::optional<uint32_t> preferred;
+			{
+				const std::shared_lock lock(impl->pipelineBinaries.mutex);
+				for (const auto& placement : impl->pipelineBinaries.staticSamplerPlacements) {
+					if (placement.key == key && placement.count == count) {
+						if (!preferred) preferred = placement.offset;
+						continue;
+					}
+					for (uint32_t e = 0; e < placement.count; ++e) {
+						const uint32_t offset = placement.offset + e;
+						if (offset < capacity && taken[offset] == 0) taken[offset] = 2;
+					}
+				}
+			}
+			const auto fits = [&](uint32_t offset, bool avoidLastRun) {
+				if (offset > capacity - count) return false;
+				for (uint32_t e = 0; e < count; ++e) {
+					const uint8_t state = taken[offset + e];
+					if (state == 1 || (avoidLastRun && state == 2)) return false;
+				}
+				return true;
+			};
+			if (preferred && fits(*preferred, false)) {
+				return preferred;
+			}
+			for (const bool avoidLastRun : { true, false }) {
+				for (uint32_t offset = 0; offset + count <= capacity; ++offset) {
+					if (fits(offset, avoidLastRun)) return offset;
+				}
+			}
+			return std::nullopt;
+		}
+
 		static Result VkRegisterStaticSamplers(VulkanDevice* impl, VulkanPipelineLayout& layoutState) noexcept {
 			auto& model = impl->descriptorBuffer;
 			layoutState.staticSamplerElements.clear();
@@ -13224,7 +13547,8 @@ namespace rhi {
 						layoutState.staticSamplerElements.push_back(existing->element);
 						continue;
 					}
-					if (count > model.staticSamplerCapacity - model.staticSamplersUsed) {
+					const std::optional<uint32_t> offset = VkPlaceStaticSampler(impl, key, count);
+					if (!offset) {
 						spdlog::error("Vulkan descriptor-buffer model: static sampler (set {} binding {}, {} elements) does not fit the sampler heaps' "
 							"static-sampler tail ({} of {} elements used; maxSamplerDescriptorBufferRange {})", staticSampler.set, staticSampler.binding, count,
 							model.staticSamplersUsed, model.staticSamplerCapacity, static_cast<uint64_t>(impl->descriptorBufferProperties.maxSamplerDescriptorBufferRange));
@@ -13236,7 +13560,7 @@ namespace rhi {
 					}
 					registered.key = std::move(key);
 					registered.count = count;
-					registered.element = model.samplerCapacity + model.staticSamplersUsed;
+					registered.element = model.samplerCapacity + *offset;
 					model.staticSamplersUsed += count;
 					{
 						const std::shared_lock registryLock(impl->descriptorHeaps.mutex);
