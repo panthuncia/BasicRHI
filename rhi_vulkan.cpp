@@ -11081,10 +11081,21 @@ namespace rhi {
 		static constexpr uint32_t kVkMaxStaticSamplerKeyBytes = 256;
 
 		// BASICRHI_VK_PIPELINE_BINARY=0 turns the store off: lowered pipelines are lowered and compiled every run, through the
-		// pipeline cache.
+		// pipeline cache. =1 turns it on where it is off by default (VkPipelineBinaryOffByDefault).
 		static bool VkPipelineBinarySwitchedOff() noexcept {
 			static const bool off = [] { const char* value = std::getenv("BASICRHI_VK_PIPELINE_BINARY"); return value && std::strcmp(value, "0") == 0; }();
 			return off;
+		}
+
+		static bool VkPipelineBinarySwitchedOn() noexcept {
+			static const bool on = [] { const char* value = std::getenv("BASICRHI_VK_PIPELINE_BINARY"); return value && std::strcmp(value, "1") == 0; }();
+			return on;
+		}
+
+		// NVIDIA (GTX 980 Ti, driver 582.78): every pipeline made from binaries keeps its own copy of a 2 MiB binary that all
+		// pipelines share, also with one binary object kept for every pipeline. About 6,000 pipelines held 12 GB of process memory.
+		static bool VkPipelineBinaryOffByDefault(const VulkanDevice* impl) noexcept {
+			return impl->physicalDeviceProperties.vendorID == 0x10DE;
 		}
 
 		// The lowering diagnostics (BASICRHI_VK_VALIDATE_LOWERING, BASICRHI_VK_DUMP_LOWERED) need every module lowered, so pipelines
@@ -11528,6 +11539,8 @@ namespace rhi {
 			const char* why = nullptr;
 			PipelineCacheLoadResult notOpened = PipelineCacheLoadResult::Off;
 			if (VkPipelineBinarySwitchedOff()) why = "off (BASICRHI_VK_PIPELINE_BINARY=0)";
+			else if (VkPipelineBinaryOffByDefault(impl) && !VkPipelineBinarySwitchedOn())
+				why = "off on NVIDIA by default: each pipeline made from binaries keeps 2 MiB of process memory (BASICRHI_VK_PIPELINE_BINARY=1 turns it on)";
 			else if (!VkUniversalLayoutModel(impl)) why = "off (the binding model lowers no shaders)";
 			else {
 				notOpened = PipelineCacheLoadResult::Unsupported;
