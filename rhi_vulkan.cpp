@@ -5157,11 +5157,6 @@ namespace rhi {
 		}
 
 		static VkImageLayout VkToImageLayout(ResourceLayout layout, VkImageAspectFlags aspectMask) noexcept {
-			// Experiment: BASICRHI_VK_FORCE_GENERAL=1 keeps every image in GENERAL (but presents), as images shared with DXVK are.
-			static const bool forceGeneral = [] { const char* value = std::getenv("BASICRHI_VK_FORCE_GENERAL"); return value && std::strcmp(value, "1") == 0; }();
-			if (forceGeneral && layout != ResourceLayout::Present) {
-				return VK_IMAGE_LAYOUT_GENERAL;
-			}
 			switch (layout) {
 			case ResourceLayout::Common:
 			case ResourceLayout::DirectCommon:
