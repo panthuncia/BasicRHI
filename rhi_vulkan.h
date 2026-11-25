@@ -653,7 +653,7 @@ namespace rhi {
 
 		// Bound uniform buffers: a layout's PushIndex ranges become real uniform buffers in a push descriptor set at
 		// kBoundUniformSet (VK_KHR_push_descriptor), instead of heap CBVs read as storage buffers. The command list pushes
-		// them from the heap slots the pushed index names. Off without push descriptors, or with BASICRHI_VK_BOUND_UBO=0.
+		// them from the heap slots the pushed index names. Off without push descriptors.
 		static constexpr uint32_t kBoundUniformSet = 2;
 		static constexpr uint32_t kMaxBoundUniforms = 32;  // per layout, whatever the device allows
 		bool boundUniforms = false;

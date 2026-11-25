@@ -18739,18 +18739,12 @@ namespace rhi {
 	// logged, when the device cannot hold what the evaluation promised.
 	// Descriptor-sets model: whether PushIndex constant buffers are bound as real uniform buffers through a push descriptor set
 	// (VulkanDescriptorSetsModel::boundUniforms), and how many one layout may bind. The universal layout counts in every stage:
-	// its update-after-bind resources leave the rest of maxPerStageUpdateAfterBindResources. BASICRHI_VK_BOUND_UBO=0 turns it
-	// off (read once).
+	// its update-after-bind resources leave the rest of maxPerStageUpdateAfterBindResources.
 	static void VkInitBoundUniforms(VulkanDevice* impl, const char* caller) noexcept {
 		auto& sets = impl->descriptorSets;
 		const auto& model = impl->descriptorBuffer;
 		sets.boundUniforms = false;
 		sets.boundUniformsPerStage = sets.boundUniformsPerLayout = 0;
-		static const bool switchedOff = [] { const char* value = std::getenv("BASICRHI_VK_BOUND_UBO"); return value && std::strcmp(value, "0") == 0; }();
-		if (switchedOff) {
-			spdlog::info("{}: descriptor-sets model: bound uniform buffers off (BASICRHI_VK_BOUND_UBO=0); PushIndex constant buffers are heap storage buffers", caller);
-			return;
-		}
 		// An adopted device's host records into the same command buffers. The push descriptor set is one more set BasicRHI binds
 		// there, as it binds its universal sets: the host must bind its own descriptors again after BasicRHI's commands, which DXVK
 		// does (DxvkContext::invalidateExternalCommandState).

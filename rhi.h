@@ -737,10 +737,10 @@ namespace rhi {
 	// pushes it from the slots before the next draw or dispatch after the triggers above (and after
 	// ExecuteCommands), and skips a push of unchanged slots. The descriptors are read at record time, so
 	// they must be written before then (as D3D12's static descriptors). A layout past the uniform buffer
-	// limits, a device without push descriptors, an adopted device and BASICRHI_VK_BOUND_UBO=0 fall back
-	// to the lowering below (rhi::vulkan::BoundUniformBuffers tells which). The descriptor-buffer model
-	// (and the fallback) lowers it like a heap-indexed constant buffer whose index is read from push data
-	// (or from the spill image when that dword is spilled).
+	// limits and a device without push descriptors fall back to the lowering below
+	// (rhi::vulkan::BoundUniformBuffers tells which). The descriptor-buffer model (and the fallback)
+	// lowers it like a heap-indexed constant buffer whose index is read from push data (or from the
+	// spill image when that dword is spilled).
 	enum class LayoutRangeSource : uint32_t {
 		HeapSlot,         // binding b reads descriptor heap slot b
 		IndirectIndex,    // binding (binding + i) reads the heap slot whose index (uint32) is at record + recordOffset + 4 * i;
