@@ -310,7 +310,19 @@ if(BASICRHI_ENABLE_VULKAN)
     set(BASICRHI_SPIRV_TOOLS_INTERNAL_INCLUDE_DIRS
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SPIRV-Tools"
         "${CMAKE_CURRENT_BINARY_DIR}/_deps/SPIRV-Tools")
-    set_source_files_properties(rhi_vulkan_spirv_lowering.cpp PROPERTIES INCLUDE_DIRECTORIES "${BASICRHI_SPIRV_TOOLS_INTERNAL_INCLUDE_DIRS}")
+    # The lowering's identity (LoweringIdentity) is a hash of its sources' content, not a file time: every checkout of the same
+    # code then shares one module identifier store. Editing a source reconfigures, which updates the hash.
+    set(_basicrhi_lowering_hash "")
+    foreach(_basicrhi_lowering_source IN ITEMS rhi_vulkan_spirv_lowering.cpp rhi_vulkan_spirv_lowering.h)
+        file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/${_basicrhi_lowering_source}" _basicrhi_source_hash)
+        string(APPEND _basicrhi_lowering_hash "${_basicrhi_source_hash}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${_basicrhi_lowering_source}")
+    endforeach()
+    string(SHA256 _basicrhi_lowering_hash "${_basicrhi_lowering_hash}")
+    string(SUBSTRING "${_basicrhi_lowering_hash}" 0 16 _basicrhi_lowering_hash)
+    set_source_files_properties(rhi_vulkan_spirv_lowering.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${BASICRHI_SPIRV_TOOLS_INTERNAL_INCLUDE_DIRS}"
+        COMPILE_DEFINITIONS "BASICRHI_LOWERING_SOURCE_HASH=\"${_basicrhi_lowering_hash}\"")
     target_link_libraries(BasicRHI PRIVATE $<BUILD_INTERFACE:SPIRV-Tools-opt>)
     # volk owns Vulkan dispatch. Linking vulkan-1 as well can resolve volk's
     # function-pointer globals to loader import thunks in a mixed DX12/Vulkan

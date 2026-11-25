@@ -1874,8 +1874,9 @@ namespace rhi::vulkan_binding {
 	}
 
 	const std::string& LoweringIdentity() {
-		// Bump the version when the lowering's output changes without an edit to this file (a header, a pass option).
-		static const std::string identity = Cat("lowering 1; ", __TIMESTAMP__, "; ", spvSoftwareVersionDetailsString());
+		// Bump the version when the lowering's output changes without an edit to this file or its header (a pass option).
+		// BASICRHI_LOWERING_SOURCE_HASH is the content hash of both (CMakeLists.txt). A file time would differ per checkout.
+		static const std::string identity = Cat("lowering 1; ", BASICRHI_LOWERING_SOURCE_HASH, "; ", spvSoftwareVersionDetailsString());
 		return identity;
 	}
 
