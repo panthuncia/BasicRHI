@@ -20103,7 +20103,15 @@ namespace rhi {
 			const uint32_t queueIndex = nextPrimaryQueueIndex[familyIndex] < reservedPrimaryCount ? nextPrimaryQueueIndex[familyIndex]++ : 0u;
 			VkQueue vkQueue = VK_NULL_HANDLE;
 			vkGetDeviceQueue(device, familyIndex, queueIndex, &vkQueue);
-			const QueueHandle queueHandle = impl->queues.alloc(VulkanQueueState{ vkQueue, familyIndex, queueIndex });
+			// A kind without a queue of its own shares an earlier kind's VkQueue, and then its handle too (as AdoptVulkanDevice
+			// does): one lock per VkQueue, and ORG folds the kind into that queue's slot.
+			QueueHandle queueHandle{};
+			for (const QueueHandle earlier : { impl->gfxHandle, impl->compHandle }) {
+				const VulkanQueueState* state = earlier.valid() ? impl->queues.get(earlier) : nullptr;
+				if (state && state->queue == vkQueue) queueHandle = earlier;
+			}
+			if (!queueHandle.valid())
+				queueHandle = impl->queues.alloc(VulkanQueueState{ vkQueue, familyIndex, queueIndex });
 			switch (static_cast<QueueKind>(queueSlot)) {
 			case QueueKind::Graphics:
 				impl->gfxHandle = queueHandle;
