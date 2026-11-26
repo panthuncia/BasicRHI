@@ -3364,6 +3364,10 @@ namespace rhi {
 		Result(*waitForPresent)(Swapchain*, uint64_t presentId, uint64_t timeoutNs) noexcept = nullptr;
 		// abi_version 3.
 		TimelinePoint(*acquirePoint)(Swapchain*) noexcept = nullptr;
+		// abi_version 4.
+		Result(*resizeBuffersAfterFrames)(Swapchain*, uint32_t bufferCount, uint32_t w, uint32_t h, Format newFormat, uint32_t flags) noexcept = nullptr;
+		// abi_version 5.
+		void(*extent)(Swapchain*, uint32_t* w, uint32_t* h) noexcept = nullptr;
 	};
 
 	class Swapchain {
@@ -3392,6 +3396,21 @@ namespace rhi {
 		inline Result Present(bool vsync, const PresentSyncDesc& sync) noexcept;
 		inline Result ResizeBuffers(uint32_t bufferCount, uint32_t w, uint32_t h, Format newFmt, uint32_t flags) noexcept {
 			return vt->resizeBuffers ? vt->resizeBuffers(this, bufferCount, w, h, newFmt, flags) : Result::Unsupported;
+		}
+		/// ResizeBuffers without its wait for the whole device. The caller has waited for every frame that used the images (their
+		/// copies and presents, on the queue the swapchain presents on), so work on other queues may still run. D3D12 then only
+		/// releases and takes the images; Vulkan waits for the present queue and the presented frames. A backend without it runs
+		/// ResizeBuffers, which waits for the device.
+		inline Result ResizeBuffersAfterFrames(uint32_t bufferCount, uint32_t w, uint32_t h, Format newFmt, uint32_t flags) noexcept {
+			if (vt->abi_version >= 4 && vt->resizeBuffersAfterFrames) return vt->resizeBuffersAfterFrames(this, bufferCount, w, h, newFmt, flags);
+			return ResizeBuffers(bufferCount, w, h, newFmt, flags);
+		}
+		/// The images' size, which may differ from the one asked for: a Vulkan surface's extent is the window's (Win32). False
+		/// without the query (abi_version below 5).
+		inline bool Extent(uint32_t& w, uint32_t& h) noexcept {
+			if (vt->abi_version < 5 || !vt->extent) return false;
+			vt->extent(this, &w, &h);
+			return true;
 		}
 
 		/// What this swapchain can do: tearing, vsync switching, present wait, HDR metadata.

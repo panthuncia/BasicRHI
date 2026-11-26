@@ -11423,12 +11423,16 @@ namespace rhi {
 			return Result::Ok;
 		}
 
-		static Result sc_resizeBuffers(
+		// waitForDevice: ResizeBuffers' wait for every queue. Without it (resizeBuffersAfterFrames) the caller has waited for the
+		// frames that used the images: their copies and presents ran on the queue the swapchain presents on, and DXGI needs only
+		// that and no reference to them held. Work on the other queues (compute, copies, uploads) never touches a backbuffer.
+		static Result Dx12ResizeSwapchainBuffers(
 			Swapchain* sc,
 			uint32_t numBuffers,
 			uint32_t w, uint32_t h,
 			Format newFormat,
-			uint32_t flags) noexcept
+			uint32_t flags,
+			bool waitForDevice) noexcept
 		{
 			auto* s = dx12_detail::SC(sc);
 			if (!s || !s->pSlProxySC || !s->dev) {
@@ -11448,7 +11452,7 @@ namespace rhi {
 			const UINT resizeFlags = s->flags | static_cast<UINT>(flags);
 
 			// Ensure nothing is using the old backbuffers.
-			Dx12WaitDeviceIdle(dev);
+			if (waitForDevice) Dx12WaitDeviceIdle(dev);
 
 			// Release all refs to old backbuffers.
 			for (uint32_t i = 0; i < oldCount; ++i)
@@ -11595,6 +11599,17 @@ namespace rhi {
 
 			s->current = s->pSlProxySC->GetCurrentBackBufferIndex();
 			return Result::Ok;
+		}
+		static Result sc_resizeBuffers(Swapchain* sc, uint32_t numBuffers, uint32_t w, uint32_t h, Format newFormat, uint32_t flags) noexcept {
+			return Dx12ResizeSwapchainBuffers(sc, numBuffers, w, h, newFormat, flags, true);
+		}
+		static Result sc_resizeBuffersAfterFrames(Swapchain* sc, uint32_t numBuffers, uint32_t w, uint32_t h, Format newFormat, uint32_t flags) noexcept {
+			return Dx12ResizeSwapchainBuffers(sc, numBuffers, w, h, newFormat, flags, false);
+		}
+		static void sc_extent(Swapchain* sc, uint32_t* w, uint32_t* h) noexcept {
+			auto* s = dx12_detail::SC(sc);
+			if (w) *w = s ? s->w : 0;
+			if (h) *h = s ? s->h : 0;
 		}
 		static void sc_setName(Swapchain* sc, const char* n) noexcept {} // Cannot name IDXGISwapChain
 
@@ -12456,7 +12471,9 @@ namespace rhi {
 
 	#if BASICRHI_ENABLE_STREAMLINE
 		void SlLogMessageCallback(sl::LogType level, const char* message) {
-			//spdlog::info("Streamline Log: {}", message);
+			// BASICRHI_STREAMLINE_LOG=1 forwards Streamline's log, verbose (InitSL sets the level).
+			static const bool forward = [] { const char* v = std::getenv("BASICRHI_STREAMLINE_LOG"); return v && v[0] == '1'; }();
+			if (forward) spdlog::info("Streamline Log [{}]: {}", static_cast<int>(level), message ? message : "");
 		}
 
 		// Streamline's resources, and DLSS's through it, are allocated here so they get high residency priority: over the
@@ -12535,7 +12552,7 @@ namespace rhi {
 
 			sl::Preferences pref{};
 			pref.showConsole = false; // for debugging, set to false in production
-			pref.logLevel = sl::LogLevel::eDefault;
+			pref.logLevel = [] { const char* v = std::getenv("BASICRHI_STREAMLINE_LOG"); return v && v[0] == '1' ? sl::LogLevel::eVerbose : sl::LogLevel::eDefault; }();
 			auto path = GetExePath() + L"\\NVSL";
 			const wchar_t* path_wchar = path.c_str();
 			pref.pathsToPlugins = { &path_wchar }; // change this if Streamline plugins are not located next to the executable
@@ -12844,7 +12861,7 @@ namespace rhi {
 		&sc_present,
 		&sc_resizeBuffers,
 		&sc_setName,
-		3u,
+		5u,
 		&sc_caps,
 		&sc_isColorSpaceSupported,
 		&sc_setColorSpace,
@@ -12855,7 +12872,9 @@ namespace rhi {
 		&sc_frameLatencyWaitableObject,
 		&sc_presentCount,
 		&sc_waitForPresent,
-		&sc_acquirePoint };
+		&sc_acquirePoint,
+		&sc_resizeBuffersAfterFrames,
+		&sc_extent };
 	const ResourceVTable g_buf_rvt = {
 		&buf_map,
 		&buf_unmap,

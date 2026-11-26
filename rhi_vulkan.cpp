@@ -10666,6 +10666,19 @@ namespace rhi {
 					}
 				}
 			}
+			if (presentResult == VK_ERROR_OUT_OF_DATE_KHR) {
+				// The surface changed (a window resized while the caller keeps presenting at the old size): this swapchain can
+				// neither present nor acquire again, and the caller's next frame needs an acquired image. It is made again now, at
+				// the surface's extent (Win32 allows no other), and returns ModeChanged; the caller re-points its images (their
+				// handles change) and resizes properly when it can.
+				spdlog::info("Vulkan swapchain: out of date at present; made again at the surface's extent");
+				const Result idleResult = VkWaitDeviceIdle(impl);
+				if (idleResult != Result::Ok) return idleResult;
+				swapchainState->pendingFrames.clear();
+				const Result recreateResult = VkCreateOrResizeSwapchain(impl, *swapchainState, swapchainState->width, swapchainState->height,
+					swapchainState->sdrFormat, swapchainState->imageCount, swapchainState->allowTearing);
+				return recreateResult == Result::Ok ? Result::ModeChanged : recreateResult;
+			}
 			if (presentResult != VK_SUCCESS && presentResult != VK_SUBOPTIMAL_KHR) {
 				return ToRHI(presentResult);
 			}
@@ -10717,8 +10730,50 @@ namespace rhi {
 			return VkCreateOrResizeSwapchain(impl, *swapchainState, targetWidth, targetHeight, targetFormat, targetBufferCount, swapchainState->allowTearing);
 		}
 
+		// ResizeBuffers without the device idle wait (Swapchain::ResizeBuffersAfterFrames): the caller has waited for the frames
+		// that used the images. What is left is the presentation engine's: the presented frames' progress, the present queue
+		// (its presents wait on the present semaphores, which no timeline covers) and the acquire batches (waited for when the
+		// swapchain is made again). Other queues keep running. A presentation layer or a device shared with a guest still waits
+		// for the device.
+		static Result sc_resizeBuffersAfterFrames(Swapchain* swapchain, uint32_t bufferCount, uint32_t width, uint32_t height, Format newFormat, uint32_t flags) noexcept {
+			auto* impl = swapchain ? static_cast<VulkanDevice*>(swapchain->impl) : nullptr;
+			VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (!impl || !swapchainState) {
+				RHI_FAIL(Result::InvalidArgument);
+			}
+			if (swapchainState->presentationLayer || !impl->ownsDevice || impl->sharedQueues) {
+				return sc_resizeBuffers(swapchain, bufferCount, width, height, newFormat, flags);
+			}
+			if (const Result waitResult = VkWaitPresentedFrames(impl, *swapchainState, 0, UINT64_MAX); waitResult != Result::Ok) {
+				return waitResult;
+			}
+			VulkanQueueState* queueState = VkQueueStateForHandle(impl, swapchainState->presentQueue);
+			if (!queueState || queueState->queue == VK_NULL_HANDLE) {
+				queueState = VkPrimaryQueueStateForKind(impl, QueueKind::Graphics);
+			}
+			if (queueState && queueState->queue != VK_NULL_HANDLE) {
+				const VkQueueAccessGuard queueAccess(impl, queueState->queue);
+				ZoneScopedN("RHI.Vulkan.WaitPresentQueue");
+				const VkResult result = VkCheckDeviceLost(impl, vkQueueWaitIdle(queueState->queue), "Swapchain::ResizeBuffersAfterFrames");
+				if (result != VK_SUCCESS) return ToRHI(result);
+			}
+			swapchainState->pendingFrames.clear();
+
+			const Format targetFormat = newFormat != Format::Unknown ? newFormat : swapchainState->sdrFormat;
+			const uint32_t targetWidth = width != 0 ? width : swapchainState->width;
+			const uint32_t targetHeight = height != 0 ? height : swapchainState->height;
+			const uint32_t targetBufferCount = bufferCount != 0 ? bufferCount : swapchainState->imageCount;
+			return VkCreateOrResizeSwapchain(impl, *swapchainState, targetWidth, targetHeight, targetFormat, targetBufferCount, swapchainState->allowTearing);
+		}
+
 		static void sc_setName(Swapchain* swapchain, const char* name) noexcept {
 			VkIgnoreUnused(swapchain, name);
+		}
+
+		static void sc_extent(Swapchain* swapchain, uint32_t* w, uint32_t* h) noexcept {
+			const VulkanSwapchain* swapchainState = VkSwapchainState(swapchain);
+			if (w) *w = swapchainState ? swapchainState->width : 0;
+			if (h) *h = swapchainState ? swapchainState->height : 0;
 		}
 
 		static SwapchainCaps sc_caps(Swapchain* swapchain) noexcept {
@@ -17705,7 +17760,7 @@ namespace rhi {
 		&sc_present,
 		&sc_resizeBuffers,
 		&sc_setName,
-		3u,
+		5u,
 		&sc_caps,
 		&sc_isColorSpaceSupported,
 		&sc_setColorSpace,
@@ -17716,7 +17771,9 @@ namespace rhi {
 		&sc_frameLatencyWaitableObject,
 		&sc_presentCount,
 		&sc_waitForPresent,
-		&sc_acquirePoint
+		&sc_acquirePoint,
+		&sc_resizeBuffersAfterFrames,
+		&sc_extent
 	};
 
 	const ResourceVTable g_vkbuf_rvt = {
