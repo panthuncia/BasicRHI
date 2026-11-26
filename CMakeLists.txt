@@ -306,6 +306,11 @@ if(BASICRHI_ENABLE_VULKAN)
         set(SPIRV_TOOLS_BUILD_STATIC ON CACHE BOOL "" FORCE)
         set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
         add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/third_party/SPIRV-Tools" "${CMAKE_CURRENT_BINARY_DIR}/_deps/SPIRV-Tools" EXCLUDE_FROM_ALL)
+        # Under Visual Studio generators SPIRV-Tools force-includes its precompiled header by name. Its util/ sources only
+        # find it with source/ on the include path.
+        if(TARGET SPIRV-Tools-static)
+            target_include_directories(SPIRV-Tools-static PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SPIRV-Tools/source")
+        endif()
     endif()
     set(BASICRHI_SPIRV_TOOLS_INTERNAL_INCLUDE_DIRS
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SPIRV-Tools"
