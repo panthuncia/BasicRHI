@@ -877,6 +877,24 @@ namespace rhi {
 			std::array<RetiredBuffer, 4096> entries{};
 			uint64_t next = 0;
 		} retiredBuffers;
+		// VK_EXT_device_address_binding_report events (with crash markers): every bind and unbind of GPU addresses
+		// to images, buffers and memory, for the fault report. A read in an unbound range names the freed object.
+		struct AddressBinding {
+			uint64_t address = 0;
+			uint64_t size = 0;
+			uint64_t handle = 0;
+			int64_t ticks = 0;  // QueryPerformanceCounter
+			uint32_t objectType = 0;
+			uint32_t thread = 0;
+			bool bound = false;
+			std::array<char, 48> name{};
+		};
+		struct AddressBindingRing {
+			std::mutex mutex;
+			std::vector<AddressBinding> entries;  // 1 << 18 entries once enabled
+			uint64_t next = 0;
+		} addressBindings;
+		VkDebugUtilsMessengerEXT addressMessenger = VK_NULL_HANDLE;
 		bool nullDescriptorEnabled = false;  // VK_EXT_robustness2 nullDescriptor: views with no resource
 		bool pushDescriptorEnabled = false;  // VK_KHR_push_descriptor (bound uniform buffers in the descriptor-sets model)
 		// Every feature the descriptor-sets model needs: update-after-bind and non-uniform indexing for each kind, partially bound,

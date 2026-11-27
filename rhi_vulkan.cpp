@@ -381,6 +381,48 @@ namespace rhi {
 			}
 			return VK_FALSE;
 		}
+		// The debug name of the resource this thread is destroying: address unbind events take it.
+		static thread_local const char* t_vkDestroyingName = nullptr;
+
+		// VK_EXT_device_address_binding_report: keeps every bind and unbind in the device's ring for the fault report.
+		static VKAPI_ATTR VkBool32 VKAPI_CALL VkAddressBindingCallback(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT type,
+			const VkDebugUtilsMessengerCallbackDataEXT* callbackData, void* userData) noexcept {
+			if (!(type & VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT) || !callbackData || !userData)
+				return VK_FALSE;
+			const VkDeviceAddressBindingCallbackDataEXT* binding = nullptr;
+			for (auto* next = static_cast<const VkBaseInStructure*>(callbackData->pNext); next; next = next->pNext)
+				if (next->sType == VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT)
+					binding = reinterpret_cast<const VkDeviceAddressBindingCallbackDataEXT*>(next);
+			if (!binding)
+				return VK_FALSE;
+			auto& ring = static_cast<VulkanDevice*>(userData)->addressBindings;
+			VulkanDevice::AddressBinding e;
+			e.address = binding->baseAddress;
+			e.size = binding->size;
+			e.bound = binding->bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT;
+			if (callbackData->objectCount > 0) {
+				e.handle = callbackData->pObjects[0].objectHandle;
+				e.objectType = static_cast<uint32_t>(callbackData->pObjects[0].objectType);
+				const char* name = callbackData->pObjects[0].pObjectName;
+				if (!name || !*name)
+					name = e.bound ? nullptr : t_vkDestroyingName;
+				if (name)
+					std::strncpy(e.name.data(), name, e.name.size() - 1);
+			}
+			LARGE_INTEGER now{};
+			QueryPerformanceCounter(&now);
+			e.ticks = now.QuadPart;
+			e.thread = static_cast<uint32_t>(GetCurrentThreadId());
+			try {
+				const std::scoped_lock lock(ring.mutex);
+				if (ring.entries.empty())
+					ring.entries.resize(1u << 18);
+				ring.entries[ring.next++ % ring.entries.size()] = e;
+			} catch (...) {
+			}
+			return VK_FALSE;
+		}
+
 		static constexpr uint32_t kVkInvalidQueueFamily = 0xFFFFFFFFu;
 		static void VkDestroyTracyGpuContext(VulkanQueueState& queueState) noexcept;
 
@@ -4106,6 +4148,51 @@ namespace rhi {
 						}
 					}
 				}
+				{
+					// Address binding events covering or next to the address, newest first: an unbind names a freed object.
+					auto& ring = impl->addressBindings;
+					std::unique_lock lock(ring.mutex, std::try_to_lock);
+					if (lock.owns_lock() && !ring.entries.empty()) {
+						LARGE_INTEGER now{}, frequency{};
+						QueryPerformanceCounter(&now);
+						QueryPerformanceFrequency(&frequency);
+						const auto typeName = [](uint32_t t) {
+							switch (t) {
+							case VK_OBJECT_TYPE_IMAGE: return "image";
+							case VK_OBJECT_TYPE_BUFFER: return "buffer";
+							case VK_OBJECT_TYPE_DEVICE_MEMORY: return "memory";
+							default: return "object";
+							}
+						};
+						// A live resource's name by its Vulkan handle (images and buffers bound before naming carry none).
+						const auto liveName = [impl](uint64_t handle) -> std::string {
+							std::shared_lock resourcesLock(impl->resources.mutex, std::try_to_lock);
+							if (!resourcesLock.owns_lock())
+								return {};
+							for (const auto& slot : impl->resources.slots)
+								if (slot.alive && (reinterpret_cast<uint64_t>(slot.obj.image) == handle || reinterpret_cast<uint64_t>(slot.obj.buffer) == handle ||
+													  reinterpret_cast<uint64_t>(slot.obj.memory) == handle))
+									return std::string(slot.obj.name.data()) + " (live)";
+							return {};
+						};
+						uint32_t logged = 0;
+						const uint64_t count = (std::min<uint64_t>)(ring.next, ring.entries.size());
+						for (uint64_t k = 0; k < count && logged < 32; ++k) {
+							const auto& e = ring.entries[(ring.next - 1 - k) % ring.entries.size()];
+							if (!nextTo(e.address, e.size))
+								continue;
+							++logged;
+							std::string name = e.name.data();
+							if (name.empty())
+								name = liveName(e.handle);
+							spdlog::error("Vulkan fault attribution: address {} {} 0x{:x} '{}' ({} bytes at 0x{:x}), {:.1f} ms before the report, thread {}: {}",
+								e.bound ? "bind" : "UNBIND", typeName(e.objectType), e.handle, name, e.size, e.address,
+								frequency.QuadPart ? 1000.0 * double(now.QuadPart - e.ticks) / double(frequency.QuadPart) : 0.0, e.thread, where(e.address, e.size));
+						}
+						if (!logged)
+							spdlog::error("Vulkan fault attribution: none of the last {} address binding events covers or neighbours the address", count);
+					}
+				}
 			} catch (...) {
 			}
 		}
@@ -5369,6 +5456,10 @@ namespace rhi {
 			}
 			const std::scoped_lock viewLock(impl->descriptorViewsMutex);
 			std::scoped_lock memoryLifetimeLock(impl->deviceMemoryMutex);
+			struct DestroyingName {
+				explicit DestroyingName(const char* a_name) { t_vkDestroyingName = a_name; }
+				~DestroyingName() { t_vkDestroyingName = nullptr; }
+			} destroyingName(resource.name.data());
 
 			if (resource.mappedData != nullptr && resource.memory != VK_NULL_HANDLE) {
 				auto mappingIt = impl->hostMemoryMappings.find(resource.memory);
@@ -17511,6 +17602,10 @@ namespace rhi {
 			device = VK_NULL_HANDLE;
 		}
 
+		if (instance != VK_NULL_HANDLE && addressMessenger != VK_NULL_HANDLE && vkDestroyDebugUtilsMessengerEXT) {
+			vkDestroyDebugUtilsMessengerEXT(instance, addressMessenger, nullptr);
+			addressMessenger = VK_NULL_HANDLE;
+		}
 		if (instance != VK_NULL_HANDLE && debugMessenger != VK_NULL_HANDLE && vkDestroyDebugUtilsMessengerEXT) {
 			VkDrainValidationMessages(this);
 			vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
@@ -18983,6 +19078,14 @@ namespace rhi {
 		};
 		(void)removeName;
 
+		// Address binding reports come with crash markers and need a debug utils messenger. Debug utils turned on only for them leaves
+		// object names and labels off.
+		const bool addressBindingsRequested = VkCrashMarkersRequested(ci) && VkHasInstanceExtension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+		const bool debugUtilsOnlyForAddresses = addressBindingsRequested &&
+			std::none_of(enabledExtensions.begin(), enabledExtensions.end(), [](const char* name) { return name && std::strcmp(name, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; });
+		if (addressBindingsRequested)
+			appendUniqueName(enabledExtensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+
 #if BASICRHI_ENABLE_STREAMLINE
 		if (streamlineInitialized && g_vkSlDlssRequirementsValid) {
 			for (uint32_t index = 0; index < g_vkSlDlssRequirements.vkNumInstanceExtensions; ++index) {
@@ -19804,6 +19907,17 @@ namespace rhi {
 		}
 		if (enableBufferMarkers) appendUniqueName(enabledDeviceExtensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
 		if (enableCheckpoints) appendUniqueName(enabledDeviceExtensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+		VkPhysicalDeviceAddressBindingReportFeaturesEXT enabledAddressBindingFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT };
+		if (addressBindingsRequested && VkHasDeviceExtension(physicalDevice, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+			VkPhysicalDeviceAddressBindingReportFeaturesEXT supported{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT };
+			VkPhysicalDeviceFeatures2 query{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+			query.pNext = &supported;
+			vkGetPhysicalDeviceFeatures2(physicalDevice, &query);
+			if (supported.reportAddressBinding == VK_TRUE) {
+				enabledAddressBindingFeatures.reportAddressBinding = VK_TRUE;
+				appendUniqueName(enabledDeviceExtensions, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+			}
+		}
 
 #if BASICRHI_ENABLE_STREAMLINE && defined(VK_NV_optical_flow)
 		// Last, so a Streamline that was turned off above takes no optical flow queue.
@@ -19894,6 +20008,10 @@ namespace rhi {
 		if (enabledFaultFeatures.deviceFault == VK_TRUE) {
 			enabledFaultFeatures.pNext = const_cast<void*>(deviceCreateInfo.pNext);
 			deviceCreateInfo.pNext = &enabledFaultFeatures;
+		}
+		if (enabledAddressBindingFeatures.reportAddressBinding == VK_TRUE) {
+			enabledAddressBindingFeatures.pNext = const_cast<void*>(deviceCreateInfo.pNext);
+			deviceCreateInfo.pNext = &enabledAddressBindingFeatures;
 		}
 #if BASICRHI_ENABLE_STREAMLINE && defined(VK_NV_optical_flow)
 		if (enabledOpticalFlowFeatures.opticalFlow == VK_TRUE) {
@@ -20004,7 +20122,16 @@ namespace rhi {
 		auto impl = std::make_shared<VulkanDevice>();
 		impl->selfWeak = impl;
 		impl->instance = instance;
-		impl->debugUtilsEnabled = instanceExtensionEnabled(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+		impl->debugUtilsEnabled = instanceExtensionEnabled(VK_EXT_DEBUG_UTILS_EXTENSION_NAME) && !debugUtilsOnlyForAddresses;
+		if (enabledAddressBindingFeatures.reportAddressBinding == VK_TRUE && vkCreateDebugUtilsMessengerEXT) {
+			VkDebugUtilsMessengerCreateInfoEXT addressInfo{ VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
+			addressInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT;
+			addressInfo.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
+			addressInfo.pfnUserCallback = &VkAddressBindingCallback;
+			addressInfo.pUserData = impl.get();
+			const bool created = vkCreateDebugUtilsMessengerEXT(instance, &addressInfo, nullptr, &impl->addressMessenger) == VK_SUCCESS;
+			spdlog::info("CreateVulkanDevice: address binding reports {}", created ? "on" : "requested, but the messenger failed");
+		}
 		if (ci.enableDebug && vkCreateDebugUtilsMessengerEXT) {
 			VkDebugUtilsMessengerCreateInfoEXT debugInfo{ VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
 			debugInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
