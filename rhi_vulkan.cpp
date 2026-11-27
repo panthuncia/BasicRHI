@@ -4191,6 +4191,51 @@ namespace rhi {
 						}
 						if (!logged)
 							spdlog::error("Vulkan fault attribution: none of the last {} address binding events covers or neighbours the address", count);
+						// The nearest bound ranges below and above it, and the lowest address any event named.
+						{
+							const VulkanDevice::AddressBinding* below = nullptr;
+							const VulkanDevice::AddressBinding* above = nullptr;
+							uint64_t lowest = ~0ull;
+							for (uint64_t k = 0; k < count; ++k) {
+								const auto& e = ring.entries[(ring.next - 1 - k) % ring.entries.size()];
+								if (e.size == 0)
+									continue;
+								lowest = (std::min)(lowest, e.address);
+								if (e.address <= a && (!below || e.address > below->address))
+									below = &e;
+								if (e.address > a && (!above || e.address < above->address))
+									above = &e;
+							}
+							for (const auto* e : { below, above })
+								if (e)
+									spdlog::error("Vulkan fault attribution: nearest address {} {} {} 0x{:x} '{}' ({} bytes at 0x{:x}): {}", e == below ? "below" : "above",
+										e->bound ? "bind" : "UNBIND", typeName(e->objectType), e->handle, e->name.data(), e->size, e->address, where(e->address, e->size));
+							spdlog::error("Vulkan fault attribution: the lowest address any binding event named is 0x{:x}", lowest);
+						}
+						// An address under 4 GiB that nothing holds may be a real address whose high word was lost: the objects whose
+						// ranges hold its low word.
+						if (!logged && a < (1ull << 32)) {
+							uint32_t holders = 0;
+							for (uint64_t k = 0; k < count && holders < 24; ++k) {
+								const auto& e = ring.entries[(ring.next - 1 - k) % ring.entries.size()];
+								if (e.size == 0)
+									continue;
+								bool holds = false;
+								for (uint64_t high = e.address >> 32; high <= (e.address + e.size - 1) >> 32 && !holds; ++high)
+									holds = ((high << 32) | a) >= e.address && ((high << 32) | a) < e.address + e.size;
+								if (!holds)
+									continue;
+								++holders;
+								std::string name = e.name.data();
+								if (name.empty())
+									name = liveName(e.handle);
+								spdlog::error("Vulkan fault attribution: low word held by address {} {} 0x{:x} '{}' ({} bytes at 0x{:x}), {:.1f} ms before the report",
+									e.bound ? "bind" : "UNBIND", typeName(e.objectType), e.handle, name, e.size, e.address,
+									frequency.QuadPart ? 1000.0 * double(now.QuadPart - e.ticks) / double(frequency.QuadPart) : 0.0);
+							}
+							if (!holders)
+								spdlog::error("Vulkan fault attribution: no address binding event holds the address's low word");
+						}
 					}
 				}
 			} catch (...) {
