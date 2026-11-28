@@ -4065,6 +4065,28 @@ namespace rhi {
 								spdlog::error("Vulkan fault attribution: read as heap {}'s descriptor, the fault page is slots [0x{:x}, 0x{:x}]", i, faultSlotLo,
 									faultSlotHi);
 							}
+							// A heap index taken from a float word: index * stride wraps in 32 bits to the fault's low word. snap7-devloss6 saw
+							// 80.0, 50.0, 640.0, 2048.0 and 0.51-0.62 this way, below and past the heap.
+							if (heap.type == DescriptorHeapType::CbvSrvUav && heap.descriptorStride && (a < base || a >= base + heap.descriptorBytes)) {
+								const uint64_t low = static_cast<uint32_t>(a - base) & ~0xFFFull;
+								std::string floats;
+								for (uint64_t top = 0; top < heap.descriptorStride; ++top) {
+									const uint64_t wrapped = (top << 32) | low;
+									if (wrapped % heap.descriptorStride)
+										continue;
+									const uint64_t index = wrapped / heap.descriptorStride;
+									if (index > 0xFFFFFFFFull)
+										continue;
+									float value = 0.0f;
+									const uint32_t word = static_cast<uint32_t>(index);
+									std::memcpy(&value, &word, sizeof(value));
+									const float magnitude = value < 0.0f ? -value : value;
+									if (magnitude >= 1e-3f && magnitude <= 1e6f)
+										floats += std::format("{}0x{:08x} ({:g})", floats.empty() ? "" : ", ", word, value);
+								}
+								if (!floats.empty())
+									spdlog::error("Vulkan fault attribution: as a heap {} index that wrapped in 32 bits, the fault page's start is index {}", i, floats);
+							}
 						}
 					}
 				}
