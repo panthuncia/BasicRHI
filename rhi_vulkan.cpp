@@ -19,6 +19,7 @@
 #include <string_view>
 #include <cstddef>
 #include <mutex>
+#include <thread>
 #include <shared_mutex>
 #include <unordered_map>
 #include <utility>
@@ -4282,11 +4283,26 @@ namespace rhi {
 		// VK_EXT_device_fault's report: the description, the faulting address ranges and the vendor's fault codes.
 		static void VkLogDeviceFault(VulkanDevice* impl, VkDeviceAddress& firstAddress, const char*& firstKind) noexcept {
 			try {
+				// A timeline can read UINT64_MAX before the driver puts the device in the lost state; until then the query fails
+				// (VK_ERROR_UNKNOWN). The device is dead, so poll for up to 3 s rather than lose the record.
 				VkDeviceFaultCountsEXT counts{ VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT };
-				if (const VkResult result = vkGetDeviceFaultInfoEXT(impl->device, &counts, nullptr); result != VK_SUCCESS) {
-					spdlog::error("Vulkan device fault: vkGetDeviceFaultInfoEXT (counts) failed ({})", static_cast<int>(result));
+				const auto start = std::chrono::steady_clock::now();
+				VkResult countsResult = vkGetDeviceFaultInfoEXT(impl->device, &counts, nullptr);
+				uint32_t tries = 1;
+				while (countsResult != VK_SUCCESS && std::chrono::steady_clock::now() - start < std::chrono::seconds(3)) {
+					std::this_thread::sleep_for(std::chrono::milliseconds(10));
+					counts = VkDeviceFaultCountsEXT{ VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT };
+					countsResult = vkGetDeviceFaultInfoEXT(impl->device, &counts, nullptr);
+					++tries;
+				}
+				const double waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+				if (countsResult != VK_SUCCESS) {
+					spdlog::error("Vulkan device fault: vkGetDeviceFaultInfoEXT (counts) failed ({}) {} times over {:.0f} ms", static_cast<int>(countsResult),
+						tries, waitedMs);
 					return;
 				}
+				if (tries > 1)
+					spdlog::error("Vulkan device fault: the device reached the lost state {:.0f} ms after the loss was seen ({} queries)", waitedMs, tries);
 				std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
 				std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
 				counts.vendorBinarySize = 0;  // the vendor binary dump is not enabled
