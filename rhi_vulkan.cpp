@@ -4432,6 +4432,20 @@ namespace rhi {
 				if (!progress || vkGetSemaphoreCounterValue(impl->device, progress->semaphore, &completed) != VK_SUCCESS) return;
 				queue->progressCompleted = (std::max)(queue->progressCompleted, completed);
 				if (completed >= list.submittedProgress) return;
+				// A batch's signals are not updated at once: its own signal can read reached a moment before the progress one. Any
+				// signal of that submission reached means it completed.
+				const auto& log = queue->submitLog;
+				for (uint64_t index = log.count > VulkanSubmitLog::kEntries ? log.count - VulkanSubmitLog::kEntries : 0; index < log.count; ++index) {
+					const auto& entry = log.entries[index % VulkanSubmitLog::kEntries];
+					if (entry.progress != list.submittedProgress) continue;
+					for (uint8_t i = 0; i < entry.signalCount; ++i) {
+						const VulkanTimeline* timeline = VkTimelineState(impl, entry.signals[i].t);
+						uint64_t reached = 0;
+						if (timeline && timeline->semaphore != VK_NULL_HANDLE && vkGetSemaphoreCounterValue(impl->device, timeline->semaphore, &reached) == VK_SUCCESS &&
+							reached >= entry.signals[i].value)
+							return;
+					}
+				}
 				spdlog::critical("Vulkan command list '{}' is {} while its last submission is pending: queue family {} index {}, its progress {}, "
 					"completed {}, submitted {}. The queue's pending submissions follow",
 					list.name.data(), a_what, queue->familyIndex, queue->queueIndex, list.submittedProgress, completed, queue->progressSubmitted);
