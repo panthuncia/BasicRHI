@@ -861,8 +861,16 @@ namespace rhi {
 				uint64_t range = 0;
 				uint64_t key = 0;
 				bool live = false;
+				uint64_t releasedNs = 0;  // steady clock at the release, 0 while live
 			};
 			std::vector<PairRecord> pairs;
+			// BASICRHI_VK_VIEW_REF_POISON=1 (diagnostic): a released pair's descriptors cover kPoisonBase + pair * kPoisonSpan, an
+			// address range nothing is bound at, so a load through a stale ref faults there and the fault report names the pair.
+			// Freed pairs are reused oldest first, and only once kPoisonQuarantine of them are free.
+			static constexpr uint64_t kPoisonBase = 0x100000000000ull;
+			static constexpr uint64_t kPoisonSpan = 1ull << 28;
+			static constexpr size_t kPoisonQuarantine = 4096;
+			bool poison = false;
 		} viewRefs;
 		// The last buffers destroyed with a device address, for the fault report: a read in one is a use after free.
 		struct RetiredBuffer {

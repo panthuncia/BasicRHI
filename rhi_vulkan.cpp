@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <span>
 #include <cctype>
 #include <cmath>
@@ -2748,6 +2749,12 @@ namespace rhi {
 			}
 			impl->shaderVisibleResourceCapacity -= BUFFER_VIEW_REF_SLOTS;
 			r.ready = true;
+			// The poison needs descriptors written from an address (the heap and universal models).
+			if (const char* value = std::getenv("BASICRHI_VK_VIEW_REF_POISON"); value && std::strcmp(value, "1") == 0) {
+				r.poison = !VkDescriptorSetsModel(impl);
+				spdlog::warn("{}: buffer view ref poison {}: released pairs cover 0x{:x} + pair * 0x{:x}", caller, r.poison ? "on" : "unsupported in the descriptor-sets model",
+					VulkanDevice::ViewRefRegion::kPoisonBase, VulkanDevice::ViewRefRegion::kPoisonSpan);
+			}
 			spdlog::info("{}: buffer view refs: {} pairs at heap slot {} (the client's capacity)", caller, BUFFER_VIEW_REF_PAIRS,
 				impl->shaderVisibleResourceCapacity);
 		}
@@ -2773,11 +2780,17 @@ namespace rhi {
 			if (const auto found = r.pairByResource.find(key); found != r.pairByResource.end())
 				return refAt(found->second);
 			uint32_t pair = 0;
-			if (!r.freePairs.empty()) {
+			if (r.poison && r.freePairs.size() >= VulkanDevice::ViewRefRegion::kPoisonQuarantine) {
+				pair = r.freePairs.front();
+				r.freePairs.erase(r.freePairs.begin());
+			} else if (!r.poison && !r.freePairs.empty()) {
 				pair = r.freePairs.back();
 				r.freePairs.pop_back();
 			} else if (r.nextPair < BUFFER_VIEW_REF_PAIRS) {
 				pair = r.nextPair++;
+			} else if (!r.freePairs.empty()) {
+				pair = r.freePairs.front();
+				r.freePairs.erase(r.freePairs.begin());
 			} else {
 				if (!r.loggedFull) {
 					r.loggedFull = true;
@@ -2815,10 +2828,21 @@ namespace rhi {
 			const uint32_t pair = found->second;
 			r.pairByResource.erase(found);
 			std::byte* srv = r.staging.data() + static_cast<size_t>(2 * pair * r.stride);
-			VkWriteViewRefDescriptor(impl, srv, VK_NULL_HANDLE, 0, 0);
+			if (r.poison) {
+				const uint64_t poison = VulkanDevice::ViewRefRegion::kPoisonBase + pair * VulkanDevice::ViewRefRegion::kPoisonSpan;
+				const VkDeviceSize span = (std::min<VkDeviceSize>)(VulkanDevice::ViewRefRegion::kPoisonSpan, impl->physicalDeviceProperties.limits.maxStorageBufferRange);
+				VkWriteViewRefDescriptor(impl, srv, VK_NULL_HANDLE, poison, span);
+				const VulkanResource* resource = VkResourceState(impl, handle);
+				spdlog::info("Vulkan buffer view ref poison: pair {} (slot {}) released by buffer {}:{} '{}' ({} bytes at 0x{:x}); now covers 0x{:x}", pair,
+					impl->shaderVisibleResourceCapacity + 2 * pair, handle.index, handle.generation, resource ? resource->name.data() : "?", r.pairs[pair].range,
+					r.pairs[pair].address, poison);
+			} else {
+				VkWriteViewRefDescriptor(impl, srv, VK_NULL_HANDLE, 0, 0);
+			}
 			std::memcpy(srv + r.stride, srv, static_cast<size_t>(r.stride));
 			VkPublishViewRefPair(impl, pair);
 			r.pairs[pair].live = false;  // the address stays: the fault report names the freed buffer
+			r.pairs[pair].releasedNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 			r.freePairs.push_back(pair);
 		}
 
@@ -4101,6 +4125,19 @@ namespace rhi {
 								spdlog::error("Vulkan fault attribution: no live buffer is {} bytes or larger", faultSlotLo);
 						}
 					}
+				}
+				if (impl->viewRefs.ready && impl->viewRefs.poison && a >= VulkanDevice::ViewRefRegion::kPoisonBase &&
+					a < VulkanDevice::ViewRefRegion::kPoisonBase + BUFFER_VIEW_REF_PAIRS * VulkanDevice::ViewRefRegion::kPoisonSpan) {
+					// A load through a released pair: the address names the pair and the ref's byte offset.
+					const auto& r = impl->viewRefs;
+					const uint64_t pair = (a - VulkanDevice::ViewRefRegion::kPoisonBase) / VulkanDevice::ViewRefRegion::kPoisonSpan;
+					const uint64_t offset = (a - VulkanDevice::ViewRefRegion::kPoisonBase) % VulkanDevice::ViewRefRegion::kPoisonSpan;
+					const auto& p = r.pairs[pair];
+					const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+					spdlog::error("Vulkan fault attribution: POISON: a load through released view ref pair {} (slot {}) at byte offset 0x{:x}; the pair is {} now, "
+						"last buffer {}:{} ({} bytes at 0x{:x}), released {:.1f} ms ago", pair, impl->shaderVisibleResourceCapacity + 2 * pair, offset,
+						p.live ? "live again (reused)" : "free", p.key & 0xFFFFFFFFu, p.key >> 32, p.range, p.address,
+						p.releasedNs ? double(now - p.releasedNs) / 1e6 : -1.0);
 				}
 				if (impl->viewRefs.ready) {
 					auto& r = impl->viewRefs;
