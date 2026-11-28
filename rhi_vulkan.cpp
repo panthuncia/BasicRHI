@@ -7220,6 +7220,14 @@ namespace rhi {
 					}
 					RHI_FAIL(Result::InvalidArgument);
 				}
+				// A timeline's signals rise in submission order. One at or below an earlier one is invalid; the driver may then never
+				// see the earlier batch complete (post-hang).
+				if (!timeline->importedD3D12Fence && signal.value <= timeline->lastSubmittedSignalValue) {
+					const auto names = submittrace::TimelineNames();
+					const auto name = names.find(signal.t.index);
+					spdlog::critical("Vulkan queue submit signals timeline t{} '{}' to {}, not above its last submitted signal {} (thread {})", signal.t.index,
+						name != names.end() ? name->second : std::string("?"), signal.value, timeline->lastSubmittedSignalValue, GetCurrentThreadId());
+				}
 				signalSemaphores.push_back(timeline->semaphore);
 				signalValues.push_back(signal.value);
 			}
