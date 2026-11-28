@@ -7781,6 +7781,38 @@ namespace rhi {
 			return (std::min)(impl->physicalDeviceProperties.limits.maxViewports, MAX_VIEWPORTS);
 		}
 
+		/** @brief Lowers a_extent to the attachment's size at its view's mip. Images of unknown size leave it. */
+		static void VkNoteAttachmentExtent(const VulkanResource& resource, const VulkanImageViewSlot& view, VkExtent2D& a_extent) noexcept {
+			if (!resource.width || !resource.height)
+				return;
+			const uint32_t mip = view.range.baseMip;
+			a_extent.width = (std::min)(a_extent.width, (std::max)(resource.width >> mip, 1u));
+			a_extent.height = (std::min)(a_extent.height, (std::max)(resource.height >> mip, 1u));
+		}
+
+		/**
+		 * @brief The pass's render area, clipped to its attachments as D3D12 clips to its render targets. Vulkan leaves rendering past an
+		 * attachment undefined, and a guest resize lost the device that way (a pass at the new size on the old target's image). Each clip
+		 * is logged (the first 64, then every 4096th).
+		 */
+		static VkExtent2D VkClampRenderArea(const PassBeginInfo& passInfo, VkExtent2D attachmentExtent) noexcept {
+			VkExtent2D area{ passInfo.width, passInfo.height };
+			const auto fits = [](uint32_t a_offset, uint32_t a_size, uint32_t a_limit) { return a_limit == UINT32_MAX || uint64_t(a_offset) + a_size <= a_limit; };
+			if (fits(passInfo.x, area.width, attachmentExtent.width) && fits(passInfo.y, area.height, attachmentExtent.height))
+				return area;
+			const auto clip = [](uint32_t a_offset, uint32_t a_size, uint32_t a_limit) {
+				return a_limit == UINT32_MAX ? a_size : (a_offset >= a_limit ? 0u : (std::min)(a_size, a_limit - a_offset));
+			};
+			const VkExtent2D clipped{ clip(passInfo.x, area.width, attachmentExtent.width), clip(passInfo.y, area.height, attachmentExtent.height) };
+			static std::atomic<uint64_t> s_clips{ 0 };
+			const uint64_t clips = s_clips.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (clips <= 64 || clips % 4096 == 0)
+				spdlog::warn("Vulkan BeginPass: '{}' asked for a {}x{} render area at ({}, {}) on {}x{} attachments; clipped to {}x{} (clip {})",
+					passInfo.debugName ? passInfo.debugName : "", area.width, area.height, passInfo.x, passInfo.y, attachmentExtent.width,
+					attachmentExtent.height, clipped.width, clipped.height, clips);
+			return clipped;
+		}
+
 		static void cl_beginPass(CommandList* commandList, const PassBeginInfo& passInfo) noexcept {
 			ZoneScopedN("RHI.Vulkan.BeginPass");
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
@@ -7805,6 +7837,8 @@ namespace rhi {
 				return;
 			}
 			commandListState->passColorResources.clear();
+			// The smallest attachment's extent at its view's mip. The render area must stay inside it.
+			VkExtent2D attachmentExtent{ UINT32_MAX, UINT32_MAX };
 
 			for (const ColorAttachment& color : passInfo.colors) {
 				VulkanDescriptorHeap* descriptorHeap = VkDescriptorHeapState(impl, color.rtv.heap);
@@ -7846,6 +7880,7 @@ namespace rhi {
 
 				colorAttachmentStorage[colorAttachmentCount++] = attachmentInfo;
 				commandListState->passColorResources.push_back(viewSlot->resource);
+				VkNoteAttachmentExtent(*resource, *viewSlot, attachmentExtent);
 			}
 
 			VkRenderingAttachmentInfo depthAttachment{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
@@ -7878,11 +7913,12 @@ namespace rhi {
 				}
 
 				commandListState->passDepthResource = viewSlot->resource;
+				VkNoteAttachmentExtent(*resource, *viewSlot, attachmentExtent);
 			}
 
 			VkRenderingInfo renderingInfo{ VK_STRUCTURE_TYPE_RENDERING_INFO };
 			renderingInfo.renderArea.offset = { static_cast<int32_t>(passInfo.x), static_cast<int32_t>(passInfo.y) };
-			renderingInfo.renderArea.extent = { passInfo.width, passInfo.height };
+			renderingInfo.renderArea.extent = VkClampRenderArea(passInfo, attachmentExtent);
 			commandListState->passRenderArea = renderingInfo.renderArea;
 			renderingInfo.layerCount = 1;
 			renderingInfo.colorAttachmentCount = colorAttachmentCount;
@@ -7942,6 +7978,12 @@ namespace rhi {
 
 			VkSetRenderAreaViewport(*commandListState, passInfo.x, passInfo.y, passInfo.width, passInfo.height, passInfo.minDepth,
 				passInfo.maxDepth);
+			// As D3D12, which clips to the render targets: the viewport stays as asked and the scissor keeps to the attachments.
+			if (renderingInfo.renderArea.extent.width != passInfo.width || renderingInfo.renderArea.extent.height != passInfo.height) {
+				commandListState->scissors[0] = VkClampScissor(passInfo.x, passInfo.y, renderingInfo.renderArea.extent.width,
+					renderingInfo.renderArea.extent.height);
+				VkApplyScissors(*commandListState, 0, 1);
+			}
 		}
 
 		static void cl_endPass(CommandList* commandList) noexcept {
