@@ -161,6 +161,36 @@ namespace rhi {
 		}
 	};
 
+	// A queue's last submissions: the progress value each signals, its thread, lists, waits and signals. q_submit and the
+	// present relay write it under timelinesMutex. The stall report (DumpCrashDiagnostics) and the reset of a pending list
+	// read it: a submission past the queue's completed progress shows what it waits for.
+	struct VulkanSubmitLog {
+		struct Entry {
+			uint64_t progress = 0;  // the queue's progress value it signals
+			uint32_t thread = 0;
+			uint32_t lists = 0;
+			const char* kind = "";
+			uint8_t waitCount = 0, signalCount = 0;
+			std::array<TimelinePoint, 6> waits{}, signals{};  // the first six
+		};
+		static constexpr uint32_t kEntries = 64;
+		std::array<Entry, kEntries> entries{};
+		uint64_t count = 0;
+		void Note(const char* a_kind, uint64_t a_progress, uint32_t a_thread, uint32_t a_lists, Span<TimelinePoint> a_waits, Span<TimelinePoint> a_signals) noexcept
+		{
+			auto& entry = entries[count++ % kEntries];
+			entry = {};
+			entry.progress = a_progress;
+			entry.thread = a_thread;
+			entry.lists = a_lists;
+			entry.kind = a_kind;
+			for (const auto& wait : a_waits)
+				if (entry.waitCount < entry.waits.size()) entry.waits[entry.waitCount++] = wait;
+			for (const auto& signal : a_signals)
+				if (entry.signalCount < entry.signals.size()) entry.signals[entry.signalCount++] = signal;
+		}
+	};
+
 	struct VulkanQueueState {
 		VkQueue queue = VK_NULL_HANDLE;
 		uint32_t familyIndex = 0xFFFFFFFFu;
@@ -174,6 +204,8 @@ namespace rhi {
 		TimelineHandle progress{};
 		bool hasProgress = false;
 		uint64_t progressSubmitted = 0;
+		uint64_t progressCompleted = 0;  // the last completed value read (VkCheckListIdleLocked)
+		VulkanSubmitLog submitLog;
 	};
 
 	struct VulkanImageViewSlot;
@@ -541,6 +573,11 @@ namespace rhi {
 		// labels' marker names.
 		uint32_t crashMarkerSlot = UINT32_MAX;
 		std::vector<const char*> crashLabelStack;
+		// The last submission's queue and the progress value it signals (q_submit). A reset or another submission before that
+		// value completes is reported (VkCheckListIdleLocked).
+		QueueHandle submittedQueue{};
+		uint64_t submittedProgress = 0;
+		std::array<char, 48> name{};  // SetName's, truncated
 		// A secondary (VK_COMMAND_BUFFER_LEVEL_SECONDARY, Device::CreateSecondaryCommandList).
 		bool secondary = false;
 		// This recording of a secondary continues the executing primary's rendering (BeginSecondary with insideRendering):

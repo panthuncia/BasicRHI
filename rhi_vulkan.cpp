@@ -4358,6 +4358,88 @@ namespace rhi {
 			}
 		}
 
+		// A queue's submissions past its completed progress, oldest first, each with what it waits for. A wait past its timeline's
+		// completed value holds the queue; one past every signal submitted so far waits for work nobody has submitted yet.
+		// timelinesMutex must be held. Returns the lines logged.
+		static uint32_t VkLogPendingSubmissionsLocked(VulkanDevice* impl, const VulkanQueueState& queue, uint64_t completed, spdlog::level::level_enum level) noexcept {
+			uint32_t lines = 0;
+			try {
+				const auto names = submittrace::TimelineNames();
+				const auto describe = [&](const TimelinePoint& a_point, bool a_wait) {
+					const auto name = names.find(a_point.t.index);
+					std::string text = std::format(" t{} '{}'{}{}", a_point.t.index, name != names.end() ? name->second : std::string("?"), a_wait ? ">=" : "=",
+						a_point.value);
+					if (!a_wait) return text;
+					const VulkanTimeline* timeline = VkTimelineState(impl, a_point.t);
+					uint64_t reached = 0;
+					if (!timeline || timeline->semaphore == VK_NULL_HANDLE || vkGetSemaphoreCounterValue(impl->device, timeline->semaphore, &reached) != VK_SUCCESS)
+						return text + " (timeline gone)";
+					if (reached >= a_point.value) return text + " (reached)";
+					text += std::format(" (at {}", reached);
+					if (!timeline->importedD3D12Fence && timeline->lastSubmittedSignalValue < a_point.value)
+						text += std::format(", NO SIGNAL SUBMITTED: the last is {}", timeline->lastSubmittedSignalValue);
+					return text + ")";
+				};
+				const auto& log = queue.submitLog;
+				const uint64_t first = log.count > VulkanSubmitLog::kEntries ? log.count - VulkanSubmitLog::kEntries : 0;
+				for (uint64_t index = first; index < log.count; ++index) {
+					const auto& entry = log.entries[index % VulkanSubmitLog::kEntries];
+					if (entry.progress <= completed) continue;
+					std::string text = std::format("Vulkan queue family {} index {}: pending {} (progress {}) on thread {}, {} lists, waits:", queue.familyIndex,
+						queue.queueIndex, entry.kind, entry.progress, entry.thread, entry.lists);
+					for (uint8_t w = 0; w < entry.waitCount; ++w) text += describe(entry.waits[w], true);
+					text += "; signals:";
+					for (uint8_t i = 0; i < entry.signalCount; ++i) text += describe(entry.signals[i], false);
+					spdlog::log(level, "{}", text);
+					++lines;
+				}
+			} catch (...) {
+			}
+			return lines;
+		}
+
+		// Every queue's progress, and its submissions not yet completed with their waits (VkLogPendingSubmissionsLocked).
+		static uint32_t VkLogPendingSubmissions(VulkanDevice* impl, spdlog::level::level_enum level) noexcept {
+			uint32_t lines = 0;
+			try {
+				const std::lock_guard lock(impl->timelinesMutex);
+				for (auto& slot : impl->queues.slots) {
+					if (!slot.alive || !slot.obj.hasProgress) continue;
+					const VulkanTimeline* progress = VkTimelineState(impl, slot.obj.progress);
+					uint64_t completed = 0;
+					if (!progress || vkGetSemaphoreCounterValue(impl->device, progress->semaphore, &completed) != VK_SUCCESS) continue;
+					spdlog::log(level, "Vulkan queue family {} index {}: progress submitted {}, completed {}", slot.obj.familyIndex, slot.obj.queueIndex,
+						slot.obj.progressSubmitted, completed);
+					++lines;
+					lines += VkLogPendingSubmissionsLocked(impl, slot.obj, completed, level);
+				}
+			} catch (...) {
+			}
+			return lines;
+		}
+
+		// A list is reset or submitted again only once its last submission completed: every submission signals its queue's progress
+		// timeline, so that value tells. Doing either to a pending list is invalid; the NVIDIA driver then spins in
+		// vkResetCommandBuffer (post-hang). So it is logged, with what the queue's pending submissions wait for. a_what names the
+		// call. timelinesMutex must be held.
+		static void VkCheckListIdleLocked(VulkanDevice* impl, const VulkanCommandList& list, const char* a_what) noexcept {
+			if (!list.submittedProgress) return;
+			try {
+				VulkanQueueState* queue = VkQueueStateForHandle(impl, list.submittedQueue);
+				if (!queue || !queue->hasProgress || queue->progressCompleted >= list.submittedProgress) return;
+				const VulkanTimeline* progress = VkTimelineState(impl, queue->progress);
+				uint64_t completed = 0;
+				if (!progress || vkGetSemaphoreCounterValue(impl->device, progress->semaphore, &completed) != VK_SUCCESS) return;
+				queue->progressCompleted = (std::max)(queue->progressCompleted, completed);
+				if (completed >= list.submittedProgress) return;
+				spdlog::critical("Vulkan command list '{}' is {} while its last submission is pending: queue family {} index {}, its progress {}, "
+					"completed {}, submitted {}. The queue's pending submissions follow",
+					list.name.data(), a_what, queue->familyIndex, queue->queueIndex, list.submittedProgress, completed, queue->progressSubmitted);
+				VkLogPendingSubmissionsLocked(impl, *queue, completed, spdlog::level::critical);
+			} catch (...) {
+			}
+		}
+
 		// Logs every list's last begun and finished marker and every queue's checkpoints; with deviceLost, the fault report too.
 		// A list whose two ids differ was still on the GPU. Returns the marker lines logged.
 		// summary, when given, receives the lists still in flight, and the fault's first address and kind (deviceLost only).
@@ -7072,6 +7154,7 @@ namespace rhi {
 				}
 #endif
 
+				VkCheckListIdleLocked(impl, *commandListState, "submitted again");
 				commandBuffers.push_back(commandListState->commandBuffer);
 			}
 
@@ -7259,6 +7342,14 @@ namespace rhi {
 				if (signalProgress) {
 					++queueState->progressSubmitted;
 					VkTimelineState(impl, queueState->progress)->lastSubmittedSignalValue = queueState->progressSubmitted;
+					queueState->submitLog.Note("submission", queueState->progressSubmitted, static_cast<uint32_t>(GetCurrentThreadId()), lists.size, submit.waits,
+						submit.signals);
+					for (uint32_t index = 0; index < lists.size; ++index) {
+						if (VulkanCommandList* commandListState = VkCommandListState(impl, lists.data[index].GetHandle())) {
+							commandListState->submittedQueue = queue->GetQueueHandle();
+							commandListState->submittedProgress = queueState->progressSubmitted;
+						}
+					}
 				}
 				for (uint32_t index = 0; index < lists.size; ++index) {
 					if (VulkanCommandList* commandListState = VkCommandListState(impl, lists.data[index].GetHandle())) {
@@ -7656,6 +7747,10 @@ namespace rhi {
 			if (!impl || impl->device == VK_NULL_HANDLE || !commandListState || !allocatorState || allocatorState->pool == VK_NULL_HANDLE) {
 				spdlog::error("Vulkan command list reset received invalid state");
 				return;
+			}
+			{
+				const std::lock_guard lock(impl->timelinesMutex);
+				VkCheckListIdleLocked(impl, *commandListState, "reset");
 			}
 			VkDestroyCommandListTransientQueryPools(impl, *commandListState);
 			commandListState->tracyGpuZoneStack.clear();
@@ -10529,6 +10624,8 @@ namespace rhi {
 			auto* impl = commandList ? static_cast<VulkanDevice*>(commandList->impl) : nullptr;
 			VulkanCommandList* commandListState = VkCommandListState(commandList);
 			if (commandListState) {
+				commandListState->name = {};
+				if (name) std::strncpy(commandListState->name.data(), name, commandListState->name.size() - 1);
 				VkSetObjectName(impl, reinterpret_cast<uint64_t>(commandListState->commandBuffer), VK_OBJECT_TYPE_COMMAND_BUFFER, name);
 				if (impl) VkNameCrashMarkerSlot(impl, *commandListState, name);
 			}
@@ -10882,6 +10979,9 @@ namespace rhi {
 					signalQueueState->progressSubmitted = progressValue;
 					if (VulkanTimeline* progress = VkTimelineState(impl, signalQueueState->progress))
 						progress->lastSubmittedSignalValue = progressValue;
+					TimelinePoint relayWait = waitTimeline ? sync->wait : TimelinePoint{};
+					signalQueueState->submitLog.Note("present relay", progressValue, static_cast<uint32_t>(GetCurrentThreadId()), 0,
+						{ &relayWait, waitTimeline ? 1u : 0u }, {});
 				}
 
 				VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
@@ -20930,7 +21030,9 @@ namespace rhi {
 
 		uint32_t DumpCrashDiagnostics(Device device, bool deviceLost) noexcept {
 			if (!device || device.vt != &g_vkdevvt || !device.impl) return 0;
-			return VkDumpCrashMarkers(static_cast<VulkanDevice*>(device.impl), deviceLost);
+			auto* impl = static_cast<VulkanDevice*>(device.impl);
+			const uint32_t pending = deviceLost ? 0 : VkLogPendingSubmissions(impl, spdlog::level::critical);
+			return pending + VkDumpCrashMarkers(impl, deviceLost);
 		}
 
 		Result import_image(Device device, const ImportedImageDesc& desc, ResourcePtr& out) noexcept {
